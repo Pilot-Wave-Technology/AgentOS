@@ -1,0 +1,352 @@
+{% extends "base.html" %}
+{% from "partials/_info_popover.html" import info_popover %}
+{% block title %}{{ story.title }}: {{ goal.name }}{% endblock %}
+{% block content %}
+<div class="p-6 lg:p-8 max-w-4xl mx-auto">
+  <!-- Breadcrumb -->
+  <div class="flex items-center gap-2 text-2xs text-gray-600 mb-4">
+    <a href="/goals/{{ pid }}/stories" class="hover:text-gray-400 transition-colors">Stories</a>
+    <span>/</span>
+    <span class="text-gray-400">{{ story.id[:8] }}</span>
+  </div>
+
+  <!-- Header -->
+  <div class="flex items-start justify-between gap-4 mb-6">
+    <div class="flex-1 min-w-0">
+      <h1 class="text-xl font-semibold text-gray-100">{{ story.title }}</h1>
+      <div class="flex items-center gap-3 mt-2">
+        <span class="pill
+          {% if story.state == 'done' %}pill-success
+          {% elif story.state == 'reviewed' %}pill-success
+          {% elif story.state == 'in_progress' %}pill-info
+          {% elif story.state == 'blocked' %}pill-error
+          {% elif story.state == 'proposed' %}pill-neutral
+          {% elif story.state == 'accepted' %}pill-warning
+          {% elif story.state == 'rejected' %}pill-error
+          {% else %}pill-neutral{% endif %}">
+          {{ story.state | replace("_", " ") }}
+        </span>
+        <span class="pill
+          {% if story.priority == 'critical' %}pill-error
+          {% elif story.priority == 'high' %}pill-warning
+          {% else %}pill-neutral{% endif %}">
+          {{ story.priority }}
+        </span>
+        {% if story.story_weight %}
+        <span class="text-2xs text-gray-500">Size: {{ story.story_weight }} ({{ story.story_weight_label }})</span>
+        {% endif %}
+        {% if story.assigned_to and story.assigned_to in member_names %}
+        <span class="text-2xs text-indigo-400">Assigned to {{ member_names[story.assigned_to] }}</span>
+        {% endif %}
+      </div>
+    </div>
+    <!-- Actions: only the assigned user (or admin) can drive the lifecycle -->
+    {% set is_owner = story.assigned_to == user.uid %}
+    <div class="flex items-center gap-2 flex-shrink-0">
+      {% if story.story_kind == 'merge' %}
+      <span class="text-xs text-gray-500 italic">Managed by the Git Engine: approve or cancel in the Git Engine view</span>
+      {% else %}
+      {% if story.state == 'proposed' %}
+        {% if not story.assigned_to or story.assigned_to == user.uid %}
+        {% if needs_resource %}
+        <button class="btn btn-primary text-xs opacity-50 cursor-not-allowed"
+                disabled title="No repo allocated. Ask the GO to grant the repo(s) this story works in (or add one via the Resources panel).">
+          Accept
+        </button>
+        {% elif needs_branch_name %}
+        <button class="btn btn-primary text-xs opacity-50 cursor-not-allowed"
+                disabled title="Repo linked but no working branch yet - the Git Engine cuts it when work starts.">
+          Accept
+        </button>
+        {% else %}
+        <form action="/goals/{{ pid }}/stories/{{ story.id }}/accept" method="post" data-toast-submit data-fail="Failed to accept story.">
+          <button class="btn btn-primary text-xs">Accept</button>
+        </form>
+        {% endif %}
+        {% else %}
+        <span class="text-xs text-gray-500 italic">Assigned to {{ member_names.get(story.assigned_to, story.assigned_to) }}</span>
+        {% endif %}
+      {% elif story.state == 'accepted' %}
+        {% if is_owner %}
+        <form action="/goals/{{ pid }}/stories/{{ story.id }}/start" method="post" data-toast-submit data-fail="Failed to start story.">
+          <button class="btn btn-primary text-xs"
+            {% if not deps_met %}disabled title="Upstream stories or required resources are not ready"{% endif %}>
+            Start Working
+          </button>
+        </form>
+        <a href="/goals/{{ pid }}/chat/pick-assistant?import_story={{ story.id }}"
+           class="btn btn-secondary text-xs">Import to Assistant</a>
+        {{ info_popover(
+          "Hands this story to a live agent to work on - a task-scoped IA (or, in operator mode, a real Claude Code process with actual side effects on the repo). This isn't a preview; the agent starts acting."
+        ) }}
+        {% else %}
+        <span class="text-xs text-gray-500 italic">Assigned to {{ member_names.get(story.assigned_to, story.assigned_to) }}</span>
+        {% endif %}
+      {% elif story.state == 'in_progress' %}
+        {% if is_owner %}
+        <form action="/goals/{{ pid }}/stories/{{ story.id }}/done" method="post"
+          data-confirm="Mark this story as done?">
+          <button class="btn btn-primary text-xs">Mark Done</button>
+        </form>
+        <a href="/goals/{{ pid }}/chat/pick-assistant?import_story={{ story.id }}"
+           class="btn btn-secondary text-xs">Open in Assistant</a>
+        {{ info_popover(
+          "Opens the live agent already working this story - a task-scoped IA (or, in operator mode, a real Claude Code process with actual side effects on the repo)."
+        ) }}
+        {% else %}
+        <span class="text-xs text-gray-500 italic">In progress · {{ member_names.get(story.assigned_to, story.assigned_to) }}</span>
+        {% endif %}
+      {% elif story.state == 'blocked' %}
+        <span class="text-xs text-gray-500 italic">Blocked · {{ member_names.get(story.assigned_to, story.assigned_to) }}</span>
+      {% endif %}
+      {% endif %}
+    </div>
+  </div>
+
+  <!-- Branch requirement banner for operator-mode proposed stories -->
+  {% if needs_resource %}
+  <div class="card p-4 mb-4 border-orange-500/40 bg-orange-950/20">
+    <div class="flex items-start gap-3">
+      <span class="text-orange-400 text-sm shrink-0">⚠</span>
+      <div>
+        <p class="text-sm font-medium text-orange-300 mb-1">Repository required before accepting</p>
+        <p class="text-xs text-gray-400">
+          This goal has more than one repository, so a coding story must declare which
+          one(s) it works in. To fix it:
+        </p>
+        <ol class="text-xs text-gray-400 list-decimal list-inside mt-1 space-y-0.5">
+          <li>Ask the GO to grant the repo(s) this story works in (<span class="font-mono">grant_resource</span>, <span class="font-mono">relation="produces"</span>)</li>
+          <li>Or link a repo to this story via the <a href="/goals/{{ pid }}/resources/browser" class="font-medium text-orange-300 hover:text-orange-200 underline">Resources panel</a></li>
+        </ol>
+        <p class="text-xs text-gray-500 mt-1">The Accept button will activate once a repository is allocated. The Git Engine then cuts the working branch automatically.</p>
+      </div>
+    </div>
+  </div>
+  {% elif needs_branch_name %}
+  <div class="card p-4 mb-4 border-orange-500/40 bg-orange-950/20">
+    <div class="flex items-start gap-3">
+      <span class="text-orange-400 text-sm shrink-0">⚠</span>
+      <div>
+        <p class="text-sm font-medium text-orange-300 mb-1">Working branch not cut yet</p>
+        <p class="text-xs text-gray-400">
+          A repository is linked but its workstream branch hasn't been cut yet.
+          The Git Engine cuts it automatically when the story starts - you can
+          accept now; provisioning waits for the branch.
+        </p>
+      </div>
+    </div>
+  </div>
+  {% endif %}
+
+  <!-- Execution Mode Toggle (Phase 4): only togglable pre-pickup -->
+  {% if story.state in ('proposed', 'accepted') and (not story.assigned_to or story.assigned_to == user.uid) %}
+  <div class="card p-4 mb-4 border-indigo-500/30 bg-indigo-950/20">
+    <div class="flex items-center justify-between gap-4">
+      <div>
+        <h2 class="text-xs font-semibold text-indigo-300 uppercase tracking-wider mb-1">Execution Mode</h2>
+        <div class="text-xs text-gray-400">
+          {% if story.execution_mode == 'operator' %}
+            <span class="text-indigo-300 font-medium">Operator</span>:
+            Your assistant will spawn a Claude Code subprocess and drive it through
+            plan / code / test / review when this story is picked up.
+            Bypasses the IA-dispatch pipeline.
+          {% else %}
+            <span class="text-gray-300 font-medium">IA dispatch (default)</span>:
+            Your assistant will write a task spec and dispatch to planner-ia → dev-ia →
+            test-ia → review-ia pipeline.
+          {% endif %}
+        </div>
+      </div>
+      <form action="/goals/{{ pid }}/stories/{{ story.id }}/execution-mode" method="post"
+            class="flex-shrink-0" data-toast-submit
+            {% if story.execution_mode != 'operator' %}data-confirm="Switch this story to operator mode? When you import it to the assistant, it will spawn Claude Code directly instead of writing a task spec."{% endif %}>
+        {% if story.execution_mode == 'operator' %}
+          <input type="hidden" name="mode" value="ia_dispatch">
+          <button class="btn btn-secondary text-xs">Switch to IA dispatch</button>
+        {% else %}
+          <input type="hidden" name="mode" value="operator">
+          <button class="btn btn-secondary text-xs">
+            Switch to operator mode
+          </button>
+        {% endif %}
+      </form>
+    </div>
+  </div>
+  {% elif story.execution_mode == 'operator' %}
+  <!-- Read-only indicator for non-toggleable states -->
+  <div class="card p-3 mb-4 border-indigo-500/20 bg-indigo-950/10">
+    <div class="text-xs text-indigo-300">
+      <span class="font-medium">Operator mode</span>: this story is running via a Claude Code subprocess.
+    </div>
+  </div>
+  {% endif %}
+
+  <!-- Description -->
+  {% if story.description %}
+  <div class="card p-5 mb-4">
+    <h2 class="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-2">Description</h2>
+    <div class="text-sm text-gray-300 whitespace-pre-wrap">{{ story.description }}</div>
+  </div>
+  {% endif %}
+
+  <!-- Acceptance Criteria -->
+  {% if story.acceptance_criteria %}
+  <div class="card p-5 mb-4">
+    <h2 class="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-2">Acceptance Criteria</h2>
+    <div class="text-sm text-gray-300 whitespace-pre-wrap">{{ story.acceptance_criteria }}</div>
+  </div>
+  {% endif %}
+
+  <!-- Blocked reason -->
+  {% if story.state == 'blocked' and story.blocked_reason %}
+  <div class="card p-5 mb-4 border-orange-500/30">
+    <h2 class="text-xs font-semibold text-orange-400 uppercase tracking-wider mb-2">Blocked</h2>
+    <div class="text-sm text-orange-300">{{ story.blocked_reason }}</div>
+  </div>
+  {% endif %}
+
+  <!-- Dependencies -->
+  {% if dep_stories or downstream %}
+  <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
+    {% if dep_stories %}
+    <div class="card p-5">
+      <h2 class="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-3">Depends On</h2>
+      <div class="space-y-2">
+        {% for d in dep_stories %}
+        <a href="/goals/{{ pid }}/stories/{{ d.id }}" class="flex items-center gap-2 text-sm hover:bg-surface-hover rounded px-2 py-1 -mx-2 transition-colors">
+          <div class="w-1.5 h-1.5 rounded-full flex-shrink-0
+            {% if d.state == 'done' %}bg-emerald-400
+            {% elif d.state == 'in_progress' %}bg-blue-400
+            {% elif d.state == 'blocked' %}bg-orange-400
+            {% else %}bg-gray-600{% endif %}"></div>
+          <span class="text-gray-300 truncate">{{ d.title }}</span>
+          <span class="pill pill-neutral text-2xs ml-auto flex-shrink-0">{{ d.state | replace("_", " ") }}</span>
+        </a>
+        {% endfor %}
+      </div>
+    </div>
+    {% endif %}
+    {% if downstream %}
+    <div class="card p-5">
+      <h2 class="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-3">Unblocks</h2>
+      <div class="space-y-2">
+        {% for d in downstream %}
+        <a href="/goals/{{ pid }}/stories/{{ d.id }}" class="flex items-center gap-2 text-sm hover:bg-surface-hover rounded px-2 py-1 -mx-2 transition-colors">
+          <div class="w-1.5 h-1.5 rounded-full flex-shrink-0 bg-gray-600"></div>
+          <span class="text-gray-300 truncate">{{ d.title }}</span>
+          <span class="pill pill-neutral text-2xs ml-auto flex-shrink-0">{{ d.state | replace("_", " ") }}</span>
+        </a>
+        {% endfor %}
+      </div>
+    </div>
+    {% endif %}
+  </div>
+  {% endif %}
+
+  <!-- Story-scoped Resources (only what the GO has actually allocated) -->
+  <div class="card p-5 mb-4">
+    <h2 class="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-3">Story Resources</h2>
+    {% if resources %}
+    <div class="space-y-3">
+      {% for r in resources %}
+      <div>
+        <div class="flex items-center gap-2 text-sm">
+          <span class="text-2xs px-1.5 py-0.5 rounded bg-surface-active text-gray-500 font-mono flex-shrink-0">{{ r.kind }}</span>
+          <span class="text-gray-300 truncate">{{ r.name }}</span>
+          {% if r.kind == 'branch' and r.branch_name %}
+          <span class="text-2xs text-emerald-400 font-mono flex-shrink-0">{{ r.branch_name }}</span>
+          {% endif %}
+          {% if r.relation %}
+          <span class="text-2xs px-1.5 py-0.5 rounded
+            {% if r.relation == 'produces' %}bg-emerald-900/40 text-emerald-400
+            {% elif r.relation == 'modifies' %}bg-orange-900/40 text-orange-400
+            {% else %}bg-blue-900/40 text-blue-400{% endif %} flex-shrink-0">
+            {{ r.relation }}
+          </span>
+          {% endif %}
+          {% if r.locked_by %}
+          <span class="text-2xs text-orange-400 flex-shrink-0">locked</span>
+          {% endif %}
+        </div>
+        {% if r.uri %}
+        <p class="text-2xs text-gray-600 ml-14 mt-0.5 truncate">{{ r.uri[:80] }}</p>
+        {% endif %}
+        {% if r.go_note %}
+        <p class="text-2xs text-gray-400 ml-14 mt-1 italic">GO note: {{ r.go_note[:300] }}</p>
+        {% endif %}
+        {% if r.human_context and not r.go_note %}
+        <p class="text-2xs text-gray-600 ml-14 mt-1">{{ r.human_context[:120] }}</p>
+        {% endif %}
+      </div>
+      {% endfor %}
+    </div>
+    <p class="text-2xs text-gray-600 mt-3">These are the resources the GO has allocated specifically to this story. The assistant for this story sees exactly this set in its RESOURCES.md.</p>
+    {% else %}
+    <p class="text-sm text-gray-500 italic">No resources allocated yet. The GO can grant access via <code class="text-2xs">grant_resource</code>; without any grants, the assistant falls back to seeing all active goal resources.</p>
+    {% endif %}
+  </div>
+
+  <!-- Tasks under this story -->
+  <div class="card overflow-hidden mb-4">
+    <div class="px-5 py-4 flex items-center justify-between border-b border-border">
+      <h2 class="text-xs font-semibold text-gray-400 uppercase tracking-wider">
+        Tasks
+        {% if total_count > 0 %}
+        <span class="text-gray-600 ml-1">{{ done_count }}/{{ total_count }}</span>
+        {% endif %}
+      </h2>
+      {% if story.state in ('accepted', 'in_progress') and story.assigned_to == user.uid %}
+      <a href="/goals/{{ pid }}/chat/pick-assistant?import_story={{ story.id }}"
+         class="text-2xs text-brand hover:text-brand-light transition-colors">
+        {% if story.state == 'accepted' %}Import to Assistant{% else %}Open in Assistant{% endif %}
+      </a>
+      {% endif %}
+    </div>
+
+    {% if child_tasks %}
+    <div class="divide-y divide-border">
+      {% for task in child_tasks %}
+      <div class="flex items-center px-5 py-2.5 gap-3">
+        <div class="w-1.5 h-1.5 rounded-full flex-shrink-0
+          {% if task.state == 'done' or task.state == 'approved' %}bg-emerald-400
+          {% elif task.state == 'failed' %}bg-red-400
+          {% elif task.state == 'in_progress' %}bg-blue-400 animate-pulse
+          {% elif task.state == 'blocked' %}bg-orange-400
+          {% else %}bg-gray-600{% endif %}"></div>
+        <div class="flex-1 min-w-0">
+          <div class="text-sm text-gray-300 truncate">{{ task.title }}</div>
+        </div>
+        <span class="text-2xs text-gray-600 font-mono flex-shrink-0">{{ task.template_id or task.assigned_to or "None" }}</span>
+        <span class="pill
+          {% if task.state == 'done' or task.state == 'approved' %}pill-success
+          {% elif task.state == 'failed' %}pill-error
+          {% elif task.state == 'in_progress' %}pill-info
+          {% elif task.state == 'blocked' %}pill-error
+          {% else %}pill-neutral{% endif %} flex-shrink-0">
+          {{ task.state | replace("_", " ") }}
+        </span>
+      </div>
+      {% endfor %}
+    </div>
+    {% else %}
+    <div class="px-5 py-8 text-center">
+      <p class="text-sm text-gray-600">No tasks yet.</p>
+      {% if story.state == 'in_progress' %}
+      <p class="text-2xs text-gray-700 mt-1">Import this story to your assistant to start creating tasks.</p>
+      {% elif story.state in ['proposed', 'accepted'] %}
+      <p class="text-2xs text-gray-700 mt-1">Tasks will be created when you start working on this story.</p>
+      {% endif %}
+    </div>
+    {% endif %}
+
+    {% if total_count > 0 %}
+    <div class="px-5 py-2.5 border-t border-border bg-surface">
+      <div class="w-full h-1.5 bg-surface-active rounded-full overflow-hidden">
+        <div class="h-full bg-emerald-500 rounded-full transition-all"
+             style="width: {{ (done_count / total_count * 100) | int if total_count > 0 else 0 }}%"></div>
+      </div>
+    </div>
+    {% endif %}
+  </div>
+</div>
+{% endblock %}

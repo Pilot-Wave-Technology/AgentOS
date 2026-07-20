@@ -1,0 +1,139 @@
+{% extends "base.html" %}
+{% from "partials/_info_popover.html" import info_popover %}
+{% block title %}{{ task.title }}: Tasks{% endblock %}
+{% block content %}
+<div class="p-8 max-w-3xl mx-auto">
+  <a href="/goals/{{ pid }}/tasks" class="inline-flex items-center gap-1.5 text-xs text-gray-500 hover:text-gray-300 transition-colors mb-5">
+    <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"/>
+    </svg>
+    Board
+  </a>
+
+  <!-- Task header -->
+  <div class="card p-6 mb-5">
+    <div class="flex items-start justify-between gap-4">
+      <div class="min-w-0">
+        <h1 class="text-lg font-semibold text-gray-100">{{ task.title }}</h1>
+        <div class="mt-1 flex items-center gap-2 flex-wrap">
+          <span class="inline-flex items-center gap-1.5 px-2 py-0.5 rounded text-xs font-medium
+            {% if task.state == 'done' %}bg-green-900/40 text-green-400 border border-green-800/50
+            {% elif task.state == 'failed' %}bg-red-900/40 text-red-400 border border-red-800/50
+            {% elif task.state == 'in_progress' %}bg-blue-900/40 text-blue-400 border border-blue-800/50
+            {% elif task.state == 'awaiting_approval' %}bg-yellow-900/40 text-yellow-400 border border-yellow-800/50
+            {% elif task.state == 'halted' %}bg-red-900/40 text-red-400 border border-red-800/50
+            {% else %}bg-gray-800/60 text-gray-400 border border-gray-700/50{% endif %}">
+            <span class="w-1.5 h-1.5 rounded-full
+              {% if task.state == 'done' %}bg-green-400
+              {% elif task.state in ('failed', 'halted') %}bg-red-400
+              {% elif task.state == 'in_progress' %}bg-blue-400
+              {% elif task.state == 'awaiting_approval' %}bg-yellow-400
+              {% else %}bg-gray-500{% endif %}"></span>
+            {{ task.state.replace("_", " ") }}
+          </span>
+          {% if task.state == 'halted' %}
+          {{ info_popover(
+            "Halted is terminal - an operator force-killed this task. There is no restart or resume from here; create a new task to redo the work."
+          ) }}
+          {% endif %}
+          <span class="text-xs px-2 py-0.5 rounded
+            {% if task.priority == 'critical' %}bg-red-900/40 text-red-400 border border-red-800/50
+            {% elif task.priority == 'high' %}bg-orange-900/40 text-orange-400 border border-orange-800/50
+            {% elif task.priority == 'medium' %}bg-yellow-900/40 text-yellow-400 border border-yellow-800/50
+            {% else %}bg-gray-800/60 text-gray-400 border border-gray-700/50{% endif %}">
+            {{ task.priority }}
+          </span>
+        </div>
+      </div>
+
+      <div class="flex gap-2 flex-shrink-0">
+        {% if task.state == "awaiting_approval" and (role == "admin" or task.assigned_to == user.uid) %}
+        {% set approve_action = "/goals/" ~ pid ~ "/tasks/" ~ task.id ~ ("/human-review" if human_review else "/approve") %}
+        <form action="{{ approve_action }}" method="post" data-toast-submit data-fail="Failed to approve task.">
+          <input type="hidden" name="action" value="approve" />
+          <button class="px-4 py-2 bg-green-700 hover:bg-green-600 rounded-lg text-sm">✓ Approve</button>
+        </form>
+        <form action="{{ approve_action }}" method="post" data-toast-submit data-fail="Failed to reject task.">
+          <input type="hidden" name="action" value="reject" />
+          <button class="px-4 py-2 bg-red-800 hover:bg-red-700 rounded-lg text-sm">✗ Reject</button>
+        </form>
+        {% endif %}
+        {% if role == "admin" or task.assigned_to == user.uid %}
+        <form action="/goals/{{ pid }}/tasks/{{ task.id }}/delete" method="post"
+          data-confirm="This deletes the task and all its subtasks. This cannot be undone." data-confirm-danger="true" data-confirm-phrase="Delete this task">
+          <button class="px-4 py-2 bg-gray-800 hover:bg-red-900 text-gray-400 hover:text-red-300 rounded-lg text-sm transition-colors">
+            Delete
+          </button>
+        </form>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+
+  <!-- Details -->
+  <div class="grid grid-cols-1 lg:grid-cols-3 gap-5 mb-5">
+    <div class="lg:col-span-2 card p-6">
+      <h2 class="text-sm font-semibold text-gray-200 mb-2">Description</h2>
+      <p class="text-sm text-gray-400 whitespace-pre-wrap">{{ task.description or "No description." }}</p>
+    </div>
+    <div class="card p-6 space-y-3 text-sm">
+      <div>
+        <div class="text-xs text-gray-500 mb-0.5">Assigned to</div>
+        <div class="font-mono text-indigo-300">{{ task.assigned_to or "None" }}</div>
+      </div>
+      <div>
+        <div class="text-xs text-gray-500 mb-0.5">Due</div>
+        <div class="text-gray-300">{{ task.due_at or "Not Set" }}</div>
+      </div>
+      <div>
+        <div class="text-xs text-gray-500 mb-0.5">Approval required</div>
+        <div class="text-gray-300">{% if task.approval_required %}Yes{% else %}No{% endif %}</div>
+      </div>
+      {% if task.depends_on %}
+      <div>
+        <div class="text-xs text-gray-500 mb-0.5">Depends on</div>
+        {% for dep in task.depends_on %}
+        <a href="/goals/{{ pid }}/tasks/{{ dep }}" class="block text-xs text-indigo-400 hover:text-indigo-300">{{ dep }}</a>
+        {% endfor %}
+      </div>
+      {% endif %}
+    </div>
+  </div>
+
+  <!-- State transition -->
+  {% set valid_next = {
+    "pending":            ["ready", "in_progress", "cancelled", "failed"],
+    "ready":              ["dispatching", "cancelled", "failed"],
+    "dispatching":        ["in_progress", "failed"],
+    "in_progress":        ["blocked", "awaiting_approval", "done", "failed"],
+    "blocked":            ["ready", "in_progress", "done", "cancelled", "failed"],
+    "awaiting_approval":  [],
+    "approved":           ["done"],
+    "rejected":           ["ready", "pending", "failed"],
+    "done":               [],
+    "failed":             ["ready", "pending"],
+    "cancelled":          [],
+  } %}
+  {% if valid_next[task.state] %}
+  <section class="card p-6">
+    <h2 class="text-sm font-semibold text-gray-200 mb-3 flex items-center gap-1.5">Move to state
+      {{ info_popover(
+        "Only the states this task is actually allowed to move to next are listed - the task state machine defines which transitions are valid from here. Some states (like awaiting_approval) aren't manually settable at all; they're driven by the Approve/Reject actions above instead."
+      ) }}
+    </h2>
+    <form class="flex flex-wrap gap-2 items-end" action="/goals/{{ pid }}/tasks/{{ task.id }}/transition" method="post" data-toast-submit data-fail="Failed to update state.">
+      <select name="state" class="px-3 py-1.5 bg-gray-800 border border-gray-700 rounded-lg text-sm">
+        {% for s in valid_next[task.state] %}
+        <option value="{{ s }}">{{ s.replace("_", " ") }}</option>
+        {% endfor %}
+      </select>
+      <input name="note" placeholder="Optional note"
+        class="flex-1 min-w-40 px-3 py-1.5 bg-gray-800 border border-gray-700 rounded-lg text-sm focus:outline-none focus:border-indigo-500" />
+      <button type="submit" class="px-4 py-1.5 bg-indigo-600 hover:bg-indigo-500 rounded-lg text-sm">Update</button>
+    </form>
+  </section>
+  {% endif %}
+
+</div>
+{% endblock %}
+

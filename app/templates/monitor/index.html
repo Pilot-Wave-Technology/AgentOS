@@ -1,0 +1,255 @@
+{% extends "base.html" %}
+{% from "partials/_info_popover.html" import info_popover %}
+{% block title %}Monitor: {{ goal.name }}{% endblock %}
+{% block content %}
+<div class="p-8 max-w-6xl mx-auto">
+  <a href="/goals/{{ pid }}" class="inline-flex items-center gap-1 text-xs text-gray-500 hover:text-gray-300 transition-colors mb-5">
+    <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"/></svg>
+    {{ goal.name }}
+  </a>
+  <div class="flex items-center justify-between mb-8">
+    <h1 class="text-2xl font-bold">Monitoring Dashboard</h1>
+    <!-- Gateway health badge -->
+    <div class="flex items-center gap-2 px-3 py-1.5 bg-gray-900 border border-gray-800 rounded-lg text-sm">
+      <span class="w-2.5 h-2.5 rounded-full {% if health.status == 'ok' %}bg-green-500{% else %}bg-red-500{% endif %}"></span>
+      Gateway: {{ health.status | upper }}
+    </div>
+  </div>
+
+  <!-- Error banners -->
+  {% if health.status != 'ok' and health.error %}
+  <div class="mb-6 px-4 py-3 bg-red-900/30 border border-red-800/50 rounded-xl text-sm text-red-300">
+    <div class="font-medium mb-1">Gateway Unreachable</div>
+    <div class="text-xs text-red-400/70 font-mono">{{ health.error }}</div>
+  </div>
+  {% endif %}
+  {% if sessions_error %}
+  <div class="mb-6 px-4 py-3 bg-yellow-900/30 border border-yellow-800/50 rounded-xl text-sm text-yellow-300">
+    <div class="font-medium mb-1">Failed to fetch session data</div>
+    <div class="text-xs text-yellow-400/70 font-mono">{{ sessions_error }}</div>
+  </div>
+  {% endif %}
+
+  <!-- Stats row -->
+  <div class="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
+    <div class="bg-gray-900 border border-gray-800 rounded-xl p-5">
+      <div class="flex items-center gap-1 mb-1">
+        <span class="text-xs text-gray-500 uppercase tracking-wide">Active Agents</span>
+        {{ info_popover("Distinct agents currently provisioned for this goal -- GO, each user's Assistant, and any task templates in use. Counts each real identity once, not once per conversation thread or task dispatch.") }}
+      </div>
+      <div class="text-3xl font-bold text-indigo-400">{{ active_agent_count }}</div>
+      {% if terminated_count %}
+      <div class="flex items-center gap-1 mt-1">
+        <span class="text-2xs text-gray-600">+{{ terminated_count }} terminated (last hr)</span>
+        {{ info_popover("Agents with no remaining live threads or tasks, kept visible for an hour after their last one ended so they don't disappear mid-poll. Not counted in Active Agents above.", label="Terminated") }}
+      </div>
+      {% endif %}
+    </div>
+    <div class="bg-gray-900 border border-gray-800 rounded-xl p-5">
+      <div class="text-xs text-gray-500 uppercase tracking-wide mb-1">Tasks in Flight</div>
+      <div class="text-3xl font-bold text-blue-400">{{ active_tasks | length }}</div>
+    </div>
+    <div class="bg-gray-900 border border-gray-800 rounded-xl p-5">
+      <div class="flex items-center gap-1 mb-1">
+        <span class="text-xs text-gray-500 uppercase tracking-wide">Live Sessions</span>
+        {{ info_popover("Gateway chat sessions active in the last hour for this goal, plus claude-code task DAGs currently executing. An agent shown as idle below may still have had a session recently -- this only counts the last hour.") }}
+      </div>
+      <div class="text-3xl font-bold text-green-400">{{ (sessions | length) + (goal_dags | length) }}</div>
+      {% if goal_dags %}
+      <div class="flex items-center gap-1 mt-1">
+        <span class="text-2xs text-gray-600">{{ sessions | length }} gateway &middot; {{ goal_dags | length }} claude-code</span>
+        {{ info_popover("Gateway sessions are chat.send conversations over the WebSocket bridge. Claude-code sessions are claude-code-phase task DAGs, which run over claude-cli and never register as a gateway session.", label="Gateway vs. claude-code") }}
+      </div>
+      {% endif %}
+    </div>
+    <div class="bg-gray-900 border border-gray-800 rounded-xl p-5">
+      <div class="flex items-center gap-1 mb-1">
+        <span class="text-xs text-gray-500 uppercase tracking-wide">Tokens Used</span>
+        {{ info_popover("Lifetime total across every token call ever recorded for this goal -- not limited to currently-visible agents.") }}
+      </div>
+      <div class="text-3xl font-bold text-yellow-400" title="{{ '{:,}'.format(total_tokens) }}">{{ total_tokens | abbrev_num }}</div>
+      {% if historical_tokens %}
+      <div class="flex items-center gap-1 mt-1">
+        <span class="text-2xs text-gray-600">{{ shown_tokens | abbrev_num }} shown &middot; {{ historical_tokens | abbrev_num }} from finished agents</span>
+        {{ info_popover("Usage attributed to agents or conversation threads that finished more than an hour ago and no longer have a row in Agent Status below -- still real spend, just not shown per-agent anymore.", label="From finished agents") }}
+      </div>
+      {% endif %}
+    </div>
+  </div>
+
+  <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+    <!-- Agent status: polled every 5s, skips re-render on 304 -->
+    <section class="bg-gray-900 border border-gray-800 rounded-xl p-5">
+      <h2 class="font-semibold mb-4">Agent Status</h2>
+      <div id="agents-status-body"
+        hx-get="/goals/{{ pid }}/monitor/agents-partial"
+        hx-trigger="every 5s"
+        hx-swap="innerHTML"
+        hx-on::after-request="updateAgentsEtag(event)">
+        {% include "partials/agents_table.html" %}
+      </div>
+    </section>
+
+    <!-- Tasks needing attention (pending/running/blocked/halted) -->
+    <section class="bg-gray-900 border border-gray-800 rounded-xl p-5">
+      <div class="flex items-center justify-between mb-4">
+        <h2 class="font-semibold">Tasks Needing Attention</h2>
+        <a href="/goals/{{ pid }}/tasks" class="text-xs text-indigo-400 hover:text-indigo-300">View board →</a>
+      </div>
+      {% if active_tasks %}
+      <div class="space-y-2">
+        {% for t in active_tasks %}
+        <a href="/goals/{{ pid }}/tasks/{{ t.id }}"
+           class="flex items-center gap-3 text-sm hover:bg-gray-800 rounded-lg px-2 py-2 transition-colors">
+          <span class="w-1.5 h-1.5 rounded-full flex-shrink-0
+            {% if t.state in ('pending', 'dispatching') %}bg-gray-400
+            {% elif t.state == 'in_progress' %}bg-blue-400
+            {% elif t.state == 'blocked' %}bg-orange-400
+            {% elif t.state == 'awaiting_approval' %}bg-yellow-400
+            {% elif t.state == 'halted' %}bg-red-500
+            {% else %}bg-gray-600{% endif %}">
+          </span>
+          <span class="flex-1 truncate">{{ t.title }}</span>
+          <span class="text-xs flex-shrink-0
+            {% if t.state == 'halted' %}text-red-400
+            {% elif t.state == 'awaiting_approval' %}text-yellow-400
+            {% elif t.state == 'blocked' %}text-orange-400
+            {% else %}text-gray-500{% endif %}">
+            {{ t.state | replace('_', ' ') }}
+          </span>
+        </a>
+        {% endfor %}
+      </div>
+      {% else %}
+      <p class="text-sm text-gray-500">No tasks requiring attention.</p>
+      {% endif %}
+    </section>
+  </div>
+
+  <!-- Recent Tasks + Recent Activity -->
+  <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 mt-6">
+
+    <!-- Recent Tasks -->
+    <div class="card p-4">
+      <div class="flex items-center justify-between mb-3">
+        <h2 class="text-xs font-semibold uppercase tracking-wider text-gray-500">Recent Tasks</h2>
+        <a href="/goals/{{ pid }}/tasks" class="text-2xs text-brand hover:text-brand-light transition-colors">View all &rarr;</a>
+      </div>
+      {% if recent_tasks %}
+      <div class="space-y-1.5">
+        {% for t in recent_tasks[:6] %}
+        <a href="/goals/{{ pid }}/tasks/{{ t.id }}"
+           class="flex items-center gap-3 px-3 py-2 rounded-md hover:bg-white/5 transition-colors group">
+          <span class="pill flex-shrink-0
+            {% if t.state == 'done' or t.state == 'approved' %}pill-success
+            {% elif t.state in ('failed', 'rejected', 'halted') %}pill-error
+            {% elif t.state in ('in_progress', 'dispatching') %}pill-info
+            {% elif t.state == 'awaiting_approval' %}pill-warning
+            {% elif t.state == 'blocked' %}pill-warning
+            {% elif t.state == 'cancelled' %}pill-neutral
+            {% else %}pill-neutral{% endif %}">
+            {{ t.state | replace('_', ' ') }}
+          </span>
+          <span class="flex-1 text-sm text-gray-300 group-hover:text-gray-100 transition-colors truncate">{{ t.title }}</span>
+        </a>
+        {% endfor %}
+      </div>
+      {% else %}
+      <p class="text-xs text-gray-600 py-4 text-center">No tasks yet: start a chat with your Assistant.</p>
+      {% endif %}
+    </div>
+
+    <!-- Recent Activity -->
+    <div class="card p-4">
+      <div class="flex items-center justify-between mb-3">
+        <h2 class="text-xs font-semibold uppercase tracking-wider text-gray-500">Recent Activity</h2>
+        <a href="/goals/{{ pid }}/audit" class="text-2xs text-brand hover:text-brand-light transition-colors">View all &rarr;</a>
+      </div>
+      {% if activity %}
+      <div class="space-y-1.5">
+        {% for ev in activity %}
+        {% set et = ev.event_type or '' %}
+        <div class="flex items-start gap-2.5 px-2 py-1.5">
+          <span class="mt-0.5 text-2xs px-1.5 py-0.5 rounded font-mono flex-shrink-0
+            {% if et.startswith('task.') %}bg-blue-900/40 text-blue-300
+            {% elif et.startswith('story.') %}bg-purple-900/40 text-purple-300
+            {% elif et.startswith('goal.') %}bg-green-900/40 text-green-300
+            {% elif et.startswith('approval.') %}bg-yellow-900/40 text-yellow-300
+            {% else %}bg-gray-800 text-gray-400{% endif %}">
+            {{ et.split('.')[-1] }}
+          </span>
+          <div class="flex-1 min-w-0">
+            <p class="text-xs text-gray-300 truncate">
+              {% set p = ev.payload if ev.payload is mapping else {} %}
+              {% if p.get('task_title') %}{{ p.task_title }}
+              {% elif p.get('story_title') %}{{ p.story_title }}
+              {% elif p.get('title') %}{{ p.title }}
+              {% else %}{{ et }}{% endif %}
+            </p>
+            <p class="text-2xs text-gray-600" {% if ev.timestamp %}data-utc="{{ ev.timestamp.isoformat() }}"{% endif %}>{{ ev.timestamp.strftime('%b %d %H:%M') if ev.timestamp else '' }}{% if ev.timestamp %} UTC{% endif %}</p>
+          </div>
+        </div>
+        {% endfor %}
+      </div>
+      {% else %}
+      <p class="text-xs text-gray-600 py-4 text-center">No activity recorded yet.</p>
+      {% endif %}
+    </div>
+  </div>
+
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+// Track the current ETag so each HTMX poll sends If-None-Match.
+// On a 304 the browser body is empty and HTMX skips the swap: no flicker.
+// On a 200 we capture the new ETag from the response headers for next time.
+let _agentsEtag = "{{ agents_etag }}";
+
+// Pagination state: persisted across HTMX swaps so the page doesn't reset
+// to 1 every time the polling endpoint returns new data.
+const AGENTS_PAGE_SIZE = 5;
+let _agentsPage = 0;
+
+function _applyAgentsPagination() {
+  const rows = document.querySelectorAll('#agents-list .agent-row');
+  if (!rows.length) return;
+  const total = rows.length;
+  const maxPage = Math.ceil(total / AGENTS_PAGE_SIZE) - 1;
+  if (_agentsPage > maxPage) _agentsPage = maxPage;
+  const start = _agentsPage * AGENTS_PAGE_SIZE;
+  const end = start + AGENTS_PAGE_SIZE;
+  rows.forEach((r, i) => { r.style.display = (i >= start && i < end) ? '' : 'none'; });
+  const label = document.getElementById('agents-page-label');
+  if (label) label.textContent = `${start + 1}–${Math.min(end, total)} of ${total}`;
+  const prev = document.getElementById('agents-prev');
+  const next = document.getElementById('agents-next');
+  if (prev) prev.disabled = _agentsPage === 0;
+  if (next) next.disabled = _agentsPage >= maxPage;
+}
+
+function agentsPrevPage() { if (_agentsPage > 0) { _agentsPage--; _applyAgentsPagination(); } }
+function agentsNextPage() {
+  const total = document.querySelectorAll('#agents-list .agent-row').length;
+  if ((_agentsPage + 1) * AGENTS_PAGE_SIZE < total) { _agentsPage++; _applyAgentsPagination(); }
+}
+
+function updateAgentsEtag(evt) {
+  const xhr = evt.detail.xhr;
+  if (xhr.status === 200) {
+    const newEtag = xhr.getResponseHeader('ETag');
+    if (newEtag) _agentsEtag = newEtag;
+    // Re-apply pagination after a real swap (304 means no DOM change needed)
+    _applyAgentsPagination();
+  }
+  // Keep the hx-headers attribute current so the next trigger sends the
+  // latest ETag we know about
+  const el = document.getElementById('agents-status-body');
+  if (el) el.setAttribute('hx-headers', JSON.stringify({'If-None-Match': _agentsEtag}));
+}
+
+// Apply on initial page load
+document.addEventListener('DOMContentLoaded', _applyAgentsPagination);
+</script>
+{% endblock %}

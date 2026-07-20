@@ -1,0 +1,2437 @@
+{% extends "base.html" %}
+{% from "partials/_info_popover.html" import info_popover %}
+{% from "partials/_tour_trigger.html" import tour_trigger %}
+{% block title %}Chat: {{ agent.name }}{% endblock %}
+{% block content %}
+<!-- Markdown rendering: marked.js + highlight.js (hljs theme loaded in base.html, swapped on theme toggle) -->
+<script src="https://cdn.jsdelivr.net/npm/marked@15/marked.min.js"></script>
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11/build/highlight.min.js"></script>
+<!-- XSS: DOMPurify sanitizes rendered markdown before it hits innerHTML (see safe_markdown.js) -->
+<script src="https://cdn.jsdelivr.net/npm/dompurify@3/dist/purify.min.js"></script>
+<script src="/static/js/safe_markdown.js"></script>
+<script src="/static/js/markdown_renderer.js"></script>
+
+<style>
+  /* Agent bubble prose overrides for a clean dark-mode look */
+  .agent-prose h1, .agent-prose h2, .agent-prose h3,
+  .agent-prose h4, .agent-prose h5, .agent-prose h6 {
+    color: #e2e8f0; font-weight: 600; margin-top: 1em; margin-bottom: 0.4em; line-height: 1.3;
+  }
+  .agent-prose h1 { font-size: 1.25rem; }
+  .agent-prose h2 { font-size: 1.1rem; }
+  .agent-prose h3 { font-size: 1rem; }
+  .agent-prose p { margin: 0.4em 0; line-height: 1.6; }
+  .agent-prose ul, .agent-prose ol { margin: 0.4em 0; padding-left: 1.5em; }
+  .agent-prose ul { list-style-type: disc; }
+  .agent-prose ol { list-style-type: decimal; }
+  .agent-prose li { margin: 0.2em 0; }
+  .agent-prose li > ul, .agent-prose li > ol { margin: 0.1em 0; }
+  .agent-prose strong { color: #f1f5f9; font-weight: 600; }
+  .agent-prose em { color: #cbd5e1; }
+  .agent-prose a { color: #818cf8; text-decoration: underline; }
+  .agent-prose blockquote {
+    border-left: 3px solid #4f46e5; padding: 0.3em 0.8em; margin: 0.5em 0;
+    color: #94a3b8; background: rgba(99,102,241,0.06); border-radius: 0 0.375rem 0.375rem 0;
+  }
+  .agent-prose code:not(pre code) {
+    background: rgba(255,255,255,0.08); padding: 0.15em 0.35em; border-radius: 0.25rem;
+    font-size: 0.85em; color: #e2e8f0; font-family: 'Fira Code', ui-monospace, monospace;
+  }
+  .agent-prose pre {
+    background: #0d1117; border: 1px solid #1e293b; border-radius: 0.5rem;
+    padding: 0.8em 1em; margin: 0.6em 0; overflow-x: auto; position: relative;
+  }
+  .agent-prose pre code {
+    background: none; padding: 0; border-radius: 0; font-size: 0.82em;
+    font-family: 'Fira Code', ui-monospace, monospace; color: #e2e8f0;
+  }
+  .agent-prose table {
+    width: 100%; border-collapse: collapse; margin: 0.6em 0; font-size: 0.85em;
+  }
+  .agent-prose th, .agent-prose td {
+    border: 1px solid #1e293b; padding: 0.4em 0.7em; text-align: left;
+  }
+  .agent-prose th { background: rgba(255,255,255,0.04); font-weight: 600; color: #e2e8f0; }
+  .agent-prose hr { border-color: #1e293b; margin: 0.8em 0; }
+  /* Copy button for code blocks */
+  .code-copy-btn {
+    position: absolute; top: 0.4em; right: 0.4em; padding: 0.2em 0.5em;
+    font-size: 0.7em; background: rgba(255,255,255,0.08); border: 1px solid #334155;
+    border-radius: 0.25rem; color: #94a3b8; cursor: pointer; opacity: 0; transition: opacity 0.15s;
+  }
+  .agent-prose pre:hover .code-copy-btn { opacity: 1; }
+  .code-copy-btn:hover { background: rgba(255,255,255,0.15); color: #e2e8f0; }
+  /* Agent card styles */
+  .agent-card { border-radius: 0.75rem; padding: 1rem 1.25rem; border: 1px solid; }
+  .agent-card.card-question { border-color: #4f46e5; background: rgba(79,70,229,0.06); }
+  .agent-card.card-progress { border-color: #374151; background: rgba(55,65,81,0.3); }
+  .agent-card.card-completion { border-color: #059669; background: rgba(5,150,105,0.06); }
+  .agent-card.card-failure { border-color: #dc2626; background: rgba(220,38,38,0.06); }
+  .agent-card.card-approval { border-color: #d97706; background: rgba(217,119,6,0.06); }
+  .agent-card.card-review { border-color: #7c3aed; background: rgba(124,58,237,0.06); }
+  .card-review-body .review-task-ref { font-size: 0.75rem; color: #6b7280; margin-bottom: 0.5rem; }
+  .card-review-body .review-verdict-row { display: flex; align-items: center; gap: 0.75rem; margin-bottom: 0.5rem; }
+  .review-verdict-badge { font-size: 0.75rem; font-weight: 600; padding: 0.2rem 0.6rem; border-radius: 999px; }
+  .verdict-approved { background: rgba(5,150,105,0.15); color: #34d399; }
+  .verdict-changes_required { background: rgba(217,119,6,0.15); color: #fbbf24; }
+  .verdict-rejected { background: rgba(220,38,38,0.15); color: #f87171; }
+  .review-score { font-size: 0.75rem; color: #9ca3af; }
+  .card-review-body .review-summary { font-size: 0.875rem; color: #d1d5db; margin-bottom: 0.5rem; }
+  .card-review-body details { margin-top: 0.5rem; }
+  .card-review-body summary { font-size: 0.75rem; color: #6b7280; cursor: pointer; }
+  .card-review-body summary:hover { color: #9ca3af; }
+  .card-review-body ul { list-style: disc; padding-left: 1.25rem; margin-top: 0.25rem; font-size: 0.8rem; color: #9ca3af; }
+  .card-review-body li { margin-bottom: 0.2rem; }
+  .card-review-body .review-updated-spec { margin-top: 0.5rem; font-size: 0.8rem; color: #9ca3af; border-top: 1px solid #374151; padding-top: 0.5rem; }
+  .agent-card .card-header { display: flex; align-items: center; gap: 0.5rem; font-size: 0.75rem; color: #9ca3af; margin-bottom: 0.5rem; }
+  .agent-card .card-title { font-size: 0.875rem; font-weight: 600; color: #e2e8f0; margin-bottom: 0.25rem; }
+  .agent-card .card-body { font-size: 0.875rem; color: #d1d5db; line-height: 1.5; }
+  .agent-card .card-body .agent-prose { font-size: 0.875rem; }
+  .agent-card .card-context { margin-top: 0.5rem; }
+  .agent-card .card-context summary { font-size: 0.75rem; color: #6b7280; cursor: pointer; }
+  .agent-card .card-context summary:hover { color: #9ca3af; }
+  .agent-card .card-context .detail-content { margin-top: 0.5rem; font-size: 0.8rem; color: #9ca3af; max-height: 600px; overflow-y: auto; }
+  .agent-card .card-options { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-top: 0.75rem; }
+  .agent-card .card-option { padding: 0.375rem 0.75rem; border-radius: 0.5rem; font-size: 0.75rem; font-weight: 500; cursor: pointer; transition: all 0.15s; border: 1px solid transparent; }
+  .agent-card .card-option.opt-primary { background: #4f46e5; color: white; }
+  .agent-card .card-option.opt-primary:hover { background: #4338ca; }
+  .agent-card .card-option.opt-secondary { background: #374151; color: #e5e7eb; }
+  .agent-card .card-option.opt-secondary:hover { background: #4b5563; }
+  .agent-card .card-option.opt-danger { background: rgba(220,38,38,0.15); color: #fca5a5; border-color: rgba(220,38,38,0.3); }
+  .agent-card .card-option.opt-danger:hover { background: rgba(220,38,38,0.25); }
+  .agent-card .card-custom-input { margin-top: 0.5rem; display: flex; gap: 0.5rem; }
+  .agent-card .card-custom-input input { flex: 1; background: #1f2937; border: 1px solid #374151; border-radius: 0.5rem; padding: 0.375rem 0.75rem; font-size: 0.75rem; color: #e5e7eb; }
+  .agent-card .card-custom-input input:focus { outline: none; border-color: #4f46e5; }
+  .agent-card .card-custom-input button { padding: 0.375rem 0.75rem; background: #374151; color: #e5e7eb; border-radius: 0.5rem; font-size: 0.75rem; cursor: pointer; white-space: nowrap; }
+  .agent-card .card-custom-input button.opt-replan { background: rgba(234,88,12,0.2); color: #fb923c; border: 1px solid rgba(234,88,12,0.3); }
+  .agent-card .card-custom-input button.opt-replan:hover { background: rgba(234,88,12,0.3); }
+  .agent-card .card-artifacts { margin-top: 0.5rem; font-size: 0.75rem; color: #9ca3af; }
+  .agent-card .card-responded { margin-top: 0.5rem; font-size: 0.75rem; color: #6b7280; font-style: italic; }
+  .agent-card.responded { opacity: 0.6; }
+  .agent-card.responded .card-options, .agent-card.responded .card-custom-input { display: none; }
+</style>
+
+<div class="flex h-full">
+  <!-- Chat area (full width: no thread sidebar) -->
+  <div class="flex-1 flex flex-col min-w-0">
+    <!-- Header: SHCA info + participants + actions -->
+    <div id="chat-header" class="px-5 py-2.5 border-b border-border flex items-center gap-3 bg-surface/50">
+      {% if pid is defined %}
+      <a href="/goals/{{ pid }}" class="text-gray-500 hover:text-gray-300 transition-colors flex-shrink-0">
+        <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"/></svg>
+      </a>
+      {% endif %}
+      <!-- SHCA avatar + name -->
+      <div class="w-7 h-7 rounded-full bg-brand/20 text-brand flex items-center justify-center text-xs font-bold flex-shrink-0">
+        {{ agent.name[0].upper() if agent.name else "A" }}
+      </div>
+      <div class="min-w-0">
+        <div class="font-medium text-sm text-gray-200 truncate">{{ agent.name }}</div>
+        {% if goal is defined %}
+        <div class="text-2xs text-gray-600">{{ goal.name }}</div>
+        {% endif %}
+      </div>
+
+      <!-- Participants -->
+      <div class="flex items-center gap-1 ml-4 sidebar-label">
+        <div class="flex -space-x-1.5">
+          {% if user.photo_url %}
+          <img src="{{ user.photo_url }}" class="w-5 h-5 rounded-full border border-surface" title="{{ user.display_name or user.email }}" />
+          {% else %}
+          <div class="w-5 h-5 rounded-full bg-brand/20 text-brand flex items-center justify-center text-2xs font-bold border border-surface"
+               title="{{ user.display_name or user.email }}">
+            {{ (user.display_name or user.email or "?")[0].upper() }}
+          </div>
+          {% endif %}
+          <!-- Agent avatar -->
+          <div class="w-5 h-5 rounded-full bg-emerald-500/20 text-emerald-400 flex items-center justify-center text-2xs font-bold border border-surface"
+               title="{{ agent.name }}">
+            {{ agent.name[0].upper() if agent.name else "A" }}
+          </div>
+        </div>
+        <button id="btn-add-participant" onclick="document.getElementById('modal-add-participant').classList.remove('hidden')"
+          class="w-5 h-5 rounded-full border border-dashed border-gray-700 flex items-center justify-center text-gray-600 hover:text-gray-400 hover:border-gray-500 transition-colors ml-1" title="Add participant">
+          <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"/>
+          </svg>
+        </button>
+      </div>
+
+      <!-- Spacer -->
+      <div class="flex-1"></div>
+
+      {% if agent.get("type") == "SHCA" and user.preferences.get("startup_wizard_enabled", True) %}
+      {{ tour_trigger("assistant-thread-intro", "What is the Assistant?") }}
+      {% endif %}
+
+      <!-- Actions -->
+      {% if thread_id %}
+      <div class="flex items-center gap-1.5">
+        <!-- Context-usage ring (fills as tokens accumulate; turns amber, then red, near compaction). -->
+        <div id="usage-ring" class="relative w-7 h-7 flex items-center justify-center opacity-40"
+             title="Context usage: send a message to populate">
+          <svg viewBox="0 0 28 28" class="w-7 h-7 -rotate-90">
+            <circle cx="14" cy="14" r="11" stroke="currentColor" stroke-width="2.5" fill="none" class="text-slate-700"/>
+            <circle id="usage-ring-fg" cx="14" cy="14" r="11" stroke="currentColor" stroke-width="2.5" fill="none"
+                    stroke-dasharray="69.115" stroke-dashoffset="69.115" stroke-linecap="round"
+                    class="text-emerald-400 transition-all duration-300"/>
+          </svg>
+        </div>
+        <form action="/goals/{{ pid }}/chat/{{ agent.id }}/threads/{{ thread_id }}/delete" method="post"
+          data-confirm="This cannot be undone." data-confirm-danger="true" data-confirm-phrase="Delete this conversation">
+          <button id="btn-delete-conversation" type="submit" title="Delete conversation"
+            class="w-7 h-7 flex items-center justify-center rounded-md text-gray-600 hover:text-red-400 hover:bg-surface-hover transition-colors">
+            <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/>
+            </svg>
+          </button>
+        </form>
+        <div class="text-right">
+          <div id="conn-status" class="flex items-center gap-1.5 text-2xs text-gray-600 ml-1">
+            <span id="conn-dot" class="w-1.5 h-1.5 rounded-full bg-gray-600"></span>
+            <span id="conn-label">Connecting…</span>
+          </div>
+          {% if thread_id %}
+          <div class="text-2xs text-gray-700 font-mono mt-0.5">{{ thread_id[:12] }}</div>
+          {% endif %}
+        </div>
+      </div>
+      {% else %}
+      <div class="text-right">
+        <div id="conn-status" class="flex items-center gap-1.5 text-2xs text-gray-600">
+          <span id="conn-dot" class="w-1.5 h-1.5 rounded-full bg-gray-600"></span>
+          <span id="conn-label">Connecting…</span>
+        </div>
+      </div>
+      {% endif %}
+    </div>
+
+    <!-- Add participant modal -->
+    <div id="modal-add-participant" class="hidden fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50 p-4"
+         onclick="if(event.target===this) this.classList.add('hidden')">
+      <div class="card w-full max-w-sm p-6">
+        <h2 class="text-lg font-semibold mb-2 text-gray-100">Add Participants</h2>
+        <p class="text-sm text-gray-500 mb-4">Select goal members to add to this conversation.</p>
+        <div id="participant-list" class="space-y-1.5 max-h-60 overflow-y-auto">
+          <div class="text-2xs text-gray-600 py-2">Loading members...</div>
+        </div>
+        <div class="flex justify-end gap-2 mt-4">
+          <button type="button" onclick="document.getElementById('modal-add-participant').classList.add('hidden')"
+            class="btn btn-secondary btn-sm">Cancel</button>
+          <button type="button" onclick="submitSelectedParticipants()" class="btn btn-primary btn-sm">Add Selected</button>
+        </div>
+      </div>
+    </div>
+    <script>
+    // Load members when modal opens
+    const _origShowModal = document.getElementById('modal-add-participant');
+    const _observer = new MutationObserver(() => {
+      if (!_origShowModal.classList.contains('hidden')) loadGoalMembers();
+    });
+    _observer.observe(_origShowModal, { attributes: true, attributeFilter: ['class'] });
+
+    async function loadGoalMembers() {
+      const threadId = "{{ thread_id }}";
+      const res = await fetch(`/goals/{{ pid }}/chat/members/search?q=&exclude_thread=${threadId}`);
+      const data = await res.json();
+      const container = document.getElementById('participant-list');
+      if (!data.results || data.results.length === 0) {
+        container.innerHTML = '<div class="text-2xs text-gray-500 py-4 text-center">All goal members are already in this conversation</div>';
+        return;
+      }
+      container.innerHTML = data.results.map(r => `
+        <label class="flex items-center gap-3 px-3 py-2 rounded-lg hover:bg-surface-hover cursor-pointer transition-colors">
+          <input type="checkbox" value="${r.uid}" class="participant-checkbox rounded border-gray-600 bg-gray-700 text-indigo-500 focus:ring-indigo-500">
+          <div class="flex-1">
+            <div class="text-sm text-gray-200" title="${escapeHtml(r.email || '')}">${escapeHtml(r.name)}</div>
+          </div>
+          <span class="text-2xs uppercase tracking-wide text-gray-500 px-1.5 py-0.5 rounded border border-gray-700 flex-shrink-0">${escapeHtml(r.role || '')}</span>
+        </label>
+      `).join('');
+    }
+
+    async function submitSelectedParticipants() {
+      const checkboxes = document.querySelectorAll('.participant-checkbox:checked');
+      if (checkboxes.length === 0) return;
+
+      for (const cb of checkboxes) {
+        const form = document.createElement('form');
+        form.method = 'POST';
+        form.setAttribute('action', `/goals/{{ pid }}/chat/{{ agent.id }}/thread/{{ thread_id }}/add-participant`);
+        const input = document.createElement('input');
+        input.type = 'hidden';
+        input.name = 'participant_uid';
+        input.value = cb.value;
+        form.appendChild(input);
+        document.body.appendChild(form);
+
+        // Submit via fetch to avoid page reload for each
+        await fetch(form.getAttribute('action'), {
+          method: 'POST',
+          headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+          body: `participant_uid=${cb.value}`,
+        });
+      }
+
+      // Reload page after all added
+      window.location.reload();
+    }
+    </script>
+
+    <!-- Messages -->
+    {# Operator-mode action banner (Stage 3-d/3-l + Stage 5 pause/replan): #}
+    {% if current_story and current_story.workspace_state == 'ready' %}
+    <div id="phase-banner" class="px-4 py-2 border-b border-border bg-indigo-500/5 flex items-center gap-3 text-2xs flex-wrap">
+      <span class="text-gray-500 uppercase tracking-wider">Phase:</span>
+      <span class="font-mono {% if current_story.execution_paused %}text-amber-300{% else %}text-indigo-300{% endif %}">
+        {% if current_story.execution_paused %}⏸ paused{% else %}{{ current_story.current_phase or 'planning' }}{% endif %}
+      </span>
+      {{ info_popover(
+        "The assistant works this story through a plan → execute → review loop: discovery/planning (writing and scoping a plan), awaiting_plan_approval (waiting on you to approve it), executing (running the approved plan), awaiting_next (a diff landed - continue planning or mark done), awaiting_review (waiting on a diff review). \"paused\" means you (or an admin) froze it - Resume or Replan to continue.",
+        label="What do these phases mean?"
+      ) }}
+      {% if current_story.execution_paused %}
+      <button onclick="resumeStory()" class="ml-auto px-3 py-1 rounded bg-emerald-600 hover:bg-emerald-500 text-white text-2xs font-semibold">
+        ▶ Resume
+      </button>
+      <button onclick="replanStory()" class="px-3 py-1 rounded bg-indigo-600 hover:bg-indigo-500 text-white text-2xs font-semibold">
+        ♻ Replan
+      </button>
+      {% elif current_story.current_phase == 'awaiting_plan_approval' or (current_story.current_phase == 'planning' and current_story.current_plan_path) %}
+      <button id="approve-plan-btn" onclick="approvePlan()" class="ml-auto px-3 py-1 rounded bg-green-600 hover:bg-green-500 text-white text-2xs font-semibold">
+        ✓ Approve plan
+      </button>
+      {# Mark-done only for a continuation cycle (story already shipped ≥1 plan). A
+         never-approved story isn't "done" — it's cancelled from the board. #}
+      {% if current_story.current_plan_id %}
+      <button onclick="markStoryDone()" title="Close the story without running this new plan" class="px-3 py-1 rounded bg-green-600 hover:bg-green-500 text-white text-2xs font-semibold">
+        ✓ Mark story done
+      </button>
+      {% endif %}
+      {% elif current_story.current_phase == 'planning' %}
+      <span id="approve-plan-placeholder" class="ml-auto px-3 py-1 text-gray-500 text-2xs italic">Writing plan…</span>
+      {% if current_story.current_plan_id %}
+      <button onclick="markStoryDone()" title="Close the story without adding this feature" class="px-3 py-1 rounded bg-green-600 hover:bg-green-500 text-white text-2xs font-semibold">
+        ✓ Mark story done
+      </button>
+      {% endif %}
+      {% elif current_story.current_phase == 'discovery' %}
+      <span class="ml-auto text-gray-400">Scoping the work.</span>
+      {% elif current_story.current_phase == 'executing' %}
+      <button onclick="pauseStory()" class="ml-auto px-3 py-1 rounded bg-amber-600 hover:bg-amber-500 text-white text-2xs font-semibold">
+        ⏸ Pause
+      </button>
+      {% elif current_story.current_phase == 'awaiting_next' %}
+      <span class="ml-auto text-gray-400">Diff pushed. Continue planning or:</span>
+      <button onclick="markStoryDone()" class="px-3 py-1 rounded bg-green-600 hover:bg-green-500 text-white text-2xs font-semibold">
+        ✓ Mark story done
+      </button>
+      {% elif current_story.current_phase == 'awaiting_review' %}
+      <span class="ml-auto text-gray-400">Awaiting diff review.</span>
+      <button id="gen-diff-review-btn" onclick="retryDiffReview()" class="px-3 py-1 rounded bg-indigo-600 hover:bg-indigo-500 text-white text-2xs font-semibold">
+        ⟳ Generate diff review
+      </button>
+      {% endif %}
+      <span id="phase-banner-msg" class="ml-auto text-gray-500 hidden"></span>
+    </div>
+    {% endif %}
+
+    <div id="messages" class="flex-1 overflow-y-auto px-5 py-4 space-y-4">
+      {% if thread_id %}
+      {% for msg in messages %}
+      {% if msg.card_data and msg.card_data is mapping and msg.card_data.kind == 'story_state_snapshot' %}
+      {# Phase 4 Stage 4: pre-turn state snapshot for SHCA. Expanded by  #}
+      {# default so the human sees exactly what context SHCA is reading. #}
+      <div class="flex justify-start">
+        <details class="max-w-3xl w-full" open>
+          <summary class="cursor-pointer text-2xs text-gray-400 hover:text-gray-200 select-none px-2 py-1 inline-flex items-center gap-1.5 rounded bg-indigo-500/10 border border-indigo-500/30">
+            <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
+            <span class="font-semibold text-indigo-300">Assistant context</span>
+            {% if msg.card_data.phase and msg.card_data.phase != 'none' %}<span class="text-gray-600">·</span><span class="text-gray-400">phase={{ msg.card_data.phase }}</span>{% endif %}
+            {% if msg.card_data.story_type and msg.card_data.story_type != 'none' %}<span class="text-gray-600">·</span><span class="text-gray-400">type={{ msg.card_data.story_type }}</span>{% endif %}
+            {% if msg.card_data.claude_session_id and msg.card_data.claude_session_id not in ('none', '(not spawned yet)') %}<span class="text-gray-600">·</span><span class="text-gray-400">claude={{ msg.card_data.claude_session_id[:8] }}…</span>{% endif %}
+          </summary>
+          <pre class="mt-1.5 px-3 py-2 text-2xs font-mono text-gray-300 bg-indigo-500/5 border border-indigo-500/20 rounded whitespace-pre-wrap">{{ msg.content }}</pre>
+        </details>
+      </div>
+      {% elif msg.card_data and msg.card_data is mapping and msg.card_data.kind == 'claude_tool_progress' %}
+      {# Stage 3 live progress: one-line activity card from Claude's hook #}
+      <div class="flex justify-start">
+        <div class="max-w-3xl w-full px-3 py-1.5 text-2xs font-mono border-l-2 border-indigo-500/40 bg-indigo-500/5 text-gray-400 flex items-center gap-2">
+          <span class="text-gray-600" data-utc="{{ msg.created_at.isoformat() if msg.created_at else '' }}">{{ msg.created_at.strftime('%b %d, %H:%M:%S') if msg.created_at else '' }} UTC</span>
+          {% if msg.card_data.task_id %}<span class="text-indigo-300">T{{ msg.card_data.task_id }}</span>{% endif %}
+          <span class="text-gray-300">{{ msg.content }}</span>
+        </div>
+      </div>
+      {% elif msg.card_data and msg.card_data is mapping and msg.card_data.kind == 'phase_task_progress' %}
+      {# Stage 3-i: task progress card (mechanical, bypasses SHCA LLM) #}
+      <div class="flex justify-start">
+        <div class="max-w-3xl w-full px-4 py-3 rounded-xl text-sm border
+                    {% if msg.card_data.sentinel == 'DONE' %}border-green-500/30 bg-green-500/5
+                    {% elif msg.card_data.sentinel == 'BLOCKED' %}border-amber-500/30 bg-amber-500/5
+                    {% elif msg.card_data.sentinel == 'FAILED' %}border-red-500/30 bg-red-500/5
+                    {% else %}border-gray-500/30 bg-gray-500/5{% endif %}">
+          <div class="flex items-center gap-2 text-xs font-mono mb-1">
+            <span class="px-1.5 py-0.5 rounded bg-surface text-gray-300">T{{ msg.card_data.task_id }}</span>
+            <span class="text-gray-500">·</span>
+            <span class="text-indigo-300">{{ msg.card_data.phase }}</span>
+            <span class="text-gray-500">·</span>
+            <span class="font-semibold
+                         {% if msg.card_data.sentinel == 'DONE' %}text-green-400
+                         {% elif msg.card_data.sentinel == 'BLOCKED' %}text-amber-400
+                         {% elif msg.card_data.sentinel == 'FAILED' %}text-red-400
+                         {% else %}text-gray-400{% endif %}">{{ msg.card_data.sentinel or 'output' }}</span>
+          </div>
+          {# Render markdown via the .agent-prose[data-md] page-load handler.       #}
+          {# Claude's PHASE_TASK_DONE summaries use headers/lists/bold/code. The    #}
+          {# handler falls back to escaped pre-wrap if marked.parse returns empty,  #}
+          {# so weird input can't leave the body blank.                             #}
+          <div class="agent-prose text-gray-200 text-sm" data-md="{{ msg.content | e }}">{{ msg.content }}</div>
+          {% if msg.card_data.card_subkind == 'blocked-question' %}
+          <div class="mt-2 text-2xs text-amber-300 italic">↳ Reply in chat to answer this question; it's auto-relayed to Claude.</div>
+          {% endif %}
+        </div>
+      </div>
+      {% elif msg.card_data and msg.card_data is mapping and msg.card_data.kind == 'diff_review' %}
+      {# Stage 3-l: diff review card #}
+      <div class="flex justify-start">
+        <div class="max-w-3xl w-full px-4 py-3 rounded-xl text-sm border border-blue-500/40 bg-blue-500/5">
+          <div class="flex items-center gap-2 text-xs font-semibold uppercase tracking-wider text-blue-300 mb-2">
+            <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2"/>
+            </svg>
+            Diff Review
+            <span class="text-2xs text-gray-500 font-normal ml-2">{{ msg.card_data.stat }}</span>
+          </div>
+          <div class="agent-prose text-gray-200" data-md="{{ msg.content | e }}">{{ msg.content }}</div>
+          {% if msg.card_data.decided %}
+          <div class="mt-3 text-2xs font-semibold uppercase tracking-wider
+                      {% if msg.card_data.decided == 'approve' %}text-emerald-300{% else %}text-rose-300{% endif %}">
+            {% if msg.card_data.decided == 'approve' %}✓ Approved &amp; pushed{% else %}✗ Rejected: sent back to Claude{% endif %}
+          </div>
+          {% else %}
+          <form data-approval-id="{{ msg.card_data.approval_id }}"
+                onsubmit="return decideDiff(event, '{{ msg.card_data.approval_id }}')"
+                class="mt-3 flex gap-2 items-center">
+            <textarea name="feedback" rows="2" placeholder="Optional feedback if rejecting…"
+                      class="input text-2xs flex-1"></textarea>
+            <button type="button" onclick="decideDiffAction(event, '{{ msg.card_data.approval_id }}', 'approve')"
+                    class="px-3 py-2 rounded bg-green-600 hover:bg-green-500 text-white text-2xs font-semibold">
+              ✓ Approve & push
+            </button>
+            <button type="button" onclick="decideDiffAction(event, '{{ msg.card_data.approval_id }}', 'reject')"
+                    class="px-3 py-2 rounded bg-red-600 hover:bg-red-500 text-white text-2xs font-semibold">
+              ✗ Reject
+            </button>
+          </form>
+          {% endif %}
+        </div>
+      </div>
+      {% elif msg.card_data and msg.card_data is mapping and msg.card_data.kind == 'dag_recovery' %}
+      {# Phase 3: DAG recovery card (Replan / Retry / Abandon). mode='failed' (red) | 'blocked' (amber). #}
+      {% set _blocked = msg.card_data.mode == 'blocked' %}
+      <div class="flex justify-start">
+        <div class="max-w-3xl w-full px-4 py-3 rounded-xl text-sm border {% if _blocked %}border-amber-500/40 bg-amber-500/5{% else %}border-rose-500/40 bg-rose-500/5{% endif %}">
+          <div class="flex items-center gap-2 text-xs font-semibold uppercase tracking-wider {% if _blocked %}text-amber-300{% else %}text-rose-300{% endif %} mb-2">
+            {% if _blocked %}Phase Blocked — answer in chat to resume, or:{% else %}Phase Failed{% endif %}
+          </div>
+          <div class="agent-prose text-gray-200" data-md="{{ msg.content | e }}">{{ msg.content }}</div>
+          {% if msg.card_data.decided %}
+          <div class="mt-3 text-2xs font-semibold uppercase tracking-wider text-gray-400">
+            {{ msg.card_data.decided }}
+          </div>
+          {% else %}
+          <div class="mt-3 flex gap-2 items-center flex-wrap recovery-card">
+            <input name="feedback" placeholder="Optional feedback for replan…"
+                   class="input text-2xs flex-1 min-w-40" />
+            {% for opt in msg.card_data.options %}
+            <button type="button" onclick="recoverAction(event, '{{ opt }}')"
+                    class="px-3 py-2 rounded text-white text-2xs font-semibold
+                    {% if opt == 'replan' %}bg-blue-600 hover:bg-blue-500
+                    {% elif opt == 'abandon' %}bg-red-600 hover:bg-red-500
+                    {% elif opt == 'review_keep' %}bg-emerald-600 hover:bg-emerald-500
+                    {% else %}bg-gray-600 hover:bg-gray-500{% endif %}">
+              {% if opt == 'replan' %}♻ Replan{% elif opt == 'retry' %}↻ Retry{% elif opt == 'review_keep' %}📥 Review &amp; keep{% elif opt == 'abandon' %}✕ Abandon{% else %}{{ opt }}{% endif %}
+            </button>
+            {% endfor %}
+          </div>
+          {% endif %}
+        </div>
+      </div>
+      {% elif msg.card_data %}
+      <div class="flex justify-start" data-utc="{{ msg.created_at.isoformat() if msg.created_at else '' }}">
+        <div class="card-container max-w-2xl w-full">
+          <script type="application/json" class="card-json">{{ ((msg.card_data | tojson) if msg.card_data is mapping else msg.card_data) | replace("</", "<\\/") | safe }}</script>
+        </div>
+      </div>
+      {% elif msg.sender == 'system' or (msg.content or '').startswith('# Story Mode Active') %}
+      <!-- System / story-kickoff message: distinct context banner, markdown rendered.
+           Matches sender='system' (legacy import-task path) AND the GO-attributed
+           "# Story Mode Active" kickoff that fires when a user starts working on
+           a story: both should look like context, not chat. -->
+      <div class="flex justify-center" data-utc="{{ msg.created_at.isoformat() if msg.created_at else '' }}">
+        <div class="max-w-3xl w-full px-4 py-3 rounded-xl text-sm border border-indigo-500/30 bg-indigo-500/5">
+          <div class="flex items-center gap-2 text-xs font-semibold uppercase tracking-wider text-indigo-300 mb-2">
+            <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/>
+            </svg>
+            Context loaded
+          </div>
+          <div class="agent-prose text-gray-200" data-md="{{ msg.content | e }}">{{ msg.content }}</div>
+        </div>
+      </div>
+      {% elif msg.role == 'agent' and msg.sender == 'go' %}
+      <!-- Relay from the Goal Orchestrator into this assistant's thread. It is an
+           INBOUND message to the assistant (the assistant replies to it), not the
+           assistant's own output: render it distinctly with GO attribution so it
+           never masquerades as the assistant. -->
+      <div class="flex justify-start" data-utc="{{ msg.created_at.isoformat() if msg.created_at else '' }}">
+        <div class="max-w-3xl w-full px-4 py-3 rounded-xl text-sm border border-emerald-500/30 bg-emerald-500/5">
+          <div class="flex items-center gap-2 text-xs font-semibold uppercase tracking-wider text-emerald-300 mb-2">
+            <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z"/>
+            </svg>
+            Goal Orchestrator
+          </div>
+          <div class="agent-prose text-gray-200" data-md="{{ msg.content | e }}">{{ msg.content }}</div>
+        </div>
+      </div>
+      {% else %}
+      <div class="flex flex-col {% if msg.role == 'human' %}items-end{% else %}items-start{% endif %}"
+           data-utc="{{ msg.created_at.isoformat() if msg.created_at else '' }}">
+        {% if msg.role == 'human' and msg.sender_name %}<span class="text-[0.67rem] text-gray-500 mb-0.5 mr-1">{{ msg.sender_name }}</span>{% endif %}
+        <div class="{% if msg.role == 'human' %}max-w-xl{% else %}max-w-3xl{% endif %} px-4 py-2.5 rounded-2xl text-sm
+          {% if msg.role == 'human' %}bg-brand text-white rounded-br-sm{% else %}bg-surface border border-border text-gray-200 rounded-bl-sm{% endif %}">
+          <div class="agent-prose" data-md="{{ msg.content | e }}">{{ msg.content }}</div>
+        </div>
+      </div>
+      {% endif %}
+      {% endfor %}
+      <div id="typing-indicator" class="hidden justify-start">
+        <div class="bg-surface border border-border rounded-2xl rounded-bl-sm px-4 py-3">
+          <div class="flex gap-1.5">
+            <span class="w-1.5 h-1.5 bg-gray-500 rounded-full animate-bounce" style="animation-delay:0ms"></span>
+            <span class="w-1.5 h-1.5 bg-gray-500 rounded-full animate-bounce" style="animation-delay:150ms"></span>
+            <span class="w-1.5 h-1.5 bg-gray-500 rounded-full animate-bounce" style="animation-delay:300ms"></span>
+          </div>
+        </div>
+      </div>
+      <!-- Compaction indicator: shown when the gateway is compacting context.
+           Compaction can take several minutes on large sessions; without this
+           the UI looks frozen and the user assumes their message is lost. -->
+      <div id="compacting-indicator" class="hidden justify-start my-2">
+        <div class="bg-amber-900/20 border border-amber-700/50 rounded-2xl px-4 py-2 flex items-center gap-2">
+          <svg class="w-4 h-4 text-amber-400 animate-spin flex-shrink-0" fill="none" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+            <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+            <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.4 0 0 5.4 0 12h4zm2 5.3A8 8 0 014 12H0c0 3 1.1 5.8 3 7.9l3-2.6z"></path>
+          </svg>
+          <div>
+            <div class="text-xs font-semibold text-amber-300">Compacting conversation history</div>
+            <div class="text-xs text-amber-400/70">This can take a few minutes on long sessions. Your message will be processed once compaction completes.</div>
+          </div>
+        </div>
+      </div>
+      {% else %}
+      <div class="flex items-center justify-center h-full">
+        <div class="text-center">
+          <svg class="w-10 h-10 mx-auto text-gray-700 mb-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1" d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z"/>
+          </svg>
+          <p class="text-sm text-gray-500">Select a conversation or start a new one</p>
+        </div>
+      </div>
+      <div id="typing-indicator" class="hidden justify-start">
+        <div class="bg-surface border border-border rounded-2xl rounded-bl-sm px-4 py-3">
+          <div class="flex gap-1.5">
+            <span class="w-1.5 h-1.5 bg-gray-500 rounded-full animate-bounce" style="animation-delay:0ms"></span>
+            <span class="w-1.5 h-1.5 bg-gray-500 rounded-full animate-bounce" style="animation-delay:150ms"></span>
+            <span class="w-1.5 h-1.5 bg-gray-500 rounded-full animate-bounce" style="animation-delay:300ms"></span>
+          </div>
+        </div>
+      </div>
+      {% endif %}
+    </div>
+
+    <!-- Input -->
+    <div class="px-5 py-3 border-t border-border">
+      {% if is_read_only %}
+      <!-- Read-only: this thread's owner has left the goal (see threads_left_goal_at
+           migration / remove_goal_member). Input stays in the DOM (disabled)
+           rather than removed, so existing script references to #msg-input /
+           #send-btn stay valid — the WS handler also rejects a raw send
+           attempt server-side regardless (THREAD_READ_ONLY), this is just UI. -->
+      <div class="px-3 py-2 mb-2 text-xs text-gray-500 bg-white/5 rounded-lg text-center">
+        This member has left the goal — this conversation is read-only.
+      </div>
+      {% endif %}
+      <!-- Upload status banner -->
+      <div id="upload-status" class="hidden mb-2 px-3 py-1.5 text-xs rounded-lg"></div>
+      <div class="flex gap-3 items-end">
+        <input id="file-input" type="file" class="hidden" multiple
+          accept=".pdf,.xlsx,.xls,.docx,.doc,.md,.txt,.csv,.json,.yaml,.yml,.png,.jpg,.jpeg"
+          onchange="uploadFiles(this.files)" {% if is_read_only %}disabled{% endif %}>
+        <button type="button" onclick="document.getElementById('file-input').click()"
+          class="btn btn-secondary py-3 px-3 rounded-xl flex-shrink-0"
+          title="Attach file (becomes a goal-wide read-only resource)"
+          {% if is_read_only %}disabled{% endif %}>
+          <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+              d="M15.172 7l-6.586 6.586a2 2 0 102.828 2.828l6.414-6.586a4 4 0 00-5.656-5.656l-6.415 6.585a6 6 0 108.486 8.486L20.5 13"/>
+          </svg>
+        </button>
+        <textarea id="msg-input" rows="1"
+          placeholder="{% if is_read_only %}This conversation is read-only{% else %}Message {{ agent.name }}… (paste or attach files to share with the goal){% endif %}"
+          class="input rounded-xl py-3 resize-none max-h-40 overflow-y-auto"
+          onkeydown="handleKey(event)" onpaste="handlePaste(event)"
+          {% if is_read_only %}disabled{% endif %}></textarea>
+        <button id="send-btn" onclick="sendMessage()"
+          class="btn btn-primary py-3 px-5 rounded-xl flex-shrink-0 disabled:opacity-40"
+          {% if is_read_only %}disabled{% endif %}>
+          <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8"/>
+          </svg>
+        </button>
+      </div>
+      {% if not is_read_only %}
+      <div class="text-2xs text-gray-600 mt-1.5 pl-1">Enter to send · Shift+Enter for new line · 📎 / paste / drag-drop to attach files</div>
+      {% endif %}
+    </div>
+  </div>
+
+  {% if current_story and current_story.workspace_state == 'ready' %}
+  <!-- Horizontal resizer between chat and workspace panel -->
+  <div id="ws-resize-handle-x"
+       class="w-1 flex-shrink-0 bg-border hover:bg-indigo-500/60 cursor-col-resize transition-colors"
+       title="Drag to resize"></div>
+  <!-- Right rail: workspace file viewer (Stage 1 of plan-approval flow) -->
+  <aside id="workspace-panel"
+         class="flex-shrink-0 border-l border-border bg-surface/30 flex flex-col"
+         style="width: 24rem;"
+         data-story-id="{{ current_story.id }}">
+    <div class="px-4 py-2.5 border-b border-border flex items-center gap-2">
+      <svg class="w-4 h-4 text-indigo-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+              d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z"/>
+      </svg>
+      <div class="min-w-0 flex-1">
+        <div class="text-xs font-semibold text-gray-200 truncate">Workspace</div>
+        <div class="text-2xs text-gray-500 truncate" title="{{ current_story.title }}">{{ current_story.title }}</div>
+      </div>
+      <button id="ws-refresh-btn" class="text-2xs text-gray-500 hover:text-gray-300 px-2 py-1 rounded hover:bg-surface" title="Refresh tree">
+        ↻
+      </button>
+    </div>
+    <div id="ws-panel-body" class="flex-1 min-h-0 flex flex-col">
+      <!-- File tree -->
+      <div id="ws-tree" class="overflow-y-auto px-2 py-2 text-xs font-mono"
+           style="flex: 1 1 auto; min-height: 4rem;">
+        <div class="text-gray-500 text-2xs italic px-2 py-1">Loading…</div>
+      </div>
+      <!-- Vertical resizer between tree and content pane (only shown when content is open) -->
+      <div id="ws-resize-handle-y"
+           class="hidden h-1 flex-shrink-0 bg-border hover:bg-indigo-500/60 cursor-row-resize transition-colors"
+           title="Drag to resize"></div>
+      <!-- File content (collapsible) -->
+      <div id="ws-content-pane" class="hidden flex-col border-t border-border"
+           style="flex: 1 1 50%; min-height: 6rem;">
+        <div class="px-3 py-1.5 border-b border-border bg-surface/40 flex items-center gap-2 text-2xs">
+          <span id="ws-content-path" class="font-mono text-gray-300 truncate flex-1"></span>
+          <span id="ws-content-meta" class="text-gray-600"></span>
+          <button onclick="closeWsContent()" class="text-gray-500 hover:text-gray-300 px-1.5">✕</button>
+        </div>
+        <div id="ws-content-body" class="flex-1 min-h-0 overflow-y-auto px-3 py-2 text-xs">
+          <!-- markdown renders into .agent-prose; code into <pre><code> -->
+        </div>
+      </div>
+    </div>
+  </aside>
+  {% endif %}
+</div>
+
+<script>
+const PID = "{{ pid }}";
+const AGENT_ID = "{{ agent.id }}";
+const THREAD_ID = "{{ thread_id }}";
+const IS_READ_ONLY = {{ 'true' if is_read_only else 'false' }};
+const TOKEN = "{{ firebase_token }}";
+const currentUserName = {{ (user.display_name or user.email or "") | tojson }};
+const currentUid = {{ user.uid | tojson }};
+const CURRENT_STORY_ID = {% if current_story %}"{{ current_story.id }}"{% else %}""{% endif %};
+const INITIAL_PHASE = {% if current_story %}"{{ current_story.current_phase or '' }}"{% else %}""{% endif %};
+const INITIAL_PLAN_PATH = {% if current_story and current_story.current_plan_path %}"{{ current_story.current_plan_path }}"{% else %}""{% endif %};
+
+const messagesEl = document.getElementById('messages');
+const inputEl = document.getElementById('msg-input');
+const typingEl = document.getElementById('typing-indicator');
+const connDot = document.getElementById('conn-dot');
+const connLabel = document.getElementById('conn-label');
+
+let ws = null;
+let currentAgentBubble = null;
+let currentAgentContent = "";
+// Counts messages we've optimistically rendered in this tab.
+// Each fanout human_message echo (non-slack) decrements and is skipped.
+// Resets on WS disconnect so a reconnect starts clean.
+let _ownMessagesPending = 0;
+
+
+// ── Context-usage ring ──────────────────────────────────────────────────────
+// Reads {totalTokens, contextTokens, softThresholdTokens} from
+// /api/memory/usage and paints the SVG arc proportionally.
+const USAGE_RING_CIRCUMFERENCE = 69.115;  // 2π * r where r=11
+async function refreshUsageRing() {
+  const ring = document.getElementById('usage-ring');
+  const fg = document.getElementById('usage-ring-fg');
+  if (!ring || !fg) return;
+  const goalId = '{{ pid }}';
+  const agentId = '{{ agent.id }}';
+  const threadId = '{{ thread_id or "" }}';
+  if (!threadId) return;
+  try {
+    const qs = new URLSearchParams({goal_id: goalId, agent_id: agentId, thread_id: threadId});
+    const resp = await fetch(`/api/memory/usage?${qs}`);
+    const data = await resp.json().catch(() => ({}));
+    if (!data.ok || !data.contextTokens || !data.totalTokens) {
+      fg.style.strokeDashoffset = String(USAGE_RING_CIRCUMFERENCE);
+      ring.classList.add('opacity-40');
+      ring.title = 'Context usage: no data yet';
+      return;
+    }
+    ring.classList.remove('opacity-40');
+    const tokens = data.totalTokens;
+    const cap = data.contextTokens;
+    const ratio = Math.min(1, tokens / cap);
+    fg.style.strokeDashoffset = String(USAGE_RING_CIRCUMFERENCE * (1 - ratio));
+    // Color: green < soft*0.6, amber < soft, red >= soft.
+    const soft = data.softThresholdTokens && data.softThresholdTokens > 0
+      ? data.softThresholdTokens : Math.floor(cap * 0.9);
+    fg.classList.remove('text-emerald-400', 'text-amber-400', 'text-red-500');
+    if (tokens >= soft) fg.classList.add('text-red-500');
+    else if (tokens >= soft * 0.6) fg.classList.add('text-amber-400');
+    else fg.classList.add('text-emerald-400');
+    const pct = (ratio * 100).toFixed(1);
+    const stale = data.totalTokensFresh === false ? ' (stale)' : '';
+    let title = `Context: ${tokens.toLocaleString()} / ${cap.toLocaleString()} tokens (${pct}%)${stale}\n`
+              + `Soft flush at: ${soft.toLocaleString()}\n`
+              + `Compactions so far: ${data.compactionCount || 0}\n`
+              + `Model: ${data.model || 'unknown'}`;
+    if (typeof data.memoryFileChars === 'number' && typeof data.memoryFileLimitChars === 'number') {
+      const mPct = (data.memoryFileChars / data.memoryFileLimitChars * 100).toFixed(1);
+      title += `\nMEMORY.md: ${data.memoryFileChars.toLocaleString()} / ${data.memoryFileLimitChars.toLocaleString()} chars (${mPct}%)`;
+    }
+    ring.title = title;
+  } catch (err) {
+    // Silent: leave ring at last known state.
+  }
+}
+window.addEventListener('DOMContentLoaded', refreshUsageRing);
+// Auto-poll while tab is visible. The WS event-driven path
+// (token_stream_end / lifecycle:end) only fires on chat:final and
+// can miss interim gateway counter updates (tool calls, streaming
+// pauses, post-final aggregation). 8s is cheap: sessions.status
+// just reads in-memory counters, no transcript scan.
+setInterval(() => {
+  if (document.visibilityState === 'visible') refreshUsageRing();
+}, 8000);
+
+// ── Markdown renderer ──────────────────────────────────────────────────────
+// Base config (breaks/gfm/async, plain code(), link() with target=_blank) is
+// in /static/js/markdown_renderer.js, loaded above. marked.use() accumulates
+// across calls, so this only layers chat's copy-button code() variant on top
+// — the shared link() override stays active.
+try {
+  marked.use({
+    async: false,
+    breaks: true,
+    gfm: true,
+    renderer: {
+      code(token) {
+        // marked@9+ passes a token object; earlier versions pass (code, lang).
+        const code = (token && typeof token === 'object') ? (token.text ?? token) : token;
+        const lang = (token && typeof token === 'object') ? token.lang : arguments[1];
+        const highlighted = lang && hljs.getLanguage(lang)
+          ? hljs.highlight(code, { language: lang }).value
+          : hljs.highlightAuto(code).value;
+        // No inline onclick — DOMPurify strips event handlers. A delegated
+        // click listener (below) wires up .code-copy-btn instead.
+        return `<pre><button class="code-copy-btn" type="button">Copy</button><code class="hljs">${highlighted}</code></pre>\n`;
+      }
+    }
+  });
+} catch (e) {
+  console.warn('marked.use() failed, falling back to default config:', e);
+}
+
+function renderMd(text) {
+  if (!text) return '';
+  try {
+    // safeMarkdown = marked.parse + DOMPurify (fail-closed to escaped text).
+    // All chat message content funnels through renderMd before innerHTML, so
+    // sanitizing here closes the stored-XSS vector for the whole chat surface.
+    const html = safeMarkdown(text);
+    if (typeof html !== 'string') {
+      throw new Error('safeMarkdown returned non-string');
+    }
+    return html;
+  } catch (e) {
+    console.warn('renderMd failed:', e);
+    return '';
+  }
+}
+
+function copyCode(btn) {
+  const code = btn.parentElement.querySelector('code');
+  if (!code) return;
+  navigator.clipboard.writeText(code.textContent);
+  btn.textContent = 'Copied!';
+  setTimeout(() => { btn.textContent = 'Copy'; }, 1500);
+}
+
+// Delegated handler for code-block Copy buttons. The buttons carry no inline
+// onclick (DOMPurify strips event handlers), so wire them up at the document
+// level — works for both server-rendered and live-streamed code blocks.
+document.addEventListener('click', function (e) {
+  const btn = e.target.closest && e.target.closest('.code-copy-btn');
+  if (btn) copyCode(btn);
+});
+
+// Render stored messages on page load (Jinja escapes content; data-md holds raw text).
+// IMPORTANT: only overwrite innerHTML if renderMd produced something. Otherwise
+// keep the server-rendered fallback so we never end up with a blank bubble when
+// marked.parse fails on weird input.
+document.querySelectorAll('.agent-prose[data-md]').forEach(el => {
+  const rendered = renderMd(el.dataset.md);
+  if (rendered && rendered.trim()) {
+    el.innerHTML = rendered;
+  } else if (el.dataset.md) {
+    // Fallback: render the raw text with preserved whitespace so newlines
+    // don't collapse into one wall of text.
+    el.style.whiteSpace = 'pre-wrap';
+    el.textContent = el.dataset.md;
+  }
+});
+
+// ── Connection ─────────────────────────────────────────────────────────────
+function setConnStatus(state) {
+  const colors = { connected: 'bg-green-500', disconnected: 'bg-red-500', connecting: 'bg-yellow-500' };
+  const labels = { connected: 'Connected', disconnected: 'Disconnected', connecting: 'Connecting…' };
+  connDot.className = `w-2 h-2 rounded-full ${colors[state]}`;
+  connLabel.textContent = labels[state];
+}
+
+async function connect() {
+  if (!THREAD_ID) return;  // No thread selected: don't connect
+
+  // Discard the previous WS without re-triggering its onclose reconnect loop.
+  if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+    ws.onclose = null;
+    ws.close(1000);
+  }
+
+  // Firebase tokens baked into the HTML expire after 1 hour. Use the SDK's
+  // cached-or-auto-refreshed token so reconnects during long story executions
+  // don't fail with "Unauthorized" (which drops subscribers silently).
+  let token = TOKEN;
+  try {
+    const fbUser = typeof firebase !== 'undefined' && firebase.auth && firebase.auth().currentUser;
+    if (fbUser) token = await fbUser.getIdToken(false);
+  } catch (_) { /* fall back to baked-in TOKEN */ }
+
+  const wsProto = location.protocol === 'https:' ? 'wss' : 'ws';
+  const url = `${wsProto}://${location.host}/goals/${PID}/chat/${AGENT_ID}/ws?thread_id=${THREAD_ID}&token=${encodeURIComponent(token)}`;
+  ws = new WebSocket(url);
+
+  ws.onopen = () => {
+    // Mark this thread as actively viewed so the sidebar badge JS skips
+    // unread notifications for it while the user is watching live.
+    window.CURRENT_THREAD_ID = THREAD_ID;
+    setConnStatus('connected');
+    appendSystemMessage('Connected to agent session', { isError: false });
+  };
+  ws.onclose = (e) => {
+    if (window.CURRENT_THREAD_ID === THREAD_ID) window.CURRENT_THREAD_ID = null;
+    setConnStatus('disconnected');
+    _ownMessagesPending = 0;  // stale pending count: reset on reconnect
+    if (e.code !== 1000) {
+      appendSystemMessage(`Connection lost (code ${e.code}). Reconnecting…`, {
+        isError: true, code: 'WS_DISCONNECTED', source: 'websocket',
+      });
+    }
+    setTimeout(connect, 3000);
+  };
+  ws.onerror = () => {
+    setConnStatus('disconnected');
+  };
+
+  ws.onmessage = (e) => {
+    const data = JSON.parse(e.data);
+    handleGatewayMessage(data);
+  };
+}
+
+// ── Message handling ───────────────────────────────────────────────────────
+let toolIndicator = null;
+// Deduplicate token_stream_end frames: the session's direct _broadcast and
+// the fanout listener both deliver token_stream_end for every agent reply.
+// Track rendered message IDs so the second delivery is a no-op.
+const _renderedMsgIds = new Set();
+// The most recent optimistic ("your own send") human bubble, still untagged by
+// a canonical message_id. Kept so a server rejection (e.g. kill-switch freeze,
+// which drops the message before persisting) can pull it back: otherwise it
+// lingers looking delivered while nothing ever replies.
+let _lastOptimisticBubble = null;
+
+function handleGatewayMessage(data) {
+  if (data.type === 'token') {
+    typingEl.classList.add('hidden');
+    removeToolIndicator();
+    if (!currentAgentBubble) {
+      currentAgentContent = "";
+      currentAgentBubble = appendBubble('agent', '');
+    }
+    // Cumulative replace: render markdown on every update
+    currentAgentContent = data.token;
+    const proseEl = currentAgentBubble.querySelector('.agent-prose');
+    proseEl.innerHTML = renderMd(currentAgentContent);
+    scrollBottom();
+
+  } else if (data.type === 'token_stream_end') {
+    // Dedup: direct _broadcast and fanout both deliver token_stream_end.
+    // Skip if this message_id was already rendered by whichever path arrived first.
+    if (data.message_id && _renderedMsgIds.has(data.message_id)) return;
+    if (data.message_id) _renderedMsgIds.add(data.message_id);
+    typingEl.classList.add('hidden');
+    removeToolIndicator();
+    // Final render with the authoritative content
+    if (data.full_content) {
+      if (!currentAgentBubble) {
+        // No prior token events created a bubble: create one now.
+        // This happens when the gateway sends the response only via
+        // chat:final (no assistant stream deltas).
+        currentAgentBubble = appendBubble('agent', '');
+      }
+      const proseEl = currentAgentBubble.querySelector('.agent-prose');
+      proseEl.innerHTML = renderMd(data.full_content);
+    }
+    // Tag the bubble with its canonical DB id (sent from openclaw.py
+    // after persist) and advance the poll cursor. Without this the
+    // next /poll runs with a stale `after=` and re-renders this same
+    // reply as a duplicate.
+    if (data.message_id) {
+      if (currentAgentBubble) {
+        currentAgentBubble.setAttribute('data-msg-id', data.message_id);
+      }
+      lastMsgId = data.message_id;
+    }
+    currentAgentBubble = null;
+    currentAgentContent = "";
+    // A phase_changed push arrived mid-stream: now that the message is fully
+    // rendered, reload so the phase banner re-renders (WS-primary path).
+    if (_pendingPhaseReload) { window.location.reload(); return; }
+    // Reactive plan-ready check: Claude just finished a turn: see if it
+    // wrote the plan file (validate-plan hook sets current_plan_path).
+    // Also the lost-frame fallback for phase_changed (rare).
+    checkPlanBannerAfterTurn();
+    // Turn complete: refresh the context-usage ring.
+    refreshUsageRing();
+
+  } else if (data.type === 'agent_event' && data.stream === 'compaction' && data.data) {
+    // Compaction can take minutes on large contexts (gateway aggregate
+    // timeout is 5 min). Show the indicator so users don't think their
+    // message was lost. The user's incoming message IS queued by the
+    // gateway and will be processed once compaction completes.
+    const compactingEl = document.getElementById('compacting-indicator');
+    if (compactingEl) {
+      if (data.data.phase === 'start') {
+        compactingEl.classList.remove('hidden');
+      } else if (data.data.phase === 'end') {
+        compactingEl.classList.add('hidden');
+        if (typeof refreshUsageRing === 'function') refreshUsageRing();
+      }
+    }
+
+  } else if (data.type === 'tool_start') {
+    typingEl.classList.add('hidden');
+    showToolIndicator(data.name);
+
+  } else if (data.type === 'tool_result') {
+    removeToolIndicator();
+    // Show tool error inline if the tool failed
+    if (data.is_error && data.error) {
+      appendSystemMessage(`Tool "${data.name}" failed: ${data.error}`, {
+        isError: true, code: 'TOOL_EXEC_ERROR', source: data.name,
+      });
+    }
+
+  } else if (data.type === 'error') {
+    typingEl.classList.add('hidden');
+    removeToolIndicator();
+    currentAgentBubble = null;
+    currentAgentContent = "";
+    appendSystemMessage(data.message, {
+      isError: true,
+      code: data.code || '',
+      retryable: data.retryable || false,
+      source: data.source || '',
+    });
+
+  } else if (data.type === 'agent_card') {
+    // Dedup by canonical msg id: the durable fan-out can deliver the same card
+    // row more than once (notify on insert AND the agent-forward's dispatch
+    // NOTIFY), so a card must render exactly once. Mirrors the human_message
+    // dedup above.
+    if (data.msg_id && _renderedMsgIds.has(data.msg_id)) return;
+    if (data.msg_id) _renderedMsgIds.add(data.msg_id);
+    typingEl.classList.add('hidden');
+    removeToolIndicator();
+    renderAgentCard(data);
+
+  } else if (data.type === 'human_message') {
+    // A human message echoed by the chat-queue fanout (your own send, another
+    // tab, Slack, or another user on the thread).
+    //
+    // 1) Dedup by canonical message_id: the fanout can deliver the same
+    //    persisted row more than once (NOTIFY on insert AND on dispatch).
+    if (data.message_id && _renderedMsgIds.has(data.message_id)) return;
+    // A human message (your own echo, or another user's) means the agent is about
+    // to respond: SHOW the thinking loader. (This previously HID it, which is why
+    // the loader never appeared after sending: your send showed it, then your echo
+    // arrived a beat later and hid it for the whole thinking phase.)
+    typingEl.classList.remove('hidden');
+    const _rawHuman = data.content || '';
+    const _ctxHuman = _rawHuman.indexOf('<!--shca-state-context-->');
+    const _humanContent = _ctxHuman !== -1 ? _rawHuman.slice(0, _ctxHuman).trimEnd() : _rawHuman;
+    // 2) Collapse YOUR own send + its server echo into one bubble. When you
+    //    send, the bubble is rendered instantly (optimistic, no msg-id); the
+    //    server then echoes it back. Adopt the echo onto that untagged bubble
+    //    by content match and stamp the canonical id on it.
+    //    We do NOT gate this on origin. The root cause of the duplicate was
+    //    messages.platform DEFAULTing to 'slack' (migration 038): so UI-typed
+    //    messages were broadcast with origin='slack' even with Slack unbound,
+    //    and an origin guard here silently skipped adopt and re-rendered your
+    //    own message. That default is now dropped server-side
+    //    (messages_platform_default_null); keeping adopt origin-agnostic is
+    //    belt-and-suspenders so any future mislabel can't reintroduce the dup.
+    //    adopt is self-collapsing: a genuine Slack/other-user message has no
+    //    matching untagged optimistic bubble, so it still renders normally.
+    if (adoptOwnHumanBubble(_humanContent, data.message_id)) {
+      if (data.message_id) _renderedMsgIds.add(data.message_id);
+      _ownMessagesPending = Math.max(0, _ownMessagesPending - 1);
+      return;
+    }
+    if (data.message_id) _renderedMsgIds.add(data.message_id);
+    const _PLATFORM_LABELS = { slack: 'Slack', notion: 'Notion' };
+    const _hb = appendBubble('human', _humanContent, data.sender_name || _PLATFORM_LABELS[data.origin] || null);
+    if (data.message_id && _hb) _hb.setAttribute('data-msg-id', data.message_id);
+
+  } else if (data.type === 'tool_progress') {
+    // Live Claude tool-call card (Phase 4 Stage 3). Server-side
+    // broadcast: NOT persisted in messages table - so it appears
+    // live but vanishes on refresh. That's intentional: cards are
+    // ephemeral activity, not part of the conversation history.
+    appendToolProgressCard(data);
+
+  } else if (data.type === 'phase_task_progress') {
+    // Sentinel-driven progress card (DONE / BLOCKED / FAILED / output).
+    // Persisted to messages table; this is the live-update path so an
+    // open tab sees it without a refresh.
+    appendPhaseTaskProgressCard(data);
+
+  } else if (data.type === 'diff_review') {
+    // End-of-DAG diff-review card with Approve / Reject buttons.
+    // Persisted to messages table; this is the live-update path.
+    appendDiffReviewCard(data);
+
+  } else if (data.type === 'dag_recovery') {
+    // Phase 3: DAG failure recovery card (Replan / Retry / Abandon).
+    // Persisted to messages table; this is the live-update path.
+    appendDagRecoveryCard(data);
+
+  } else if (data.type === 'plan_ready') {
+    // validate-plan hook set current_plan_path: replace the "Writing plan…"
+    // span with the green Approve button immediately (no polling needed).
+    swapBannerToPlanReady();
+
+  } else if (data.type === 'phase_changed') {
+    // WS-primary phase-banner update: the assistant's story_phase tool moved the
+    // story to a new phase. Reload so the banner + its phase-specific buttons
+    // re-render. If a reply is still streaming, defer the reload to
+    // token_stream_end so we don't cut the message off.
+    if (data.to_phase && _bannerPhase && data.to_phase !== _bannerPhase) {
+      if (currentAgentBubble) { _pendingPhaseReload = true; }
+      else { window.location.reload(); }
+    }
+
+  } else if (data.type === 'plan_approved_notify') {
+    // Fired by approve_plan() after tasks are dispatched: gives live
+    // feedback so the user doesn't have to type to see execution started.
+    const n = data.task_count || 0;
+    appendSystemMessage(
+      `Plan approved: ${n} task${n !== 1 ? 's' : ''} dispatched and running.`,
+      { isError: false },
+    );
+
+  } else if (data.type === 'system_notice') {
+    // Server rejected this turn without producing a reply: most commonly the
+    // kill switch (code EXECUTION_PAUSED): the message was dropped, not queued.
+    // Stop the fake "typing…" indicator (nothing is coming) and make the
+    // rejection visible so the user doesn't wait on a frozen goal forever.
+    typingEl.classList.add('hidden');
+    removeToolIndicator();
+    currentAgentBubble = null;
+    currentAgentContent = "";
+    if (data.code === 'EXECUTION_PAUSED' && _lastOptimisticBubble
+        && !_lastOptimisticBubble.getAttribute('data-msg-id')) {
+      // The message never persisted, so no echo will ever adopt this bubble.
+      // Remove it so it doesn't read as delivered.
+      _lastOptimisticBubble.remove();
+      _lastOptimisticBubble = null;
+      _ownMessagesPending = Math.max(0, _ownMessagesPending - 1);
+    }
+    appendSystemMessage(
+      data.message || 'Execution is paused: your message was not delivered. Resume to continue.',
+      { isError: false, tone: 'warn', sticky: true, code: data.code || '' },
+    );
+  }
+}
+
+function appendPhaseTaskProgressCard(data) {
+  const wrap = document.createElement('div');
+  wrap.className = 'flex justify-start';
+  const sentinel = (data.sentinel || '').toUpperCase();
+  const phase = data.phase || '';
+  const taskId = data.task_id || '';
+  const subkind = data.card_subkind || 'output';
+  let color = 'gray';
+  let label = 'progress';
+  if (sentinel === 'DONE') { color = 'emerald'; label = 'done'; }
+  else if (sentinel === 'BLOCKED' || subkind === 'blocked-question') {
+    color = 'amber'; label = 'blocked';
+  }
+  else if (sentinel === 'FAILED') { color = 'rose'; label = 'failed'; }
+  else if (sentinel === 'OFF_PROTOCOL') { color = 'orange'; label = 'off-protocol'; }
+  // Render content as markdown: Claude's PHASE_TASK_DONE summaries contain
+  // headers, bold, code, lists. Fall back to escaped pre-wrap if marked fails.
+  const rawContent = data.content || '';
+  const rendered = renderMd(rawContent);
+  const bodyHtml = rendered && rendered.trim()
+    ? `<div class="agent-prose text-gray-200">${rendered}</div>`
+    : `<div class="text-gray-200 whitespace-pre-wrap">${escapeHtml(rawContent)}</div>`;
+  wrap.innerHTML = `
+    <div class="max-w-3xl w-full px-4 py-3 rounded-xl text-sm border border-${color}-500/40 bg-${color}-500/5">
+      <div class="flex items-center gap-2 text-xs font-semibold uppercase tracking-wider text-${color}-300 mb-2">
+        <span>T${escapeHtml(taskId)}</span>
+        <span class="text-gray-500">·</span>
+        <span>${escapeHtml(phase)}</span>
+        <span class="text-gray-500">·</span>
+        <span>${escapeHtml(label)}</span>
+      </div>
+      ${bodyHtml}
+    </div>`;
+  messagesEl.insertBefore(wrap, typingEl);
+  scrollBottom();
+}
+
+function appendDiffReviewCard(data) {
+  const wrap = document.createElement('div');
+  wrap.className = 'flex justify-start';
+  const approvalId = data.approval_id || '';
+  const stat = data.stat || '';
+  const content = data.content || '';
+  // Render the markdown-ish content as a simple HTML block (paragraphs
+  // split on blank lines). The persisted version uses agent-prose for
+  // full markdown; this live card is intentionally lighter.
+  const paragraphs = content.split(/\n\n+/).map(p =>
+    `<p class="mb-2">${escapeHtml(p)}</p>`,
+  ).join('');
+  wrap.innerHTML = `
+    <div class="max-w-3xl w-full px-4 py-3 rounded-xl text-sm border border-blue-500/40 bg-blue-500/5">
+      <div class="flex items-center gap-2 text-xs font-semibold uppercase tracking-wider text-blue-300 mb-2">
+        Diff Review
+        <span class="text-2xs text-gray-500 font-normal ml-2">${escapeHtml(stat)}</span>
+      </div>
+      <div class="text-gray-200">${paragraphs}</div>
+      <form data-approval-id="${escapeHtml(approvalId)}"
+            onsubmit="return decideDiff(event, '${escapeHtml(approvalId)}')" class="mt-3 flex gap-2 items-center">
+        <textarea name="feedback" rows="2" placeholder="Optional feedback if rejecting…"
+                  class="input text-2xs flex-1"></textarea>
+        <button type="button" onclick="decideDiffAction(event, '${escapeHtml(approvalId)}', 'approve')"
+                class="px-3 py-2 rounded bg-green-600 hover:bg-green-500 text-white text-2xs font-semibold">
+          ✓ Approve &amp; push
+        </button>
+        <button type="button" onclick="decideDiffAction(event, '${escapeHtml(approvalId)}', 'reject')"
+                class="px-3 py-2 rounded bg-red-600 hover:bg-red-500 text-white text-2xs font-semibold">
+          ✗ Reject
+        </button>
+      </form>
+    </div>`;
+  messagesEl.insertBefore(wrap, typingEl);
+  scrollBottom();
+}
+
+function appendDagRecoveryCard(data) {
+  const wrap = document.createElement('div');
+  wrap.className = 'flex justify-start';
+  const content = data.content || '';
+  const options = Array.isArray(data.options) ? data.options : ['replan', 'retry', 'abandon'];
+  const paragraphs = content.split(/\n\n+/).map(p => `<p class="mb-2">${escapeHtml(p)}</p>`).join('');
+  const LABELS = { replan: '♻ Replan', retry: '↻ Retry', review_keep: '📥 Review & keep', abandon: '✕ Abandon' };
+  const CLS = { replan: 'bg-blue-600 hover:bg-blue-500', abandon: 'bg-red-600 hover:bg-red-500', retry: 'bg-gray-600 hover:bg-gray-500', review_keep: 'bg-emerald-600 hover:bg-emerald-500' };
+  const buttons = options.map(opt =>
+    `<button type="button" onclick="recoverAction(event, '${escapeHtml(opt)}')" class="px-3 py-2 rounded text-white text-2xs font-semibold ${CLS[opt] || 'bg-gray-600 hover:bg-gray-500'}">${LABELS[opt] || escapeHtml(opt)}</button>`,
+  ).join('');
+  const blocked = data.mode === 'blocked';
+  const boxCls = blocked ? 'border-amber-500/40 bg-amber-500/5' : 'border-rose-500/40 bg-rose-500/5';
+  const hdrCls = blocked ? 'text-amber-300' : 'text-rose-300';
+  const hdrTxt = blocked ? 'Phase Blocked — answer in chat to resume, or:' : 'Phase Failed';
+  wrap.innerHTML = `
+    <div class="max-w-3xl w-full px-4 py-3 rounded-xl text-sm border ${boxCls}">
+      <div class="flex items-center gap-2 text-xs font-semibold uppercase tracking-wider ${hdrCls} mb-2">${hdrTxt}</div>
+      <div class="text-gray-200">${paragraphs}</div>
+      <div class="mt-3 flex gap-2 items-center flex-wrap recovery-card">
+        <input name="feedback" placeholder="Optional feedback for replan…" class="input text-2xs flex-1 min-w-40" />
+        ${buttons}
+      </div>
+    </div>`;
+  messagesEl.insertBefore(wrap, typingEl);
+  scrollBottom();
+}
+
+function appendToolProgressCard(data) {
+  const TOOL_STYLE = {
+    Read:        'border-blue-500/50 bg-blue-50/80 dark:bg-blue-500/5 text-blue-700 dark:text-blue-300/80',
+    Write:       'border-green-500/50 bg-green-50/80 dark:bg-green-500/5 text-green-700 dark:text-green-300/80',
+    Edit:        'border-amber-500/50 bg-amber-50/80 dark:bg-amber-500/5 text-amber-700 dark:text-amber-300/80',
+    NotebookEdit:'border-amber-500/50 bg-amber-50/80 dark:bg-amber-500/5 text-amber-700 dark:text-amber-300/80',
+    Grep:        'border-purple-500/50 bg-purple-50/80 dark:bg-purple-500/5 text-purple-700 dark:text-purple-300/80',
+    Glob:        'border-purple-500/50 bg-purple-50/80 dark:bg-purple-500/5 text-purple-700 dark:text-purple-300/80',
+    Bash:        'border-orange-500/50 bg-orange-50/80 dark:bg-orange-500/5 text-orange-700 dark:text-orange-300/80',
+    WebFetch:    'border-sky-500/50 bg-sky-50/80 dark:bg-sky-500/5 text-sky-700 dark:text-sky-300/80',
+    WebSearch:   'border-sky-500/50 bg-sky-50/80 dark:bg-sky-500/5 text-sky-700 dark:text-sky-300/80',
+  };
+  const style = TOOL_STYLE[data.tool] || 'border-indigo-500/50 bg-indigo-50/80 dark:bg-indigo-500/5 text-indigo-700 dark:text-indigo-300/80';
+  const wrap = document.createElement('div');
+  wrap.className = 'flex justify-start';
+  const ts = new Date((data.ts || Date.now()/1000) * 1000).toLocaleString([], {month: 'short', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12:false, timeZone:'UTC'});
+  const taskBadge = data.task_id
+    ? `<span class="text-gray-400 dark:text-gray-600 shrink-0">·T${escapeHtml(data.task_id)}</span>`
+    : '';
+  wrap.innerHTML = `
+    <div class="max-w-3xl w-full px-3 py-1 text-2xs font-mono border-l-2 ${style} flex items-center gap-2 overflow-hidden">
+      <span class="text-gray-400 dark:text-gray-600 shrink-0">${escapeHtml(ts)}</span>
+      ${taskBadge}
+      <span class="truncate">${escapeHtml(data.icon || '⚙️')} ${escapeHtml(data.summary || data.tool || '')}</span>
+    </div>`;
+  messagesEl.insertBefore(wrap, typingEl);
+  scrollBottom();
+}
+
+function showToolIndicator(toolName) {
+  removeToolIndicator();
+  toolIndicator = document.createElement('div');
+  toolIndicator.className = 'flex justify-start';
+  toolIndicator.innerHTML = `
+    <div class="bg-gray-800/60 border border-gray-700/50 rounded-2xl rounded-bl-sm px-4 py-2.5 flex items-center gap-2">
+      <svg class="w-3.5 h-3.5 text-indigo-400 animate-spin" fill="none" viewBox="0 0 24 24">
+        <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"/>
+        <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/>
+      </svg>
+      <span class="text-xs text-gray-400">Using <span class="text-indigo-300 font-medium">${escapeHtml(toolName)}</span></span>
+    </div>`;
+  typingEl.insertAdjacentElement('beforebegin', toolIndicator);
+  scrollBottom();
+}
+
+function removeToolIndicator() {
+  if (toolIndicator) { toolIndicator.remove(); toolIndicator = null; }
+}
+
+function appendBubble(role, content, senderName = null) {
+  const wrapper = document.createElement('div');
+  const isHuman = role === 'human';
+  wrapper.className = `flex flex-col ${isHuman ? 'items-end' : 'items-start'}`;
+  const nameHtml = isHuman && senderName
+    ? `<span class="text-[0.67rem] text-gray-500 mb-0.5 mr-1">${escapeHtml(senderName)}</span>` : '';
+  wrapper.innerHTML = `
+    ${nameHtml}
+    <div class="${isHuman ? 'max-w-xl' : 'max-w-3xl'} px-4 py-2.5 rounded-2xl text-sm
+      ${isHuman ? 'bg-brand text-white rounded-br-sm' : 'bg-surface border border-border text-gray-200 rounded-bl-sm'}">
+      <div class="agent-prose">${renderMd(content)}</div>
+    </div>`;
+  typingEl.insertAdjacentElement('beforebegin', wrapper);
+  scrollBottom();
+  return wrapper;
+}
+
+// Collapse an optimistic human bubble with its server echo. Finds the most
+// recent rendered human bubble that has no canonical id yet and whose text
+// matches `text`; if found, stamps `msgId` on it (so repeat echoes dedup) and
+// returns true. Human bubble wrappers are `.flex.flex-col.items-end` with the
+// rendered text in a `.agent-prose` child (see appendBubble).
+function adoptOwnHumanBubble(text, msgId) {
+  // Compare RENDERED text on both sides: the optimistic bubble's .agent-prose holds
+  // renderMd(content), so markdown transforms (-- → en-dash, list bullets, multi-line
+  // → paragraphs) make the raw echo text differ from the bubble's textContent. Render
+  // the echo the same way before comparing: else the match fails and we double-render
+  // (the duplicate-bubble bug). Same apples-to-apples approach as the poll dedup.
+  const _tmp = document.createElement('div');
+  _tmp.innerHTML = renderMd(text || '');
+  const want = (_tmp.textContent || '').replace(/\s+/g, ' ').trim();
+  if (!want) return false;
+  const wrappers = document.querySelectorAll('.flex.flex-col.items-end:not([data-msg-id])');
+  for (let i = wrappers.length - 1; i >= 0; i--) {
+    const prose = wrappers[i].querySelector('.agent-prose');
+    const got = prose ? (prose.textContent || '').replace(/\s+/g, ' ').trim() : '';
+    if (got && got === want) {
+      if (msgId) wrappers[i].setAttribute('data-msg-id', msgId);
+      return true;
+    }
+  }
+  return false;
+}
+
+function escapeHtml(str) {
+  const d = document.createElement('div');
+  d.textContent = str;
+  return d.innerHTML;
+}
+
+function appendSystemMessage(text, opts = {}) {
+  const el = document.createElement('div');
+  const isError = opts.isError !== false;
+  const code = opts.code || '';
+  const retryable = opts.retryable || false;
+  const source = opts.source || '';
+  // tone: 'error' (red) | 'warn' (amber, e.g. kill-switch pause) | 'info' (gray).
+  // Defaults from isError for backward compat. `sticky` keeps the notice up
+  // (a pause message must not auto-vanish before the user reads why).
+  const tone = opts.tone || (isError ? 'error' : 'info');
+  const sticky = opts.sticky || false;
+  const toneClass = tone === 'error' ? 'bg-red-900/30 border border-red-800/50 text-red-300'
+    : tone === 'warn' ? 'bg-amber-900/30 border border-amber-800/50 text-amber-200'
+    : 'bg-gray-800/50 border border-gray-700/50 text-gray-400';
+  const icon = tone === 'error' ? '⚠' : tone === 'warn' ? '⏸' : 'ℹ';
+
+  el.className = `flex justify-center py-2`;
+  el.innerHTML = `
+    <div class="max-w-xl px-4 py-2.5 rounded-xl text-xs ${toneClass}">
+      <div class="flex items-start gap-2">
+        <span class="flex-shrink-0 mt-0.5">${icon}</span>
+        <div class="flex-1">
+          <div>${escapeHtml(text)}</div>
+          ${code ? `<div class="mt-1 text-[0.67rem] opacity-60 font-mono">${escapeHtml(code)}${source ? ' · ' + escapeHtml(source) : ''}</div>` : ''}
+          ${retryable ? `<button onclick="retryLastMessage(this)" class="mt-1.5 px-2 py-0.5 bg-red-800/50 hover:bg-red-700/50 rounded text-[0.67rem] text-red-200 transition-colors">Retry</button>` : ''}
+        </div>
+      </div>
+    </div>`;
+  typingEl.insertAdjacentElement('beforebegin', el);
+  scrollBottom();
+
+  // Auto-dismiss transient info messages after 10s; errors and sticky
+  // notices (e.g. a pause) stay until the user acts.
+  if (!isError && !sticky) {
+    setTimeout(() => el.remove(), 10000);
+  }
+}
+
+// ── Card rendering ──────────────────────────────────────────────────────
+const cardIcons = { question: '❓', progress: '📋', completion: '✅', failure: '❌', approval: '🎯', review: '🔍' };
+const cardColors = {
+  question: 'card-question', progress: 'card-progress',
+  completion: 'card-completion', failure: 'card-failure', approval: 'card-approval', review: 'card-review',
+};
+
+function buildReviewHtml(card) {
+  const verdictLabels = { approved: 'Approved', changes_required: 'Changes Required', rejected: 'Rejected' };
+  const verdict = card.verdict || '';
+  const label = verdictLabels[verdict] || verdict;
+  const score = card.quality_score ?? '?';
+  const findings = (card.findings || []).map(f => `<li>${escapeHtml(f)}</li>`).join('');
+  const recs = (card.recommendations || []).map(r => `<li>${escapeHtml(r)}</li>`).join('');
+  return `
+    <div class="card-review-body">
+      <div class="review-task-ref">Re: ${escapeHtml(card.reviewed_task_title || '')}</div>
+      <div class="review-verdict-row">
+        <span class="review-verdict-badge verdict-${escapeHtml(verdict)}">${escapeHtml(label)}</span>
+        <span class="review-score">${score}/100</span>
+      </div>
+      <div class="review-summary agent-prose">${renderMd(card.summary || '')}</div>
+      ${findings ? `<details><summary>Findings (${(card.findings||[]).length})</summary><ul>${findings}</ul></details>` : ''}
+      ${recs ? `<details><summary>Recommendations (${(card.recommendations||[]).length})</summary><ul>${recs}</ul></details>` : ''}
+      ${card.updated_spec ? `<details class="review-updated-spec"><summary>Updated spec</summary><div class="agent-prose">${renderMd(card.updated_spec)}</div></details>` : ''}
+    </div>`;
+}
+
+function renderAgentCard(card) {
+  const el = document.createElement('div');
+  el.className = 'flex justify-start';
+  el.setAttribute('data-card-task', card.task_id || '');
+  el.setAttribute('data-utc', new Date().toISOString());
+
+  const ct = card.card_type || 'progress';
+  const icon = cardIcons[ct] || '📌';
+  const colorClass = cardColors[ct] || 'card-progress';
+  const responded = card.responded ? ' responded' : '';
+
+  let optionsHtml = '';
+  if (card.options && card.options.length && !card.responded) {
+    const btns = card.options.map(opt => {
+      const style = opt.style === 'primary' ? 'opt-primary' : opt.style === 'danger' ? 'opt-danger' : 'opt-secondary';
+      return `<button class="card-option ${style}" onclick="respondToCard('${escapeHtml(card.task_id)}','${escapeHtml(opt.id)}','${escapeHtml(opt.value)}')">${escapeHtml(opt.label)}</button>`;
+    }).join('');
+    optionsHtml = `<div class="card-options">${btns}</div>`;
+  }
+
+  let customHtml = '';
+  if (card.allow_custom && !card.responded) {
+    const isQuestion = card.card_type === 'question';
+    customHtml = `
+      <div class="card-custom-input">
+        <input type="text" placeholder="Custom answer..." id="custom-${card.task_id}" onkeydown="if(event.key==='Enter')respondToCardCustom('${escapeHtml(card.task_id)}')">
+        <button onclick="respondToCardCustom('${escapeHtml(card.task_id)}')">Reply</button>
+        ${isQuestion ? `<button class="opt-replan" onclick="respondToCardReplan('${escapeHtml(card.task_id)}')" title="Send answer and re-run the planner to revise the plan">Reply &amp; Re-plan</button>` : ''}
+      </div>`;
+  }
+
+  let contextHtml = '';
+  if (card.context) {
+    contextHtml = `<details class="card-context"><summary>Show details</summary><div class="detail-content agent-prose">${renderMd(card.context)}</div></details>`;
+  }
+
+  let artifactsHtml = '';
+  if (card.artifacts && card.artifacts.length) {
+    const items = card.artifacts.map(a => {
+      if (a.type === 'branch') return `<div>🌿 <code>${escapeHtml(a.ref || '')}</code></div>`;
+      if (a.type === 'file') return `<div>📁 <code>${escapeHtml(a.path || '')}</code></div>`;
+      if (a.type === 'test_results') return `<div>🧪 ${escapeHtml(JSON.stringify(a))}</div>`;
+      return `<div>📎 ${escapeHtml(a.type || '')}</div>`;
+    }).join('');
+    artifactsHtml = `<div class="card-artifacts">${items}</div>`;
+  }
+
+  let respondedHtml = '';
+  if (card.responded) {
+    respondedHtml = `<div class="card-responded">✓ Responded</div>`;
+  }
+
+  const bodyHtml = ct === 'review'
+    ? buildReviewHtml(card)
+    : `<div class="card-title">${escapeHtml(card.title || '')}</div>
+       <div class="card-body"><div class="agent-prose">${renderMd(card.body || '')}</div></div>`;
+
+  el.innerHTML = `
+    <div class="agent-card ${colorClass}${responded}">
+      <div class="card-header">
+        <span>${icon}</span>
+        <span class="font-medium">${escapeHtml(card.agent_name || card.agent || 'Agent')}</span>
+        <span>·</span>
+        <span class="font-mono">${escapeHtml(card.task_id || '')}</span>
+      </div>
+      ${bodyHtml}
+      ${contextHtml}
+      ${artifactsHtml}
+      ${optionsHtml}
+      ${customHtml}
+      ${respondedHtml}
+    </div>`;
+
+  typingEl.insertAdjacentElement('beforebegin', el);
+  scrollBottom();
+}
+
+function respondToCard(taskId, optionId, value) {
+  // Grey out the card
+  const cardEl = document.querySelector(`[data-card-task="${taskId}"] .agent-card`);
+  if (cardEl) {
+    cardEl.classList.add('responded');
+    const optionsEl = cardEl.querySelector('.card-options');
+    if (optionsEl) optionsEl.innerHTML = `<div class="card-responded">✓ ${escapeHtml(value)}</div>`;
+    const customEl = cardEl.querySelector('.card-custom-input');
+    if (customEl) customEl.remove();
+  }
+
+  // Show user's response as a bubble
+  appendBubble('human', `[Re: ${taskId}] ${value}`, currentUserName);
+
+  // Send via WebSocket
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({
+      type: 'card_response',
+      task_id: taskId,
+      option_id: optionId,
+      value: value,
+    }));
+  }
+}
+
+function respondToCardCustom(taskId) {
+  const input = document.getElementById(`custom-${taskId}`);
+  if (!input || !input.value.trim()) return;
+  respondToCard(taskId, 'custom', input.value.trim());
+}
+
+function respondToCardReplan(taskId) {
+  const input = document.getElementById(`custom-${taskId}`);
+  if (!input || !input.value.trim()) {
+    showToast('Please type your answer before clicking Reply & Re-plan', 'info');
+    return;
+  }
+  respondToCard(taskId, 'replan', input.value.trim());
+}
+
+// Render stored cards on page load
+document.querySelectorAll('.card-container').forEach(el => {
+  try {
+    // Try script tag first (new format), fall back to data attribute (old format)
+    const scriptEl = el.querySelector('script.card-json');
+    let raw = scriptEl ? scriptEl.textContent.trim() : (el.dataset.card || '');
+    if (!raw) return;
+    // Unescape <\/ back to </ (escaped to prevent closing script tag)
+    raw = raw.replace(/<\\\//g, '</');
+    let card = JSON.parse(raw);
+    // Handle double-encoded JSON (old card_data stored as string literal)
+    if (typeof card === 'string') card = JSON.parse(card);
+    if (!card || typeof card !== 'object') return;
+    if (scriptEl) scriptEl.remove();
+    const wrapper = document.createElement('div');
+    // Temporarily put rendering target
+    const tempTyping = typingEl;
+    el.appendChild(wrapper);
+    // Render inline
+    const ct = card.card_type || 'progress';
+    const icon = cardIcons[ct] || '📌';
+    const colorClass = cardColors[ct] || 'card-progress';
+    const responded = card.responded ? ' responded' : '';
+
+    let optionsHtml = '';
+    if (card.options && card.options.length && !card.responded) {
+      const btns = card.options.map(opt => {
+        const style = opt.style === 'primary' ? 'opt-primary' : opt.style === 'danger' ? 'opt-danger' : 'opt-secondary';
+        return `<button class="card-option ${style}" onclick="respondToCard('${escapeHtml(card.task_id)}','${escapeHtml(opt.id)}','${escapeHtml(opt.value)}')">${escapeHtml(opt.label)}</button>`;
+      }).join('');
+      optionsHtml = `<div class="card-options">${btns}</div>`;
+    }
+
+    let customHtml = '';
+    if (card.allow_custom && !card.responded) {
+      customHtml = `<div class="card-custom-input"><input type="text" placeholder="Custom answer..." id="custom-${card.task_id}" onkeydown="if(event.key==='Enter')respondToCardCustom('${escapeHtml(card.task_id)}')"><button onclick="respondToCardCustom('${escapeHtml(card.task_id)}')">Send</button></div>`;
+    }
+
+    let contextHtml = '';
+    if (card.context) {
+      contextHtml = `<details class="card-context"><summary>Show details</summary><div class="detail-content agent-prose">${renderMd(card.context)}</div></details>`;
+    }
+
+    let artifactsHtml = '';
+    if (card.artifacts && card.artifacts.length) {
+      const items = card.artifacts.map(a => {
+        if (a.type === 'branch') return `<div>🌿 <code>${escapeHtml(a.ref || '')}</code></div>`;
+        if (a.type === 'file') return `<div>📁 <code>${escapeHtml(a.path || '')}</code></div>`;
+        return `<div>📎 ${escapeHtml(a.type || '')}</div>`;
+      }).join('');
+      artifactsHtml = `<div class="card-artifacts">${items}</div>`;
+    }
+
+    const storedBodyHtml = ct === 'review'
+      ? buildReviewHtml(card)
+      : `<div class="card-title">${escapeHtml(card.title || '')}</div>
+         <div class="card-body"><div class="agent-prose">${renderMd(card.body || '')}</div></div>`;
+
+    el.innerHTML = `
+      <div class="agent-card ${colorClass}${responded}">
+        <div class="card-header"><span>${icon}</span><span class="font-medium">${escapeHtml(card.agent_name || 'Agent')}</span><span>·</span><span class="font-mono">${escapeHtml(card.task_id || '')}</span></div>
+        ${storedBodyHtml}
+        ${contextHtml}${artifactsHtml}${optionsHtml}${customHtml}
+        ${card.responded ? '<div class="card-responded">✓ Responded</div>' : ''}
+      </div>`;
+  } catch (e) {
+    el.textContent = 'Failed to render card';
+  }
+});
+
+let lastSentContent = '';
+function retryLastMessage(btn) {
+  if (lastSentContent && ws && ws.readyState === WebSocket.OPEN) {
+    btn.textContent = 'Retrying…';
+    btn.disabled = true;
+    ws.send(JSON.stringify({ type: 'message', content: lastSentContent }));
+    typingEl.classList.remove('hidden');
+  }
+}
+
+function scrollBottom() {
+  messagesEl.scrollTop = messagesEl.scrollHeight;
+}
+
+// ── Send ───────────────────────────────────────────────────────────────────
+function sendMessage() {
+  if (IS_READ_ONLY) return;
+  const content = inputEl.value.trim();
+  if (!content || !ws || ws.readyState !== WebSocket.OPEN) return;
+  lastSentContent = content;
+  _lastOptimisticBubble = appendBubble('human', content, currentUserName);
+  _ownMessagesPending++;
+  ws.send(JSON.stringify({ type: 'message', content }));
+  typingEl.classList.remove('hidden');
+  inputEl.value = '';
+  inputEl.style.height = 'auto';
+  scrollBottom();
+}
+
+function handleKey(e) {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
+}
+
+// ── File upload (chat → goal_resources, refresh all sessions) ──────────────
+// PID is already declared at the top of the script.
+const SENDER_AGENT = "shca";
+
+function showUploadStatus(msg, kind) {
+  const el = document.getElementById('upload-status');
+  if (!el) return;
+  el.classList.remove('hidden', 'bg-emerald-900/40', 'bg-red-900/40', 'bg-blue-900/40', 'text-emerald-300', 'text-red-300', 'text-blue-300');
+  if (kind === 'success') el.classList.add('bg-emerald-900/40', 'text-emerald-300');
+  else if (kind === 'error') el.classList.add('bg-red-900/40', 'text-red-300');
+  else el.classList.add('bg-blue-900/40', 'text-blue-300');
+  el.textContent = msg;
+}
+
+function hideUploadStatus(delayMs) {
+  setTimeout(() => {
+    const el = document.getElementById('upload-status');
+    if (el) el.classList.add('hidden');
+  }, delayMs || 4000);
+}
+
+async function uploadOneFile(file) {
+  const fd = new FormData();
+  fd.append('file', file);
+  fd.append('sender_agent', SENDER_AGENT);
+  showUploadStatus(`⬆ Uploading ${file.name} (${Math.round(file.size/1024)} KB)…`, 'info');
+  try {
+    const resp = await fetch(`/goals/${PID}/chat/upload`, {
+      method: 'POST', body: fd,
+    });
+    if (!resp.ok) {
+      const err = await resp.text();
+      showUploadStatus(`✗ ${file.name}: ${err.substring(0,200)}`, 'error');
+      hideUploadStatus(8000);
+      return null;
+    }
+    const data = await resp.json();
+    const r = data.refresh || {};
+    const refreshSummary = `GO:${r.go ? '✓' : '–'}, Assistants:${r.assistants ?? r.shcas ?? 0}, IAs:${r.ia_workers || 0}`;
+    showUploadStatus(
+      `✓ ${file.name} uploaded (${data.file_type.toUpperCase()}). Available to all agents. Refreshed: ${refreshSummary}`,
+      'success',
+    );
+    appendBubble('human',
+      `📎 **Attached file:** \`${file.name}\` (${data.file_type}, ${Math.round(data.file_size/1024)} KB)\n\n` +
+      `_This file is now available as a read-only goal resource. ` +
+      `All agents (GO, your assistant, IAs) have been notified and can reference it._`,
+      currentUserName,
+    );
+    hideUploadStatus(6000);
+    return data;
+  } catch (e) {
+    showUploadStatus(`✗ ${file.name}: ${e.message}`, 'error');
+    hideUploadStatus(8000);
+    return null;
+  }
+}
+
+async function uploadFiles(fileList) {
+  if (!fileList || fileList.length === 0) return;
+  for (const f of fileList) await uploadOneFile(f);
+  document.getElementById('file-input').value = '';
+}
+
+function handlePaste(e) {
+  if (!e.clipboardData || !e.clipboardData.files || e.clipboardData.files.length === 0) return;
+  e.preventDefault();
+  uploadFiles(e.clipboardData.files);
+}
+
+// Drag & drop on the whole chat area
+document.addEventListener('dragover', (e) => { e.preventDefault(); });
+document.addEventListener('drop', (e) => {
+  e.preventDefault();
+  if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+    uploadFiles(e.dataTransfer.files);
+  }
+});
+
+// Auto-resize textarea
+inputEl.addEventListener('input', () => {
+  inputEl.style.height = 'auto';
+  inputEl.style.height = Math.min(inputEl.scrollHeight, 160) + 'px';
+});
+
+// ── DB Polling fallback ─────────────────────────────────────────────────
+// When user sends a message, start polling DB for agent response.
+// Stops when response is received via WebSocket OR via poll.
+let pollTimer = null;
+let lastMsgId = '';
+let waitingForResponse = false;
+
+// Track the last message ID on page load
+{% if messages %}
+lastMsgId = '{{ messages[-1].id if messages else "" }}';
+{% endif %}
+
+function startPolling() {
+  if (pollTimer) return;
+  waitingForResponse = true;
+  pollTimer = setInterval(pollForMessages, 3000);
+}
+
+function stopPolling() {
+  waitingForResponse = false;
+  if (pollTimer) {
+    clearInterval(pollTimer);
+    pollTimer = null;
+  }
+}
+
+async function pollForMessages() {
+  if (!THREAD_ID || !waitingForResponse) return;
+  // Don't poll if WS is actively streaming a response
+  if (currentAgentBubble || currentAgentContent) return;
+  try {
+    const url = `/goals/${PID}/chat/${AGENT_ID}/poll?thread_id=${THREAD_ID}&after=${lastMsgId}&token=${encodeURIComponent(TOKEN)}`;
+    const resp = await fetch(url);
+    if (!resp.ok) return;
+    const data = await resp.json();
+    if (data.messages && data.messages.length > 0) {
+      for (const msg of data.messages) {
+        // Skip if we already showed this via WebSocket streaming
+        if (document.querySelector(`[data-msg-id="${msg.id}"]`)) continue;
+
+        // Skip human messages (already shown when sent)
+        if (msg.role === 'human') {
+          lastMsgId = msg.id;
+          continue;
+        }
+
+        // Skip if WS already showed a bubble with similar content (no
+        // data-msg-id on WS bubbles). The existing bubble's textContent
+        // is the markdown-rendered plain text; msg.content from the DB
+        // is raw markdown. Render msg.content the same way and compare
+        // textContent on both sides: apples to apples.
+        const _tmp = document.createElement('div');
+        _tmp.innerHTML = renderMd(msg.content || '');
+        const newRendered = (_tmp.textContent || '').replace(/\s+/g, ' ').trim().substring(0, 200);
+
+        const existingBubbles = document.querySelectorAll('.agent-prose');
+        let dupBubble = null;
+        for (const el of existingBubbles) {
+          const existingRendered = (el.textContent || '').replace(/\s+/g, ' ').trim().substring(0, 200);
+          if (existingRendered && newRendered && existingRendered === newRendered) {
+            dupBubble = el;
+            break;
+          }
+        }
+        if (dupBubble) {
+          // Tag the existing bubble with the canonical id so future
+          // polls can match by data-msg-id directly.
+          const wrapper = dupBubble.closest('[data-msg-id]') || dupBubble.parentElement;
+          if (wrapper && !wrapper.hasAttribute('data-msg-id')) {
+            wrapper.setAttribute('data-msg-id', msg.id);
+          }
+          lastMsgId = msg.id;
+          stopPolling();
+          continue;
+        }
+
+        // Agent message from DB: show it
+        typingEl.classList.add('hidden');
+        removeToolIndicator();
+        currentAgentBubble = null;
+        currentAgentContent = "";
+        const bubble = appendBubble('agent', msg.content);
+        bubble.setAttribute('data-msg-id', msg.id);
+        lastMsgId = msg.id;
+        stopPolling();
+        // Reactive plan-ready check when poll delivers an agent message.
+        checkPlanBannerAfterTurn();
+      }
+    }
+  } catch (e) {
+    // Ignore poll errors
+  }
+}
+
+// Override sendMessage to start polling alongside WS
+const _originalSendMessage = sendMessage;
+sendMessage = function() {
+  const content = inputEl.value.trim();
+  if (!content || !ws || ws.readyState !== WebSocket.OPEN) return;
+  _originalSendMessage();
+  startPolling();
+};
+
+// Stop polling when WebSocket delivers the response
+const _originalHandleGatewayMessage = handleGatewayMessage;
+handleGatewayMessage = function(data) {
+  _originalHandleGatewayMessage(data);
+  // WS is delivering content: no need for poll fallback
+  if (data.type === 'token' || data.type === 'token_stream_end') {
+    stopPolling();
+  }
+};
+
+setConnStatus('connecting');
+connect();
+scrollBottom();
+
+// ── Restore "agent is running" indicator on page load ─────────────────────
+// If the agent is mid-run when we load, the chat_run_state row tells us
+// whether to show "thinking…" or "Using <tool>…". Live WS events take
+// over from here. No-op if status=idle.
+(async function restoreRunState() {
+  try {
+    const resp = await fetch(
+      `/goals/${PID}/chat/${AGENT_ID}/run-state?thread_id=${encodeURIComponent(THREAD_ID || '')}`,
+    );
+    if (!resp.ok) return;
+    const r = await resp.json();
+    if (r.status === 'using_tool' && r.tool) {
+      showToolIndicator(r.tool);
+    } else if (r.status === 'thinking') {
+      typingEl.classList.remove('hidden');
+    }
+  } catch (e) { /* idle / ignore */ }
+})();
+
+// addParticipant is now handled by submitAddParticipant() in the modal script above
+
+// ── Approval actions (Stage 3-d, 3-l) ──────────────────────────────────────
+async function approvePlan() {
+  const banner = document.getElementById('phase-banner-msg');
+  if (banner) { banner.textContent = 'Approving plan…'; banner.classList.remove('hidden'); }
+  try {
+    const resp = await fetch(`/goals/${PID}/stories/${CURRENT_STORY_ID}/plan/approve`, {
+      method: 'POST', credentials: 'include',
+    });
+    const data = await resp.json();
+    if (!resp.ok || !data.ok) {
+      if (banner) banner.innerHTML = `<span class="text-red-400">${data.user_message || data.error || 'failed'}</span>`;
+      return;
+    }
+    if (banner) banner.innerHTML =
+      `<span class="text-green-400">✓ Plan approved: ${data.task_count} tasks created` +
+      (data.plan_pushed ? ', plan pushed' : (data.push_error ? ', push failed' : '')) +
+      `</span>`;
+    setTimeout(() => window.location.reload(), 1200);
+  } catch (e) {
+    if (banner) banner.innerHTML = `<span class="text-red-400">${e.message}</span>`;
+  }
+}
+
+
+// (Re)generate the diff-review card for a story parked at awaiting_review.
+// The card is created by begin_diff_review, which can fail at the gitDiff step
+// (e.g. a large diff that exceeded the old WS frame limit), leaving the story
+// stranded with no card. This re-fires it. Guarded server-side (no-op if a diff
+// review is already pending), so it's safe to call manually or auto on load.
+async function retryDiffReview(silent) {
+  const banner = document.getElementById('phase-banner-msg');
+  const btn = document.getElementById('gen-diff-review-btn');
+  if (!silent && banner) { banner.textContent = 'Generating diff review…'; banner.classList.remove('hidden'); }
+  if (btn) btn.disabled = true;
+  try {
+    const resp = await fetch(`/goals/${PID}/stories/${CURRENT_STORY_ID}/diff/retry`, {
+      method: 'POST', credentials: 'include',
+    });
+    const data = await resp.json();
+    if (!resp.ok || !data.ok) {
+      if (!silent && banner) banner.innerHTML = `<span class="text-red-400">${data.error || 'failed'}</span>`;
+      if (btn) btn.disabled = false;
+      return;
+    }
+    if (data.regenerated) {
+      if (banner) banner.innerHTML = `<span class="text-green-400">✓ Diff review ready</span>`;
+      setTimeout(() => window.location.reload(), 1000);
+    } else if (!silent) {
+      if (banner) banner.innerHTML = `<span class="text-gray-400">${data.note || 'diff review already present'}</span>`;
+      if (btn) btn.disabled = false;
+    } else if (btn) {
+      btn.disabled = false;
+    }
+  } catch (e) {
+    if (!silent && banner) banner.innerHTML = `<span class="text-red-400">${e.message}</span>`;
+    if (btn) btn.disabled = false;
+  }
+}
+
+// Self-heal: if the story loads already parked at awaiting_review, try once to
+// (re)generate the diff-review card. No-op server-side if a card already exists.
+if (CURRENT_STORY_ID && INITIAL_PHASE === 'awaiting_review') {
+  window.addEventListener('DOMContentLoaded', () => retryDiffReview(true));
+}
+
+
+// ── Phase 4 Stage 5: pause / resume / replan / mark-done ─────────────
+
+async function pauseStory() {
+  const banner = document.getElementById('phase-banner-msg');
+  if (banner) { banner.textContent = 'Pausing…'; banner.classList.remove('hidden'); }
+  try {
+    const resp = await fetch(`/goals/${PID}/stories/${CURRENT_STORY_ID}/pause`, {
+      method: 'POST', credentials: 'include',
+    });
+    const data = await resp.json();
+    if (!resp.ok || !data.ok) {
+      if (banner) banner.innerHTML = `<span class="text-red-400">${data.user_message || data.error || data.detail || 'pause failed'}</span>`;
+      return;
+    }
+    if (banner) banner.innerHTML = `<span class="text-amber-300">⏸ Paused</span>`;
+    setTimeout(() => window.location.reload(), 800);
+  } catch (e) {
+    if (banner) banner.innerHTML = `<span class="text-red-400">${e.message}</span>`;
+  }
+}
+
+async function resumeStory() {
+  const banner = document.getElementById('phase-banner-msg');
+  if (banner) { banner.textContent = 'Resuming…'; banner.classList.remove('hidden'); }
+  try {
+    const resp = await fetch(`/goals/${PID}/stories/${CURRENT_STORY_ID}/resume`, {
+      method: 'POST', credentials: 'include',
+    });
+    const data = await resp.json();
+    if (!resp.ok || !data.ok) {
+      if (banner) banner.innerHTML = `<span class="text-red-400">${data.user_message || data.error || data.detail || 'resume failed'}</span>`;
+      return;
+    }
+    if (banner) banner.innerHTML = `<span class="text-emerald-300">▶ Resumed</span>`;
+    setTimeout(() => window.location.reload(), 800);
+  } catch (e) {
+    if (banner) banner.innerHTML = `<span class="text-red-400">${e.message}</span>`;
+  }
+}
+
+async function replanStory() {
+  const result = await window.confirmAction({
+    title: 'Replan this story',
+    body: 'Leave the field blank to just replan freely.',
+    reason: true,
+    reasonPlaceholder: 'What would you like to change?',
+  });
+  if (!result) return;
+  const feedback = result.reason;
+
+  const banner = document.getElementById('phase-banner-msg');
+  if (banner) { banner.textContent = 'Initiating replan…'; banner.classList.remove('hidden'); }
+  try {
+    const body = new URLSearchParams({ feedback });
+    const resp = await fetch(`/goals/${PID}/stories/${CURRENT_STORY_ID}/replan`, {
+      method: 'POST', credentials: 'include',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: body.toString(),
+    });
+    const data = await resp.json();
+    if (!resp.ok || !data.ok) {
+      if (banner) banner.innerHTML = `<span class="text-red-400">${data.user_message || data.error || data.detail || 'replan failed'}</span>`;
+      return;
+    }
+    if (banner) banner.innerHTML = `<span class="text-indigo-300">♻ Replan started: ${data.cancelled_pending || 0} pending tasks cancelled</span>`;
+    setTimeout(() => window.location.reload(), 1200);
+  } catch (e) {
+    if (banner) banner.innerHTML = `<span class="text-red-400">${e.message}</span>`;
+  }
+}
+
+async function markStoryDone() {
+  const result = await window.confirmAction({
+    title: 'Mark story as done',
+    body: 'No more DAGs can be added afterwards.',
+  });
+  if (!result) return;
+  const banner = document.getElementById('phase-banner-msg');
+  if (banner) { banner.textContent = 'Marking done…'; banner.classList.remove('hidden'); }
+  try {
+    let resp = await fetch(`/goals/${PID}/stories/${CURRENT_STORY_ID}/mark-done`, {
+      method: 'POST', credentials: 'include',
+    });
+    let data = await resp.json();
+    // Closing would discard uncommitted work → confirm, or bail so the human can keep it.
+    if (data.needs_confirm) {
+      const proceed = await window.confirmAction({
+        title: 'Discard uncommitted work?',
+        body: (data.reason || 'Uncommitted work will be discarded.')
+              + '\n\nOK = mark done anyway (discard). Cancel = keep working.',
+      });
+      if (!proceed) { if (banner) banner.classList.add('hidden'); return; }
+      resp = await fetch(`/goals/${PID}/stories/${CURRENT_STORY_ID}/mark-done`, {
+        method: 'POST', credentials: 'include',
+        body: new URLSearchParams({ force: 'true' }),
+      });
+      data = await resp.json();
+    }
+    if (!resp.ok || !data.ok) {
+      if (banner) banner.innerHTML = `<span class="text-red-400">${data.error || data.detail || 'mark-done failed'}</span>`;
+      return;
+    }
+    if (banner) banner.innerHTML = `<span class="text-green-400">✓ Story marked done</span>`;
+    setTimeout(() => window.location.reload(), 1200);
+  } catch (e) {
+    if (banner) banner.innerHTML = `<span class="text-red-400">${e.message}</span>`;
+  }
+}
+
+async function recoverAction(ev, action) {
+  // Phase 3: DAG failure recovery card buttons → POST /stories/{sid}/recover.
+  ev.preventDefault();
+  const card = ev.target.closest('.recovery-card');
+  const reenable = () => {
+    if (!card) return;
+    card.dataset.deciding = '';
+    card.querySelectorAll('button').forEach(b => { b.disabled = false; b.classList.remove('opacity-50', 'cursor-not-allowed'); });
+  };
+  if (card) {
+    if (card.dataset.deciding === '1') return;
+    card.dataset.deciding = '1';
+    card.querySelectorAll('button').forEach(b => { b.disabled = true; b.classList.add('opacity-50', 'cursor-not-allowed'); });
+  }
+  const feedbackEl = card ? card.querySelector('input[name=feedback]') : null;
+  const feedback = feedbackEl ? feedbackEl.value : '';
+  const banner = document.getElementById('phase-banner-msg');
+  const body = new URLSearchParams({ action, feedback });
+  try {
+    const resp = await fetch(`/goals/${PID}/stories/${CURRENT_STORY_ID}/recover`, {
+      method: 'POST', credentials: 'include', body,
+    });
+    const data = await resp.json();
+    // Abandon would discard uncommitted completed-phase work → confirm, or bail so the
+    // human can click "Review & keep" instead.
+    if (data.needs_confirm) {
+      const proceed = await window.confirmAction({
+        title: 'Discard uncommitted work?',
+        body: (data.reason || 'Uncommitted work will be discarded.')
+              + `\n\nOK = discard & ${action}. Cancel = keep it (use “📥 Review & keep”).`,
+      });
+      if (!proceed) { reenable(); return; }
+      const resp2 = await fetch(`/goals/${PID}/stories/${CURRENT_STORY_ID}/recover`, {
+        method: 'POST', credentials: 'include',
+        body: new URLSearchParams({ action, feedback, force: 'true' }),
+      });
+      const data2 = await resp2.json();
+      if (!resp2.ok || !data2.ok) {
+        if (banner) { banner.classList.remove('hidden'); banner.innerHTML = `<span class="text-red-400">${data2.user_message || data2.error || data2.detail || (action + ' failed')}</span>`; }
+        reenable();
+        return;
+      }
+      if (banner) { banner.classList.remove('hidden'); banner.innerHTML = `<span class="text-indigo-300">${action} started…</span>`; }
+      setTimeout(() => window.location.reload(), 1000);
+      return;
+    }
+    if (!resp.ok || !data.ok) {
+      if (banner) { banner.classList.remove('hidden'); banner.innerHTML = `<span class="text-red-400">${data.user_message || data.error || data.detail || (action + ' failed')}</span>`; }
+      reenable();
+      return;
+    }
+    if (banner) { banner.classList.remove('hidden'); banner.innerHTML = `<span class="text-indigo-300">${action} started…</span>`; }
+    setTimeout(() => window.location.reload(), 1000);
+  } catch (e) {
+    if (banner) { banner.classList.remove('hidden'); banner.innerHTML = `<span class="text-red-400">${e.message}</span>`; }
+    reenable();
+  }
+}
+
+async function decideDiffAction(ev, approvalId, decision) {
+  ev.preventDefault();
+  // Disable buttons on every form for this approval_id immediately so a
+  // duplicate click (e.g. from a live card + the persisted card both
+  // visible) can't race against the in-flight request.
+  const forms = document.querySelectorAll(`form[data-approval-id="${approvalId}"]`);
+  if (forms.length && forms[0].dataset.deciding === '1') return;
+  forms.forEach(f => {
+    f.dataset.deciding = '1';
+    f.querySelectorAll('button').forEach(b => {
+      b.disabled = true;
+      b.classList.add('opacity-50', 'cursor-not-allowed');
+    });
+  });
+
+  const form = ev.target.closest('form');
+  const feedback = form ? form.querySelector('textarea[name=feedback]').value : '';
+  const body = new URLSearchParams({ approval_id: approvalId, decision, feedback });
+  try {
+    const resp = await fetch(`/goals/${PID}/stories/${CURRENT_STORY_ID}/diff/decide`, {
+      method: 'POST', credentials: 'include',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: body.toString(),
+    });
+    const data = await resp.json();
+    if (!resp.ok || !data.ok) {
+      // Re-enable so the user can try again with corrected input.
+      forms.forEach(f => {
+        f.dataset.deciding = '';
+        f.querySelectorAll('button').forEach(b => {
+          b.disabled = false;
+          b.classList.remove('opacity-50', 'cursor-not-allowed');
+        });
+      });
+      showToast('Decision failed: ' + (data.user_message || data.error || resp.statusText), 'error');
+      return;
+    }
+    setTimeout(() => window.location.reload(), 800);
+  } catch (e) {
+    showToast(e.message, 'error');
+  }
+}
+function decideDiff() { return false; }  // form onsubmit no-op (we use buttons)
+
+// ── Workspace file viewer (Stage 1) ──────────────────────────────────────
+// Lives in the right-rail #workspace-panel. Only rendered when a story is
+// active for this thread (current_story is set + workspace_state='ready').
+(function setupWorkspacePanel() {
+  if (!CURRENT_STORY_ID) return;
+  const panel = document.getElementById('workspace-panel');
+  if (!panel) return;
+  const treeEl = document.getElementById('ws-tree');
+  const refreshBtn = document.getElementById('ws-refresh-btn');
+  const contentPane = document.getElementById('ws-content-pane');
+  const contentPath = document.getElementById('ws-content-path');
+  const contentMeta = document.getElementById('ws-content-meta');
+  const contentBody = document.getElementById('ws-content-body');
+
+  const TREE_URL = `/goals/${PID}/stories/${CURRENT_STORY_ID}/workspace/tree`;
+  const FILE_URL = `/goals/${PID}/stories/${CURRENT_STORY_ID}/workspace/file`;
+
+  // Map mime → highlight.js language hint
+  function langForMime(mime, path) {
+    const ext = (path.match(/\.([a-z0-9]+)$/i) || [])[1]?.toLowerCase() || '';
+    if (mime === 'text/markdown') return 'markdown';
+    if (mime === 'text/x-python') return 'python';
+    if (mime === 'text/javascript' || mime === 'application/json') return ext === 'json' ? 'json' : 'javascript';
+    if (mime === 'text/x-typescript') return ext.startsWith('ts') ? 'typescript' : 'javascript';
+    if (mime === 'text/x-yaml') return 'yaml';
+    if (mime === 'text/x-toml') return 'toml';
+    if (mime === 'text/x-shellscript') return 'bash';
+    if (mime === 'text/html') return 'html';
+    if (mime === 'text/css') return 'css';
+    if (mime === 'text/x-sql') return 'sql';
+    if (mime === 'text/x-go') return 'go';
+    if (mime === 'text/x-rust') return 'rust';
+    if (mime === 'text/x-c' || mime === 'text/x-c++') return mime.endsWith('++') ? 'cpp' : 'c';
+    if (mime === 'text/x-diff') return 'diff';
+    return '';
+  }
+
+  function fmtSize(bytes) {
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+    return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+  }
+
+  // Build a tree node structure from a flat entry list.
+  function buildTree(entries) {
+    const root = { name: '', children: new Map() };
+    for (const e of entries) {
+      const parts = e.path.split('/');
+      let cur = root;
+      for (let i = 0; i < parts.length; i++) {
+        const name = parts[i];
+        const isLeaf = i === parts.length - 1;
+        if (!cur.children.has(name)) {
+          cur.children.set(name, { name, children: new Map(), isFile: false });
+        }
+        const node = cur.children.get(name);
+        if (isLeaf) {
+          node.isFile = (e.type === 'file');
+          node.size = e.size;
+          node.path = e.path;
+        }
+        cur = node;
+      }
+    }
+    return root;
+  }
+
+  function renderTree(root) {
+    treeEl.innerHTML = '';
+    if (root.children.size === 0) {
+      treeEl.innerHTML = '<div class="text-gray-500 text-2xs italic px-2 py-1">No files in workspace yet.</div>';
+      return;
+    }
+    const list = document.createElement('ul');
+    list.className = 'space-y-0.5';
+    renderNode(root, list, 0);
+    treeEl.appendChild(list);
+  }
+
+  function renderNode(node, parentList, depth) {
+    // Sort: dirs first then files, both alphabetically.
+    const items = [...node.children.values()].sort((a, b) => {
+      if (a.isFile !== b.isFile) return a.isFile ? 1 : -1;
+      return a.name.localeCompare(b.name);
+    });
+    for (const child of items) {
+      const li = document.createElement('li');
+      li.style.paddingLeft = `${depth * 0.75}rem`;
+      if (child.isFile) {
+        const btn = document.createElement('button');
+        btn.className = 'block w-full text-left px-1 py-0.5 rounded hover:bg-surface text-gray-300 hover:text-gray-100 truncate';
+        btn.title = `${child.path} · ${fmtSize(child.size)}`;
+        btn.innerHTML = `<span class="text-gray-500">📄</span> ${child.name}`;
+        btn.dataset.path = child.path;
+        btn.dataset.size = child.size;
+        btn.onclick = () => openFile(child.path);
+        li.appendChild(btn);
+      } else {
+        const toggle = document.createElement('button');
+        toggle.className = 'block w-full text-left px-1 py-0.5 rounded hover:bg-surface text-gray-200 truncate';
+        toggle.innerHTML = `<span class="ws-caret">▾</span> <span class="text-indigo-400">📁</span> ${child.name}`;
+        li.appendChild(toggle);
+        const sublist = document.createElement('ul');
+        sublist.className = 'space-y-0.5';
+        renderNode(child, sublist, depth + 1);
+        li.appendChild(sublist);
+        toggle.onclick = () => {
+          const collapsed = sublist.classList.toggle('hidden');
+          toggle.querySelector('.ws-caret').textContent = collapsed ? '▸' : '▾';
+        };
+      }
+      parentList.appendChild(li);
+    }
+  }
+
+  async function refreshTree() {
+    treeEl.innerHTML = '<div class="text-gray-500 text-2xs italic px-2 py-1">Loading…</div>';
+    try {
+      const resp = await fetch(TREE_URL, { credentials: 'include' });
+      if (!resp.ok) throw new Error(`${resp.status} ${resp.statusText}`);
+      const data = await resp.json();
+      const root = buildTree(data.entries || []);
+      renderTree(root);
+      if (data.truncated) {
+        const warn = document.createElement('div');
+        warn.className = 'text-2xs text-amber-400 italic px-2 py-1';
+        warn.textContent = 'Tree truncated at 2000 entries.';
+        treeEl.appendChild(warn);
+      }
+    } catch (e) {
+      treeEl.innerHTML = `<div class="text-2xs text-red-400 px-2 py-1">Failed to load: ${e.message}</div>`;
+    }
+  }
+
+  async function openFile(relPath) {
+    contentPane.classList.remove('hidden');
+    contentPane.classList.add('flex');
+    document.getElementById('ws-resize-handle-y').classList.remove('hidden');
+    contentPath.textContent = relPath;
+    contentMeta.textContent = '';
+    contentBody.innerHTML = '<div class="text-gray-500 italic">Loading…</div>';
+    try {
+      const url = `${FILE_URL}?path=${encodeURIComponent(relPath)}`;
+      const resp = await fetch(url, { credentials: 'include' });
+      if (!resp.ok) {
+        const txt = await resp.text();
+        throw new Error(`${resp.status}: ${txt.slice(0, 200)}`);
+      }
+      const data = await resp.json();
+      contentMeta.textContent = `${fmtSize(data.size)}${data.truncated ? ' · truncated' : ''}`;
+      renderFileContent(data);
+    } catch (e) {
+      contentBody.innerHTML = `<div class="text-red-400">Failed to load: ${e.message}</div>`;
+    }
+  }
+
+  function renderFileContent(data) {
+    contentBody.innerHTML = '';
+    if (data.mime === 'application/octet-stream' || !data.content) {
+      const note = document.createElement('div');
+      note.className = 'text-gray-500 italic';
+      note.textContent = data.size === 0
+        ? '(empty file)'
+        : '(binary preview not available)';
+      contentBody.appendChild(note);
+      return;
+    }
+    if (data.mime === 'text/markdown') {
+      const wrap = document.createElement('div');
+      wrap.className = 'agent-prose';
+      wrap.innerHTML = renderMd(data.content);
+      contentBody.appendChild(wrap);
+      // Highlight any code blocks within the rendered markdown
+      wrap.querySelectorAll('pre code').forEach(block => {
+        try { hljs.highlightElement(block); } catch {}
+      });
+      return;
+    }
+    // Source code or text
+    const pre = document.createElement('pre');
+    pre.className = 'rounded-md text-xs overflow-x-auto m-0';
+    pre.style.background = '#0d1117';
+    pre.style.padding = '0.8em 1em';
+    const code = document.createElement('code');
+    const lang = langForMime(data.mime, data.path);
+    if (lang) code.className = `language-${lang}`;
+    code.textContent = data.content;
+    pre.appendChild(code);
+    contentBody.appendChild(pre);
+    try { hljs.highlightElement(code); } catch {}
+  }
+
+  function closeWsContent() {
+    contentPane.classList.add('hidden');
+    contentPane.classList.remove('flex');
+    document.getElementById('ws-resize-handle-y').classList.add('hidden');
+    contentBody.innerHTML = '';
+  }
+  window.closeWsContent = closeWsContent;
+
+  refreshBtn.onclick = refreshTree;
+  refreshTree();
+
+  // ── Resizers ──
+  // Persist sizes per (goal, story) in localStorage so they stick across reloads.
+  const SIZE_KEY = `ws-panel-sizes:${PID}:${CURRENT_STORY_ID}`;
+  function loadSizes() {
+    try { return JSON.parse(localStorage.getItem(SIZE_KEY) || '{}'); } catch { return {}; }
+  }
+  function saveSizes(s) {
+    try { localStorage.setItem(SIZE_KEY, JSON.stringify(s)); } catch {}
+  }
+  const sizes = loadSizes();
+  if (sizes.panelWidth) panel.style.width = sizes.panelWidth + 'px';
+  if (sizes.treeHeight) {
+    document.getElementById('ws-tree').style.flex = `0 0 ${sizes.treeHeight}px`;
+  }
+
+  // Horizontal resizer (panel width)
+  const handleX = document.getElementById('ws-resize-handle-x');
+  if (handleX) {
+    let startX = 0, startW = 0, dragging = false;
+    handleX.addEventListener('mousedown', (e) => {
+      dragging = true;
+      startX = e.clientX;
+      startW = panel.getBoundingClientRect().width;
+      document.body.style.cursor = 'col-resize';
+      document.body.style.userSelect = 'none';
+      e.preventDefault();
+    });
+    window.addEventListener('mousemove', (e) => {
+      if (!dragging) return;
+      // Drag left = grow panel (handle is on panel's left edge)
+      const next = Math.min(Math.max(startW + (startX - e.clientX), 240), Math.min(window.innerWidth - 320, 1200));
+      panel.style.width = next + 'px';
+    });
+    window.addEventListener('mouseup', () => {
+      if (!dragging) return;
+      dragging = false;
+      document.body.style.cursor = '';
+      document.body.style.userSelect = '';
+      const cur = loadSizes();
+      cur.panelWidth = Math.round(panel.getBoundingClientRect().width);
+      saveSizes(cur);
+    });
+  }
+
+  // Vertical resizer (tree height vs content pane height)
+  const handleY = document.getElementById('ws-resize-handle-y');
+  if (handleY) {
+    let startY = 0, startH = 0, dragging = false;
+    handleY.addEventListener('mousedown', (e) => {
+      dragging = true;
+      startY = e.clientY;
+      startH = treeEl.getBoundingClientRect().height;
+      document.body.style.cursor = 'row-resize';
+      document.body.style.userSelect = 'none';
+      e.preventDefault();
+    });
+    window.addEventListener('mousemove', (e) => {
+      if (!dragging) return;
+      const panelBody = document.getElementById('ws-panel-body');
+      const panelH = panelBody.getBoundingClientRect().height;
+      // Keep at least 64px of tree, at least 96px of content
+      const max = panelH - 96 - handleY.getBoundingClientRect().height - 28; // 28px header of content
+      const next = Math.min(Math.max(startH + (e.clientY - startY), 64), max);
+      treeEl.style.flex = `0 0 ${next}px`;
+    });
+    window.addEventListener('mouseup', () => {
+      if (!dragging) return;
+      dragging = false;
+      document.body.style.cursor = '';
+      document.body.style.userSelect = '';
+      const cur = loadSizes();
+      cur.treeHeight = Math.round(treeEl.getBoundingClientRect().height);
+      saveSizes(cur);
+    });
+  }
+})();
+
+// ── Plan-ready banner update ─────────────────────────────────────────────────
+// During the planning phase with no plan path the header shows a non-clickable
+// "Writing plan…" span. Once the validate-plan hook writes current_plan_path
+// to the DB it broadcasts a {type:"plan_ready"} WS frame to this session;
+// handleGatewayMessage routes it to swapBannerToPlanReady(), which replaces
+// the span with the green Approve button: no polling required.
+//
+// checkPlanBannerAfterTurn() is a belt-and-suspenders fallback fired after
+// each completed agent turn (token_stream_end / pollForMessages); it covers
+// the edge case where the WS push is lost.
+let _planBannerDone = !!(INITIAL_PLAN_PATH || INITIAL_PHASE !== 'planning');
+// The phase the currently-rendered banner reflects. The assistant can transition
+// the story phase via its story_phase tool with no live signal to this tab; when we
+// detect the phase moved off this value we reload so the banner + its buttons
+// re-render (control-panel transitions already reload on the user's click).
+let _bannerPhase = INITIAL_PHASE;
+// Set by the phase_changed WS push when a reply is mid-stream; the reload is then
+// deferred to token_stream_end so we don't cut off the assistant's message.
+let _pendingPhaseReload = false;
+
+function swapBannerToPlanReady() {
+  if (_planBannerDone) return;
+  // Find the placeholder before marking done: if it's missing, leave
+  // _planBannerDone=false so the checkPlanBannerAfterTurn fallback can retry.
+  const placeholder = document.getElementById('approve-plan-placeholder');
+  if (!placeholder) return;
+  _planBannerDone = true;
+  const btn = document.createElement('button');
+  btn.id = 'approve-plan-btn';
+  btn.className = 'ml-auto px-3 py-1 rounded bg-green-600 hover:bg-green-500 text-white text-2xs font-semibold';
+  btn.textContent = '✓ Approve plan';
+  btn.onclick = approvePlan;
+  placeholder.replaceWith(btn);
+}
+
+async function checkPlanBannerAfterTurn() {
+  if (!CURRENT_STORY_ID) return;
+  try {
+    const resp = await fetch(`/goals/${PID}/stories/${CURRENT_STORY_ID}/phase`, { credentials: 'include' });
+    if (!resp.ok) return;
+    const data = await resp.json();
+    // General phase transition (e.g. the assistant moved discovery→planning or
+    // →awaiting_next via its story_phase tool). Reload so the phase banner + its
+    // phase-specific buttons re-render. NOT gated by _planBannerDone — that only
+    // guards the within-'planning' plan-ready swap below, and would otherwise skip
+    // this entirely for stories that didn't start in planning.
+    if (data.current_phase && _bannerPhase && data.current_phase !== _bannerPhase) {
+      window.location.reload();
+      return;
+    }
+    // Within 'planning': the plan file just landed → swap "Writing plan…" to the
+    // Approve button (no reload needed; phase is unchanged).
+    if (!_planBannerDone && (data.current_plan_path || data.current_phase === 'awaiting_plan_approval')) {
+      swapBannerToPlanReady();
+    }
+  } catch (_) { /* non-fatal */ }
+}
+</script>
+{% endblock %}
+
+{% block extra_js %}
+{% if auto_fire_tour %}
+<script>
+// Milestone tour: first-ever visit to THIS goal's Assistant thread. The
+// route already scopes auto_fire_tour to SHCA (Assistant) agents only -
+// this page also renders IA/GO chat views, which this milestone's copy
+// doesn't apply to. Must run in extra_js (after tour.js loads) — content
+// renders inside <main>, before the bottom-of-body script tags.
+autoFireTour('assistant-thread-intro', 800);
+</script>
+{% endif %}
+{% endblock %}

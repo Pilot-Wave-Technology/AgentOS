@@ -1,0 +1,20 @@
+name: CI
+# Validates migrations/SEQUENCE on every push and PR to the control-plane branch.
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  migration-sequence:
+    name: Migration SEQUENCE validation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate migrations/SEQUENCE
+        # Same check the pre-push hook and Cloud Build run: every SEQUENCE entry has
+        # a matching .sql/.py file, every migration file is listed, no duplicates.
+        # Pure bash — no database, no Python, no project setup needed.
+        run: bash migrations/check_sequence.sh

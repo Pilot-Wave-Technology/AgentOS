@@ -1,0 +1,182 @@
+{% from "partials/_info_popover.html" import info_popover %}
+<div class="bg-gray-900 border border-gray-800 rounded-xl p-5" id="goal-cost-panel">
+
+  {# Header + goal dropdown #}
+  <div class="flex items-center justify-between mb-4 gap-4 flex-wrap">
+    <h3 class="font-semibold">Goal Cost Breakdown</h3>
+    <select
+      name="goal_id"
+      hx-get="/dashboard/goal-cost"
+      hx-target="#goal-cost-panel"
+      hx-swap="outerHTML"
+      hx-include="[name='goal_id']"
+      hx-trigger="change"
+      class="bg-gray-800 border border-gray-700 text-sm text-gray-300 rounded-lg px-3 py-1.5
+             focus:outline-none focus:border-indigo-500 min-w-48">
+      <option value="">Select a goal</option>
+      {% for g in goals %}
+      <option value="{{ g.id }}" {% if g.id == goal_id %}selected{% endif %}>{{ g.name }}</option>
+      {% endfor %}
+    </select>
+  </div>
+
+  {% if not goal_id %}
+  <p class="text-sm text-gray-600 py-4 text-center">Select a goal to see its cost breakdown.</p>
+
+  {% elif not breakdown or not breakdown.total_cost_str %}
+  <p class="text-sm text-gray-600 py-4 text-center">No token usage recorded for this goal in the last 30 days.</p>
+
+  {% else %}
+  {% set b = breakdown %}
+
+  {# Summary row #}
+  <div class="flex items-baseline gap-3 mb-5">
+    <span class="text-2xl font-bold text-green-400">{{ b.total_cost_str }}</span>
+    {% if b.total_tokens_str %}
+    <span class="text-sm text-gray-500">{{ b.total_tokens_str }} tokens · last 30 days</span>
+    {% endif %}
+  </div>
+
+  {# Daily spend by provider (30d): stacked bar, same pattern as the
+     system-wide "Daily spend by provider" chart -- one series per provider,
+     full 30-day calendar (gaps filled with 0), same height. #}
+  {% if b.daily_labels_json and b.daily_labels_json != '[]' %}
+  <div>
+    <div class="text-xs text-gray-500 mb-2 font-medium uppercase tracking-wide">Daily spend by provider (30d)</div>
+    <div class="h-64">
+      <canvas id="gcb-daily-chart"
+        data-labels='{{ b.daily_labels_json }}'
+        data-datasets='{{ b.daily_datasets_json }}'></canvas>
+    </div>
+  </div>
+  {% endif %}
+
+  {# By story: same top-5 cut + overflow disclosure as the system-wide
+     "Cost by story" chart -- this goal's own story_rows caps at 10, the
+     chart shows the top 5 so Chart.js's autoSkip never hides a label. #}
+  {% if b.story_labels_json and b.story_labels_json != '[]' %}
+  <div class="mt-4">
+    <div class="flex items-baseline justify-between mb-2">
+      <div class="text-xs text-gray-500 font-medium uppercase tracking-wide">By top {{ b.stories_shown_count }} stories</div>
+      {% if b.stories_other_str %}
+      <div class="text-2xs text-gray-600" title="Remaining cost among the next few stories not shown here (this goal's own top-10 cap may hide more beyond that)">
+        + {{ b.stories_other_str }}
+      </div>
+      {% endif %}
+    </div>
+    <div class="h-32">
+      <canvas id="gcb-stories-chart"
+        data-labels='{{ b.story_labels_json }}'
+        data-values='{{ b.story_costs_json }}'></canvas>
+    </div>
+  </div>
+  {% endif %}
+
+  {# Agent detail table #}
+  {% if b.agents %}
+  <div class="mt-5 pt-4 border-t border-gray-800 space-y-1.5">
+    <div class="text-xs text-gray-500 font-medium uppercase tracking-wide mb-2">Agent detail</div>
+    {% for a in b.agents %}
+    {% if a.phases %}
+    {# claude-code-phase work attributed to this person -- nested phase
+       breakdown (coder/reviewer/tester/...), collapsed by default. Same
+       <details>/<summary> pattern as "Top goals by cost" above. #}
+    <details class="group">
+      <summary class="flex items-center gap-2 text-sm cursor-pointer list-none [&::-webkit-details-marker]:hidden">
+        <svg class="w-2.5 h-2.5 text-gray-600 flex-shrink-0 transition-transform group-open:rotate-90"
+             fill="currentColor" viewBox="0 0 8 8"><path d="M1 0l6 4-6 4z"/></svg>
+        <span class="flex-1 truncate text-gray-300">{{ a.label }}</span>
+        <span class="text-xs text-gray-600">{{ a.provider }}</span>
+        <span class="text-xs text-gray-500 hidden sm:block"
+              title="in {{ a.inp }} · cache read {{ a.cr }} · cache write {{ a.cw }} · out {{ a.out }}">
+          {{ a.tokens_str }}
+        </span>
+        <span class="font-medium text-gray-300 w-16 text-right">{{ a.cost_str }}</span>
+      </summary>
+      <div class="ml-4 mt-0.5 space-y-0.5 border-l border-gray-800 pl-3">
+        {% for p in a.phases %}
+        <div class="flex items-center gap-2 text-xs text-gray-500">
+          <span class="flex-1 truncate">{{ p.phase }}</span>
+          {% if p.phase == 'Other work' %}
+          {{ info_popover("Couldn't be matched to a specific phase (coder/reviewer/tester/etc.) -- either the task record is missing or has no phase set. Still real spend attributed to this person, just not broken out further.", label="Other work") }}
+          {% endif %}
+          <span class="text-gray-600">{{ p.tokens_str }}</span>
+          <span class="text-gray-400 w-16 text-right">{{ p.cost_str }}</span>
+        </div>
+        {% endfor %}
+      </div>
+    </details>
+    {% else %}
+    <div class="flex items-center gap-2 text-sm">
+      <span class="flex-1 truncate {% if a.unresolved_kind %}text-gray-500{% else %}text-gray-300{% endif %} pl-[18px]">{{ a.label }}</span>
+      {% if a.unresolved_kind == 'fragment' %}
+      {{ info_popover("Couldn't be matched to a saved agent name -- likely more usage from a person already shown elsewhere in this list, split across a separate conversation thread that this dashboard can't resolve back to them yet.", label="Unresolved agent") }}
+      {% elif a.unresolved_kind == 'no_attribution' %}
+      {{ info_popover("This usage has no agent recorded at the source -- e.g. automated claude-code-phase task work, which tracks by task/story instead of by agent. Grouped by model here since there's no agent identity to show.", label="No agent attribution") }}
+      {% endif %}
+      <span class="text-xs text-gray-600">{{ a.provider }}</span>
+      <span class="text-xs text-gray-500 hidden sm:block"
+            title="in {{ a.inp }} · cache read {{ a.cr }} · cache write {{ a.cw }} · out {{ a.out }}">
+        {{ a.tokens_str }}
+      </span>
+      <span class="font-medium text-gray-300 w-16 text-right">{{ a.cost_str }}</span>
+    </div>
+    {% endif %}
+    {% endfor %}
+  </div>
+  {% endif %}
+
+  {% endif %}{# end breakdown #}
+</div>
+
+<script>
+(function () {
+  function hbar(id, color) {
+    const el = document.getElementById(id);
+    if (!el || !window.Chart) return;
+    const labels = JSON.parse(el.dataset.labels || '[]');
+    const values = JSON.parse(el.dataset.values || '[]');
+    if (!labels.length) return;
+    new Chart(el, {
+      type: 'bar',
+      data: { labels, datasets: [{ data: values, backgroundColor: color, borderRadius: 2, borderWidth: 0 }] },
+      options: {
+        indexAxis: 'y', responsive: true, maintainAspectRatio: false,
+        plugins: { legend: { display: false },
+          tooltip: { callbacks: { label: ctx => ' $' + ctx.parsed.x.toFixed(4) } } },
+        scales: {
+          x: { grid: { color: '#1f2937' }, ticks: { color: '#6b7280', font: { size: 10 },
+               callback: v => '$' + v.toFixed(3) } },
+          y: { grid: { display: false }, ticks: { color: '#9ca3af', font: { size: 10 } } },
+        },
+      },
+    });
+  }
+  // Same config as the system-wide "Daily spend by provider" chart
+  // (initStackedChart in dashboard/index.html) -- one series per provider.
+  function stackedBar(id) {
+    const el = document.getElementById(id);
+    if (!el || !window.Chart) return;
+    const labels   = JSON.parse(el.dataset.labels   || '[]');
+    const datasets = JSON.parse(el.dataset.datasets || '[]');
+    if (!labels.length) return;
+    new Chart(el, {
+      type: 'bar',
+      data: { labels: labels.map(d => d.slice(5)), datasets },
+      options: {
+        responsive: true, maintainAspectRatio: false,
+        plugins: { legend: { position: 'bottom', labels: { color: '#9ca3af', font: { size: 10 }, boxWidth: 10 } },
+          tooltip: { callbacks: { label: ctx => ' ' + ctx.dataset.label + ': $' + ctx.parsed.y.toFixed(4) } } },
+        scales: {
+          x: { stacked: true, grid: { display: false }, ticks: { color: '#6b7280', font: { size: 10 } } },
+          y: { stacked: true, grid: { color: '#1f2937' }, ticks: { color: '#6b7280', font: { size: 10 },
+               callback: v => '$' + v.toFixed(3) } },
+        },
+      },
+    });
+  }
+  stackedBar('gcb-daily-chart');
+  hbar('gcb-agents-chart',  '#34d399');
+  hbar('gcb-stories-chart', '#f59e0b');
+})();
+</script>

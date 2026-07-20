@@ -1,0 +1,225 @@
+{% extends "base.html" %}
+{% from "partials/_tour_trigger.html" import tour_trigger %}
+{% block title %}Tasks: {{ goal.name }}{% endblock %}
+{% block content %}
+<div class="p-6 lg:p-8 max-w-6xl mx-auto">
+  <a href="/goals/{{ pid }}" class="inline-flex items-center gap-1 text-xs text-gray-500 hover:text-gray-300 transition-colors mb-5">
+    <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"/></svg>
+    {{ goal.name }}
+  </a>
+  <!-- Header -->
+  <div class="flex items-center justify-between mb-6">
+    <div>
+      <h1 id="tasks-header" class="text-xl font-semibold text-gray-100">Tasks</h1>
+      <p class="text-sm text-gray-500 mt-0.5">{{ goal.name }}</p>
+    </div>
+    {% if user.preferences.get("startup_wizard_enabled", True) %}
+    {{ tour_trigger("tasks-board-intro", "How Tasks work") }}
+    {% endif %}
+  </div>
+
+  <!-- Parent tasks list -->
+  {% if parent_tasks %}
+  <div class="space-y-3">
+    {% for task in parent_tasks %}
+    {% set subs = subtasks_by_parent.get(task.id, []) %}
+    {% set done_count = subs | selectattr("state", "equalto", "done") | list | length %}
+    {% set approved_count = subs | selectattr("state", "equalto", "approved") | list | length %}
+    {% set total_count = subs | length %}
+    {% set completed_count = done_count + approved_count %}
+    {% set blocked_subs = subs | selectattr("state", "equalto", "blocked") | list %}
+    {% set in_progress_subs = subs | selectattr("state", "equalto", "in_progress") | list %}
+
+    <div class="card overflow-hidden">
+      <!-- Parent task header -->
+      <div class="px-5 py-4 cursor-pointer hover:bg-surface-hover transition-colors"
+           onclick="toggleSubtasks('{{ task.id }}')">
+        <div class="flex items-center justify-between">
+          <div class="flex items-center gap-3 flex-1 min-w-0">
+            <!-- Status indicator -->
+            <div class="w-2 h-2 rounded-full flex-shrink-0
+              {% if task.state == 'done' or task.state == 'approved' %}bg-emerald-400
+              {% elif task.state == 'failed' %}bg-red-400
+              {% elif task.state == 'in_progress' or task.state == 'dispatching' %}bg-blue-400 animate-pulse
+              {% elif task.state == 'awaiting_approval' %}bg-yellow-400
+              {% elif task.state == 'blocked' %}bg-orange-400
+              {% else %}bg-gray-600{% endif %}"></div>
+
+            <div class="flex-1 min-w-0">
+              <div class="text-sm font-medium text-gray-200 truncate">{{ task.title }}</div>
+              {% if task.description %}
+              <p class="text-2xs text-gray-600 mt-0.5 line-clamp-1">{{ task.description }}</p>
+              {% endif %}
+              <div class="flex items-center gap-2 mt-1 text-2xs text-gray-600">
+                <span class="font-mono" title="Task ID">{{ task.id[:8] }}</span>
+                {% if task.story_id %}
+                <span>·</span>
+                <a href="/goals/{{ pid }}/stories/{{ task.story_id }}"
+                   class="text-brand hover:text-brand-strong font-mono"
+                   title="Parent story">story:{{ task.story_id[:8] }}</a>
+                {% endif %}
+                {% if task.template_id %}
+                <span>·</span>
+                <span class="font-mono" title="Agent template">{{ task.template_id }}</span>
+                {% endif %}
+              </div>
+            </div>
+          </div>
+          <div class="flex items-center gap-3 flex-shrink-0 ml-4">
+            {% if total_count > 0 %}
+            <div class="text-2xs text-gray-500">
+              {{ completed_count }}/{{ total_count }}
+              {% if blocked_subs %}<span class="text-orange-400 ml-1">{{ blocked_subs | length }} blocked</span>{% endif %}
+              {% if in_progress_subs %}<span class="text-blue-400 ml-1">{{ in_progress_subs | length }} running</span>{% endif %}
+            </div>
+            <!-- Progress bar -->
+            <div class="w-20 h-1 bg-surface-active rounded-full overflow-hidden">
+              <div class="h-full bg-emerald-500 rounded-full transition-all"
+                   style="width: {{ (completed_count / total_count * 100) if total_count > 0 else 0 }}%"></div>
+            </div>
+            {% endif %}
+            {% if task.assigned_to and member_names and task.assigned_to in member_names %}
+            <span class="text-2xs text-indigo-400">{{ member_names[task.assigned_to] }}</span>
+            {% elif task.assigned_to %}
+            <span class="text-2xs text-gray-500">{{ task.template_id or task.assigned_to }}</span>
+            {% endif %}
+            <span class="pill
+              {% if task.state == 'done' or task.state == 'approved' %}pill-success
+              {% elif task.state == 'failed' %}pill-error
+              {% elif task.state == 'in_progress' or task.state == 'dispatching' %}pill-info
+              {% elif task.state == 'awaiting_approval' %}pill-warning
+              {% elif task.state == 'blocked' %}pill-error
+              {% else %}pill-neutral{% endif %}">
+              {{ task.state | replace("_", " ") }}
+            </span>
+            <svg id="chevron-{{ task.id }}" class="w-4 h-4 text-gray-600 transition-transform duration-200" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/>
+            </svg>
+          </div>
+        </div>
+      </div>
+
+      <!-- Subtasks (collapsible) -->
+      <div id="subtasks-{{ task.id }}" class="hidden border-t border-border">
+        {% if subs %}
+        <div class="divide-y divide-border">
+          {% for sub in subs %}
+          <a href="/goals/{{ pid }}/tasks/{{ sub.id }}"
+             class="flex items-center px-5 py-2.5 gap-3 hover:bg-surface-hover transition-colors">
+            <!-- Dependency -->
+            <div class="w-5 text-center text-gray-700 text-2xs">
+              {% if sub.depends_on %}↳{% else %}·{% endif %}
+            </div>
+
+            <!-- Status dot -->
+            <div class="w-1.5 h-1.5 rounded-full flex-shrink-0
+              {% if sub.state == 'done' or sub.state == 'approved' %}bg-emerald-400
+              {% elif sub.state == 'failed' %}bg-red-400
+              {% elif sub.state == 'in_progress' %}bg-blue-400 animate-pulse
+              {% elif sub.state == 'blocked' %}bg-orange-400
+              {% elif sub.state == 'awaiting_approval' %}bg-yellow-400
+              {% else %}bg-gray-600{% endif %}"></div>
+
+            <!-- Title -->
+            <div class="flex-1 min-w-0">
+              <div class="text-sm text-gray-300 truncate">{{ sub.title }}</div>
+              <div class="flex items-center gap-2 mt-0.5 text-2xs text-gray-600">
+                <span class="font-mono">{{ sub.id[:8] }}</span>
+                {% if sub.story_id %}
+                <span>·</span>
+                <span class="font-mono text-brand">story:{{ sub.story_id[:8] }}</span>
+                {% endif %}
+                {% if sub.blocked_reason %}
+                <span class="text-orange-400 truncate">· {{ sub.blocked_reason }}</span>
+                {% endif %}
+              </div>
+            </div>
+
+            <!-- Agent (template currently doing the work) -->
+            <span class="text-2xs text-gray-600 font-mono flex-shrink-0" title="Agent template">
+              {{ sub.template_id or sub.assigned_to or "None" }}
+            </span>
+
+            <!-- State -->
+            <span class="pill
+              {% if sub.state == 'done' or sub.state == 'approved' %}pill-success
+              {% elif sub.state == 'failed' %}pill-error
+              {% elif sub.state == 'in_progress' %}pill-info
+              {% elif sub.state == 'awaiting_approval' %}pill-warning
+              {% elif sub.state == 'blocked' %}pill-error
+              {% else %}pill-neutral{% endif %} flex-shrink-0">
+              {{ sub.state | replace("_", " ") }}
+            </span>
+          </a>
+          {% endfor %}
+        </div>
+        {% else %}
+        <div class="px-5 py-3 text-2xs text-gray-600">No subtasks - waiting for planner.</div>
+        {% endif %}
+
+        <!-- Task actions -->
+        <div class="px-5 py-2.5 border-t border-border flex items-center gap-3 bg-surface">
+          <a href="/goals/{{ pid }}/tasks/{{ task.id }}"
+             class="text-2xs text-brand hover:text-brand-light transition-colors">View details</a>
+          <span class="text-gray-800">·</span>
+          <span class="text-2xs text-gray-600 font-mono">{{ task.id[:8] }}</span>
+          <span class="text-gray-800">·</span>
+          <form action="/goals/{{ pid }}/tasks/{{ task.id }}/delete" method="post"
+            data-confirm="This deletes the task and all subtasks. This cannot be undone." data-confirm-danger="true" data-confirm-phrase="Delete this task" class="inline">
+            <button type="submit" class="text-2xs text-gray-600 hover:text-red-400 transition-colors">Delete</button>
+          </form>
+        </div>
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+  {% else %}
+  <div class="card p-12 text-center">
+    <svg class="w-12 h-12 mx-auto text-gray-700 mb-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2"/>
+    </svg>
+    <p class="text-gray-500 text-sm">No tasks yet.</p>
+    <p class="text-gray-600 text-xs mt-1">Create one or ask your Assistant to start a task.</p>
+  </div>
+  {% endif %}
+</div>
+
+
+<script>
+function toggleSubtasks(taskId) {
+  const el = document.getElementById('subtasks-' + taskId);
+  const chevron = document.getElementById('chevron-' + taskId);
+  if (el.classList.contains('hidden')) {
+    el.classList.remove('hidden');
+    chevron.style.transform = 'rotate(180deg)';
+  } else {
+    el.classList.add('hidden');
+    chevron.style.transform = 'rotate(0deg)';
+  }
+}
+
+// Auto-expand tasks that have active subtasks
+document.addEventListener('DOMContentLoaded', () => {
+  document.querySelectorAll('[id^="subtasks-"]').forEach(el => {
+    const hasActive = el.querySelector('.bg-blue-400, .bg-orange-400, .bg-yellow-400');
+    if (hasActive) {
+      el.classList.remove('hidden');
+      const id = el.id.replace('subtasks-', '');
+      const chevron = document.getElementById('chevron-' + id);
+      if (chevron) chevron.style.transform = 'rotate(180deg)';
+    }
+  });
+});
+</script>
+{% endblock %}
+
+{% block extra_js %}
+{% if auto_fire_tour %}
+<script>
+// Milestone tour: first-ever visit to this goal's Tasks page. Must run in
+// extra_js (after tour.js loads) — content renders inside <main>, before
+// the bottom-of-body script tags.
+autoFireTour('tasks-board-intro', 600);
+</script>
+{% endif %}
+{% endblock %}

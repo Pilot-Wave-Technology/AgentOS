@@ -1,0 +1,156 @@
+[
+  {
+    "provider": "anthropic",
+    "model": "claude-haiku-4-5",
+    "provider_label": "Anthropic API",
+    "notes": null,
+    "input_rate": "1.00000000",
+    "output_rate": "5.00000000",
+    "cache_read_rate": "0.10000000",
+    "cache_write_rate": "1.25000000",
+    "thinking_rate": null
+  },
+  {
+    "provider": "anthropic",
+    "model": "claude-opus-4-7",
+    "provider_label": "Anthropic API",
+    "notes": null,
+    "input_rate": "5.00000000",
+    "output_rate": "25.00000000",
+    "cache_read_rate": "0.50000000",
+    "cache_write_rate": "6.25000000",
+    "thinking_rate": null
+  },
+  {
+    "provider": "anthropic",
+    "model": "claude-opus-4-8",
+    "provider_label": null,
+    "notes": null,
+    "input_rate": "5.00000000",
+    "output_rate": "25.00000000",
+    "cache_read_rate": "0.50000000",
+    "cache_write_rate": "6.25000000",
+    "thinking_rate": null
+  },
+  {
+    "provider": "anthropic",
+    "model": "claude-sonet-5",
+    "provider_label": null,
+    "notes": null,
+    "input_rate": "2.00000000",
+    "output_rate": "10.00000000",
+    "cache_read_rate": "0.30000000",
+    "cache_write_rate": "3.75000000",
+    "thinking_rate": null
+  },
+  {
+    "provider": "anthropic",
+    "model": "claude-sonnet-4-5",
+    "provider_label": "Anthropic API",
+    "notes": null,
+    "input_rate": "3.00000000",
+    "output_rate": "15.00000000",
+    "cache_read_rate": "0.30000000",
+    "cache_write_rate": "3.75000000",
+    "thinking_rate": null
+  },
+  {
+    "provider": "claude-cli",
+    "model": "haiku",
+    "provider_label": "Claude CLI",
+    "notes": null,
+    "input_rate": "1.00000000",
+    "output_rate": "5.00000000",
+    "cache_read_rate": "0.10000000",
+    "cache_write_rate": "1.25000000",
+    "thinking_rate": null
+  },
+  {
+    "provider": "claude-cli",
+    "model": "opus",
+    "provider_label": "Claude CLI",
+    "notes": null,
+    "input_rate": "5.00000000",
+    "output_rate": "25.00000000",
+    "cache_read_rate": "0.50000000",
+    "cache_write_rate": "6.25000000",
+    "thinking_rate": null
+  },
+  {
+    "provider": "claude-cli",
+    "model": "sonnet",
+    "provider_label": "Claude CLI",
+    "notes": null,
+    "input_rate": "3.00000000",
+    "output_rate": "15.00000000",
+    "cache_read_rate": "0.30000000",
+    "cache_write_rate": "3.75000000",
+    "thinking_rate": null
+  },
+  {
+    "provider": "google",
+    "model": "gemini-2.5-flash",
+    "provider_label": "Google Gemini",
+    "notes": null,
+    "input_rate": "0.30000000",
+    "output_rate": "2.50000000",
+    "cache_read_rate": "0.03000000",
+    "cache_write_rate": "0E-8",
+    "thinking_rate": null
+  },
+  {
+    "provider": "google",
+    "model": "gemini-2.5-flash-exp",
+    "provider_label": "Google Gemini",
+    "notes": null,
+    "input_rate": "0.30000000",
+    "output_rate": "2.50000000",
+    "cache_read_rate": "0.03000000",
+    "cache_write_rate": "0E-8",
+    "thinking_rate": null
+  },
+  {
+    "provider": "google",
+    "model": "gemini-2.5-flash-preview",
+    "provider_label": "Google Gemini",
+    "notes": null,
+    "input_rate": "0.30000000",
+    "output_rate": "2.50000000",
+    "cache_read_rate": "0.03000000",
+    "cache_write_rate": "0E-8",
+    "thinking_rate": null
+  },
+  {
+    "provider": "google",
+    "model": "gemini-2.5-pro",
+    "provider_label": "Google Gemini",
+    "notes": null,
+    "input_rate": "1.25000000",
+    "output_rate": "10.00000000",
+    "cache_read_rate": "0.12500000",
+    "cache_write_rate": "0E-8",
+    "thinking_rate": null
+  },
+  {
+    "provider": "google",
+    "model": "gemini-2.5-pro-exp",
+    "provider_label": "Google Gemini",
+    "notes": null,
+    "input_rate": "1.25000000",
+    "output_rate": "10.00000000",
+    "cache_read_rate": "0.12500000",
+    "cache_write_rate": "0E-8",
+    "thinking_rate": null
+  },
+  {
+    "provider": "google",
+    "model": "gemini-2.5-pro-preview",
+    "provider_label": "Google Gemini",
+    "notes": null,
+    "input_rate": "1.25000000",
+    "output_rate": "10.00000000",
+    "cache_read_rate": "0.12500000",
+    "cache_write_rate": "0E-8",
+    "thinking_rate": null
+  }
+]

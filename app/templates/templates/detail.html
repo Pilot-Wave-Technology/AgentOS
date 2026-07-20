@@ -1,0 +1,468 @@
+{% extends "base.html" %}
+{% block title %}{{ template.id }}: Template{% endblock %}
+{% block content %}
+<div class="p-8 max-w-5xl mx-auto">
+  <div class="mb-6">
+    <a href="/templates" class="inline-flex items-center gap-1 text-sm text-indigo-400 hover:text-indigo-300">
+      <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"/></svg>
+      Templates
+    </a>
+  </div>
+
+  <div class="flex items-center justify-between mb-6">
+    <div>
+      <h1 class="text-2xl font-bold">
+        {% if template.emoji %}<span class="text-2xl mr-2">{{ template.emoji }}</span>{% endif %}
+        <span class="font-mono text-indigo-400">{{ template.id }}</span>
+        <span class="text-xs text-gray-500 ml-2">v{{ template.version }} · {{ 'Assistant' if template.type == 'SHCA' else template.type }}</span>
+      </h1>
+      <p class="text-xs text-gray-500 mt-1">
+        {{ instances | length }} live instance{{ "" if instances|length == 1 else "s" }} ·
+        {{ applicable_skills | length }} skill{{ "" if applicable_skills|length == 1 else "s" }} for {{ 'Assistant' if template.type == 'SHCA' else template.type }} ·
+        Last updated <span {% if template.updated_at %}data-utc="{{ template.updated_at.isoformat() }}"{% endif %}>{{ template.updated_at.strftime("%Y-%m-%d %H:%M") if template.updated_at else "" }}{% if template.updated_at %} UTC{% endif %}</span>
+      </p>
+    </div>
+  </div>
+
+  {# ── Tab bar ── #}
+  <div class="flex gap-1 border-b border-gray-800 mb-8" id="tab-bar">
+    <button class="tab-btn px-4 py-2 text-sm rounded-t-lg transition-colors" data-tab="config" onclick="switchTab('config')">Config</button>
+    <button class="tab-btn px-4 py-2 text-sm rounded-t-lg transition-colors" data-tab="files" onclick="switchTab('files')">Files</button>
+    <button class="tab-btn px-4 py-2 text-sm rounded-t-lg transition-colors" data-tab="tools" onclick="switchTab('tools')">Tools</button>
+    <button class="tab-btn px-4 py-2 text-sm rounded-t-lg transition-colors" data-tab="info" onclick="switchTab('info')">Info</button>
+  </div>
+
+  {# ── Config tab ── #}
+  <div id="tab-config" class="tab-panel">
+    {% if can_edit %}
+    <form method="post" action="/templates/{{ template.id }}" class="space-y-4" data-toast-submit data-fail="Failed to save metadata.">
+      <div>
+        <label class="block text-sm text-gray-400 mb-1.5">Name</label>
+        <input name="name" required maxlength="200" value="{{ template.name }}"
+               class="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm focus:outline-none focus:border-indigo-500" />
+      </div>
+      <div>
+        <label class="block text-sm text-gray-400 mb-1.5">Description</label>
+        <textarea name="description" rows="2"
+                  class="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm focus:outline-none focus:border-indigo-500">{{ template.description }}</textarea>
+      </div>
+      <div class="grid grid-cols-2 gap-4">
+        <div>
+          <label class="block text-sm text-gray-400 mb-1.5">Model</label>
+          <select name="model" required
+                  class="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm font-mono focus:outline-none focus:border-indigo-500">
+            {% for m in models %}
+            <option value="{{ m }}" {% if m == template.model %}selected{% endif %}>{{ m }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div>
+          <label class="block text-sm text-gray-400 mb-1.5">Emoji</label>
+          <input name="emoji" maxlength="8" value="{{ template.emoji }}"
+                 class="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm focus:outline-none focus:border-indigo-500" />
+        </div>
+      </div>
+      <div>
+        <label class="block text-sm text-gray-400 mb-1.5">Notes</label>
+        <textarea name="notes" rows="2"
+                  class="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm focus:outline-none focus:border-indigo-500">{{ template.notes }}</textarea>
+      </div>
+      <div>
+        <label class="block text-sm text-gray-400 mb-1.5">Change reason <span class="text-gray-600">(written to history)</span></label>
+        <input name="change_reason" maxlength="200"
+               class="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm focus:outline-none focus:border-indigo-500" />
+      </div>
+      <div class="flex justify-end pt-2">
+        <button type="submit" class="btn btn-primary">Save metadata (bump to v{{ template.version + 1 }})</button>
+      </div>
+    </form>
+    {% else %}
+    <div class="space-y-4">
+      <div>
+        <label class="block text-sm text-gray-500 mb-1.5">Name</label>
+        <p class="text-sm">{{ template.name }}</p>
+      </div>
+      <div>
+        <label class="block text-sm text-gray-500 mb-1.5">Description</label>
+        <p class="text-sm text-gray-300">{{ template.description or "Not Set" }}</p>
+      </div>
+      <div class="grid grid-cols-2 gap-4">
+        <div>
+          <label class="block text-sm text-gray-500 mb-1.5">Model</label>
+          <p class="text-sm font-mono">{{ template.model }}</p>
+        </div>
+        <div>
+          <label class="block text-sm text-gray-500 mb-1.5">Emoji</label>
+          <p class="text-sm">{{ template.emoji or "Not Set" }}</p>
+        </div>
+      </div>
+      <div>
+        <label class="block text-sm text-gray-500 mb-1.5">Notes</label>
+        <p class="text-sm text-gray-300">{{ template.notes or "Not Set" }}</p>
+      </div>
+    </div>
+    {% endif %}
+  </div>
+
+  {# ── Files tab ── #}
+  <div id="tab-files" class="tab-panel hidden">
+    <p class="text-xs text-gray-500 mb-6">
+      Saving any file pushes the new content to every live instance on its next inference turn.
+      <strong>IDENTITY.md</strong>, <strong>HEARTBEAT.md</strong>, and <strong>BOOTSTRAP.md</strong> are per-instance and not edited here.
+    </p>
+    <div class="space-y-6">
+    {% for filename in editable_filenames %}
+      {% set file = files_by_name.get(filename) %}
+      {% if can_edit %}
+      <form class="border border-border rounded-lg p-4" method="post" action="/templates/{{ template.id }}/files/{{ filename }}" data-toast-submit data-fail="Failed to save file.">
+        <div class="flex items-center justify-between mb-3">
+          <div>
+            <span class="font-mono text-sm text-indigo-400">{{ filename }}</span>
+            {% if file and file.updated_at %}
+            <span class="text-xs text-gray-500 ml-2" data-utc="{{ file.updated_at.isoformat() }}">updated {{ file.updated_at.strftime("%Y-%m-%d %H:%M") }} UTC</span>
+            {% endif %}
+          </div>
+          <button type="submit" class="btn btn-secondary btn-sm">Save & push to live instances</button>
+        </div>
+        <textarea name="content" rows="18" placeholder="(empty)"
+                  class="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-xs font-mono focus:outline-none focus:border-indigo-500 resize-y">{{ file.content if file else "" }}</textarea>
+        <div class="mt-2">
+          <input name="change_reason" maxlength="200" placeholder="Change reason (history)"
+                 class="w-full px-3 py-1.5 bg-gray-900 border border-gray-800 rounded text-xs focus:outline-none focus:border-indigo-500" />
+        </div>
+      </form>
+      {% else %}
+      <div class="border border-border rounded-lg p-4">
+        <div class="mb-3">
+          <span class="font-mono text-sm text-indigo-400">{{ filename }}</span>
+          {% if file and file.updated_at %}
+          <span class="text-xs text-gray-500 ml-2" data-utc="{{ file.updated_at.isoformat() }}">updated {{ file.updated_at.strftime("%Y-%m-%d %H:%M") }} UTC</span>
+          {% endif %}
+        </div>
+        <pre class="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-xs font-mono whitespace-pre-wrap">{{ file.content if file else "(empty)" }}</pre>
+      </div>
+      {% endif %}
+    {% endfor %}
+    </div>
+  </div>
+
+  {# ── Tools tab ── #}
+  <div id="tab-tools" class="tab-panel hidden">
+
+    {# Profile assignment #}
+    <h3 class="text-base font-semibold mb-1">Tool Profiles</h3>
+    <p class="text-xs text-gray-500 mb-4">
+      Profiles are expanded into a flat tool allowlist at provisioning time. Order is preserved.
+      <a href="/tools#profiles" class="text-indigo-400 hover:text-indigo-300 ml-1">Manage profiles →</a>
+    </p>
+    {% if can_edit %}
+    <form method="post" action="/templates/{{ template.id }}/profiles" class="mb-10" data-toast-submit data-fail="Failed to save profile assignments.">
+      <div class="space-y-2 mb-4">
+        {% if all_profiles %}
+          {% for p in all_profiles %}
+          <label class="flex items-start gap-3 px-4 py-3 bg-gray-800 border rounded-lg cursor-pointer transition-colors
+                         {% if p.id in assigned_profile_ids %}border-indigo-500 bg-indigo-900/10{% else %}border-gray-700 hover:border-indigo-500/50{% endif %}"
+                 id="profile-label-{{ p.id }}">
+            <input type="checkbox" name="profile_ids" value="{{ p.id }}"
+                   {% if p.id in assigned_profile_ids %}checked{% endif %}
+                   onchange="onProfileToggle(this)"
+                   class="mt-0.5 rounded text-indigo-500 focus:ring-indigo-500 focus:ring-offset-0 flex-shrink-0" />
+            <div class="min-w-0">
+              <span class="font-mono text-sm text-indigo-300">{{ p.id }}</span>
+              <span class="text-gray-400 text-sm ml-2">{{ p.name | replace('SHCA Coordinator', 'Assistant Coordinator') }}</span>
+              <span class="pill pill-info ml-2">{{ p.tool_names | length }} tool{{ 's' if p.tool_names | length != 1 else '' }}</span>
+              {% if p.description %}<p class="text-xs text-gray-500 mt-0.5">{{ p.description }}</p>{% endif %}
+            </div>
+          </label>
+          {% endfor %}
+        {% else %}
+        <p class="text-sm text-gray-500">No profiles defined yet.
+          <a href="/settings/tool-profiles/new" class="text-indigo-400 hover:text-indigo-300 ml-1">Create one →</a>
+        </p>
+        {% endif %}
+      </div>
+      {% if all_profiles %}
+      <div class="flex justify-end">
+        <button type="submit" class="btn btn-primary">Save profile assignments</button>
+      </div>
+      {% endif %}
+    </form>
+    {% else %}
+    <div class="mb-10">
+      {% if all_profiles %}
+      <div class="flex flex-wrap gap-2">
+        {% for p in all_profiles %}
+        {% if p.id in assigned_profile_ids %}
+        <span class="pill pill-info">{{ p.id }}: {{ p.name | replace('SHCA Coordinator', 'Assistant Coordinator') }}</span>
+        {% endif %}
+        {% endfor %}
+      </div>
+      {% if not assigned_profile_ids %}<p class="text-sm text-gray-500">No profiles assigned.</p>{% endif %}
+      {% else %}
+      <p class="text-sm text-gray-500">No profiles defined yet.</p>
+      {% endif %}
+    </div>
+    {% endif %}
+
+    {# Direct tool overrides #}
+    <h3 class="text-base font-semibold mb-1">Direct Tool Overrides</h3>
+    <p class="text-xs text-gray-500 mb-4">
+      Applied on top of profile resolution. <strong>Allow</strong> adds tools regardless of profiles.
+      <strong>Deny</strong> removes tools even if a profile grants them - tools in both lists cancel out.
+    </p>
+    {% if can_edit %}
+    <form method="post" action="/templates/{{ template.id }}/tools" data-toast-submit data-fail="Failed to save tool overrides." data-success-hash="tab-tools">
+
+      {# Filter #}
+      <input id="tool-filter" type="text" placeholder="Filter tools…"
+        oninput="filterToolCheckboxes(this.value)"
+        class="w-full px-3 py-1.5 bg-gray-800 border border-gray-700 rounded-lg text-sm focus:outline-none focus:border-indigo-500 mb-5" />
+
+      <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-5">
+
+        {# Allow column #}
+        <div>
+          <div class="flex items-center justify-between mb-2">
+            <span class="text-sm text-gray-300 font-medium">Allow
+              <span id="allow-count" class="text-gray-600 ml-1 text-xs">({{ tmpl_tools_allow | length }} selected)</span>
+            </span>
+            <div class="flex gap-2">
+              <button type="button" onclick="selectAll('allow')" class="text-xs text-indigo-400 hover:text-indigo-300">All</button>
+              <span class="text-gray-700">·</span>
+              <button type="button" onclick="clearAll('allow')" class="text-xs text-gray-500 hover:text-gray-300">Clear</button>
+            </div>
+          </div>
+          <div class="space-y-3" id="allow-groups">
+            {% for group_name in tools_by_group.keys() | sort %}
+            {% set group_tools = tools_by_group[group_name] %}
+            <div class="tool-group border border-gray-800 rounded-lg overflow-hidden">
+              <div class="px-3 py-1.5 bg-gray-900/60 border-b border-gray-800">
+                <span class="text-xs font-semibold text-gray-500 uppercase tracking-wider">{{ group_name }}</span>
+              </div>
+              <div class="p-2 flex flex-wrap gap-1.5">
+                {% for t in group_tools %}
+                <label class="tool-checkbox-label inline-flex items-center gap-1.5 px-2.5 py-1 bg-gray-800 border rounded-md cursor-pointer transition-colors
+                              {% if t.name in tmpl_tools_allow %}border-green-600 bg-green-900/20{% else %}border-gray-700 hover:border-green-700/50{% endif %}"
+                       data-toolname="{{ t.name }}"
+                       title="{{ t.name }}">
+                  <input type="checkbox" name="tools_allow" value="{{ t.name }}"
+                         {% if t.name in tmpl_tools_allow %}checked{% endif %}
+                         onchange="onToolToggle(this, 'allow')"
+                         class="rounded text-green-500 focus:ring-green-500 focus:ring-offset-0 flex-shrink-0" />
+                  <span class="text-xs font-mono text-gray-300">{{ t.name }}</span>
+                </label>
+                {% endfor %}
+              </div>
+            </div>
+            {% endfor %}
+          </div>
+        </div>
+
+        {# Deny column #}
+        <div>
+          <div class="flex items-center justify-between mb-2">
+            <span class="text-sm text-gray-300 font-medium">Deny
+              <span id="deny-count" class="text-gray-600 ml-1 text-xs">({{ tmpl_tools_deny | length }} selected)</span>
+            </span>
+            <div class="flex gap-2">
+              <button type="button" onclick="selectAll('deny')" class="text-xs text-red-400 hover:text-red-300">All</button>
+              <span class="text-gray-700">·</span>
+              <button type="button" onclick="clearAll('deny')" class="text-xs text-gray-500 hover:text-gray-300">Clear</button>
+            </div>
+          </div>
+          <div class="space-y-3" id="deny-groups">
+            {% for group_name in tools_by_group.keys() | sort %}
+            {% set group_tools = tools_by_group[group_name] %}
+            <div class="tool-group border border-gray-800 rounded-lg overflow-hidden">
+              <div class="px-3 py-1.5 bg-gray-900/60 border-b border-gray-800">
+                <span class="text-xs font-semibold text-gray-500 uppercase tracking-wider">{{ group_name }}</span>
+              </div>
+              <div class="p-2 flex flex-wrap gap-1.5">
+                {% for t in group_tools %}
+                <label class="tool-checkbox-label inline-flex items-center gap-1.5 px-2.5 py-1 bg-gray-800 border rounded-md cursor-pointer transition-colors
+                              {% if t.name in tmpl_tools_deny %}border-red-600 bg-red-900/20{% else %}border-gray-700 hover:border-red-700/50{% endif %}"
+                       data-toolname="{{ t.name }}"
+                       title="{{ t.name }}">
+                  <input type="checkbox" name="tools_deny" value="{{ t.name }}"
+                         {% if t.name in tmpl_tools_deny %}checked{% endif %}
+                         onchange="onToolToggle(this, 'deny')"
+                         class="rounded text-red-500 focus:ring-red-500 focus:ring-offset-0 flex-shrink-0" />
+                  <span class="text-xs font-mono text-gray-300">{{ t.name }}</span>
+                </label>
+                {% endfor %}
+              </div>
+            </div>
+            {% endfor %}
+          </div>
+        </div>
+
+      </div>
+      <div class="flex justify-end pt-2 border-t border-gray-800">
+        <button type="submit" class="btn btn-primary">Save tool overrides</button>
+      </div>
+    </form>
+    {% else %}
+    <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+      <div>
+        <span class="text-sm text-gray-300 font-medium">Allow</span>
+        <div class="flex flex-wrap gap-1.5 mt-2">
+          {% for name in tmpl_tools_allow %}
+          <span class="text-xs font-mono px-2.5 py-1 bg-gray-800 border border-green-600 bg-green-900/20 rounded-md text-gray-300">{{ name }}</span>
+          {% else %}
+          <p class="text-sm text-gray-500">None.</p>
+          {% endfor %}
+        </div>
+      </div>
+      <div>
+        <span class="text-sm text-gray-300 font-medium">Deny</span>
+        <div class="flex flex-wrap gap-1.5 mt-2">
+          {% for name in tmpl_tools_deny %}
+          <span class="text-xs font-mono px-2.5 py-1 bg-gray-800 border border-red-600 bg-red-900/20 rounded-md text-gray-300">{{ name }}</span>
+          {% else %}
+          <p class="text-sm text-gray-500">None.</p>
+          {% endfor %}
+        </div>
+      </div>
+    </div>
+    {% endif %}
+  </div>
+
+  {# ── Info tab ── #}
+  <div id="tab-info" class="tab-panel hidden">
+
+    <h3 class="text-base font-semibold mb-3">Live instances</h3>
+    {% if instances %}
+    <table class="w-full text-sm mb-10">
+      <thead class="text-xs text-gray-500 uppercase border-b border-gray-800">
+        <tr>
+          <th class="text-left pb-2 pr-6">id</th>
+          <th class="text-left pb-2 pr-6">name</th>
+          <th class="text-left pb-2 pr-6">status</th>
+          <th class="text-left pb-2">created</th>
+        </tr>
+      </thead>
+      <tbody class="divide-y divide-gray-800/60">
+        {% for inst in instances %}
+        <tr>
+          <td class="py-2 pr-6 font-mono text-xs text-gray-300">{{ inst.id }}</td>
+          <td class="py-2 pr-6 text-sm">{{ inst.name }}</td>
+          <td class="py-2 pr-6">
+            <span class="pill {% if inst.status == 'active' %}pill-success{% else %}pill-neutral{% endif %}">{{ inst.status }}</span>
+          </td>
+          <td class="py-2 text-xs text-gray-400" {% if inst.created_at %}data-utc="{{ inst.created_at.isoformat() }}"{% endif %}>{{ inst.created_at.strftime("%Y-%m-%d") if inst.created_at else "" }}{% if inst.created_at %} UTC{% endif %}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <p class="text-sm text-gray-500 mb-10">No live instances yet.</p>
+    {% endif %}
+
+    <h3 class="text-base font-semibold mb-3">Applicable skills</h3>
+    <p class="text-xs text-gray-500 mb-3">
+      Skills with this template's type in <code>applicable_to</code>.
+      Edit at <a href="/settings/skills" class="text-indigo-400">/skills</a>.
+    </p>
+    {% if applicable_skills %}
+    <ul class="space-y-1">
+      {% for s in applicable_skills %}
+      <li class="text-sm">
+        <a href="/settings/skills/{{ s.name }}" class="font-mono text-indigo-400 hover:text-indigo-300">{{ s.name }}</a>
+        <span class="text-gray-400 ml-2">{{ s.title }}</span>
+        {% if s.status != 'active' %}<span class="pill pill-neutral ml-2">{{ s.status }}</span>{% endif %}
+      </li>
+      {% endfor %}
+    </ul>
+    {% else %}
+    <p class="text-sm text-gray-500">None.</p>
+    {% endif %}
+  </div>
+
+</div>
+
+<script>
+const TABS = ['config', 'files', 'tools', 'info'];
+
+function switchTab(name) {
+  if (!TABS.includes(name)) name = 'config';
+  TABS.forEach(t => {
+    const panel = document.getElementById('tab-' + t);
+    const btn = document.querySelector('[data-tab="' + t + '"]');
+    if (t === name) {
+      panel.classList.remove('hidden');
+      btn.classList.add('text-indigo-400', 'border-b-2', 'border-indigo-500');
+      btn.classList.remove('text-gray-500');
+    } else {
+      panel.classList.add('hidden');
+      btn.classList.remove('text-indigo-400', 'border-b-2', 'border-indigo-500');
+      btn.classList.add('text-gray-500');
+    }
+  });
+  history.replaceState(null, '', '#tab-' + name);
+}
+
+function onProfileToggle(checkbox) {
+  const label = document.getElementById("profile-label-" + checkbox.value);
+  if (checkbox.checked) {
+    label.classList.add("border-indigo-500", "bg-indigo-900/10");
+    label.classList.remove("border-gray-700");
+  } else {
+    label.classList.remove("border-indigo-500", "bg-indigo-900/10");
+    label.classList.add("border-gray-700");
+  }
+}
+
+function onToolToggle(checkbox, kind) {
+  const label = checkbox.closest("label");
+  const activeClasses = kind === 'allow'
+    ? ["border-green-600", "bg-green-900/20"]
+    : ["border-red-600", "bg-red-900/20"];
+  if (checkbox.checked) {
+    label.classList.add(...activeClasses);
+    label.classList.remove("border-gray-700");
+  } else {
+    label.classList.remove(...activeClasses);
+    label.classList.add("border-gray-700");
+  }
+  updateToolCount(kind);
+}
+
+function updateToolCount(kind) {
+  const count = document.querySelectorAll(`input[name="tools_${kind}"]:checked`).length;
+  document.getElementById(kind + '-count').textContent = `(${count} selected)`;
+}
+
+function selectAll(kind) {
+  document.querySelectorAll(`input[name="tools_${kind}"]`).forEach(cb => {
+    if (!cb.checked) { cb.checked = true; onToolToggle(cb, kind); }
+  });
+}
+function clearAll(kind) {
+  document.querySelectorAll(`input[name="tools_${kind}"]:checked`).forEach(cb => {
+    cb.checked = false; onToolToggle(cb, kind);
+  });
+}
+
+function filterToolCheckboxes(query) {
+  const q = (query || "").toLowerCase().trim();
+  ['allow-groups', 'deny-groups'].forEach(containerId => {
+    const container = document.getElementById(containerId);
+    if (!container) return;
+    container.querySelectorAll('.tool-checkbox-label').forEach(label => {
+      const name = (label.dataset.toolname || "").toLowerCase();
+      label.style.display = !q || name.includes(q) ? "" : "none";
+    });
+    container.querySelectorAll('.tool-group').forEach(group => {
+      const visible = group.querySelectorAll('.tool-checkbox-label:not([style*="none"])').length;
+      group.style.display = visible === 0 ? "none" : "";
+    });
+  });
+}
+
+// Activate tab from URL hash on load.
+(function() {
+  const hash = location.hash.replace('#tab-', '');
+  switchTab(TABS.includes(hash) ? hash : 'config');
+})();
+</script>
+{% endblock %}

@@ -1,0 +1,356 @@
+{# Tab content: rendered by both the full page load and HTMX tab swaps.
+   The tab bar lives HERE (not in index.html) so it re-renders on every swap
+   and always reflects the currently active tab correctly.
+   active_tab: "overview" | "cost" | "operations" | "system" | "taximeter" | "my_work"
+   Members (non-operators) always see the My Work content regardless of tab. #}
+
+{% set show_system = system and is_operator %}
+
+{# ── Data freshness bar ───────────────────────────────────────────────────── #}
+{% if is_operator %}
+<div class="flex items-center justify-between mb-3 px-1">
+  <span class="text-xs text-gray-600" id="dashboard-refreshed-at">
+    {% if refreshed_at %}
+      Data as of <span id="refreshed-ago" data-iso="{{ refreshed_at.isoformat() }}">…</span>
+    {% else %}
+      Live data
+    {% endif %}
+  </span>
+  <button
+    hx-post="/dashboard/refresh"
+    hx-swap="none"
+    hx-disabled-elt="this"
+    hx-on::before-request="this.textContent = '↻ Refreshing…'"
+    hx-on::after-request="window.dashboardAfterRefresh(event)"
+    class="text-xs text-gray-500 hover:text-indigo-400 transition-colors flex items-center gap-1 disabled:opacity-50 disabled:cursor-not-allowed"
+    id="dashboard-refresh-btn">
+    ↻ Refresh
+  </button>
+</div>
+<script>
+(function () {
+  function timeAgo(iso) {
+    const diffMs = Date.now() - new Date(iso).getTime();
+    const s = Math.floor(diffMs / 1000);
+    if (s < 60)  return s + 's ago';
+    if (s < 3600) return Math.floor(s / 60) + 'm ago';
+    return Math.floor(s / 3600) + 'h ago';
+  }
+  function updateAgo() {
+    const el = document.getElementById('refreshed-ago');
+    if (el && el.dataset.iso) el.textContent = timeAgo(el.dataset.iso);
+  }
+  updateAgo();
+  // This whole script re-runs on every HTMX tab swap (body.html is the swap
+  // target's content) - clear any interval from a prior swap first, or they
+  // stack up indefinitely across tab switches.
+  if (window.__dashboardAgoInterval) clearInterval(window.__dashboardAgoInterval);
+  window.__dashboardAgoInterval = setInterval(updateAgo, 30000);
+
+  // Cache-busting version tag: kept in sync with the freshest known
+  // refreshed_at on every render, and injected into every /dashboard/body
+  // request's query string (see the htmx:configRequest listener below).
+  // Bumping it after a manual refresh makes the next fetch a URL the browser
+  // cache has never seen - a guaranteed real network hit - while leaving
+  // max-age=60 caching fully intact for ordinary tab-switching that happens
+  // between refreshes.
+  window.__dashboardDataVersion = "{{ refreshed_at.isoformat() if refreshed_at else '' }}";
+
+  if (!window.__dashboardConfigListenerAttached) {
+    window.__dashboardConfigListenerAttached = true;
+    document.body.addEventListener('htmx:configRequest', function (evt) {
+      // Append directly to detail.path (rather than detail.parameters) so
+      // this doesn't depend on how htmx merges `parameters` into a path
+      // that already has its own query string (?tab=...) for a plain GET.
+      if (evt.detail.path && evt.detail.path.indexOf('/dashboard/body') === 0) {
+        const sep = evt.detail.path.indexOf('?') === -1 ? '?' : '&';
+        evt.detail.path += sep + '_v=' + encodeURIComponent(window.__dashboardDataVersion || '');
+      }
+    });
+  }
+
+  window.dashboardAfterRefresh = function (evt) {
+    const btn = document.getElementById('dashboard-refresh-btn');
+    if (evt.detail.successful) {
+      const body = JSON.parse(evt.detail.xhr.responseText);
+      if (body.busy) {
+        if (btn) btn.textContent = '⏳ Already running…';
+        setTimeout(() => { if (btn) btn.textContent = '↻ Refresh'; }, 2500);
+        return;
+      }
+      const el = document.getElementById('refreshed-ago');
+      if (el) { el.dataset.iso = body.refreshed_at; el.textContent = 'just now'; }
+      window.__dashboardDataVersion = body.refreshed_at || window.__dashboardDataVersion;
+      if (btn) btn.textContent = '✓ Refreshed';
+      setTimeout(() => { if (btn) btn.textContent = '↻ Refresh'; }, 2000);
+    } else {
+      if (btn) { btn.textContent = '✗ Failed'; setTimeout(() => { btn.textContent = '↻ Refresh'; }, 2000); }
+    }
+  };
+}());
+</script>
+{% endif %}
+
+{% if is_operator %}
+<div class="flex gap-1 mb-6 border-b border-gray-800 overflow-x-auto dashboard-tabs">
+  {% set tab_labels = {
+    "overview":   "Overview",
+    "cost":       "Cost",
+    "operations": "Operations",
+    "system":     "System",
+    "taximeter":  "Taximeter",
+    "task_queue": "Task Queue",
+    "my_work":    "My Work"
+  } %}
+  {% for t in tabs if t not in ('operations', 'my_work') %}
+  <button
+    hx-get="/dashboard/body?tab={{ t }}"
+    hx-target="#dashboard-body"
+    hx-swap="innerHTML"
+    hx-sync="#dashboard-body:replace"
+    hx-push-url="/dashboard?tab={{ t }}"
+    class="px-4 py-2.5 text-sm font-medium whitespace-nowrap transition-colors border-b-2 -mb-px
+      {% if active_tab == t %}
+        border-indigo-500 text-indigo-400
+      {% else %}
+        border-transparent text-gray-500 hover:text-gray-300 hover:border-gray-600
+      {% endif %}">
+    {{ tab_labels[t] }}
+  </button>
+  {% endfor %}
+</div>
+{% endif %}
+
+{# ── OVERVIEW ──────────────────────────────────────────────────────────────── #}
+{% if active_tab == "overview" or not is_operator %}
+<div class="space-y-4">
+
+  {% if show_system %}
+  {# Pagination state: computed once, used in both operational and degraded paths #}
+  {% set page_size = 5 %}
+  {% set act_offset = (activity_page | default(0)) * page_size %}
+  {% set act_page_items = system.activity[act_offset : act_offset + page_size] %}
+  {% set act_has_prev = (activity_page | default(0)) > 0 %}
+  {% set act_has_next = (system.activity | length) > act_offset + page_size %}
+
+  {# Health: compact all-clear banner (operational) or full health + fleet + activity/attention (degraded) #}
+  {% if system.health.verdict == 'operational'
+     and system.attention.total == 0
+     and not degraded %}
+    {% include "dashboard/partials/system_allclear.html" %}
+    {% include "dashboard/partials/system_fleet.html" %}
+  {% else %}
+    {% include "dashboard/partials/system_health.html" %}
+    {# Fleet stats above activity/attention in degraded path #}
+    {% include "dashboard/partials/system_fleet.html" %}
+    {# Degraded: recent activity on the left, needs attention on the right #}
+    <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
+      {% if system.activity %}
+      <div class="bg-gray-900 border border-gray-800 rounded-xl p-5" id="recent-activity">
+        <div class="flex items-center justify-between mb-4">
+          <h3 class="font-semibold">Recent Activity</h3>
+          <span class="text-xs text-gray-500">across all goals</span>
+        </div>
+        {% set activity_rows = act_page_items %}
+        {% include "dashboard/partials/_activity_list.html" %}
+        {% if act_has_prev or act_has_next %}
+        <div class="flex items-center justify-between mt-3 pt-3 border-t border-gray-800">
+          {% if act_has_prev %}
+          <button hx-get="/dashboard/body?tab=overview&activity_page={{ (activity_page | default(0)) - 1 }}"
+                  hx-target="#dashboard-body" hx-swap="innerHTML" hx-sync="#dashboard-body:replace"
+                  class="text-xs text-gray-500 hover:text-gray-300 transition-colors">← Prev</button>
+          {% else %}<span></span>{% endif %}
+          <span class="text-2xs text-gray-700">page {{ (activity_page | default(0)) + 1 }}</span>
+          {% if act_has_next %}
+          <button hx-get="/dashboard/body?tab=overview&activity_page={{ (activity_page | default(0)) + 1 }}"
+                  hx-target="#dashboard-body" hx-swap="innerHTML" hx-sync="#dashboard-body:replace"
+                  class="text-xs text-gray-500 hover:text-gray-300 transition-colors">Next →</button>
+          {% else %}<span></span>{% endif %}
+        </div>
+        {% endif %}
+      </div>
+      {% endif %}
+      {% include "dashboard/partials/system_attention.html" %}
+    </div>
+  {% endif %}
+
+  {% include "dashboard/partials/system_anomalies.html" %}
+  {% endif %}
+
+  {# Personal tiles always visible in Overview #}
+  {% include "dashboard/partials/_personal_tiles.html" %}
+
+  {# Recent Activity: operators see cross-goal feed (operational only: degraded shows it beside attention above).
+     Members see personal feed. Only one feed is ever shown. #}
+  {% if show_system
+     and system.health.verdict == 'operational'
+     and system.attention.total == 0
+     and not degraded
+     and system.activity %}
+  <div class="bg-gray-900 border border-gray-800 rounded-xl p-5" id="recent-activity">
+    <div class="flex items-center justify-between mb-4">
+      <h3 class="font-semibold">Recent Activity</h3>
+      <span class="text-xs text-gray-500">across all goals</span>
+    </div>
+    {% set activity_rows = act_page_items %}
+    {% include "dashboard/partials/_activity_list.html" %}
+    {% if act_has_prev or act_has_next %}
+    <div class="flex items-center justify-between mt-3 pt-3 border-t border-gray-800">
+      {% if act_has_prev %}
+      <button hx-get="/dashboard/body?tab=overview&activity_page={{ (activity_page | default(0)) - 1 }}"
+              hx-target="#dashboard-body" hx-swap="innerHTML" hx-sync="#dashboard-body:replace"
+              class="text-xs text-gray-500 hover:text-gray-300 transition-colors">← Prev</button>
+      {% else %}<span></span>{% endif %}
+      <span class="text-2xs text-gray-700">page {{ (activity_page | default(0)) + 1 }}</span>
+      {% if act_has_next %}
+      <button hx-get="/dashboard/body?tab=overview&activity_page={{ (activity_page | default(0)) + 1 }}"
+              hx-target="#dashboard-body" hx-swap="innerHTML" hx-sync="#dashboard-body:replace"
+              class="text-xs text-gray-500 hover:text-gray-300 transition-colors">Next →</button>
+      {% else %}<span></span>{% endif %}
+    </div>
+    {% endif %}
+  </div>
+  {% elif not show_system and personal.activity %}
+  <div class="bg-gray-900 border border-gray-800 rounded-xl p-5">
+    <div class="flex items-center justify-between mb-4">
+      <h3 class="font-semibold">Recent Activity</h3>
+      <span class="text-xs text-gray-500">my goals</span>
+    </div>
+    {% set activity_rows = personal.activity %}
+    {% include "dashboard/partials/_activity_list.html" %}
+  </div>
+  {% endif %}
+
+</div>
+
+{# ── COST ──────────────────────────────────────────────────────────────────── #}
+{% elif active_tab == "cost" and show_system %}
+<div class="space-y-4">
+  {# Cost panel: lazy-loaded from mv_token_calls_priced #}
+  <div hx-get="/dashboard/panel/cost"
+       hx-trigger="load"
+       hx-swap="outerHTML">
+    {% include "dashboard/partials/_panel_skeleton.html" %}
+  </div>
+  {# Goal cost breakdown: loads via HTMX on goal selection #}
+  <div hx-get="/dashboard/goal-cost"
+       hx-trigger="load"
+       hx-target="this"
+       hx-swap="innerHTML">
+    <div class="bg-gray-900 border border-gray-800 rounded-xl p-5 animate-pulse">
+      <div class="h-4 bg-gray-800 rounded w-48 mb-4"></div>
+      <div class="h-8 bg-gray-800 rounded w-40"></div>
+    </div>
+  </div>
+</div>
+
+{# ── OPERATIONS ────────────────────────────────────────────────────────────── #}
+{% elif active_tab == "operations" and show_system %}
+<div class="space-y-4">
+  {% include "dashboard/partials/system_attention.html" %}
+  {% include "dashboard/partials/system_sandbox.html" %}
+  <div hx-get="/dashboard/panel/escalations"
+       hx-trigger="load"
+       hx-swap="outerHTML">
+    {% include "dashboard/partials/_panel_skeleton.html" %}
+  </div>
+  <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
+    <div hx-get="/dashboard/panel/channels"
+         hx-trigger="load"
+         hx-swap="outerHTML">
+      {% include "dashboard/partials/_panel_skeleton.html" %}
+    </div>
+    <div hx-get="/dashboard/panel/approval-sla"
+         hx-trigger="load"
+         hx-swap="outerHTML">
+      {% include "dashboard/partials/_panel_skeleton.html" %}
+    </div>
+  </div>
+</div>
+
+{# ── INSIGHTS ──────────────────────────────────────────────────────────────── #}
+{% elif active_tab == "system" and show_system %}
+<div class="space-y-4">
+  {# 5 KPI tiles: lazy-loaded from mv_dashboard_slos #}
+  <div hx-get="/dashboard/panel/slos"
+       hx-trigger="load"
+       hx-swap="outerHTML">
+    {% include "dashboard/partials/_panel_skeleton.html" %}
+  </div>
+  {# Live sessions (only renders when sessions are active) #}
+  {% include "dashboard/partials/system_sessions.html" %}
+  {# Audit trail + Reviewer Quality side by side #}
+  <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
+    {% include "dashboard/partials/system_audit_trail.html" %}
+    <div hx-get="/dashboard/panel/reviews"
+         hx-trigger="load"
+         hx-swap="outerHTML">
+      {% include "dashboard/partials/_panel_skeleton.html" %}
+    </div>
+  </div>
+  {# Goal pace (only renders when goals have deadlines) #}
+  {% include "dashboard/partials/system_goal_velocity.html" %}
+</div>
+
+{# ── TAXIMETER ─────────────────────────────────────────────────────────────── #}
+{% elif active_tab == "taximeter" and show_system %}
+<div class="space-y-4">
+  {# Per-human contribution visibility, not a ranking: see the always-on
+     explainer inside the panel itself. #}
+  <div hx-get="/dashboard/panel/taximeter"
+       hx-trigger="load"
+       hx-swap="outerHTML">
+    {% include "dashboard/partials/_panel_skeleton.html" %}
+  </div>
+</div>
+
+{# ── TASK QUEUE ────────────────────────────────────────────────────────────── #}
+{% elif active_tab == "task_queue" and show_system %}
+<div class="space-y-4">
+  {# DAG concurrency ceiling: executing (k/N) + waiting (FIFO) + live N/enforce.
+     Lazy-loaded like the taximeter panel. #}
+  <div hx-get="/dashboard/panel/task-queue"
+       hx-trigger="load"
+       hx-swap="outerHTML">
+    {% include "dashboard/partials/_panel_skeleton.html" %}
+  </div>
+</div>
+
+{# ── MY WORK ───────────────────────────────────────────────────────────────── #}
+{% elif active_tab == "my_work" %}
+<div class="space-y-4">
+  {% include "dashboard/partials/_personal_tiles.html" %}
+  {% if personal.activity %}
+  <div class="bg-gray-900 border border-gray-800 rounded-xl p-5">
+    <div class="flex items-center justify-between mb-4">
+      <h3 class="font-semibold">Recent Activity</h3>
+      <span class="text-xs text-gray-500">my goals</span>
+    </div>
+    {% set activity_rows = personal.activity %}
+    {% include "dashboard/partials/_activity_list.html" %}
+  </div>
+  {% endif %}
+</div>
+
+{# Fallback: unknown tab → show overview content #}
+{% else %}
+<div class="space-y-4">
+  {% include "dashboard/partials/_personal_tiles.html" %}
+  {% if personal.activity %}
+  <div class="bg-gray-900 border border-gray-800 rounded-xl p-5">
+    <div class="flex items-center justify-between mb-4">
+      <h3 class="font-semibold">Recent Activity</h3>
+      <span class="text-xs text-gray-500">my goals</span>
+    </div>
+    {% set activity_rows = personal.activity %}
+    {% include "dashboard/partials/_activity_list.html" %}
+  </div>
+  {% endif %}
+</div>
+{% endif %}
+
+{% if degraded %}
+<p class="text-xs text-amber-400/70 mt-4">
+  ⚠ Some data couldn't load: {{ degraded | join(", ") }}.
+</p>
+{% endif %}

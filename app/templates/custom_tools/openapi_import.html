@@ -1,0 +1,421 @@
+{% extends "base.html" %}
+{% block title %}OpenAPI Import{% endblock %}
+
+{% block content %}
+<div class="p-8 max-w-3xl mx-auto">
+
+  <div class="mb-6">
+    <a href="/settings/tools?tab=custom-tools" class="inline-flex items-center gap-1 text-sm text-indigo-400 hover:text-indigo-300">
+      <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"/></svg>
+      Tool Registry / Custom Tools
+    </a>
+  </div>
+
+  <h1 class="text-2xl font-bold mb-1">Import OpenAPI Spec</h1>
+  <p class="text-gray-500 text-sm mb-8">
+    Paste a spec URL or raw JSON/YAML to bulk-generate tools from API operations.
+  </p>
+
+  <!-- Step 1: Spec source + auth -->
+  <div id="step-1" class="bg-gray-900 border border-gray-800 rounded-xl p-5 mb-4">
+    <h2 class="text-xs font-semibold uppercase tracking-wider text-gray-500 mb-4">1: Spec source</h2>
+
+    <div class="space-y-4">
+      <div>
+        <label class="block text-xs text-gray-400 mb-1.5">Import name <span class="text-red-400">*</span></label>
+        <input id="f-import-name" type="text" placeholder='e.g. "Stripe Payments API"'
+          class="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm focus:outline-none focus:border-indigo-500" />
+        <p class="text-xs text-gray-600 mt-1">A label to identify this import group.</p>
+      </div>
+
+      <!-- Tab selector: URL vs Paste -->
+      <div>
+        <div class="flex gap-1 border-b border-gray-800 mb-3">
+          <button id="tab-url" onclick="switchTab('url')"
+            class="px-4 py-2 text-sm rounded-t-lg text-indigo-400 border-b-2 border-indigo-500 transition-colors">
+            Import from URL
+          </button>
+          <button id="tab-paste" onclick="switchTab('paste')"
+            class="px-4 py-2 text-sm rounded-t-lg text-gray-500 hover:text-gray-300 transition-colors">
+            Paste spec manually
+          </button>
+        </div>
+
+        <div id="pane-url">
+          <label class="block text-xs text-gray-400 mb-1.5">OpenAPI spec URL</label>
+          <input id="f-spec-url" type="text" placeholder="https://api.example.com/openapi.json"
+            class="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm font-mono focus:outline-none focus:border-indigo-500" />
+          <p class="text-xs text-gray-600 mt-1">A publicly accessible URL returning JSON or YAML.</p>
+        </div>
+        <div id="pane-paste" class="hidden">
+          <label class="block text-xs text-gray-400 mb-1.5">OpenAPI spec (JSON or YAML)</label>
+          <textarea id="f-spec-paste" rows="8" spellcheck="false" placeholder='{"openapi":"3.0.0","info":{"title":"My API","version":"1.0"},"paths":{...}}'
+            class="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm font-mono focus:outline-none focus:border-indigo-500 resize-y"></textarea>
+          <p class="text-xs text-gray-600 mt-1">Paste the full OpenAPI 3.x spec document. Both JSON and YAML are accepted.</p>
+        </div>
+      </div>
+
+      <div>
+        <label class="block text-xs text-gray-400 mb-1.5">Authentication (optional)</label>
+        <select id="f-credential"
+          class="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm focus:outline-none focus:border-indigo-500">
+          <option value="">- None -</option>
+          {% for c in credentials %}
+          <option value="{{ c.id }}">{{ c.name }} ({{ c.credential_type }})</option>
+          {% endfor %}
+        </select>
+        <p class="text-xs text-gray-600 mt-1">Applied when tools call this API. The spec URL is always fetched without auth.</p>
+      </div>
+    </div>
+
+    <div id="step1-err" class="hidden mt-4 px-4 py-3 bg-red-900/30 border border-red-800 rounded-lg text-sm text-red-300"></div>
+
+    <div class="flex gap-3 mt-5">
+      <button id="btn-parse" onclick="parseSpec()" class="btn btn-primary">
+        Parse Spec →
+      </button>
+    </div>
+  </div>
+
+  <!-- Step 1b: Confirm base URL: shown only when spec has no absolute server URL -->
+  <div id="step-1b" class="hidden bg-gray-900 border border-gray-800 rounded-xl p-5 mb-4">
+    <h2 class="text-xs font-semibold uppercase tracking-wider text-gray-500 mb-4">1b: Confirm API base URL</h2>
+
+    <div id="step1b-inferred-msg" class="hidden mb-4 px-4 py-3 bg-amber-900/20 border border-amber-800 rounded-lg text-sm text-amber-300">
+      ⚠ The spec defines a relative server path. The URL below was resolved from the spec's location: verify it matches the actual API host before continuing.
+    </div>
+    <div id="step1b-missing-msg" class="hidden mb-4 px-4 py-3 bg-blue-900/20 border border-blue-800 rounded-lg text-sm text-blue-300">
+      The spec does not specify a server URL. Enter the base URL for this API.
+    </div>
+
+    <div>
+      <label class="block text-xs text-gray-400 mb-1.5">API base URL <span class="text-red-400">*</span></label>
+      <input id="f-base-url" type="text" placeholder="https://api.example.com"
+        class="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm font-mono focus:outline-none focus:border-indigo-500" />
+      <p class="text-xs text-gray-600 mt-1">All generated tools will call this host. Include scheme and host: no trailing slash.</p>
+    </div>
+
+    <div id="step1b-err" class="hidden mt-4 px-4 py-3 bg-red-900/30 border border-red-800 rounded-lg text-sm text-red-300"></div>
+
+    <div class="flex gap-3 mt-5">
+      <button onclick="confirmBaseUrl()" class="btn btn-primary">Continue →</button>
+      <button onclick="resetToStep1()" class="btn btn-secondary">← Back</button>
+    </div>
+  </div>
+
+  <!-- Step 2: Select operations -->
+  <div id="step-2" class="hidden bg-gray-900 border border-gray-800 rounded-xl p-5 mb-4">
+    <div class="flex items-center justify-between mb-2">
+      <h2 class="text-xs font-semibold uppercase tracking-wider text-gray-500">2: Configure tool &amp; select operations</h2>
+      <span id="ops-count" class="text-xs text-gray-600"></span>
+    </div>
+    <p class="text-xs text-gray-600 mb-4">
+      Server: <span id="server-url-display" class="font-mono text-gray-400"></span>
+    </p>
+
+    <!-- Single tool identity -->
+    <div class="space-y-3 mb-5 pb-5 border-b border-gray-800">
+      <div>
+        <label class="block text-xs text-gray-400 mb-1.5">Tool name <span class="text-red-400">*</span></label>
+        <input id="f-tool-name" type="text" placeholder="e.g. petstore_api"
+          class="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm font-mono focus:outline-none focus:border-indigo-500" />
+        <p class="text-xs text-gray-600 mt-1">Lowercase letters, numbers and underscores only.</p>
+      </div>
+      <div>
+        <label class="block text-xs text-gray-400 mb-1.5">Description</label>
+        <textarea id="f-tool-description" rows="2" spellcheck="false"
+          placeholder="Auto-generated from selected operations if left blank."
+          class="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm focus:outline-none focus:border-indigo-500 resize-y"></textarea>
+      </div>
+    </div>
+
+    <div class="mb-3 flex gap-3 text-xs">
+      <button onclick="selectAll(true)" class="text-indigo-400 hover:text-indigo-300">Select all</button>
+      <span class="text-gray-700">|</span>
+      <button onclick="selectAll(false)" class="text-gray-500 hover:text-gray-300">Deselect all</button>
+    </div>
+
+    <div id="ops-table" class="overflow-x-auto">
+      <!-- filled by JS -->
+    </div>
+
+    <div id="step2-err" class="hidden mt-4 px-4 py-3 bg-red-900/30 border border-red-800 rounded-lg text-sm text-red-300"></div>
+
+    <div class="flex gap-3 mt-5">
+      <button id="btn-generate" onclick="generateTools()" class="btn btn-primary">
+        Generate Tool →
+      </button>
+      <button onclick="resetToStep1()" class="btn btn-secondary">← Back</button>
+    </div>
+  </div>
+
+  <!-- Step 3: Done -->
+  <div id="step-3" class="hidden bg-green-900/20 border border-green-800 rounded-xl p-6 mb-4">
+    <h2 class="text-lg font-semibold text-green-300 mb-2">Tool created</h2>
+    <p id="done-msg" class="text-gray-400 text-sm mb-4"></p>
+    <div id="done-tools" class="space-y-1 mb-4"></div>
+    <div id="done-errors" class="hidden mb-4"></div>
+    <div class="flex gap-3">
+      <a href="/settings/tools?tab=custom-tools" class="btn btn-primary btn-sm">View all tools</a>
+      <button onclick="resetToStep1()" class="btn btn-secondary btn-sm">Import another</button>
+    </div>
+  </div>
+
+</div>
+
+<script>
+let parsedSpec = null;
+let parsedServerUrl = '';
+let parsedOperations = [];
+let confirmedBaseUrl = '';
+let activeTab = 'url';
+
+// ── Tab switching ────────────────────────────────────────────────────────────
+
+function switchTab(tab) {
+  activeTab = tab;
+  document.getElementById('pane-url').classList.toggle('hidden', tab !== 'url');
+  document.getElementById('pane-paste').classList.toggle('hidden', tab !== 'paste');
+  document.getElementById('tab-url').className = tab === 'url'
+    ? 'px-4 py-2 text-sm rounded-t-lg text-indigo-400 border-b-2 border-indigo-500 transition-colors'
+    : 'px-4 py-2 text-sm rounded-t-lg text-gray-500 hover:text-gray-300 transition-colors';
+  document.getElementById('tab-paste').className = tab === 'paste'
+    ? 'px-4 py-2 text-sm rounded-t-lg text-indigo-400 border-b-2 border-indigo-500 transition-colors'
+    : 'px-4 py-2 text-sm rounded-t-lg text-gray-500 hover:text-gray-300 transition-colors';
+}
+
+// ── Parse spec ───────────────────────────────────────────────────────────────
+
+async function parseSpec() {
+  const errEl = document.getElementById('step1-err');
+  const btn = document.getElementById('btn-parse');
+  errEl.classList.add('hidden');
+
+  const importName = document.getElementById('f-import-name').value.trim();
+  if (!importName) { errEl.textContent = 'Import name is required.'; errEl.classList.remove('hidden'); return; }
+
+  const specUrl = document.getElementById('f-spec-url').value.trim();
+  const specContent = document.getElementById('f-spec-paste').value.trim();
+
+  if (activeTab === 'url' && !specUrl) {
+    errEl.textContent = 'Spec URL is required.'; errEl.classList.remove('hidden'); return;
+  }
+  if (activeTab === 'paste' && !specContent) {
+    errEl.textContent = 'Spec content is required.'; errEl.classList.remove('hidden'); return;
+  }
+
+  btn.disabled = true; btn.textContent = 'Parsing…';
+  try {
+    const body = {};
+    if (activeTab === 'url') body.spec_url = specUrl;
+    else body.spec_content = specContent;
+
+    const r = await fetch('/api/custom-tools/openapi/parse', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+    });
+    if (!r.ok) { throw new Error(await extractErrorDetail(r, 'Parse failed')); }
+    const data = await r.json();
+    parsedSpec = data.spec;
+    parsedOperations = data.operations;
+
+    if (!data.server_url || data.server_url_inferred) {
+      // Base URL needs admin confirmation before proceeding
+      document.getElementById('f-base-url').value = data.server_url || '';
+      document.getElementById('step1b-inferred-msg').classList.toggle('hidden', !data.server_url_inferred);
+      document.getElementById('step1b-missing-msg').classList.toggle('hidden', !!data.server_url);
+      document.getElementById('step-1').classList.add('hidden');
+      document.getElementById('step-1b').classList.remove('hidden');
+    } else {
+      // Absolute server URL found in spec: proceed directly to operations
+      confirmedBaseUrl = data.server_url;
+      parsedServerUrl = data.server_url;
+      renderStep2();
+    }
+  } catch(e) {
+    errEl.textContent = e.message; errEl.classList.remove('hidden');
+  } finally {
+    btn.disabled = false; btn.textContent = 'Parse Spec →';
+  }
+}
+
+// ── Step 1b: confirm base URL ────────────────────────────────────────────────
+
+function confirmBaseUrl() {
+  const errEl = document.getElementById('step1b-err');
+  errEl.classList.add('hidden');
+
+  const val = document.getElementById('f-base-url').value.trim();
+  if (!val) { errEl.textContent = 'Base URL is required.'; errEl.classList.remove('hidden'); return; }
+  if (!/^https?:\/\/.+/.test(val)) {
+    errEl.textContent = 'Enter a full URL starting with http:// or https://.';
+    errEl.classList.remove('hidden'); return;
+  }
+
+  confirmedBaseUrl = val.replace(/\/$/, '');
+  parsedServerUrl = confirmedBaseUrl;
+  document.getElementById('step-1b').classList.add('hidden');
+  renderStep2();
+}
+
+// ── Render operation table ───────────────────────────────────────────────────
+
+const METHOD_COLORS = {
+  GET: 'text-green-400', POST: 'text-blue-400', PUT: 'text-yellow-400',
+  PATCH: 'text-orange-400', DELETE: 'text-red-400',
+};
+
+function renderStep2() {
+  document.getElementById('server-url-display').textContent = parsedServerUrl || '(unknown)';
+  document.getElementById('ops-count').textContent =
+    parsedOperations.length + ' operation' + (parsedOperations.length !== 1 ? 's' : '');
+
+  // Auto-populate tool name from import name
+  const importName = document.getElementById('f-import-name').value.trim();
+  const suggestedName = importName.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '');
+  document.getElementById('f-tool-name').value = suggestedName;
+
+  const tbody = parsedOperations.map((op, i) => `
+    <tr class="hover:bg-gray-800/50 transition-colors">
+      <td class="py-2 px-3">
+        <input type="checkbox" id="op-${i}" checked class="w-4 h-4 accent-indigo-500" />
+      </td>
+      <td class="py-2 pr-3">
+        <span class="font-mono text-xs font-semibold ${METHOD_COLORS[op.method] || 'text-gray-400'}">${esc(op.method)}</span>
+      </td>
+      <td class="py-2 pr-4">
+        <span class="font-mono text-xs text-gray-400">${esc(op.path)}</span>
+      </td>
+      <td class="py-2 pr-4">
+        <span class="font-mono text-xs text-gray-500">${esc(op.operation_id || op.suggested_name || '')}</span>
+      </td>
+      <td class="py-2 text-xs text-gray-500">${esc(op.description || '')}</td>
+    </tr>`).join('');
+
+  document.getElementById('ops-table').innerHTML = `
+    <table class="w-full text-sm">
+      <thead class="text-xs text-gray-600 border-b border-gray-800">
+        <tr>
+          <th class="pb-2 px-3 w-8"></th>
+          <th class="text-left pb-2 pr-3 w-16">Method</th>
+          <th class="text-left pb-2 pr-4">Path</th>
+          <th class="text-left pb-2 pr-4">Operation ID</th>
+          <th class="text-left pb-2">Description</th>
+        </tr>
+      </thead>
+      <tbody class="divide-y divide-gray-800/40">${tbody}</tbody>
+    </table>`;
+
+  document.getElementById('step-1').classList.add('hidden');
+  document.getElementById('step-2').classList.remove('hidden');
+}
+
+function selectAll(checked) {
+  parsedOperations.forEach((_, i) => {
+    const el = document.getElementById('op-' + i);
+    if (el) el.checked = checked;
+  });
+}
+
+// ── Generate tool ────────────────────────────────────────────────────────────
+
+async function generateTools() {
+  const errEl = document.getElementById('step2-err');
+  const btn = document.getElementById('btn-generate');
+  errEl.classList.add('hidden');
+
+  const toolName = document.getElementById('f-tool-name').value.trim();
+  if (!toolName) { errEl.textContent = 'Tool name is required.'; errEl.classList.remove('hidden'); return; }
+  if (!/^[a-z][a-z0-9_]{0,63}$/.test(toolName)) {
+    errEl.textContent = 'Tool name must be lowercase letters, numbers, and underscores only.';
+    errEl.classList.remove('hidden'); return;
+  }
+
+  const credentialId = document.getElementById('f-credential').value;
+  const toolDescription = document.getElementById('f-tool-description').value.trim();
+
+  const selected = parsedOperations
+    .map((op, i) => {
+      if (!document.getElementById('op-' + i)?.checked) return null;
+      return {
+        operation_id: op.operation_id || op.suggested_name,
+        method: op.method,
+        path: op.path,
+        description: op.description || '',
+        parameters_schema: op.parameters_schema || null,
+      };
+    })
+    .filter(Boolean);
+
+  if (!selected.length) {
+    errEl.textContent = 'Select at least one operation.'; errEl.classList.remove('hidden'); return;
+  }
+
+  // Store spec first
+  let specId;
+  try {
+    const storeBody = {
+      name: document.getElementById('f-import-name').value.trim(),
+      spec_content: parsedSpec,
+      base_url: confirmedBaseUrl,
+      credential_id: credentialId || null,
+    };
+    if (activeTab === 'url') storeBody.spec_url = document.getElementById('f-spec-url').value.trim();
+
+    const r = await fetch('/api/custom-tools/openapi/specs', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(storeBody),
+    });
+    if (!r.ok) { throw new Error(await extractErrorDetail(r, 'Failed to store spec')); }
+    specId = (await r.json()).id;
+  } catch(e) {
+    errEl.textContent = e.message; errEl.classList.remove('hidden'); return;
+  }
+
+  btn.disabled = true; btn.textContent = 'Generating…';
+  try {
+    const payload = {
+      spec_id: specId,
+      tool_name: toolName,
+      operations: selected,
+    };
+    if (toolDescription) payload.tool_description = toolDescription;
+
+    const r = await fetch('/api/custom-tools/openapi/generate', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    if (!r.ok) { throw new Error(await extractErrorDetail(r, 'Generate failed')); }
+    renderStep3(await r.json());
+  } catch(e) {
+    errEl.textContent = e.message; errEl.classList.remove('hidden');
+  } finally {
+    btn.disabled = false; btn.textContent = 'Generate Tool →';
+  }
+}
+
+function renderStep3(data) {
+  const name = data.created;
+  document.getElementById('done-msg').textContent =
+    `Tool created with ${data.operations} operation${data.operations !== 1 ? 's' : ''} and added to the tool registry.`;
+
+  document.getElementById('done-tools').innerHTML =
+    `<div class="flex items-center gap-2 text-sm">
+      <span class="text-green-400 text-xs">✓</span>
+      <a href="/custom-tools/${esc(name)}" class="font-mono text-indigo-300 text-xs hover:text-indigo-200">${esc(name)}</a>
+    </div>`;
+
+  document.getElementById('step-2').classList.add('hidden');
+  document.getElementById('step-3').classList.remove('hidden');
+}
+
+function resetToStep1() {
+  parsedSpec = null; parsedServerUrl = ''; parsedOperations = []; confirmedBaseUrl = '';
+  document.getElementById('step-1b').classList.add('hidden');
+  document.getElementById('step-2').classList.add('hidden');
+  document.getElementById('step-3').classList.add('hidden');
+  document.getElementById('step-1').classList.remove('hidden');
+  document.getElementById('step1-err').classList.add('hidden');
+}
+
+function esc(s) { return String(s).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;'); }
+</script>
+{% endblock %}

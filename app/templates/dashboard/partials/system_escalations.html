@@ -1,0 +1,35 @@
+{% set es = system.escalations %}
+<div class="bg-gray-900 border border-gray-800 rounded-xl p-5">
+  <div class="flex items-center justify-between mb-4">
+    <h3 class="font-semibold">Escalation Hot-spots</h3>
+    <span class="text-xs text-gray-500">last 30 days</span>
+  </div>
+  {% if es and es.rows %}
+  <table class="w-full text-sm">
+    <thead>
+      <tr class="text-xs text-gray-500 text-left">
+        <th class="font-normal pb-2">Goal</th>
+        <th class="font-normal pb-2 text-right">Escalations</th>
+        <th class="font-normal pb-2 text-right" title="Escalations that timed out without resolution">Timed out</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for r in es.rows %}
+      <tr class="border-t border-gray-800">
+        <td class="py-1.5 truncate max-w-[12rem]">{{ r.goal_name }}</td>
+        <td class="py-1.5 text-right text-gray-300">{{ r.total }}</td>
+        <td class="py-1.5 text-right
+          {% if r.timeout_pct >= 50 %}text-red-400
+          {% elif r.timeout_pct >= 20 %}text-amber-400
+          {% else %}text-gray-500{% endif %}">
+          {{ r.timed_out }}
+          {% if r.timeout_pct > 0 %}<span class="text-xs">({{ r.timeout_pct }}%)</span>{% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="text-sm text-green-400">No escalations in the last 30 days.</p>
+  {% endif %}
+</div>

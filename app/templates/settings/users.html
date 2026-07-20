@@ -1,0 +1,50 @@
+{% extends "base.html" %}
+{% block title %}Users{% endblock %}
+{% block content %}
+<div class="p-8 max-w-5xl mx-auto">
+
+  <a href="/settings" class="inline-flex items-center gap-1 text-xs text-gray-500 hover:text-gray-300 transition-colors mb-5">
+    <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"/>
+    </svg>
+    Settings
+  </a>
+
+  <div class="flex items-start justify-between gap-4 mb-6">
+    <div>
+      <h1 class="text-2xl font-bold">Users</h1>
+      <p class="text-sm text-gray-500 mt-0.5">{{ total }} user{{ 's' if total != 1 else '' }}</p>
+    </div>
+    <div class="flex items-center gap-2 flex-shrink-0">
+      {% include "settings/_platform_role_info_button.html" %}
+      <!-- Search -->
+      <div class="relative">
+        <svg class="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-500 pointer-events-none" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0"/>
+        </svg>
+        <input
+          id="users-search"
+          type="text"
+          name="q"
+          value="{{ q }}"
+          placeholder="Search by name or email…"
+          autocomplete="off"
+          hx-get="/settings/users"
+          hx-trigger="input changed delay:350ms"
+          hx-target="#users-section"
+          hx-push-url="true"
+          class="w-72 pl-9 pr-4 py-2 text-sm bg-surface border border-border rounded-lg focus:outline-none focus:border-brand placeholder-gray-600"
+        />
+      </div>
+    </div>
+  </div>
+
+  <!-- Table + pagination: replaced on search/page change via HTMX -->
+  <div id="users-section">
+    {% include "settings/users_rows.html" %}
+  </div>
+
+</div>
+
+{% include "settings/_platform_role_info_modal.html" %}
+{% endblock %}

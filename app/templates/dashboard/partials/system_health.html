@@ -1,0 +1,35 @@
+{% set h = system.health %}
+<div class="rounded-xl border p-5
+  {% if h.verdict == 'operational' %}bg-green-900/15 border-green-800/40
+  {% elif h.verdict == 'warning' %}bg-amber-900/15 border-amber-800/40
+  {% else %}bg-red-900/15 border-red-800/40{% endif %}">
+
+  {% if h.gateway_error %}
+  <div class="text-xs text-red-400/70 font-mono mb-3 break-all">{{ h.gateway_error }}</div>
+  {% endif %}
+
+  <div class="grid grid-cols-2 sm:grid-cols-4 gap-4 text-sm">
+    <div>
+      <div class="text-xs text-gray-500 mb-0.5">Gateway</div>
+      <div class="font-medium {% if h.gateway_ok %}text-green-400{% else %}text-red-400{% endif %}">
+        {{ "Online" if h.gateway_ok else "Offline" }}
+      </div>
+    </div>
+    <div>
+      <div class="text-xs text-gray-500 mb-0.5">Database</div>
+      <div class="font-medium {% if h.db_ok %}text-green-400{% else %}text-red-400{% endif %}">
+        {{ "OK" if h.db_ok else "Down" }}
+      </div>
+    </div>
+    <div title="Devices/processes currently connected to the gateway">
+      <div class="text-xs text-gray-500 mb-0.5">Gateway connections</div>
+      <div class="font-medium text-gray-200">{{ h.nodes if h.nodes is not none else "None" }}</div>
+    </div>
+    <div>
+      <div class="text-xs text-gray-500 mb-0.5">Uptime</div>
+      <div class="font-medium text-gray-200" {% if h.version %}title="Gateway version {{ h.version }}"{% endif %}>
+        {{ h.uptime or "N/A" }}
+      </div>
+    </div>
+  </div>
+</div>

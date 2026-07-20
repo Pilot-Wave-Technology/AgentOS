@@ -1,0 +1,53 @@
+{% set d = system.deployments %}
+<div class="bg-gray-900 border border-gray-800 rounded-xl p-5">
+  <div class="flex items-center justify-between mb-4">
+    <h3 class="font-semibold">Deployments</h3>
+    <span class="text-xs text-gray-500">last 30 days</span>
+  </div>
+
+  {# Summary stat row #}
+  <div class="flex gap-5 mb-4 text-sm">
+    <div>
+      <div class="text-xs text-gray-500 mb-0.5">Deployed</div>
+      <div class="text-xl font-bold text-green-400">{{ d.deployed }}</div>
+    </div>
+    {% if d.rolled_back > 0 %}
+    <div>
+      <div class="text-xs text-gray-500 mb-0.5">Rolled back</div>
+      <div class="text-xl font-bold text-red-400">{{ d.rolled_back }}</div>
+    </div>
+    {% endif %}
+    {% if d.prs_opened > 0 %}
+    <div>
+      <div class="text-xs text-gray-500 mb-0.5">PRs opened</div>
+      <div class="text-xl font-bold text-indigo-400">{{ d.prs_opened }}</div>
+    </div>
+    {% endif %}
+    {% if d.success_rate is not none %}
+    <div class="ml-auto text-right">
+      <div class="text-xs text-gray-500 mb-0.5">Success rate</div>
+      <div class="text-xl font-bold
+        {% if d.success_rate >= 90 %}text-green-400
+        {% elif d.success_rate >= 70 %}text-amber-400
+        {% else %}text-red-400{% endif %}">{{ d.success_rate }}%</div>
+    </div>
+    {% endif %}
+  </div>
+
+  {# Recent events feed #}
+  {% if d.events %}
+  <div class="space-y-1.5 pt-3 border-t border-gray-800">
+    {% for e in d.events %}
+    <div class="flex items-center gap-2 text-sm">
+      <span class="w-1.5 h-1.5 rounded-full flex-shrink-0
+        {% if e.ok %}bg-green-500{% else %}bg-red-500{% endif %}"></span>
+      <span class="flex-1 truncate text-gray-300">{{ e.label }}</span>
+      <span class="text-xs text-gray-500 truncate max-w-[8rem]">{{ e.goal }}</span>
+      <span class="text-xs text-gray-600 flex-shrink-0">{{ e.ago }}</span>
+    </div>
+    {% endfor %}
+  </div>
+  {% else %}
+  <p class="text-sm text-gray-500 pt-3 border-t border-gray-800">No deployments in the last 30 days.</p>
+  {% endif %}
+</div>

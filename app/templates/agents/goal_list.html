@@ -1,0 +1,177 @@
+{% extends "base.html" %}
+{% block title %}Agents: {{ goal.name }}{% endblock %}
+{% block content %}
+<div class="p-6 lg:p-8 max-w-6xl mx-auto">
+  <div class="flex items-center justify-between mb-6">
+    <div>
+      <h1 class="text-xl font-semibold text-gray-100">Agents</h1>
+      <p class="text-sm text-gray-500 mt-0.5">{{ goal.name }}</p>
+    </div>
+    {% if role == "admin" or user.system_role == "admin" %}
+    <button onclick="document.getElementById('modal-add-agent').classList.remove('hidden')"
+      class="btn btn-primary btn-sm">
+      <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"/>
+      </svg>
+      Add Agent
+    </button>
+    {% endif %}
+  </div>
+
+  {% if agents %}
+  <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+    {% for a in agents %}
+    <div class="card p-5">
+      <div class="flex items-start justify-between mb-3">
+        <div>
+          <span class="pill {% if a.type == 'SHCA' %}pill-info{% elif a.type == 'RA' %}bg-amber-900/40 text-amber-300{% else %}pill-neutral{% endif %}">
+            {{ 'Assistant' if a.type == 'SHCA' else (a.type or 'None') }}
+          </span>
+          <div class="font-medium text-gray-200 mt-2">{{ a.name or a.id }}</div>
+          <div class="text-2xs font-mono text-gray-600 mt-0.5">{{ a.id }}</div>
+        </div>
+        <div class="w-2 h-2 rounded-full mt-1 flex-shrink-0
+          {% if a.gateway_status == 'busy' %}bg-emerald-400
+          {% elif a.gateway_status == 'idle' %}bg-yellow-400
+          {% else %}bg-gray-600{% endif %}">
+        </div>
+      </div>
+      <div class="text-2xs text-gray-600 font-mono mb-4 truncate">{{ a.model or "Not Set" }}</div>
+      <div class="flex gap-2">
+        {% if a.type == 'SHCA' %}
+        <a href="/goals/{{ pid }}/chat/{{ a.id }}" class="btn btn-primary btn-sm flex-1 justify-center">Chat</a>
+        {% else %}
+        <div class="flex items-center justify-center gap-1 flex-1 text-2xs text-gray-600 border border-gray-800 rounded-lg px-2 py-1">
+          <span>⚙</span><span>{% if a.type == 'RA' %}Reviewer{% else %}Worker{% endif %}</span>
+        </div>
+        {% endif %}
+        <a href="/goals/{{ pid }}/agents/{{ a.id }}" class="btn btn-secondary btn-sm flex-1 justify-center">Details</a>
+        {% if role == "admin" or user.system_role == "admin" %}
+        <button onclick="removeAgent('{{ a.id }}')"
+          class="btn btn-sm text-red-400 hover:text-red-300 border border-red-900 hover:border-red-700 transition-colors px-2"
+          title="Remove from goal">✕</button>
+        {% endif %}
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+  {% else %}
+  <div class="card p-12 text-center">
+    <svg class="w-12 h-12 mx-auto text-gray-700 mb-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1" d="M9.75 3.104v5.714a2.25 2.25 0 01-.659 1.591L5 14.5M9.75 3.104c-.251.023-.501.05-.75.082m.75-.082a24.301 24.301 0 014.5 0m0 0v5.714c0 .597.237 1.17.659 1.591L19.8 15.3"/>
+    </svg>
+    <p class="text-gray-500 text-sm">No agents in this goal yet.</p>
+  </div>
+  {% endif %}
+</div>
+
+<!-- Add agent modal -->
+{% if role == "admin" or user.system_role == "admin" %}
+<div id="modal-add-agent" class="hidden fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50 p-4"
+     onclick="if(event.target===this) this.classList.add('hidden')">
+  <div class="card w-full max-w-md p-6 max-h-[80vh] overflow-y-auto">
+    <h2 class="text-lg font-semibold mb-4 text-gray-100">Add Agent to Goal</h2>
+
+    <!-- Assistants -->
+    <p class="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-2">Coordinators (Assistant)</p>
+    {% if available_assistants %}
+    <div class="space-y-2 mb-5">
+      {% for assistant in available_assistants %}
+      <button type="button" onclick="addAgentToGoal('{{ assistant.agent_id }}')"
+        class="card card-interactive w-full p-3 text-left group">
+        <div class="flex items-center gap-3">
+          <div class="w-8 h-8 rounded-full bg-brand/20 text-brand flex items-center justify-center text-xs font-bold flex-shrink-0">
+            {{ assistant.display_name[0].upper() }}
+          </div>
+          <div class="flex-1 min-w-0">
+            <div class="text-sm font-medium text-gray-200 group-hover:text-brand-light transition-colors">{{ assistant.display_name }}</div>
+            <div class="text-2xs text-gray-600 font-mono">{{ assistant.agent_id }}</div>
+          </div>
+          <svg class="w-4 h-4 text-gray-600 group-hover:text-brand transition-colors flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"/>
+          </svg>
+        </div>
+      </button>
+      {% endfor %}
+    </div>
+    {% else %}
+    <p class="text-xs text-gray-600 mb-5">All your Assistants are already in this goal.</p>
+    {% endif %}
+
+    <!-- Workers (IA / RA) -->
+    <p class="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-2">Workers &amp; Reviewers (IA / RA)</p>
+    {% if available_workers %}
+    <div class="space-y-2 mb-5">
+      {% for w in available_workers %}
+      <button type="button" onclick="addAgentToGoal('{{ w.id }}')"
+        class="card card-interactive w-full p-3 text-left group">
+        <div class="flex items-center gap-3">
+          <div class="w-8 h-8 rounded-full bg-gray-800 flex items-center justify-center text-base flex-shrink-0">
+            {{ w.emoji or "⚙" }}
+          </div>
+          <div class="flex-1 min-w-0">
+            <div class="flex items-center gap-2">
+              <span class="text-sm font-medium text-gray-200 group-hover:text-white transition-colors truncate">{{ w.name }}</span>
+              <span class="pill {% if w.type == 'RA' %}bg-amber-900/40 text-amber-300{% else %}bg-purple-900/40 text-purple-300{% endif %} flex-shrink-0">{{ w.type }}</span>
+            </div>
+            <div class="text-2xs text-gray-600 font-mono truncate">{{ w.id }}</div>
+          </div>
+          <svg class="w-4 h-4 text-gray-600 group-hover:text-brand transition-colors flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"/>
+          </svg>
+        </div>
+      </button>
+      {% endfor %}
+    </div>
+    {% else %}
+    <p class="text-xs text-gray-600 mb-5">All IA/RA agents are already in this goal.</p>
+    {% endif %}
+
+    <!-- Manual entry for admin -->
+    <details class="mt-1">
+      <summary class="text-2xs text-gray-600 cursor-pointer hover:text-gray-400">Add by agent ID (advanced)</summary>
+      <div class="mt-3 space-y-3">
+        <div>
+          <label class="block text-sm text-gray-400 mb-1.5">Agent ID</label>
+          <input id="add-agent-id" placeholder="e.g. custom-agent-id" class="input" />
+        </div>
+        <div>
+          <label class="block text-sm text-gray-400 mb-1.5">Additional instructions</label>
+          <textarea id="add-agent-instructions" rows="2" class="input" placeholder="Optional..."></textarea>
+        </div>
+        <button type="button" id="btn-add-agent-manual" class="btn btn-secondary btn-sm">Add by ID</button>
+      </div>
+    </details>
+
+    <div class="flex justify-end mt-4">
+      <button type="button" onclick="document.getElementById('modal-add-agent').classList.add('hidden')"
+        class="btn btn-secondary btn-sm">Close</button>
+    </div>
+  </div>
+</div>
+<script>
+  async function addAgentToGoal(agentId) {
+    const fd = new FormData();
+    fd.append('additional_instructions', '');
+    const resp = await fetch(`/goals/{{ pid }}/agents/${agentId}`, { method: 'POST', body: fd });
+    if (resp.ok || resp.redirected) { window.location.reload(); }
+    else { showToast('Error: ' + resp.status, 'error'); }
+  }
+
+  async function removeAgent(agentId) {
+    const result = await window.confirmAction({title: 'Confirm', body: `Remove agent "${agentId}" from this goal?`});
+    if (!result) return;
+    const resp = await fetch(`/goals/{{ pid }}/agents/${agentId}`, { method: 'DELETE' });
+    if (resp.ok) { window.location.reload(); }
+    else { showToast('Error: ' + resp.status, 'error'); }
+  }
+
+  document.getElementById('btn-add-agent-manual')?.addEventListener('click', async () => {
+    const agentId = document.getElementById('add-agent-id').value.trim();
+    const instructions = document.getElementById('add-agent-instructions').value;
+    if (!agentId) return;
+    await addAgentToGoal(agentId);
+  });
+</script>
+{% endif %}
+{% endblock %}

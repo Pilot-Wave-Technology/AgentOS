@@ -1,0 +1,43 @@
+{% set f = system.fleet %}
+{% set l = system.live %}
+<div class="bg-gray-900 border border-gray-800 rounded-xl px-5 py-4">
+  <div class="grid grid-cols-3 sm:grid-cols-6 gap-4 divide-x divide-gray-800">
+
+    <a href="/goals" class="block px-4 first:pl-0 hover:opacity-80 transition-opacity text-center">
+      <div class="text-2xl font-bold text-indigo-400">{{ f.active_goals }}</div>
+      <div class="text-xs text-gray-500 mt-0.5">Active goals</div>
+    </a>
+
+    <a href="/settings/agent-registry"
+       class="block px-4 hover:opacity-80 transition-opacity text-center"
+       title="{% for t, n in f.agents_by_type.items() %}{{ t }}: {{ n }}  {% endfor %}">
+      <div class="text-2xl font-bold text-purple-400">{{ f.agents_total }}</div>
+      <div class="text-xs text-gray-500 mt-0.5">Agents</div>
+    </a>
+
+    <a href="/settings/agent-registry" class="block px-4 hover:opacity-80 transition-opacity text-center">
+      <div class="text-2xl font-bold text-gray-300">{{ f.templates }}</div>
+      <div class="text-xs text-gray-500 mt-0.5">Agent Types</div>
+    </a>
+
+    <div class="px-4 text-center">
+      <div class="text-2xl font-bold text-gray-300">{{ f.active_users }}</div>
+      <div class="text-xs text-gray-500 mt-0.5">Users</div>
+    </div>
+
+    <div class="px-4 text-center" title="Agent sessions with activity in the last 60 minutes">
+      <div class="text-2xl font-bold text-green-400">{{ l.sessions }}</div>
+      <div class="text-xs text-gray-500 mt-0.5">Sessions (1h)</div>
+    </div>
+
+    <div class="px-4 text-center">
+      <div class="text-2xl font-bold text-blue-400">{{ l.running_tasks }}</div>
+      <div class="text-xs text-gray-500 mt-0.5">Running Tasks</div>
+      {% if l.queued_tasks > 0 %}
+      <div class="text-xs text-gray-600 mt-0.5">{{ l.queued_tasks }} queued</div>
+      {% endif %}
+    </div>
+
+  </div>
+
+</div>

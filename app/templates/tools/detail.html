@@ -1,0 +1,241 @@
+{% extends "base.html" %}
+{% block title %}{% if is_new %}Register Tool{% else %}{{ tool.name }}{% endif %}{% endblock %}
+{% block content %}
+<div class="p-8 max-w-3xl mx-auto">
+
+  {# Back link #}
+  <div class="mb-6">
+    <a href="/settings/tools?tab=system-tools" class="inline-flex items-center gap-1 text-sm text-indigo-400 hover:text-indigo-300">
+      <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"/></svg>
+      Tool Registry / System Tools
+    </a>
+  </div>
+
+  {# Page title + status actions #}
+  <div class="flex items-center justify-between mb-6">
+    <div>
+      {% if is_new %}
+      <h1 class="text-2xl font-bold">Register Tool</h1>
+      <p class="text-gray-500 text-sm mt-1">Adds registry metadata for a tool whose behavior already exists in code (native or plugin).</p>
+      {% else %}
+      <h1 class="text-2xl font-bold">
+        <span class="font-mono text-indigo-400">{{ tool.name }}</span>
+      </h1>
+      <p class="text-xs text-gray-500 mt-1">
+        System Tool &middot;
+        {% if tool.status == 'enabled' %}<span class="text-green-400">enabled</span>
+        {% elif tool.status == 'beta' %}<span class="text-yellow-400">beta</span>
+        {% elif tool.status == 'disabled' %}<span class="text-gray-400">disabled</span>
+        {% elif tool.status == 'unavailable' %}<span class="text-red-400">unavailable</span>
+        {% else %}<span class="text-amber-400">{{ tool.status }}</span>{% endif %}
+        &middot; registered <span {% if tool.created_at %}data-utc="{{ tool.created_at.isoformat() }}"{% endif %}>{{ tool.created_at.strftime('%Y-%m-%d') if tool.created_at else '' }}{% if tool.created_at %} UTC{% endif %}</span>
+      </p>
+      {% endif %}
+    </div>
+    {% if not is_new and can_edit and valid_transitions %}
+    {% set btn_style = {
+      'enabled':     'border border-green-800 text-green-400 hover:bg-green-900/30',
+      'beta':        'border border-yellow-800 text-yellow-400 hover:bg-yellow-900/30',
+      'disabled':    'border border-gray-700 text-gray-400 hover:bg-gray-800',
+      'deprecated':  'border border-amber-800 text-amber-400 hover:bg-amber-900/30',
+      'unavailable': 'border border-red-800 text-red-400 hover:bg-red-900/30',
+    } %}
+    <div class="flex items-center gap-2 flex-wrap">
+      {% for target in valid_transitions %}
+      <form method="post" action="/settings/tools/{{ tool.name }}/transition" class="inline"
+            data-confirm="Move '{{ tool.name }}' to {{ target }}?">
+        <input type="hidden" name="target_status" value="{{ target }}" />
+        <button type="submit" class="btn btn-sm {{ btn_style.get(target, '') }}">→ {{ target }}</button>
+      </form>
+      {% endfor %}
+    </div>
+    {% endif %}
+  </div>
+
+  {# Code-dependent notice: every tool reachable here is native (tier IS NULL); #}
+  {# custom-tier tools, even is_core ones, redirect to their tier-specific form. #}
+  {% if not is_new %}
+  <div class="mb-6 px-4 py-3 bg-blue-900/20 border border-blue-800/40 rounded-lg text-sm text-blue-300">
+    <span class="font-medium">Code-dependent tool.</span>
+    <span class="text-blue-300/80">Its behavior is defined in the platform/OpenClaw code, not stored here - it can't be edited from this page. The fields below are registry metadata only, used for search, grouping, and profile assignment.</span>
+  </div>
+  {% endif %}
+
+  {# Error banner #}
+  {% if error %}
+  <div class="mb-5 px-4 py-3 bg-red-900/30 border border-red-800/50 rounded-lg text-sm text-red-300">
+    {{ error }}
+  </div>
+  {% endif %}
+
+  {% if can_edit %}
+  {# Create path (is_new) intentionally NOT intercepted: on validation failure the
+     server re-renders this same template with `error` set (line 65 banner) and
+     every typed field preserved — better than a toast, which would lose the
+     values the operator just entered. Only the edit path gets fetch+toast. #}
+  <form {% if not is_new %}data-toast-submit data-fail="Failed to save tool."{% endif %} method="post"
+        action="{% if is_new %}/settings/tools{% else %}/settings/tools/{{ tool.name }}{% endif %}">
+
+    <!-- Section 1: Identity -->
+    <div class="bg-gray-900 border border-gray-800 rounded-xl p-5 mb-4">
+      <h2 class="text-xs font-semibold uppercase tracking-wider text-gray-500 mb-4">1: Identity</h2>
+      <div class="space-y-4">
+        {# Name (immutable after creation) #}
+        <div>
+          <label class="block text-xs text-gray-400 mb-1.5">
+            Name <span class="text-gray-600">(unique slug, immutable after creation)</span>
+          </label>
+          {% if is_new %}
+          <input name="name" required
+                 value="{{ tool.name if tool else '' }}"
+                 placeholder="e.g. my_custom_tool"
+                 class="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm font-mono focus:outline-none focus:border-indigo-500" />
+          <p class="text-xs text-gray-600 mt-1">Lowercase letters, digits, underscores, hyphens. Must start with a letter.</p>
+          {% else %}
+          <input value="{{ tool.name }}" readonly
+                 class="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm font-mono opacity-60 cursor-not-allowed" />
+          {% endif %}
+        </div>
+
+        {# Label #}
+        <div>
+          <label class="block text-xs text-gray-400 mb-1.5">Label <span class="text-gray-600">(display name)</span></label>
+          <input name="label" maxlength="120"
+                 value="{{ tool.label if tool else '' }}"
+                 placeholder="e.g. Read Files"
+                 class="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm focus:outline-none focus:border-indigo-500" />
+        </div>
+
+        {# Description #}
+        <div>
+          <label class="block text-xs text-gray-400 mb-1.5">Description <span class="text-gray-600">(1–2 sentences)</span></label>
+          <textarea name="description" rows="2" maxlength="500"
+                    placeholder="What this tool does…"
+                    class="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm focus:outline-none focus:border-indigo-500">{{ tool.description if tool else '' }}</textarea>
+        </div>
+      </div>
+    </div>
+
+    <!-- Section 2: Organization -->
+    <div class="bg-gray-900 border border-gray-800 rounded-xl p-5 mb-4">
+      <h2 class="text-xs font-semibold uppercase tracking-wider text-gray-500 mb-4">2: Organization</h2>
+      <div class="space-y-4">
+        {# Group #}
+        <div>
+          <label class="block text-xs text-gray-400 mb-1.5">
+            Group <span class="text-gray-600">(used to organise profile editors, e.g. filesystem, web, memory)</span>
+          </label>
+          <input name="group_name" maxlength="64"
+                 value="{{ tool.group_name if tool else '' }}"
+                 placeholder="e.g. filesystem"
+                 class="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm font-mono focus:outline-none focus:border-indigo-500" />
+        </div>
+
+        {# Source #}
+        <div>
+          <label class="block text-xs text-gray-400 mb-1.5">
+            Source <span class="text-gray-600">(core = upstream, platform = AgentOS tools, custom = admin-defined)</span>
+          </label>
+          <input name="source" maxlength="80"
+                 value="{{ tool.source if tool else 'core' }}"
+                 placeholder="core or platform"
+                 class="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm font-mono focus:outline-none focus:border-indigo-500" />
+        </div>
+
+        {# Tags #}
+        <div>
+          <label class="block text-xs text-gray-400 mb-1.5">
+            Tags <span class="text-gray-600">(comma-separated)</span>
+          </label>
+          <input name="tags" maxlength="300"
+                 value="{{ (tool.tags or []) | join(', ') if tool else '' }}"
+                 placeholder="e.g. read-only, filesystem, safe"
+                 class="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm focus:outline-none focus:border-indigo-500" />
+        </div>
+      </div>
+    </div>
+
+    <div class="flex gap-3 mb-8">
+      <button type="submit" class="btn btn-primary">
+        {% if is_new %}Register tool{% else %}Save changes{% endif %}
+      </button>
+      <a href="/settings/tools?tab=system-tools" class="btn btn-secondary">Cancel</a>
+    </div>
+
+  </form>
+  {% else %}
+  {# Read-only view: no form, no inputs. Same underlying data, static rendering. #}
+  <div class="space-y-4 mb-8">
+    <div class="bg-gray-900 border border-gray-800 rounded-xl p-5">
+      <h2 class="text-xs font-semibold uppercase tracking-wider text-gray-500 mb-3">Description</h2>
+      <p class="text-sm text-gray-300">{{ tool.description or 'Not Set' }}</p>
+    </div>
+    <div class="bg-gray-900 border border-gray-800 rounded-xl p-5">
+      <h2 class="text-xs font-semibold uppercase tracking-wider text-gray-500 mb-4">Registry metadata</h2>
+      <dl class="space-y-3 text-sm">
+        <div class="flex gap-4">
+          <dt class="text-gray-500 w-28 shrink-0">Group</dt>
+          <dd class="font-mono text-gray-300">{{ tool.group_name or 'Not Set' }}</dd>
+        </div>
+        <div class="flex gap-4">
+          <dt class="text-gray-500 w-28 shrink-0">Source</dt>
+          <dd class="font-mono text-gray-300">{{ tool.source or 'core' }}</dd>
+        </div>
+        <div class="flex gap-4">
+          <dt class="text-gray-500 w-28 shrink-0">Tags</dt>
+          <dd class="flex flex-wrap gap-1.5">
+            {% for tag in (tool.tags or []) %}
+            <span class="pill pill-neutral">{{ tag }}</span>
+            {% else %}
+            <span class="text-gray-600 text-sm">None</span>
+            {% endfor %}
+          </dd>
+        </div>
+      </dl>
+    </div>
+    <div class="flex justify-end">
+      <a href="/settings/tools?tab=system-tools" class="btn btn-secondary">Back</a>
+    </div>
+  </div>
+  {% endif %}
+
+  {# ── Profile & Template Usage ─────────────────────────────────────────── #}
+  {% if not is_new %}
+  <div class="mt-8 pt-6 border-t border-gray-800">
+    <h2 class="text-sm font-semibold text-gray-300 mb-1">Used in Profiles</h2>
+    {% if profiles_for_tool %}
+    <p class="text-xs text-gray-500 mb-4">
+      This tool is included in {{ profiles_for_tool | length }} profile{{ 's' if profiles_for_tool | length != 1 else '' }}.
+      Profiles marked on a template contribute this tool to every agent provisioned from that template.
+    </p>
+    <div class="space-y-3">
+      {% for p in profiles_for_tool %}
+      <div class="px-4 py-3 bg-gray-800/50 border border-gray-700 rounded-lg">
+        <div class="flex items-center gap-2 mb-2">
+          <a href="/settings/tool-profiles/{{ p.id }}"
+             class="font-mono text-sm text-indigo-300 hover:text-indigo-200">{{ p.id }}</a>
+          <span class="text-xs text-gray-500">{{ p.name | replace('SHCA Coordinator', 'Assistant Coordinator') }}</span>
+        </div>
+        {% if p.templates %}
+        <div class="flex flex-wrap gap-2">
+          {% for t in p.templates %}
+          <span class="inline-flex items-center gap-1.5 px-2 py-1 bg-gray-900 border border-gray-700 rounded text-xs">
+            <span class="pill pill-neutral text-2xs">{{ t.type }}</span>
+            <span class="text-gray-300">{{ t.name }}</span>
+          </span>
+          {% endfor %}
+        </div>
+        {% else %}
+        <p class="text-xs text-gray-600">Not assigned to any template.</p>
+        {% endif %}
+      </div>
+      {% endfor %}
+    </div>
+    {% else %}
+    <p class="text-xs text-gray-500">This tool is not included in any profile yet.</p>
+    {% endif %}
+  </div>
+  {% endif %}
+
+</div>
+{% endblock %}

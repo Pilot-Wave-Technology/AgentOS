@@ -1,0 +1,94 @@
+{% if goal_memberships %}
+<table class="w-full text-sm">
+  <thead class="text-2xs text-gray-600 uppercase border-b border-border">
+    <tr>
+      <th class="text-left pb-2 font-medium">Goal</th>
+      <th class="text-left pb-2 font-medium">Status</th>
+      <th class="text-left pb-2 font-medium">Role</th>
+      {% if can_manage %}
+      <th class="text-right pb-2 font-medium"></th>
+      {% endif %}
+    </tr>
+  </thead>
+  <tbody class="divide-y divide-border">
+    {% for m in goal_memberships %}
+    <tr>
+      <td class="py-2.5">
+        <span class="font-medium">{{ m.goal_name }}</span>
+        <div class="text-xs text-gray-600 font-mono">{{ m.goal_id }}</div>
+      </td>
+      <td class="py-2.5">
+        <span class="text-xs text-gray-500">{{ m.goal_status }}</span>
+      </td>
+      <td class="py-2.5">
+        {% if can_manage %}
+        <form method="post" action="/settings/users/{{ target.uid }}/goal-role" class="inline flex items-center gap-2">
+          <input type="hidden" name="goal_id" value="{{ m.goal_id }}" />
+          <select name="role" data-current-role="{{ m.role }}" onchange="submitGoalRoleForm(this)"
+            class="text-xs px-2 py-1 rounded border border-border bg-surface text-gray-300 focus:outline-none focus:border-brand cursor-pointer">
+            <option value="member" {% if m.role == 'member' %}selected{% endif %}>goal.member</option>
+            <option value="admin"  {% if m.role == 'admin' %}selected{% endif %}>goal.manager</option>
+          </select>
+        </form>
+        {% else %}
+        <span class="pill {% if m.role == 'admin' %}pill-info{% else %}pill-neutral{% endif %}">
+          {{ GOAL_ROLE_LABELS.get(m.role, m.role) }}
+        </span>
+        {% endif %}
+      </td>
+      {% if can_manage %}
+      <td class="py-2.5 text-right">
+        <button type="button"
+          onclick='removeGoalMember({{ target.uid | tojson }}, {{ m.goal_id | tojson }}, {{ (target.display_name or target.email or target.uid) | tojson }}, {{ m.goal_name | tojson }})'
+          class="btn btn-secondary btn-sm text-red-400 hover:text-red-300">
+          Remove
+        </button>
+      </td>
+      {% endif %}
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+
+{# Pagination: only shown when there are multiple pages #}
+{% if total_pages > 1 %}
+<div class="flex items-center justify-between mt-4">
+  <p class="text-xs text-gray-500">
+    Showing {{ (page - 1) * page_size + 1 }}–{{ display_end }} of {{ total }}
+  </p>
+  <div class="flex items-center gap-1">
+
+    {% if page > 1 %}
+    <a hx-get="/settings/users/{{ target.uid }}?page={{ page - 1 }}"
+       hx-target="#goal-memberships-section"
+       hx-push-url="true"
+       class="px-2.5 py-1.5 text-xs rounded-md border border-border hover:bg-surface-hover text-gray-400 cursor-pointer transition-colors select-none">← Prev</a>
+    {% endif %}
+
+    {% for p in page_range %}
+      {% if p is none %}
+      <span class="px-1 text-xs text-gray-600 select-none">…</span>
+      {% elif p == page %}
+      <span class="px-2.5 py-1.5 text-xs rounded-md bg-brand/20 text-brand-light border border-brand/30 select-none">{{ p }}</span>
+      {% else %}
+      <a hx-get="/settings/users/{{ target.uid }}?page={{ p }}"
+         hx-target="#goal-memberships-section"
+         hx-push-url="true"
+         class="px-2.5 py-1.5 text-xs rounded-md border border-border hover:bg-surface-hover text-gray-400 cursor-pointer transition-colors select-none">{{ p }}</a>
+      {% endif %}
+    {% endfor %}
+
+    {% if page < total_pages %}
+    <a hx-get="/settings/users/{{ target.uid }}?page={{ page + 1 }}"
+       hx-target="#goal-memberships-section"
+       hx-push-url="true"
+       class="px-2.5 py-1.5 text-xs rounded-md border border-border hover:bg-surface-hover text-gray-400 cursor-pointer transition-colors select-none">Next →</a>
+    {% endif %}
+
+  </div>
+</div>
+{% endif %}
+
+{% else %}
+<p class="text-sm text-gray-500">This user is not a member of any goals.</p>
+{% endif %}

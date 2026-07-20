@@ -1,0 +1,15 @@
+AgentOS — Control Plane (agent_os_platform)
+Copyright 2026 Port33, inc.
+
+This product is original work by Port33, inc. and the AgentOS contributors,
+licensed under the Apache License, Version 2.0 (see the LICENSE file).
+
+It depends on third-party open-source software (for example FastAPI, Starlette,
+uvicorn, asyncpg, and the Anthropic, Google, and Slack SDK), each
+distributed under its own license and retained under its own terms. See the
+project's dependency manifests for the authoritative list.
+
+The companion agent gateway — the `agent_os_openclaw` branch of this
+repository — is derived from OpenClaw (https://github.com/openclaw/openclaw),
+which is distributed under the MIT License. That branch carries its own LICENSE
+and NOTICE files covering the upstream attribution; they are not repeated here.

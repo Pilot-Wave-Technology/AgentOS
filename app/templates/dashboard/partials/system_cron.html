@@ -1,0 +1,41 @@
+{% set cr = system.cron %}
+<div class="bg-gray-900 border border-gray-800 rounded-xl p-5">
+  <div class="flex items-center justify-between mb-4">
+    <h3 class="font-semibold">Scheduled Automations</h3>
+    {% if cr and cr.total %}
+    <span class="text-xs text-gray-500">{{ cr.total }} total</span>
+    {% endif %}
+  </div>
+  {% if cr and cr.jobs %}
+  <table class="w-full text-sm">
+    <thead>
+      <tr class="text-xs text-gray-500 text-left">
+        <th class="font-normal pb-2">Name</th>
+        <th class="font-normal pb-2">Schedule</th>
+        <th class="font-normal pb-2 text-right">Last run</th>
+        <th class="font-normal pb-2 text-right">Next run</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for j in cr.jobs %}
+      <tr class="border-t border-gray-800">
+        <td class="py-1.5">
+          <div class="flex items-center gap-2">
+            <span class="w-1.5 h-1.5 rounded-full flex-shrink-0
+              {% if j.enabled %}bg-green-500{% else %}bg-gray-600{% endif %}"></span>
+            <span class="truncate max-w-[10rem]">{{ j.name }}</span>
+          </div>
+        </td>
+        <td class="py-1.5 text-gray-500 text-xs">{{ j.schedule_str }}</td>
+        <td class="py-1.5 text-right text-gray-500 text-xs">{{ j.last_run_str }}</td>
+        <td class="py-1.5 text-right text-xs
+          {% if not j.enabled %}text-gray-600
+          {% else %}text-gray-400{% endif %}">{{ j.next_run_str }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="text-sm text-gray-500">No scheduled automations configured.</p>
+  {% endif %}
+</div>

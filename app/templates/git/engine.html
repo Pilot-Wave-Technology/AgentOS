@@ -1,0 +1,50 @@
+{% extends "base.html" %}
+{% block title %}Git Engine: {{ goal.title }}{% endblock %}
+{% block content %}
+<div class="p-6 max-w-6xl mx-auto">
+
+  <a href="/goals/{{ pid }}" class="inline-flex items-center gap-1 text-xs text-gray-500 hover:text-gray-300 transition-colors mb-5">
+    <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"/></svg>
+    {{ goal.title }}
+  </a>
+
+  <div class="flex items-center justify-between mb-4">
+    <div>
+      <h1 class="text-lg font-semibold text-gray-100 flex items-center gap-2">
+        <span class="text-brand">⬡</span> Git Engine
+      </h1>
+      <p class="text-xs text-gray-500">{{ goal.title }}: verification &amp; operator view</p>
+    </div>
+    <div class="flex items-center gap-2">
+      <span class="text-2xs px-2 py-1 rounded {{ 'bg-green-500/15 text-green-400' if gitgraph_enabled else 'bg-gray-500/15 text-gray-400' }}">
+        engine {{ 'ENABLED' if gitgraph_enabled else 'dormant' }}
+      </span>
+      <button hx-post="/goals/{{ pid }}/git/ui/reconcile" hx-target="#git-state" hx-swap="innerHTML"
+              hx-indicator="#git-spin"
+              class="text-xs px-3 py-1.5 rounded bg-brand hover:bg-brand-dark text-white transition-colors">
+        Reconcile
+      </button>
+      <button hx-get="/goals/{{ pid }}/git/ui/state" hx-target="#git-state" hx-swap="innerHTML"
+              hx-indicator="#git-spin"
+              class="text-xs px-3 py-1.5 rounded bg-surface-hover hover:bg-surface-active text-gray-300 transition-colors">
+        Refresh
+      </button>
+      <span id="git-spin" class="htmx-indicator text-2xs text-gray-500">…</span>
+    </div>
+  </div>
+
+  {% if not gitgraph_enabled %}
+  <div class="mb-4 text-2xs text-amber-400/90 bg-amber-500/10 border border-amber-500/20 rounded px-3 py-2 leading-relaxed">
+    The engine worker is <b>dormant</b> (GITGRAPH_ENABLED=false). <b>Reconcile</b> derives the
+    plan + creates git nodes &amp; merge stories (DB only: safe). Branch cuts and merges run only
+    when the engine worker is enabled; until then nodes stay in <code>PLANNED</code>. The
+    <b>plan preview</b> below is fully live regardless (read-only).
+  </div>
+  {% endif %}
+
+  <div id="git-state">
+    {% include "git/_state.html" %}
+  </div>
+
+</div>
+{% endblock %}

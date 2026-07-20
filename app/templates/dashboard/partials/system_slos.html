@@ -1,0 +1,49 @@
+{% set s = system.slos %}
+<div class="grid grid-cols-2 sm:grid-cols-3 gap-4">
+
+  {# 1. Task completion rate #}
+  <div class="bg-gray-900 border border-gray-800 rounded-xl p-4">
+    <div class="text-2xs text-gray-500 uppercase tracking-wider mb-1">Completion rate</div>
+    {% if s.completion_rate is not none %}
+    <div class="text-2xl font-bold
+      {% if s.completion_rate >= 80 %}text-green-400
+      {% elif s.completion_rate >= 60 %}text-amber-400
+      {% else %}text-red-400{% endif %}">{{ s.completion_rate }}%</div>
+    <div class="text-2xs text-gray-600 mt-0.5">{{ s.completed }} done · {{ s.failed }} failed</div>
+    {% else %}
+    <div class="text-xl font-bold text-gray-600">None</div>
+    <div class="text-2xs text-gray-600 mt-0.5">No data</div>
+    {% endif %}
+  </div>
+
+  {# 2. Autonomy level #}
+  <div class="bg-gray-900 border border-gray-800 rounded-xl p-4">
+    <div class="text-2xs text-gray-500 uppercase tracking-wider mb-1">Autonomy</div>
+    {% if s.autonomy_pct is not none %}
+    <div class="text-2xl font-bold
+      {% if s.autonomy_pct >= 80 %}text-green-400
+      {% elif s.autonomy_pct >= 60 %}text-amber-400
+      {% else %}text-red-400{% endif %}">{{ s.autonomy_pct }}%</div>
+    <div class="text-2xs text-gray-600 mt-0.5" title="Estimated % of tasks completed without escalation">
+      {{ s.escalated }} escalation{{ "s" if s.escalated != 1 else "" }}
+    </div>
+    {% else %}
+    <div class="text-xl font-bold text-gray-600">None</div>
+    <div class="text-2xs text-gray-600 mt-0.5">No data</div>
+    {% endif %}
+  </div>
+
+  {# 3. p95 task completion time: 95th percentile of done/approved task duration (DB, last 30 days) #}
+  <div class="bg-gray-900 border border-gray-800 rounded-xl p-4">
+    <div class="text-2xs text-gray-500 uppercase tracking-wider mb-1">p95 Task Time</div>
+    {% if s.p95_duration_str %}
+    <div class="text-2xl font-bold text-gray-200">{{ s.p95_duration_str }}</div>
+    <div class="text-2xs text-gray-600 mt-0.5">start → done · last 30d</div>
+    {% else %}
+    <div class="text-xl font-bold text-gray-600">None</div>
+    <div class="text-2xs text-gray-600 mt-0.5">no completed tasks</div>
+    {% endif %}
+  </div>
+
+
+</div>

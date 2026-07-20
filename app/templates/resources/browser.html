@@ -1,0 +1,560 @@
+{% extends "base.html" %}
+{% from "partials/_info_popover.html" import info_popover %}
+{% from "partials/_tour_trigger.html" import tour_trigger %}
+{% block title %}Resources: {{ goal.name }}{% endblock %}
+{% block content %}
+<div class="p-6 lg:p-8 max-w-5xl mx-auto">
+  <div class="flex items-center justify-between mb-6">
+    <div>
+      <div class="flex items-center gap-2 mb-1">
+        <a href="/goals/{{ pid }}" class="inline-flex items-center gap-1 text-xs text-gray-500 hover:text-gray-300 transition-colors">
+          <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"/></svg>
+          {{ goal.name }}
+        </a>
+      </div>
+      <h1 id="resources-header" class="text-xl font-semibold text-gray-100 flex items-center gap-1.5">Resources
+        {{ info_popover(
+          "🔑 GCP service accounts here are scoped to one of two phases: a \"test SA\" is used while the integration-tester runs code against real infra, a \"deploy SA\" is used when that code ships. ☁️ A \"GCP environment\" groups both under one GCP project.",
+          label="What are the GCP resource kinds?"
+        ) }}
+      </h1>
+      <p class="text-sm text-gray-500 mt-0.5">{{ resource_count }} resource{{ 's' if resource_count != 1 else '' }}{% if show_archived %} <span class="text-2xs text-gray-600">(including archived)</span>{% endif %}</p>
+    </div>
+    <div class="flex gap-2 items-center">
+      {# Show-archived toggle. Off by default; on flips back to clean view. #}
+      {% if show_archived %}
+      <a href="/goals/{{ pid }}/resources/browser"
+         class="text-xs text-gray-400 hover:text-white">Hide archived</a>
+      {% else %}
+      <a href="/goals/{{ pid }}/resources/browser?show_archived=1"
+         class="text-xs text-gray-500 hover:text-white">Show archived</a>
+      {% endif %}
+      {% if user.preferences.get("startup_wizard_enabled", True) %}
+      {{ tour_trigger("resources-intro", "What are Resources?") }}
+      {% endif %}
+      {% if linkable_resources %}
+      <button onclick="document.getElementById('modal-link').classList.remove('hidden')"
+        class="btn btn-secondary btn-sm">Link Existing</button>
+      {% endif %}
+      <button onclick="document.getElementById('modal-upload').classList.remove('hidden')"
+        class="btn btn-secondary btn-sm">Upload File</button>
+      <button id="btn-add-resource" onclick="document.getElementById('modal-add').classList.remove('hidden')"
+        class="btn btn-primary btn-sm">Add Resource</button>
+    </div>
+  </div>
+
+  {# Macro for a pinned document card #}
+  {% macro doc_card(href, icon, title, doc) %}
+  <a href="{{ href }}" class="card p-4 flex items-center gap-3 mb-3 hover:border-gray-600 transition-colors group block">
+    <span class="text-lg">{{ icon }}</span>
+    <div class="flex-1 min-w-0">
+      <div class="text-sm font-medium text-gray-200 group-hover:text-white transition-colors">{{ title }}</div>
+      <div class="text-2xs text-gray-500 mt-0.5">
+        system · refreshes when active
+        {% if doc and doc.generated_at %}
+          &middot; updated <span data-utc="{{ doc.generated_at.isoformat() }}">{{ doc.generated_at.strftime('%Y-%m-%d %H:%M') }} UTC</span>
+          {%- if doc.chars %} · {{ doc.chars }} chars{% endif %}
+          {%- if doc.next_trigger %} · next {{ doc.next_trigger }}{% endif %}
+        {% elif doc and doc.requested_at %}
+          &middot; generating…
+        {% else %}
+          &middot; not yet generated
+        {% endif %}
+      </div>
+    </div>
+    <span class="pill pill-neutral text-2xs flex-shrink-0">read-only</span>
+    <svg class="w-4 h-4 text-gray-600 group-hover:text-gray-400 transition-colors flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"/>
+    </svg>
+  </a>
+  {% endmacro %}
+
+  {# Work Documentation card hidden - generated in background, not yet surfaced to users #}
+  {{ doc_card("/goals/" ~ pid ~ "/summary/progress", "📊", "Feature Overview",    goal_doc_progress) }}
+
+  <!-- Resource tree -->
+  {% if resources %}
+  <div class="space-y-2">
+    {% for r in resources %}
+    <div class="card p-4 {% if r.status == 'archived' %}opacity-60{% endif %}">
+      <div class="flex items-center gap-3">
+        <!-- Kind icon -->
+        <span class="text-lg" title="
+          {%- if r.kind == 'repo' %}Git repository: code scanned and summarised for agents
+          {%- elif r.kind == 'branch' %}Branch of a git repository
+          {%- elif r.kind == 'document' %}Document (PDF, DOCX, XLSX) uploaded for agents to read
+          {%- elif r.kind == 'file' %}Raw file attachment
+          {%- elif r.kind == 'service' %}External service or API endpoint
+          {%- elif r.kind == 'environment' %}Deployment environment descriptor
+          {%- elif r.kind == 'gcp_environment' %}GCP project environment: parent for GCP service accounts
+          {%- elif r.kind == 'gcp_test_sa' %}GCP service account used by the integration-tester phase
+          {%- elif r.kind == 'gcp_deploy_sa' %}GCP service account used by the deployment phase
+          {%- else %}Resource{% endif %}">
+          {% if r.kind == 'repo' %}📦{% elif r.kind == 'branch' %}🌿{% elif r.kind == 'document' %}📄{% elif r.kind == 'file' %}📎{% elif r.kind == 'service' %}⚙️{% elif r.kind == 'environment' %}🖥️{% elif r.kind == 'gcp_environment' %}☁️{% elif r.kind in ('gcp_test_sa', 'gcp_deploy_sa') %}🔑{% else %}📁{% endif %}
+        </span>
+        <div class="flex-1">
+          <a href="/goals/{{ pid }}/resources/{{ r.id }}" class="text-sm font-medium text-gray-200 hover:text-white">
+            {{ r.name }}
+          </a>
+          <div class="text-2xs text-gray-500 mt-0.5">
+            {{ r.kind }}
+            {% if r.uri %} &middot; <span class="text-gray-600">{{ r.uri[:60] }}{% if r.uri|length > 60 %}...{% endif %}</span>{% endif %}
+            {% if r.file_type %} &middot; .{{ r.file_type }}{% endif %}
+            {% if r.last_scan_time %} &middot; scanned <span data-utc="{{ r.last_scan_time.isoformat() }}">{{ r.last_scan_time.strftime('%Y-%m-%d %H:%M') }} UTC</span>{% endif %}
+          </div>
+        </div>
+        <!-- Status pills -->
+        {% if r.status == 'archived' %}
+        <span class="pill pill-neutral text-2xs" title="Archived: not provisioned into agent workspaces">archived</span>
+        {% endif %}
+        {% if r.locked_by %}
+        <span class="pill pill-warning text-2xs" title="Locked by task {{ r.locked_by }} - another task has exclusive write access">locked</span>
+        {% endif %}
+        {% if r.kind in ('gcp_test_sa', 'gcp_deploy_sa') and sa_status_map.get(r.id) in ('no_permission', 'error') %}
+        <a href="/goals/{{ pid }}/resources/{{ r.id }}"
+           class="pill pill-error text-2xs"
+           title="The control-panel service account cannot impersonate this SA - open to see fix instructions">no permission</a>
+        {% endif %}
+        <!-- Summary status -->
+        {% if r.summary_preview %}
+        <span class="pill pill-success text-2xs" title="AI-generated summary is available: click to view">summary</span>
+        {% elif r.summary_stale %}
+        <span class="pill pill-neutral text-2xs" title="No summary yet - open the resource and click Rescan">no summary</span>
+        {% endif %}
+      </div>
+      {% if r.human_context %}
+      <p class="text-xs text-gray-500 mt-2 pl-9">{{ r.human_context[:150] }}</p>
+      {% endif %}
+      {% if r.summary_preview %}
+      <p class="text-xs text-gray-400 mt-2 pl-9 line-clamp-2">{{ r.summary_preview | strip_md }}</p>
+      {% endif %}
+
+      <!-- Children (branches, files under repo) -->
+      {% if children_map.get(r.id) %}
+      <div class="ml-9 mt-3 space-y-1.5 border-l border-slate-700 pl-3">
+        {% for child in children_map[r.id] %}
+        <a href="/goals/{{ pid }}/resources/{{ child.id }}"
+           class="flex items-center gap-2 text-sm text-gray-400 hover:text-gray-200 py-1">
+          <span class="text-xs">{% if child.kind == 'branch' %}🌿{% elif child.kind == 'file' %}📎{% elif child.kind in ('gcp_test_sa', 'gcp_deploy_sa') %}🔑{% else %}📁{% endif %}</span>
+          {{ child.name }}
+          {% if child.kind == 'gcp_test_sa' %}<span class="text-2xs text-gray-600 ml-1">(test SA)</span>{% elif child.kind == 'gcp_deploy_sa' %}<span class="text-2xs text-gray-600 ml-1">(deploy SA)</span>{% endif %}
+          {% if child.locked_by %}<span class="pill pill-warning text-2xs ml-1">locked</span>{% endif %}
+          {% if child.kind in ('gcp_test_sa', 'gcp_deploy_sa') and sa_status_map.get(child.id) in ('no_permission', 'error') %}
+          <span class="pill pill-error text-2xs ml-1" title="The control-panel service account cannot impersonate this SA - open to see fix instructions">no permission</span>
+          {% endif %}
+        </a>
+        {% endfor %}
+      </div>
+      {% endif %}
+    </div>
+    {% endfor %}
+  </div>
+  {% else %}
+  <div class="card p-8 text-center">
+    <p class="text-gray-500 text-sm">No resources yet. Add a repo, upload a document, or register a service.</p>
+  </div>
+  {% endif %}
+</div>
+
+<!-- Add Resource Modal -->
+<div id="modal-add" class="hidden fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50 p-4"
+     onclick="if(event.target===this) this.classList.add('hidden')">
+  <div class="card w-full max-w-md p-6 max-h-[90vh] overflow-y-auto">
+    <div class="flex items-center justify-between mb-4">
+      <h2 class="text-lg font-semibold text-gray-100">Add Resource</h2>
+      <div class="flex items-center gap-2">
+        <!-- Step indicator: only shown during multi-step cloud setup -->
+        <span id="cloud-step-indicator" class="hidden text-xs text-gray-500"></span>
+        {% if user.preferences.get("startup_wizard_enabled", True) %}
+        {{ tour_trigger("add-resource", "How to add a Resource") }}
+        {% endif %}
+      </div>
+    </div>
+    <form action="/goals/{{ pid }}/resources/add" method="post" class="space-y-4" data-toast-submit data-fail="Failed to add resource.">
+      <div>
+        <label class="block text-sm text-gray-400 mb-1.5">Type</label>
+        <select name="kind" id="add-kind" class="input" onchange="toggleRepoFields()">
+          <option value="repo">Git Repository</option>
+          <option value="branch">Branch (of existing repo)</option>
+          <option value="cloud_resource">Cloud Resource</option>
+        </select>
+      </div>
+
+      <!-- Cloud provider sub-selector (shown only for 'cloud_resource') -->
+      <div id="cloud-provider-section" class="hidden">
+        <label class="block text-sm text-gray-400 mb-1.5">Cloud provider</label>
+        <select name="cloud_provider" id="cloud-provider" class="input" onchange="toggleRepoFields()">
+          <option value="gcp">Google Cloud Platform (GCP)</option>
+          <!-- Future: aws, azure -->
+        </select>
+      </div>
+      <div>
+        <label class="block text-sm text-gray-400 mb-1.5">Name</label>
+        <input name="name" class="input" placeholder="e.g., api-service (auto-generated for branches)" />
+      </div>
+      <!-- Repo select (shown for repo/branch kinds) -->
+      <div id="gh-repo-section">
+        <label class="block text-sm text-gray-400 mb-1.5">GitHub Repository</label>
+        <div class="relative">
+          <select id="gh-repo-select" class="input" onchange="onRepoSelected()">
+            <option value="">-- Loading repos... --</option>
+          </select>
+          <button type="button" onclick="withLoadingState(this, fetchGitHubRepos, {loadingLabel: '…'})"
+            class="absolute right-2 top-1/2 -translate-y-1/2 text-2xs text-brand hover:text-brand-light">
+            Refresh
+          </button>
+        </div>
+        <input type="hidden" name="uri" id="repo-uri" />
+        <p id="gh-repo-error" class="text-2xs text-red-400 mt-1 hidden"></p>
+      </div>
+      <!-- Fallback URL for non-repo kinds -->
+      <div id="uri-manual" class="hidden">
+        <label class="block text-sm text-gray-400 mb-1.5">URL / URI</label>
+        <input id="uri-manual-input" class="input" placeholder="https://..." oninput="document.getElementById('repo-uri').value = this.value" />
+      </div>
+      <!-- Repo-specific fields. Default branch is required (has a sane default);
+           the working-branch section is expanded by default and required —
+           the agent needs a working branch to operate on, so this can't be
+           skipped and added later. Server-side enforcement in
+           app/routers/goal_resources.py (add_resource) backs this up. -->
+      <div id="repo-fields" class="space-y-3">
+        <div>
+          <label class="block text-sm text-gray-400 mb-1.5">Default Branch</label>
+          <input name="default_branch" class="input" value="main" placeholder="main" />
+        </div>
+        <details class="pt-2 border-t border-border/40" open>
+          <summary class="text-sm text-gray-400 cursor-pointer hover:text-gray-200 select-none">
+            Configure working branch <span class="text-2xs text-amber-500">(required)</span>
+          </summary>
+          <div class="space-y-2 mt-2 pl-1">
+            <input name="working_branch" class="input" required placeholder="e.g., dev - the branch agents work from" />
+            <p class="text-2xs text-gray-600">A branch resource is auto-created alongside the repo for agents to work from.</p>
+            <label class="flex items-center gap-2 text-sm text-gray-300 cursor-pointer">
+              <input type="checkbox" name="working_branch_is_trunk" value="on" class="rounded border-gray-700 bg-gray-800" />
+              Mark as trunk for this repo
+            </label>
+            <p class="text-2xs text-gray-600 pl-6">Treat this branch as the merge target in review stories. Only one branch per repo can be trunk.</p>
+          </div>
+        </details>
+      </div>
+      <!-- Branch-specific fields. Help text trimmed; details now ride alongside
+           inputs as placeholders / inline hints instead of paragraphs. -->
+      <div id="branch-fields" class="hidden space-y-3">
+        <div>
+          <label class="block text-sm text-gray-400 mb-1.5">Parent Repository <span class="text-2xs text-gray-600">(or paste a GitHub URL above)</span></label>
+          <select name="parent_repo_id" class="input">
+            <option value="">- pick a registered repo -</option>
+            {% for r in resources if r.kind == 'repo' %}
+            <option value="{{ r.id }}">{{ r.name }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div>
+          <label class="block text-sm text-gray-400 mb-1.5">Branch Name</label>
+          <input name="branch_name" class="input" placeholder="e.g. feat/auth, fix/login-bug" />
+        </div>
+        <div class="grid grid-cols-2 gap-3">
+          <div>
+            <label class="block text-sm text-gray-400 mb-1.5">Base branch</label>
+            <input name="base_branch" class="input" value="main" placeholder="main" />
+          </div>
+          <div>
+            <label class="block text-sm text-gray-400 mb-1.5">Role</label>
+            <select name="role" class="input">
+              <option value="feature">Feature</option>
+              <option value="trunk">Trunk</option>
+              <option value="release">Release</option>
+            </select>
+          </div>
+        </div>
+        <p class="text-2xs text-gray-600">Feature: short-lived for one task chain. Trunk: agents' merge target (only one per repo). Release: long-lived release branch.</p>
+      </div>
+      <!-- Cloud Resource fields: paginated as 3 steps (env → test SA → deploy SA).
+           Each step is hidden by default; cloudStep state + showCloudStep() toggle. -->
+
+      <!-- Step 1: Environment (required) -->
+      <div id="cloud-step-env" class="hidden space-y-3">
+        <div class="text-xs font-semibold text-gray-300">Environment <span class="text-2xs font-normal text-gray-500">: required</span></div>
+        <div>
+          <label class="block text-sm text-gray-400 mb-1.5">Target GCP Project ID</label>
+          <input name="gcp_target_project_id" class="input" placeholder="my-customer-project" />
+          <p class="text-2xs text-gray-600 mt-1">The customer's GCP project where code is tested and deployed - NOT the platform project.</p>
+        </div>
+        <div>
+          <label class="block text-sm text-gray-400 mb-1.5">Target Region</label>
+          <input name="gcp_target_region" class="input" placeholder="${GCP_REGION}" />
+        </div>
+      </div>
+
+      <!-- Step 2: Test service account (optional) -->
+      <div id="cloud-step-test-sa" class="hidden space-y-3">
+        <div class="text-xs font-semibold text-gray-300">Test service account <span class="text-2xs font-normal text-gray-500">: optional</span></div>
+        <p class="text-xs text-gray-500">Attach if you want the <code>integration-tester</code> phase to run for stories in this goal. Leave blank to skip - you can always add one later via GO in chat.</p>
+        <div>
+          <label class="block text-sm text-gray-400 mb-1.5">Test SA email</label>
+          <input name="gcp_test_service_account" class="input" placeholder="test-runner@my-customer-project.iam.gserviceaccount.com" />
+          <p class="text-2xs text-gray-600 mt-1">Grant <code>roles/iam.serviceAccountTokenCreator</code> on this SA to the control-panel's Cloud Run service account so per-task impersonation tokens can be minted.</p>
+        </div>
+      </div>
+
+      <!-- Step 3: Deploy service account (optional) -->
+      <div id="cloud-step-deploy-sa" class="hidden space-y-3">
+        <div class="text-xs font-semibold text-gray-300">Deploy service account <span class="text-2xs font-normal text-gray-500">: optional</span></div>
+        <p class="text-xs text-gray-500">Attach if you want the <code>deployment</code> phase to run. Leave blank for stories that don't deploy (e.g. library code, CI/CD-handled deploys).</p>
+        <div>
+          <label class="block text-sm text-gray-400 mb-1.5">Deploy SA email</label>
+          <input name="gcp_deploy_service_account" class="input" placeholder="deployer@my-customer-project.iam.gserviceaccount.com" />
+          <p class="text-2xs text-gray-600 mt-1">Same <code>roles/iam.serviceAccountTokenCreator</code> grant required.</p>
+        </div>
+      </div>
+
+      <!-- Legacy single-section wrapper kept for the toggleRepoFields()
+           visibility check; never directly shown to the user. -->
+      <div id="gcp-env-fields" class="hidden"></div>
+      <!-- Context: collapsed by default since it's optional. Shown for
+           non-cloud kinds and on the final cloud step (toggleRepoFields
+           and showCloudStep set context-section's hidden state). -->
+      <div id="context-section">
+        <details>
+          <summary class="text-sm text-gray-400 cursor-pointer hover:text-gray-200 select-none">
+            + Add context for GO <span class="text-2xs text-gray-600">(optional)</span>
+          </summary>
+          <textarea name="human_context" rows="2" class="input mt-2" placeholder="What is this resource? Any important notes for the team."></textarea>
+        </details>
+      </div>
+
+      <!-- Default footer: cancel + submit. Used for non-cloud kinds.
+           For cloud_resource the cloud-step-nav block below replaces it. -->
+      <div id="default-footer" class="flex justify-end gap-2 pt-2">
+        <button type="button" onclick="document.getElementById('modal-add').classList.add('hidden')"
+          class="btn btn-secondary">Cancel</button>
+        <button type="submit" class="btn btn-primary">Add Resource</button>
+      </div>
+
+      <!-- Cloud multi-step nav: hidden by default. JS toggles button visibility
+           per step. The submit button only fires on the final step. -->
+      <div id="cloud-step-nav" class="hidden pt-2 flex items-center justify-between gap-2">
+        <button type="button" id="cloud-step-back"
+          onclick="cloudStepGo(-1)"
+          class="btn btn-secondary">← Back</button>
+        <div class="flex items-center gap-2">
+          <button type="button" id="cloud-step-skip"
+            onclick="cloudStepGo(1, /*skip=*/true)"
+            class="btn btn-secondary hidden">Skip</button>
+          <button type="button" id="cloud-step-next"
+            onclick="cloudStepGo(1)"
+            class="btn btn-primary">Next →</button>
+          <button type="submit" id="cloud-step-submit"
+            class="btn btn-primary hidden">Create Resource</button>
+        </div>
+      </div>
+    </form>
+    <script>
+    let reposFetched = false;
+
+    function toggleRepoFields() {
+      const kind = document.getElementById('add-kind').value;
+      const isRepo = kind === 'repo';
+      const isBranch = kind === 'branch';
+      const isGh = isRepo || isBranch;
+      const isCloud = kind === 'cloud_resource';
+
+      document.getElementById('cloud-provider-section').classList.toggle('hidden', !isCloud);
+      document.getElementById('gh-repo-section').classList.toggle('hidden', !isGh);
+      document.getElementById('uri-manual').classList.toggle('hidden', isGh || isCloud);
+      document.getElementById('repo-fields').classList.toggle('hidden', !isRepo);
+      document.getElementById('branch-fields').classList.toggle('hidden', !isBranch);
+
+      // Step-indicator + cloud-only nav vs. the single-page default nav.
+      document.getElementById('cloud-step-indicator').classList.toggle('hidden', !isCloud);
+      document.getElementById('cloud-step-nav').classList.toggle('hidden', !isCloud);
+      document.getElementById('default-footer').classList.toggle('hidden', isCloud);
+
+      // For non-cloud kinds the Context field stays visible inline; for
+      // cloud_resource it follows the step sequence (see showCloudStep).
+      const contextSection = document.getElementById('context-section');
+      contextSection.classList.toggle('hidden', isCloud);
+
+      if (isCloud) {
+        showCloudStep(1);  // entering cloud flow: start at step 1
+      } else {
+        // Hide all cloud-step sections so they don't leak into a non-cloud form.
+        ['cloud-step-env', 'cloud-step-test-sa', 'cloud-step-deploy-sa'].forEach(id => {
+          document.getElementById(id).classList.add('hidden');
+        });
+      }
+
+      if (isGh && !reposFetched) {
+        reposFetched = true;
+        fetchGitHubRepos();
+      }
+    }
+
+    // ── Cloud multi-step navigation ───────────────────────────────────
+    // Steps: 1=env, 2=test SA, 3=deploy SA. Context-for-GO rides along
+    // with step 3 (the final step) so it doesn't clutter the SA inputs.
+
+    const CLOUD_STEPS = [
+      { id: 'cloud-step-env',       label: 'Environment',       optional: false },
+      { id: 'cloud-step-test-sa',   label: 'Test SA',           optional: true  },
+      { id: 'cloud-step-deploy-sa', label: 'Deploy SA',         optional: true  },
+    ];
+    let cloudStep = 1;
+
+    function showCloudStep(n) {
+      cloudStep = Math.max(1, Math.min(CLOUD_STEPS.length, n));
+      CLOUD_STEPS.forEach((step, idx) => {
+        document.getElementById(step.id).classList.toggle('hidden', idx !== cloudStep - 1);
+      });
+      const total = CLOUD_STEPS.length;
+      document.getElementById('cloud-step-indicator').textContent =
+        `Step ${cloudStep} of ${total}: ${CLOUD_STEPS[cloudStep - 1].label}`;
+
+      const isFinal = cloudStep === total;
+      const isFirst = cloudStep === 1;
+      const isOptional = CLOUD_STEPS[cloudStep - 1].optional;
+
+      document.getElementById('cloud-step-back').classList.toggle('hidden', isFirst);
+      document.getElementById('cloud-step-skip').classList.toggle('hidden', !isOptional || isFinal);
+      document.getElementById('cloud-step-next').classList.toggle('hidden', isFinal);
+      document.getElementById('cloud-step-submit').classList.toggle('hidden', !isFinal);
+      // Context field appears alongside the final step so it doesn't get
+      // lost behind SA inputs.
+      document.getElementById('context-section').classList.toggle('hidden', !isFinal);
+    }
+
+    function cloudStepGo(delta, skip = false) {
+      if (delta > 0 && skip) {
+        // Skipping: clear the current step's input so an empty string is
+        // sent (backend treats empty SA email as "don't create SA row").
+        const cur = CLOUD_STEPS[cloudStep - 1];
+        const sec = document.getElementById(cur.id);
+        sec.querySelectorAll('input, textarea').forEach(el => { el.value = ''; });
+      }
+      showCloudStep(cloudStep + delta);
+    }
+
+    async function fetchGitHubRepos() {
+      const select = document.getElementById('gh-repo-select');
+      const errEl = document.getElementById('gh-repo-error');
+      errEl.classList.add('hidden');
+      select.innerHTML = '<option value="">-- Loading repos... --</option>';
+
+      try {
+        // The server-side call can stall (GitHub API pagination edge case) with
+        // no response ever coming back — bound it client-side so the Refresh
+        // button's spinner can't spin forever even if that happens.
+        const resp = await fetch('/api/github/repos', { signal: AbortSignal.timeout(20000) });
+        if (!resp.ok) throw new Error('Failed to fetch repos');
+        const repos = await resp.json();
+        if (repos.error) throw new Error(repos.error);
+
+        select.innerHTML = '<option value="">-- Select a repository --</option>';
+        repos.forEach(r => {
+          const opt = document.createElement('option');
+          opt.value = r.html_url || r.url || `https://github.com/${r.full_name}`;
+          opt.textContent = r.full_name;
+          opt.dataset.fullName = r.full_name;
+          select.appendChild(opt);
+        });
+      } catch (e) {
+        select.innerHTML = '<option value="">-- Failed to load --</option>';
+        errEl.textContent = e.name === 'TimeoutError' ? 'Timed out loading repos — try again' : e.message;
+        errEl.classList.remove('hidden');
+      }
+    }
+
+    function onRepoSelected() {
+      const select = document.getElementById('gh-repo-select');
+      document.getElementById('repo-uri').value = select.value;
+      // Auto-fill name if empty
+      const nameInput = document.querySelector('input[name="name"]');
+      if (select.selectedOptions[0] && !nameInput.value) {
+        const fullName = select.selectedOptions[0].dataset.fullName || '';
+        nameInput.value = fullName.split('/').pop() || '';
+      }
+    }
+
+    toggleRepoFields();
+    </script>
+  </div>
+</div>
+
+<!-- Upload File Modal -->
+<div id="modal-upload" class="hidden fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50 p-4"
+     onclick="if(event.target===this) this.classList.add('hidden')">
+  <div class="card w-full max-w-md p-6">
+    <h2 class="text-lg font-semibold mb-4 text-gray-100">Upload File</h2>
+    <form action="/goals/{{ pid }}/resources/upload" method="post" enctype="multipart/form-data" class="space-y-4" data-toast-submit data-fail="Failed to upload file.">
+      <div>
+        <label class="block text-sm text-gray-400 mb-1.5">File</label>
+        <input type="file" name="file" required
+          accept=".pdf,.xlsx,.xls,.docx,.doc,.md,.txt,.csv,.json,.yaml,.yml,.png,.jpg,.jpeg"
+          class="input file:mr-4 file:py-1 file:px-3 file:rounded-lg file:border-0 file:text-sm file:bg-indigo-600 file:text-white hover:file:bg-indigo-500" />
+        <p class="text-2xs text-gray-600 mt-1">PDF, Excel, Word, Markdown, CSV, JSON, YAML, images. Max 50MB.</p>
+      </div>
+      <div>
+        <label class="block text-sm text-gray-400 mb-1.5">Display Name (optional)</label>
+        <input name="name" class="input" placeholder="Leave blank to use filename" />
+      </div>
+      <div>
+        <label class="block text-sm text-gray-400 mb-1.5">Context for GO</label>
+        <textarea name="human_context" rows="2" class="input" placeholder="What does this file contain? Key sections to note."></textarea>
+      </div>
+      <div class="flex justify-end gap-2 pt-2">
+        <button type="button" onclick="document.getElementById('modal-upload').classList.add('hidden')"
+          class="btn btn-secondary">Cancel</button>
+        <button type="submit" class="btn btn-primary">Upload</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<!-- Link Existing Resource Modal -->
+{% if linkable_resources %}
+<div id="modal-link" class="hidden fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50 p-4"
+     onclick="if(event.target===this) this.classList.add('hidden')">
+  <div class="card w-full max-w-md p-6">
+    <h2 class="text-lg font-semibold mb-4 text-gray-100">Link Existing Resource</h2>
+    <p class="text-sm text-gray-500 mb-4">Add a resource from one of your other goals. The summary and data will be shared - no need to re-scan.</p>
+    <form action="/goals/{{ pid }}/resources/link" method="post" class="space-y-4" data-toast-submit data-fail="Failed to link resource.">
+      <div>
+        <label class="block text-sm text-gray-400 mb-1.5">Select Resource</label>
+        <select name="source_resource_id" required class="input">
+          <option value="">Choose a resource...</option>
+          {% set current_goal = {'name': ''} %}
+          {% for r in linkable_resources %}
+            {% if r.goal_name != current_goal.name %}
+              {% if current_goal.name %}</optgroup>{% endif %}
+              <optgroup label="{{ r.goal_name }}">
+              {% set _ = current_goal.update({'name': r.goal_name}) %}
+            {% endif %}
+            <option value="{{ r.id }}">
+              {% if r.kind == 'repo' %}📦{% elif r.kind == 'branch' %}🌿{% elif r.kind == 'document' %}📄{% else %}📁{% endif %}
+              {{ r.name }} ({{ r.kind }})
+            </option>
+          {% endfor %}
+          {% if current_goal.name %}</optgroup>{% endif %}
+        </select>
+      </div>
+      <div class="flex justify-end gap-2 pt-2">
+        <button type="button" onclick="document.getElementById('modal-link').classList.add('hidden')"
+          class="btn btn-secondary">Cancel</button>
+        <button type="submit" class="btn btn-primary">Link Resource</button>
+      </div>
+    </form>
+  </div>
+</div>
+{% endif %}
+{% endblock %}
+
+{% block extra_js %}
+{% if auto_fire_tour %}
+<script>
+// Milestone tour: first-ever visit to this goal's Resources page. Must run
+// in extra_js (after tour.js loads) — content renders inside <main>, before
+// the bottom-of-body script tags.
+autoFireTour('resources-intro', 600);
+</script>
+{% endif %}
+{% endblock %}

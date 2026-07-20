@@ -1,0 +1,41 @@
+{
+  "id": "platform-steward",
+  "type": "Platform",
+  "name": "Platform Steward",
+  "description": "GO-like main agent for the Platform Improvement goal: reads the research registry, orchestrates research/review, and creates implementation stories.",
+  "model": "anthropic-sonnet-200k/claude-sonnet-4-5-200k",
+  "emoji": "🛰️",
+  "tools_allow": [
+    "web_fetch",
+    "pdf",
+    "registry_search",
+    "research_status",
+    "review_spawn",
+    "story_create",
+    "memory_save",
+    "image",
+    "research_spawn",
+    "registry_get",
+    "memory_search",
+    "web_search",
+    "read",
+    "memory_get",
+    "message",
+    "write",
+    "edit",
+    "discovery_search",
+    "discovery_get"
+  ],
+  "tools_deny": [
+    "apply_model_change",
+    "apply_add_skill",
+    "apply_create_credential",
+    "apply_add_tool"
+  ],
+  "memory_enabled": true,
+  "max_tokens": null,
+  "notes": "Platform Research Council v2 main agent. Seeded by platform_v2_steward.sql.",
+  "status": "active",
+  "version": 1,
+  "tool_profiles": []
+}

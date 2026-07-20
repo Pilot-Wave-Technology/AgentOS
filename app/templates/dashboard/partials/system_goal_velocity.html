@@ -1,0 +1,51 @@
+{% set gv = system.goal_velocity %}
+{% if gv and gv.goals %}
+<div class="bg-gray-900 border border-gray-800 rounded-xl p-5">
+  <div class="flex items-center justify-between mb-4">
+    <h3 class="font-semibold">Goal Pace</h3>
+    <span class="text-xs text-gray-500">goals with deadlines</span>
+  </div>
+  <div class="space-y-3">
+    {% for g in gv.goals %}
+    <div>
+      <div class="flex items-center gap-2 mb-1">
+        <span class="w-2 h-2 rounded-full flex-shrink-0
+          {% if g.pace == 'ahead' %}bg-green-500
+          {% elif g.pace == 'on_pace' %}bg-blue-500
+          {% else %}bg-amber-500{% endif %}"></span>
+        <a href="/goals/{{ g.id }}"
+           class="text-sm text-gray-200 hover:text-white transition-colors truncate flex-1"
+           style="border-left: 2px solid {{ g.color_tag }}; padding-left: 6px;">
+          {{ g.name }}
+        </a>
+        <span class="text-2xs flex-shrink-0
+          {% if g.pace == 'ahead' %}text-green-400
+          {% elif g.pace == 'on_pace' %}text-gray-500
+          {% else %}text-amber-400{% endif %}">
+          {% if g.pace == 'ahead' %}▲ ahead
+          {% elif g.pace == 'on_pace' %}→ on pace
+          {% else %}▼ behind{% endif %}
+        </span>
+        <span class="text-2xs text-gray-600 flex-shrink-0">{{ g.days_left }}d left</span>
+      </div>
+      {# Progress bar: gray = expected, colored fill = actual #}
+      <div class="relative h-1.5 bg-gray-800 rounded-full ml-4">
+        {# Expected progress marker #}
+        <div class="absolute top-0 bottom-0 w-0.5 bg-gray-600 rounded-full"
+             style="left: {{ g.expected_pct }}%"></div>
+        {# Actual progress fill #}
+        <div class="h-full rounded-full transition-all
+          {% if g.pace == 'ahead' %}bg-green-500
+          {% elif g.pace == 'on_pace' %}bg-blue-500
+          {% else %}bg-amber-500{% endif %}"
+             style="width: {{ g.pct }}%"></div>
+      </div>
+      <div class="flex justify-between text-2xs text-gray-600 mt-0.5 ml-4">
+        <span>{{ g.pct }}% done</span>
+        <span>{{ g.expected_pct }}% expected</span>
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+</div>
+{% endif %}

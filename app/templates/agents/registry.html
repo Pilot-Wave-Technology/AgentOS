@@ -1,0 +1,888 @@
+{% extends "base.html" %}
+{% block title %}Agent Registry{% endblock %}
+{% block content %}
+<div class="p-8 max-w-6xl mx-auto">
+  <a href="/settings" class="inline-flex items-center gap-1 text-xs text-gray-500 hover:text-gray-300 transition-colors mb-5">
+    <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"/></svg>
+    Settings
+  </a>
+  <div class="flex items-center justify-between mb-8">
+    <div>
+      <h1 class="text-2xl font-bold">Agent Registry</h1>
+      <p class="text-gray-400 text-sm mt-1">Agent templates: blueprints used when spinning up agent instances</p>
+    </div>
+    <div class="flex gap-2">
+      <button onclick="openCreateModal()" class="btn btn-primary btn-sm">
+        + New Agent
+      </button>
+    </div>
+  </div>
+
+  {% if agents or q %}
+  <div class="flex items-center justify-between mb-4">
+    <div class="flex items-center gap-3">
+      <div class="relative">
+        <input id="agent-search" type="text"
+          placeholder="Search name, ID, type, model… (Enter)"
+          value="{{ q }}"
+          oninput="filterAgents(this.value)"
+          onkeydown="if(event.key==='Enter'){window.location.href='/agents?q='+encodeURIComponent(this.value)}"
+          class="px-3 py-1.5 bg-gray-800 border border-gray-700 rounded-lg text-sm focus:outline-none focus:border-indigo-500 w-72 pr-8" />
+        {% if q %}
+        <a href="/agents" class="absolute right-2 top-1/2 -translate-y-1/2 text-gray-500 hover:text-gray-300 text-xs">✕</a>
+        {% endif %}
+      </div>
+      <span id="agent-count" class="text-xs text-gray-500">
+        {% if q %}
+          {{ total }} result{{ 's' if total != 1 else '' }} for "{{ q }}"
+        {% else %}
+          {{ page_start }}–{{ page_end }} of {{ total }} agent{{ 's' if total != 1 else '' }}
+        {% endif %}
+      </span>
+    </div>
+    <div class="flex items-center gap-2">
+      {% if prev_url %}
+      <a href="{{ prev_url }}" class="btn btn-secondary btn-sm">← Prev</a>
+      {% endif %}
+      {% if not q %}<span class="text-xs text-gray-600">Page {{ page_num }}</span>{% endif %}
+      {% if next_url %}
+      <a href="{{ next_url }}" class="btn btn-secondary btn-sm">Next →</a>
+      {% endif %}
+    </div>
+  </div>
+
+  <div class="overflow-x-auto">
+    <table class="w-full text-sm">
+      <thead class="text-xs text-gray-500 uppercase border-b border-gray-800">
+        <tr>
+          <th class="text-left pb-3 pr-6">ID / Name</th>
+          <th class="text-left pb-3 pr-6">Type / Scope</th>
+          <th class="text-left pb-3 pr-6">Model</th>
+          <th class="text-left pb-3 pr-6">Tools</th>
+          <th class="text-left pb-3">Actions</th>
+        </tr>
+      </thead>
+      <tbody class="divide-y divide-gray-800/60">
+        {% for a in agents %}
+        <tr class="hover:bg-gray-900/40 agent-row transition-colors" data-search="{{ a.id }} {{ a.name }} {{ a.type }} {{ a.scope }} {{ a.model }}">
+          <td class="py-3 pr-6">
+            <div class="flex items-center gap-2.5">
+              {% if a.emoji %}<span class="text-xl leading-none">{{ a.emoji }}</span>{% endif %}
+              <div>
+                <div class="font-mono text-xs text-indigo-400 leading-tight">{{ a.id }}</div>
+                <div class="font-medium text-gray-100 mt-0.5">{{ a.name }}</div>
+              </div>
+            </div>
+          </td>
+          <td class="py-3 pr-6">
+            <div class="flex flex-col gap-1">
+              <span class="pill {% if a.type == 'SHCA' %}pill-info{% elif a.type == 'GO' %}pill-success{% elif a.type == 'RA' %}bg-amber-900/40 text-amber-300{% else %}bg-purple-900/40 text-purple-300{% endif %} self-start">{{ 'Assistant' if a.type == 'SHCA' else a.type }}</span>
+              <span class="pill {% if a.scope == 'goal' %}pill-warning{% else %}pill-neutral{% endif %} self-start">{{ a.scope or "task" }}</span>
+            </div>
+          </td>
+          <td class="py-3 pr-6">
+            <div class="font-mono text-xs text-gray-300">{{ a.model.split("/")[-1] if "/" in a.model else a.model }}</div>
+            {% if a.memory_enabled %}
+            <div class="flex items-center gap-1 mt-0.5">
+              <span class="w-1.5 h-1.5 rounded-full bg-indigo-500 flex-shrink-0"></span>
+              <span class="text-2xs text-indigo-400">memory</span>
+            </div>
+            {% endif %}
+          </td>
+          <td class="py-3 pr-6">
+            {% set tc = (a.tools_allow or []) | length %}
+            {% if tc > 0 %}
+            <span class="pill pill-neutral cursor-default" title="{{ (a.tools_allow) | join(', ') }}">{{ tc }} tools</span>
+            {% else %}
+            <span class="text-gray-600 text-xs">default</span>
+            {% endif %}
+          </td>
+          <td class="py-3">
+            <div class="flex items-center gap-1.5">
+              <button onclick="openEditModal('{{ a.id }}')" class="btn btn-secondary btn-sm">Edit</button>
+              <button onclick="deleteAgent('{{ a.id }}')" class="btn btn-danger btn-sm">Delete</button>
+            </div>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <div class="text-center py-24 text-gray-500">
+    <div class="text-5xl mb-4 opacity-20">⬡</div>
+    <p class="text-base font-medium text-gray-400 mb-1">No agents yet</p>
+    <p class="text-sm mb-5">Create the first agent to populate this registry.</p>
+    <button onclick="openCreateModal()" class="btn btn-primary">+ New Agent</button>
+  </div>
+  {% endif %}
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<!-- Create Agent Modal: Multi-step wizard                                -->
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<div id="modal-create-agent" class="hidden fixed inset-0 bg-black/70 flex items-start justify-center z-50 p-4 overflow-y-auto">
+  <div class="bg-gray-900 border border-gray-800 rounded-xl w-full max-w-2xl my-8 shadow-2xl">
+    <!-- Header -->
+    <div class="flex items-center justify-between px-5 py-4 border-b border-gray-800">
+      <h2 class="text-base font-semibold">New Agent</h2>
+      <button onclick="closeCreateModal()" class="text-gray-600 hover:text-gray-300 transition-colors text-xl leading-none">&times;</button>
+    </div>
+
+    <!-- Step indicator -->
+    <div class="px-5 pt-4 pb-3 border-b border-gray-800">
+      <div class="flex items-center">
+        <button onclick="switchTab('basics')" data-tab="basics" class="tab-btn flex items-center gap-1.5">
+          <span class="step-num w-5 h-5 rounded-full text-xs flex items-center justify-center font-semibold flex-shrink-0 bg-indigo-600 text-white transition-all">1</span>
+          <span class="step-lbl text-xs font-medium text-white transition-colors whitespace-nowrap">Basics</span>
+        </button>
+        <div class="flex-1 h-px bg-gray-700 mx-2 max-w-[28px] flex-shrink-0"></div>
+        <button onclick="switchTab('instructions')" data-tab="instructions" class="tab-btn flex items-center gap-1.5">
+          <span class="step-num w-5 h-5 rounded-full text-xs flex items-center justify-center font-semibold flex-shrink-0 bg-gray-800 text-gray-600 transition-all">2</span>
+          <span class="step-lbl text-xs font-medium text-gray-600 transition-colors whitespace-nowrap">Instructions</span>
+        </button>
+        <div class="flex-1 h-px bg-gray-700 mx-2 max-w-[28px] flex-shrink-0"></div>
+        <button onclick="switchTab('persona')" data-tab="persona" class="tab-btn flex items-center gap-1.5">
+          <span class="step-num w-5 h-5 rounded-full text-xs flex items-center justify-center font-semibold flex-shrink-0 bg-gray-800 text-gray-600 transition-all">3</span>
+          <span class="step-lbl text-xs font-medium text-gray-600 transition-colors whitespace-nowrap">Persona</span>
+        </button>
+        <div class="flex-1 h-px bg-gray-700 mx-2 max-w-[28px] flex-shrink-0"></div>
+        <button onclick="switchTab('tools')" data-tab="tools" class="tab-btn flex items-center gap-1.5">
+          <span class="step-num w-5 h-5 rounded-full text-xs flex items-center justify-center font-semibold flex-shrink-0 bg-gray-800 text-gray-600 transition-all">4</span>
+          <span class="step-lbl text-xs font-medium text-gray-600 transition-colors whitespace-nowrap">Tools</span>
+        </button>
+        <div class="flex-1 h-px bg-gray-700 mx-2 max-w-[28px] flex-shrink-0"></div>
+        <button onclick="switchTab('files')" data-tab="files" class="tab-btn flex items-center gap-1.5">
+          <span class="step-num w-5 h-5 rounded-full text-xs flex items-center justify-center font-semibold flex-shrink-0 bg-gray-800 text-gray-600 transition-all">5</span>
+          <span class="step-lbl text-xs font-medium text-gray-600 transition-colors whitespace-nowrap">Files</span>
+        </button>
+      </div>
+      <div class="mt-3 h-0.5 bg-gray-800 rounded-full overflow-hidden">
+        <div id="tab-progress" class="h-full bg-indigo-600 rounded-full transition-all duration-300" style="width: 20%"></div>
+      </div>
+    </div>
+
+    <form id="create-agent-form">
+      <!-- Tab: Basics -->
+      <div id="tab-basics" class="tab-panel p-5 space-y-4">
+        <div class="grid grid-cols-3 gap-3">
+          <div class="col-span-2">
+            <label class="block text-xs text-gray-400 mb-1.5">Agent ID <span class="text-gray-600">(slug)</span></label>
+            <input name="id" required placeholder="e.g. ia-researcher"
+              class="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm focus:outline-none focus:border-indigo-500 font-mono" />
+          </div>
+          <div>
+            <label class="block text-xs text-gray-400 mb-1.5">Emoji</label>
+            <input name="emoji" placeholder="🤖" maxlength="4"
+              class="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-lg text-center focus:outline-none focus:border-indigo-500" />
+          </div>
+        </div>
+
+        <div>
+          <label class="block text-xs text-gray-400 mb-1.5">Display Name</label>
+          <input name="name" required placeholder="Research Assistant"
+            class="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm focus:outline-none focus:border-indigo-500" />
+        </div>
+
+        <div class="grid grid-cols-3 gap-3">
+          <div>
+            <label class="block text-xs text-gray-400 mb-1.5">Type</label>
+            <select name="type" id="create-type-select" onchange="updateCreateHints()" class="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm focus:outline-none focus:border-indigo-500">
+              <option value="SHCA">Assistant: Coordinator</option>
+              <option value="IA">IA: Independent worker</option>
+              <option value="RA">RA: Reviewer</option>
+            </select>
+          </div>
+          <div>
+            <label class="block text-xs text-gray-400 mb-1.5">Scope</label>
+            <select name="scope" id="create-scope-select" onchange="updateCreateHints()" class="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm focus:outline-none focus:border-indigo-500">
+              <option value="task">Task: assigned tasks only</option>
+              <option value="goal">Goal: full project context</option>
+            </select>
+          </div>
+          <div>
+            <label class="block text-xs text-gray-400 mb-1.5">Model</label>
+            <select name="model" id="model-select" class="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm focus:outline-none focus:border-indigo-500">
+              {% for m in models %}
+              <option value="{{ m }}">{{ m.split("/")[-1] if "/" in m else m }}</option>
+              {% endfor %}
+            </select>
+          </div>
+        </div>
+        <div id="create-type-hint" class="px-3 py-2 bg-gray-800/50 rounded-lg border border-gray-700/50 text-xs text-gray-400 leading-relaxed"></div>
+
+        <div class="grid grid-cols-2 gap-3">
+          <div>
+            <label class="block text-xs text-gray-400 mb-1.5">Max tokens <span class="text-gray-600">(optional)</span></label>
+            <input name="max_tokens" type="number" min="1" placeholder="leave blank for default"
+              class="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm focus:outline-none focus:border-indigo-500" />
+          </div>
+          <div id="create-memory-section" class="flex flex-col justify-end pb-1 gap-1">
+            <label class="flex items-center gap-2 text-sm cursor-pointer select-none">
+              <input type="checkbox" name="memory_enabled" class="accent-indigo-500 w-4 h-4" />
+              <span class="text-gray-300">Enable memory</span>
+            </label>
+            <p class="text-2xs text-gray-600">Persists a MEMORY.md summary across sessions. Recommended for Assistants on long-running goals.</p>
+          </div>
+        </div>
+
+        <div>
+          <label class="block text-xs text-gray-400 mb-1.5">Notes <span class="text-gray-600">(internal, not sent to agent)</span></label>
+          <textarea name="notes" rows="2" placeholder="Optional internal notes…"
+            class="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm focus:outline-none focus:border-indigo-500 resize-none"></textarea>
+        </div>
+      </div>
+
+      <!-- Tab: Instructions (AGENTS.md) -->
+      <div id="tab-instructions" class="tab-panel p-5 space-y-3 hidden">
+        <div>
+          <div class="flex items-center justify-between mb-1.5">
+            <label class="text-xs text-gray-400 font-medium">Operating Instructions <span class="text-gray-600">(AGENTS.md)</span></label>
+            <span class="text-xs text-gray-600">loaded every session</span>
+          </div>
+          <textarea name="base_system_prompt" rows="15"
+            placeholder="{{ file_types['AGENTS.md'].placeholder }}"
+            class="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-xs focus:outline-none focus:border-indigo-500 font-mono resize-y"></textarea>
+          <p class="text-xs text-gray-600 mt-1.5">Defines what the agent does, how it behaves, rules, and workflows. This is the most important file.</p>
+        </div>
+      </div>
+
+      <!-- Tab: Persona -->
+      <div id="tab-persona" class="tab-panel p-5 space-y-4 hidden">
+        <div>
+          <div class="flex items-center justify-between mb-1.5">
+            <label class="text-xs text-gray-400 font-medium">Persona & Boundaries <span class="text-gray-600">(SOUL.md)</span></label>
+            <span class="text-xs text-gray-600">personality, tone, hard limits</span>
+          </div>
+          <textarea name="soul" rows="8"
+            placeholder="{{ file_types['SOUL.md'].placeholder }}"
+            class="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-xs focus:outline-none focus:border-indigo-500 font-mono resize-y"></textarea>
+        </div>
+
+        <div>
+          <div class="flex items-center justify-between mb-1.5">
+            <label class="text-xs text-gray-400 font-medium">User Information <span class="text-gray-600">(USER.md)</span></label>
+            <span class="text-xs text-gray-600">background about the users</span>
+          </div>
+          <textarea name="file_USER_md" rows="5"
+            placeholder="{{ file_types['USER.md'].placeholder }}"
+            class="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-xs focus:outline-none focus:border-indigo-500 font-mono resize-y"></textarea>
+        </div>
+
+        <div>
+          <div class="flex items-center justify-between mb-1.5">
+            <label class="text-xs text-gray-400 font-medium">Identity <span class="text-gray-600">(IDENTITY.md)</span></label>
+            <span class="text-xs text-gray-600">name, emoji, avatar, theme</span>
+          </div>
+          <textarea name="file_IDENTITY_md" rows="3"
+            placeholder="{{ file_types['IDENTITY.md'].placeholder }}"
+            class="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-xs focus:outline-none focus:border-indigo-500 font-mono resize-y"></textarea>
+        </div>
+      </div>
+
+      <!-- Tab: Tools -->
+      <div id="tab-tools" class="tab-panel p-5 space-y-4 hidden">
+        <p class="text-xs text-gray-500">Select tools this agent is allowed or denied. Leave both empty to use defaults.</p>
+        <div class="grid grid-cols-2 gap-4">
+          <div>
+            <label class="block text-xs text-gray-400 mb-2">Allow</label>
+            <div class="space-y-1.5 p-3 bg-gray-800/60 rounded-lg border border-gray-700/60 max-h-48 overflow-y-auto">
+              {% for t in tool_options %}
+              <label class="flex items-center gap-2 text-xs cursor-pointer hover:text-gray-200 transition-colors">
+                <input type="checkbox" name="tools_allow" value="{{ t }}" class="accent-indigo-500" />
+                {{ t }}
+              </label>
+              {% endfor %}
+            </div>
+          </div>
+          <div>
+            <label class="block text-xs text-gray-400 mb-2">Deny</label>
+            <div class="space-y-1.5 p-3 bg-gray-800/60 rounded-lg border border-gray-700/60 max-h-48 overflow-y-auto">
+              {% for t in tool_options %}
+              <label class="flex items-center gap-2 text-xs cursor-pointer hover:text-gray-200 transition-colors">
+                <input type="checkbox" name="tools_deny" value="{{ t }}" class="accent-red-500" />
+                {{ t }}
+              </label>
+              {% endfor %}
+            </div>
+          </div>
+        </div>
+
+        <div>
+          <div class="flex items-center justify-between mb-1.5">
+            <label class="text-xs text-gray-400 font-medium">Tools Documentation <span class="text-gray-600">(TOOLS.md)</span></label>
+            <span class="text-xs text-gray-600">custom API/tool docs</span>
+          </div>
+          <textarea name="file_TOOLS_md" rows="5"
+            placeholder="{{ file_types['TOOLS.md'].placeholder }}"
+            class="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-xs focus:outline-none focus:border-indigo-500 font-mono resize-y"></textarea>
+        </div>
+      </div>
+
+      <!-- Tab: Files (optional, all editable post-creation) -->
+      <div id="tab-files" class="tab-panel p-5 space-y-4 hidden">
+        <p class="text-xs text-gray-500">Optional workspace files: can all be edited after creation from the agent detail page.</p>
+
+        <div>
+          <div class="flex items-center justify-between mb-1.5">
+            <label class="text-xs text-gray-400 font-medium">Heartbeat Checklist <span class="text-gray-600">(HEARTBEAT.md)</span></label>
+            <span class="text-xs text-gray-600">periodic background tasks</span>
+          </div>
+          <textarea name="file_HEARTBEAT_md" rows="4"
+            placeholder="{{ file_types['HEARTBEAT.md'].placeholder }}"
+            class="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-xs focus:outline-none focus:border-indigo-500 font-mono resize-y"></textarea>
+        </div>
+
+        <div>
+          <div class="flex items-center justify-between mb-1.5">
+            <label class="text-xs text-gray-400 font-medium">Bootstrap / First-Run <span class="text-gray-600">(BOOTSTRAP.md)</span></label>
+            <span class="text-xs text-gray-600">one-time setup on first activation</span>
+          </div>
+          <textarea name="file_BOOTSTRAP_md" rows="4"
+            placeholder="{{ file_types['BOOTSTRAP.md'].placeholder }}"
+            class="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-xs focus:outline-none focus:border-indigo-500 font-mono resize-y"></textarea>
+        </div>
+
+        <div id="create-memory-file-section">
+          <div class="flex items-center justify-between mb-1.5">
+            <label class="text-xs text-gray-400 font-medium">Long-Term Memory <span class="text-gray-600">(MEMORY.md)</span></label>
+            <span class="text-xs text-gray-600">curated persistent memory</span>
+          </div>
+          <textarea name="file_MEMORY_md" rows="4"
+            placeholder="{{ file_types['MEMORY.md'].placeholder }}"
+            class="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-xs focus:outline-none focus:border-indigo-500 font-mono resize-y"></textarea>
+        </div>
+      </div>
+
+      <!-- Footer -->
+      <div class="flex items-center justify-between p-5 border-t border-gray-800">
+        <div class="flex items-center gap-3">
+          <button type="button" id="btn-prev" onclick="prevTab()" style="display:none" class="btn btn-secondary btn-sm">
+            ← Previous
+          </button>
+          <span id="create-error" class="hidden text-xs text-red-400"></span>
+        </div>
+        <div class="flex items-center gap-2">
+          <button type="button" onclick="closeCreateModal()"
+            class="text-sm text-gray-500 hover:text-gray-300 px-3 py-1.5 transition-colors">Cancel</button>
+          <button type="button" id="btn-next" onclick="nextTab()" class="btn btn-secondary btn-sm">
+            Next →
+          </button>
+          <button type="button" id="btn-create" onclick="submitCreateAgent()"
+            style="display:none" class="btn btn-primary btn-sm">
+            Create Agent
+          </button>
+        </div>
+      </div>
+    </form>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<!-- Edit Agent Modal                                                      -->
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<div id="modal-edit-agent" class="hidden fixed inset-0 bg-black/70 flex items-start justify-center z-50 p-4 overflow-y-auto">
+  <div class="bg-gray-900 border border-gray-800 rounded-xl w-full max-w-2xl my-8 shadow-2xl">
+    <div class="flex items-center justify-between px-5 py-4 border-b border-gray-800">
+      <div>
+        <h2 class="text-base font-semibold">Edit Agent</h2>
+        <p id="edit-agent-id" class="text-xs text-indigo-400 font-mono mt-0.5"></p>
+      </div>
+      <button onclick="closeEditModal()" class="text-gray-600 hover:text-gray-300 transition-colors text-xl leading-none">&times;</button>
+    </div>
+
+    <div id="edit-loading" class="p-10 text-center text-gray-500 text-sm">Loading…</div>
+
+    <form id="edit-agent-form" class="hidden">
+      <div class="p-5 space-y-4">
+        <div class="grid grid-cols-3 gap-3">
+          <div class="col-span-2">
+            <label class="block text-xs text-gray-400 mb-1.5">Display Name</label>
+            <input name="name" required
+              class="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm focus:outline-none focus:border-indigo-500" />
+          </div>
+          <div>
+            <label class="block text-xs text-gray-400 mb-1.5">Emoji</label>
+            <input name="emoji" maxlength="4"
+              class="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-lg text-center focus:outline-none focus:border-indigo-500" />
+          </div>
+        </div>
+
+        <div class="grid grid-cols-3 gap-3">
+          <div>
+            <label class="block text-xs text-gray-400 mb-1.5">Type</label>
+            <select name="type" onchange="updateEditTypeUI()" class="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm focus:outline-none focus:border-indigo-500">
+              <option value="SHCA">Assistant: Coordinator</option>
+              <option value="IA">IA: Independent worker</option>
+              <option value="GO">GO: Goal orchestrator</option>
+              <option value="RA">RA: Reviewer</option>
+            </select>
+          </div>
+          <div>
+            <label class="block text-xs text-gray-400 mb-1.5">Scope</label>
+            <select name="scope" class="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm focus:outline-none focus:border-indigo-500">
+              <option value="task">Task: assigned tasks only</option>
+              <option value="goal">Goal: full project context</option>
+            </select>
+          </div>
+          <div>
+            <label class="block text-xs text-gray-400 mb-1.5">Model</label>
+            <select name="model" id="edit-model-select" class="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm focus:outline-none focus:border-indigo-500">
+              {% for m in models %}
+              <option value="{{ m }}">{{ m.split("/")[-1] if "/" in m else m }}</option>
+              {% endfor %}
+            </select>
+          </div>
+        </div>
+
+        <div class="grid grid-cols-2 gap-3">
+          <div>
+            <label class="block text-xs text-gray-400 mb-1.5">Max tokens <span class="text-gray-600">(optional)</span></label>
+            <input name="max_tokens" type="number" min="1"
+              class="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm focus:outline-none focus:border-indigo-500" />
+          </div>
+          <div id="edit-memory-section" class="flex items-end pb-1">
+            <label class="flex items-center gap-2 text-sm cursor-pointer select-none">
+              <input type="checkbox" name="memory_enabled" class="accent-indigo-500 w-4 h-4" />
+              <span class="text-gray-300">Enable memory</span>
+            </label>
+          </div>
+        </div>
+
+        <div>
+          <label class="block text-xs text-gray-400 mb-1.5">Notes</label>
+          <textarea name="notes" rows="2"
+            class="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm focus:outline-none focus:border-indigo-500 resize-none"></textarea>
+        </div>
+
+        <div class="border-t border-gray-800 pt-4 space-y-4">
+          <div>
+            <label class="block text-xs text-gray-400 mb-1.5">Operating Instructions <span class="text-gray-600">(AGENTS.md)</span></label>
+            <textarea name="base_system_prompt" rows="8"
+              class="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-xs focus:outline-none focus:border-indigo-500 font-mono resize-y"></textarea>
+          </div>
+          <div>
+            <label class="block text-xs text-gray-400 mb-1.5">Persona & Boundaries <span class="text-gray-600">(SOUL.md)</span></label>
+            <textarea name="soul" rows="5"
+              class="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-xs focus:outline-none focus:border-indigo-500 font-mono resize-y"></textarea>
+          </div>
+        </div>
+
+        <div class="border-t border-gray-800 pt-4">
+          <label class="block text-xs text-gray-400 mb-2">Tool Allow-list <span class="text-gray-600">(leave empty for all tools)</span></label>
+          <div class="grid grid-cols-4 gap-1 p-3 bg-gray-800/60 rounded-lg border border-gray-700/60 max-h-36 overflow-y-auto">
+            {% for t in tool_options %}
+            <label class="flex items-center gap-1.5 text-xs cursor-pointer hover:text-gray-200 transition-colors">
+              <input type="checkbox" name="tools_allow" value="{{ t }}" class="edit-tools-allow accent-indigo-500" />
+              {{ t }}
+            </label>
+            {% endfor %}
+          </div>
+        </div>
+      </div>
+
+      <div class="flex items-center justify-between p-5 border-t border-gray-800">
+        <span id="edit-error" class="hidden text-xs text-red-400"></span>
+        <div class="flex gap-2 ml-auto">
+          <button type="button" onclick="closeEditModal()"
+            class="text-sm text-gray-500 hover:text-gray-300 px-3 py-1.5 transition-colors">Cancel</button>
+          <button type="button" onclick="submitEditAgent()" class="btn btn-primary btn-sm">
+            Save Changes
+          </button>
+        </div>
+      </div>
+    </form>
+  </div>
+</div>
+
+
+<script>
+// ── Type + scope hint (create modal) ────────────────────────────────────
+const TYPE_HINTS = {
+  SHCA: 'You interact with this agent via chat. It coordinates work and responds to your messages in real time. Best for goal coordinators and personal assistants.',
+  IA:   'Fully autonomous: runs tasks assigned by a planner without human input. No direct chat. Best for background workers (researcher, coder, analyst).',
+  RA:   'Autonomous reviewer: evaluates and critiques work produced by other agents. No generative output. Best for QA, fact-checking, and approval stages.',
+};
+const SCOPE_HINTS = {
+  task: 'Sees only the tasks explicitly assigned to it. Isolated context: good for focused workers.',
+  goal: 'Sees the full goal: all tasks, team members, and shared context. Required for planners and coordinators.',
+};
+
+function updateCreateHints() {
+  const type  = document.getElementById('create-type-select')?.value;
+  const scope = document.getElementById('create-scope-select')?.value;
+  const el = document.getElementById('create-type-hint');
+  if (!el) return;
+  const parts = [];
+  if (TYPE_HINTS[type])  parts.push('<strong>Type:</strong> ' + TYPE_HINTS[type]);
+  if (SCOPE_HINTS[scope]) parts.push('<strong>Scope:</strong> ' + SCOPE_HINTS[scope]);
+  el.innerHTML = parts.join('<br class="mb-1">');
+  el.style.display = parts.length ? '' : 'none';
+
+  const isIA = type === 'IA';
+  const memSection = document.getElementById('create-memory-section');
+  const memFileSection = document.getElementById('create-memory-file-section');
+  if (memSection) {
+    memSection.style.display = isIA ? 'none' : '';
+    if (isIA) memSection.querySelector('input[name="memory_enabled"]').checked = false;
+  }
+  if (memFileSection) memFileSection.style.display = isIA ? 'none' : '';
+}
+
+// ── Agent list filter ───────────────────────────────────────────────────
+function filterAgents(query) {
+  const q = query.toLowerCase();
+  const rows = document.querySelectorAll('.agent-row');
+  let visible = 0;
+  rows.forEach(row => {
+    const match = row.dataset.search.toLowerCase().includes(q);
+    row.style.display = match ? '' : 'none';
+    if (match) visible++;
+  });
+  const total = {{ total }};
+  const pageStart = {{ page_start }};
+  const pageEnd = {{ page_end }};
+  document.getElementById('agent-count').textContent = q
+    ? `${visible} shown: ${pageStart}–${pageEnd} of ${total} total`
+    : `${pageStart}–${pageEnd} of ${total} agents`;
+}
+
+// ── Tab / step navigation ────────────────────────────────────────────────
+const TABS = ['basics', 'instructions', 'persona', 'tools', 'files'];
+let currentTab = 0;
+
+function switchTab(name) {
+  currentTab = TABS.indexOf(name);
+  document.querySelectorAll('.tab-panel').forEach(p => p.classList.add('hidden'));
+  document.getElementById('tab-' + name).classList.remove('hidden');
+
+  // Update step indicator
+  document.querySelectorAll('.tab-btn').forEach((btn, i) => {
+    const num = btn.querySelector('.step-num');
+    const lbl = btn.querySelector('.step-lbl');
+    if (!num) return;
+    if (i < currentTab) {
+      num.className = 'step-num w-5 h-5 rounded-full text-xs flex items-center justify-center font-semibold flex-shrink-0 bg-indigo-900 text-indigo-400 transition-all';
+      num.textContent = '✓';
+      lbl.className = 'step-lbl text-xs font-medium text-gray-500 transition-colors whitespace-nowrap';
+    } else if (i === currentTab) {
+      num.className = 'step-num w-5 h-5 rounded-full text-xs flex items-center justify-center font-semibold flex-shrink-0 bg-indigo-600 text-white transition-all';
+      num.textContent = String(i + 1);
+      lbl.className = 'step-lbl text-xs font-medium text-white transition-colors whitespace-nowrap';
+    } else {
+      num.className = 'step-num w-5 h-5 rounded-full text-xs flex items-center justify-center font-semibold flex-shrink-0 bg-gray-800 text-gray-600 transition-all';
+      num.textContent = String(i + 1);
+      lbl.className = 'step-lbl text-xs font-medium text-gray-600 transition-colors whitespace-nowrap';
+    }
+  });
+
+  // Progress bar
+  const progress = Math.round(((currentTab + 1) / TABS.length) * 100);
+  document.getElementById('tab-progress').style.width = progress + '%';
+
+  updateNavButtons();
+}
+
+function nextTab() {
+  if (currentTab < TABS.length - 1) switchTab(TABS[currentTab + 1]);
+}
+
+function prevTab() {
+  if (currentTab > 0) switchTab(TABS[currentTab - 1]);
+}
+
+function updateNavButtons() {
+  document.getElementById('btn-prev').style.display   = currentTab === 0                    ? 'none' : 'inline-flex';
+  document.getElementById('btn-next').style.display   = currentTab === TABS.length - 1      ? 'none' : 'inline-flex';
+  document.getElementById('btn-create').style.display = currentTab !== TABS.length - 1      ? 'none' : 'inline-flex';
+}
+
+// ── Modal open/close ────────────────────────────────────────────────────
+function openCreateModal() {
+  document.getElementById('modal-create-agent').classList.remove('hidden');
+  switchTab('basics');
+  fetchGatewayModels();
+  updateCreateHints();
+}
+
+function closeCreateModal() {
+  document.getElementById('modal-create-agent').classList.add('hidden');
+  document.getElementById('create-agent-form').reset();
+}
+
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') {
+    closeCreateModal();
+    closeEditModal();
+  }
+});
+
+// ── Fetch models from gateway ───────────────────────────────────────────
+const CLI_MODELS = [
+  { id: 'claude-cli/opus',   name: 'Claude Code (Opus)'   },
+  { id: 'claude-cli/sonnet', name: 'Claude Code (Sonnet)' },
+  { id: 'claude-cli/haiku',  name: 'Claude Code (Haiku)'  },
+];
+
+// Normalise a model ID into the slash-prefixed form OpenClaw requires.
+// Some OpenClaw builds return bare IDs (e.g. "gemini-2.5-flash") from
+// the models.list RPC; we need "google/gemini-2.5-flash" so agents.create
+// resolves the right provider. CLI IDs already contain "/" and pass
+// through unchanged. Mirrors the server-side helper in app/llm_models.py.
+function normalizeModelId(id) {
+  if (!id || id.includes('/')) return id;
+  const lc = id.toLowerCase();
+  if (lc.startsWith('gemini-'))                 return 'google/'    + id;
+  if (lc.startsWith('claude-'))                 return 'anthropic/' + id;
+  if (lc.startsWith('gpt-') ||
+      lc.startsWith('o1-')  ||
+      lc.startsWith('o3-'))                     return 'openai/'    + id;
+  return id;
+}
+
+function appendModelsToSelect(select, gatewayModels) {
+  select.innerHTML = '';
+  gatewayModels.forEach(m => {
+    const opt = document.createElement('option');
+    opt.value = normalizeModelId(m.id);
+    opt.textContent = m.name || opt.value;
+    select.appendChild(opt);
+  });
+  const divider = document.createElement('option');
+  divider.disabled = true;
+  divider.textContent = '── Claude Code (CLI) ──';
+  select.appendChild(divider);
+  CLI_MODELS.forEach(m => {
+    const opt = document.createElement('option');
+    opt.value = m.id;
+    opt.textContent = m.name;
+    select.appendChild(opt);
+  });
+}
+
+async function fetchGatewayModels() {
+  try {
+    const resp = await fetch('/api/gateway/models');
+    if (!resp.ok) return;
+    const data = await resp.json();
+    if (data.models && data.models.length > 0) {
+      const createSelect = document.getElementById('model-select');
+      if (createSelect) appendModelsToSelect(createSelect, data.models);
+      const editSelect = document.getElementById('edit-model-select');
+      if (editSelect) appendModelsToSelect(editSelect, data.models);
+    }
+  } catch (e) {
+    console.warn('Could not fetch gateway models:', e);
+  }
+}
+
+
+// ── Edit agent type-aware UI ─────────────────────────────────────────────
+function updateEditTypeUI() {
+  const form = document.getElementById('edit-agent-form');
+  const type = form?.querySelector('[name="type"]')?.value;
+  const memSection = document.getElementById('edit-memory-section');
+  if (!memSection) return;
+  const isIA = type === 'IA';
+  memSection.style.display = isIA ? 'none' : '';
+  if (isIA) memSection.querySelector('input[name="memory_enabled"]').checked = false;
+}
+
+// ── Edit agent modal ────────────────────────────────────────────────────
+let _editAgentId = null;
+
+async function openEditModal(id) {
+  _editAgentId = id;
+  document.getElementById('edit-agent-id').textContent = id;
+  document.getElementById('edit-loading').classList.remove('hidden');
+  document.getElementById('edit-agent-form').classList.add('hidden');
+  document.getElementById('edit-error').classList.add('hidden');
+  document.getElementById('modal-edit-agent').classList.remove('hidden');
+
+  try {
+    const resp = await fetch(`/api/v1/agents/${id}`);
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const agent = await resp.json();
+    _populateEditForm(agent);
+    document.getElementById('edit-loading').classList.add('hidden');
+    document.getElementById('edit-agent-form').classList.remove('hidden');
+  } catch (e) {
+    document.getElementById('edit-loading').textContent = 'Failed to load agent: ' + e.message;
+  }
+}
+
+function _populateEditForm(agent) {
+  const form = document.getElementById('edit-agent-form');
+  const set = (name, val) => {
+    const el = form.querySelector(`[name="${name}"]`);
+    if (!el) return;
+    if (el.type === 'checkbox') el.checked = !!val;
+    else el.value = val ?? '';
+  };
+  set('name', agent.name);
+  set('emoji', agent.emoji);
+  set('type', agent.type);
+  set('scope', agent.scope);
+  set('model', agent.model);
+  set('max_tokens', agent.max_tokens || '');
+  set('memory_enabled', agent.memory_enabled);
+  set('notes', agent.notes);
+  set('base_system_prompt', agent.base_system_prompt || '');
+  set('soul', agent.soul || '');
+
+  form.querySelectorAll('.edit-tools-allow').forEach(cb => {
+    cb.checked = (agent.tools_allow || []).includes(cb.value);
+  });
+  updateEditTypeUI();
+}
+
+function closeEditModal() {
+  document.getElementById('modal-edit-agent').classList.add('hidden');
+  _editAgentId = null;
+}
+
+async function submitEditAgent() {
+  if (!_editAgentId) return;
+  const form = document.getElementById('edit-agent-form');
+  const errEl = document.getElementById('edit-error');
+  const btn = form.querySelector('button[onclick="submitEditAgent()"]');
+  errEl.classList.add('hidden');
+
+  const getValue = name => form.querySelector(`[name="${name}"]`)?.value?.trim() ?? null;
+  const maxTokensRaw = getValue('max_tokens');
+  const toolsAllow = Array.from(form.querySelectorAll('.edit-tools-allow:checked')).map(el => el.value);
+
+  const patch = {
+    name:               getValue('name') || null,
+    emoji:              getValue('emoji'),
+    type:               getValue('type') || null,
+    scope:              getValue('scope') || null,
+    model:              getValue('model') || null,
+    max_tokens:         maxTokensRaw ? parseInt(maxTokensRaw, 10) : null,
+    memory_enabled:     form.querySelector('[name="memory_enabled"]')?.checked ?? null,
+    notes:              getValue('notes'),
+    base_system_prompt: getValue('base_system_prompt'),
+    soul:               getValue('soul'),
+    tools_allow:        toolsAllow,
+  };
+
+  btn.disabled = true;
+  btn.textContent = 'Saving…';
+
+  try {
+    const resp = await fetch(`/api/v1/agents/${_editAgentId}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(patch),
+    });
+    if (!resp.ok && resp.headers.get('content-type')?.includes('text/html')) {
+      throw new Error(`Server error (${resp.status})`);
+    }
+    const data = await resp.json();
+    if (data.ok) {
+      closeEditModal();
+      location.reload();
+    } else {
+      errEl.textContent = data.detail || data.error || 'Update failed';
+      errEl.classList.remove('hidden');
+    }
+  } catch (e) {
+    errEl.textContent = 'Error: ' + e.message;
+    errEl.classList.remove('hidden');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Save Changes';
+  }
+}
+
+// ── Create agent ────────────────────────────────────────────────────────
+async function submitCreateAgent() {
+  const form = document.getElementById('create-agent-form');
+  const btn = document.getElementById('btn-create');
+  const errEl = document.getElementById('create-error');
+  errEl.classList.add('hidden');
+  errEl.textContent = '';
+
+  const getValue = name => form.querySelector(`[name="${name}"]`)?.value?.trim() ?? '';
+  const getChecked = name => Array.from(form.querySelectorAll(`[name="${name}"]:checked`)).map(el => el.value);
+
+  const maxTokensRaw = getValue('max_tokens');
+  const files = {};
+  [['file_USER_md', 'USER.md'], ['file_IDENTITY_md', 'IDENTITY.md'],
+   ['file_TOOLS_md', 'TOOLS.md'], ['file_HEARTBEAT_md', 'HEARTBEAT.md'],
+   ['file_BOOTSTRAP_md', 'BOOTSTRAP.md'], ['file_MEMORY_md', 'MEMORY.md']
+  ].forEach(([field, filename]) => {
+    const content = getValue(field);
+    if (content) files[filename] = content;
+  });
+
+  const payload = {
+    id:                   getValue('id'),
+    name:                 getValue('name'),
+    type:                 getValue('type'),
+    scope:                getValue('scope'),
+    model:                getValue('model'),
+    emoji:                getValue('emoji'),
+    base_system_prompt:   getValue('base_system_prompt'),
+    soul:                 getValue('soul'),
+    tools_allow:          getChecked('tools_allow'),
+    tools_deny:           getChecked('tools_deny'),
+    memory_enabled:       form.querySelector('[name="memory_enabled"]')?.checked ?? false,
+    max_tokens:           maxTokensRaw ? parseInt(maxTokensRaw, 10) : null,
+    notes:                getValue('notes'),
+    files,
+  };
+
+  btn.disabled = true;
+  btn.textContent = 'Creating…';
+
+  try {
+    const resp = await fetch('/api/v1/agents', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    if (!resp.ok && resp.headers.get('content-type')?.includes('text/html')) {
+      throw new Error(`Server error (${resp.status})`);
+    }
+    const data = await resp.json();
+    if (data.ok) {
+      closeCreateModal();
+      location.reload();
+    } else {
+      const msg = data.detail || data.error || 'Agent creation failed';
+      errEl.textContent = msg;
+      errEl.classList.remove('hidden');
+    }
+  } catch (e) {
+    errEl.textContent = 'Error: ' + e.message;
+    errEl.classList.remove('hidden');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Create Agent';
+  }
+}
+
+// ── Delete agent ────────────────────────────────────────────────────────
+async function deleteAgent(id) {
+  const result = await window.confirmAction({
+    title: 'Delete this agent',
+    body: `This removes "${id}" from both the gateway and the registry.`,
+    phrase: `Delete ${id}`,
+    danger: true,
+  });
+  if (!result) return;
+  try {
+    const resp = await fetch(`/api/v1/agents/${id}`, { method: 'DELETE' });
+    if (resp.ok) {
+      location.reload();
+    } else {
+      const data = await resp.json();
+      showToast(data.detail || 'Delete failed', 'error');
+    }
+  } catch (e) {
+    showToast('Delete failed: ' + e.message, 'error');
+  }
+}
+</script>
+{% endblock %}

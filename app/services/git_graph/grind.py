@@ -1,0 +1,521 @@
+"""The grind loop (spec §5/§6) — drive each ACTIVE lease holder toward a clean,
+mergeable state by spawning engine-authored diff/fix stories, without ever merging
+(a human merges on the PR; detection finalizes).
+
+For each active lease holder (its (repo,trunk) slot), live-read the trunk and
+`compare`:
+  * behind_by > 0  → ensure a DIFF story exists (a normal `code` story, created_by
+    ='engine', in the node's merge group): "sync trunk into the branch + resolve".
+  * behind_by == 0 → the branch is current; it's ready for the merge story to open
+    the PR (build §7 opens it; this step just reports "ready").
+
+KEY (spec §0): the diff/fix → merge edge only SEQUENCES dispatch; the merge is
+authorized by LIVE git truth (behind_by==0 [+ checks green]), never by the edge
+state. So a cancelled/abandoned diff cannot prematurely let the merge proceed —
+the next grind pass re-`compare`s and re-spawns if still behind.
+
+diff/fix stories are `code` (same Claude phases, different brief) marked
+created_by='engine' + merge_group_id so plan derivation / GC / council EXCLUDE them
+(they're not goal work). Idempotent: a diff id is keyed on (node, trunk_sha) so a
+same-trunk re-detect is a no-op; an external push (new trunk_sha) supersedes the
+prior in-flight diff and spawns a fresh one (only one diff in flight per node).
+
+The CONSUMER that dispatches a spawned diff story to an assistant + opens the PR on
+behind_by==0 is build §7; the CI-red → fix-story path needs the PR's checks (§7).
+Step 6 builds the behind→diff drive + the engine-authored wiring; until §7
+dispatches it, a spawned diff sits 'proposed'.
+"""
+from __future__ import annotations
+
+import hashlib
+import logging
+
+from app.database import get_pool
+from app.ledger.journal import append_event
+
+from . import github_ops as gh
+from .dispatch import notify_story_branch_ready
+from .merge_lane import _finalize_merged
+from .node_errors import clear_node_error, record_node_github_failure
+from .reconcile import _SYSTEM_ACTOR_ID
+
+_log = logging.getLogger(__name__)
+
+# Read-only for the sync-check (compare + trunk read), the CI gate, and the PR
+# review-state read. The installation token only carries permissions requested at
+# mint time (intersected with what the App is granted), so each endpoint's perm MUST
+# be listed or it 403s even when the App has it:
+#   checks:read        → GET /commits/{ref}/check-runs (the CI gate)
+#   pull_requests:read → get_merge_state_status (the approved-PR / in-merge-queue
+#                        restack guard); without it that read silently degrades to
+#                        "not approved" and could restack+dismiss a human approval.
+_GRIND_PERMS = {"contents": "read", "metadata": "read", "checks": "read",
+                "pull_requests": "read"}
+# Opening the PR needs pull_requests:write (the App re-consent prerequisite).
+_PR_OPEN_PERMS = {"contents": "read", "metadata": "read", "pull_requests": "write"}
+# Distinct fix attempts (per head sha) before a perpetually-red PR is escalated.
+_MAX_FIX_ATTEMPTS = 5
+
+
+def _diff_story_id(node_id: str, trunk_sha: str) -> str:
+    """Deterministic, idempotent id keyed on (node, trunk_sha) — a same-trunk
+    re-detect maps to the same story (no duplicate); a new trunk_sha is a new diff."""
+    return "ds_" + hashlib.sha256(f"{node_id}:{trunk_sha}:diff".encode()).hexdigest()[:14]
+
+
+def _fix_story_id(node_id: str, head_sha: str) -> str:
+    """Idempotent id keyed on (node, head_sha) — a flaky check on the SAME head maps
+    to the same fix story (no churn); a new push (head_sha changes) is a new fix."""
+    return "fs_" + hashlib.sha256(f"{node_id}:{head_sha}:fix".encode()).hexdigest()[:14]
+
+
+async def run_grind_pass() -> dict:
+    """For each active lease holder, sync-check its branch vs live trunk and spawn a
+    diff story if behind. Leader-only, short-lived pool calls (no conn held across
+    GitHub I/O)."""
+    out = {"synced": 0, "diffs_spawned": 0, "fixes_spawned": 0, "prs_opened": 0,
+           "noop_merged": 0, "escalated": 0, "ready": 0}
+    pool = get_pool()
+    holders = await pool.fetch(
+        "SELECT q.node_id, n.git_repo_id, n.goal_id, n.branch_name, n.trunk_branch, "
+        "       n.pr_number, r.owner, r.name "
+        "FROM git_merge_queue q "
+        "JOIN git_nodes n ON n.id = q.node_id "
+        "JOIN git_repos r ON r.id = n.git_repo_id "
+        "WHERE q.status = 'active' "
+        "  AND n.state NOT IN ('MERGED', 'ABANDONED', 'ESCALATED')"  # don't grind a settled holder
+    )
+    for h in holders:
+        try:
+            await _grind_one(dict(h), out)
+        except Exception as exc:
+            # Surface EVERY grind GitHub failure on the node (UI error column) instead
+            # of only logging: an auth/permission failure (401/403/404) escalates +
+            # holds the lane; a transient one is recorded + retried. Covers the
+            # trunk/compare/server-merge/PR-open/checks/ref reads in _grind_one.
+            res = await record_node_github_failure(h["node_id"], exc, context="grind")
+            if res == "escalated":
+                out["escalated"] += 1
+            _log.exception("git-engine: grind failed for node %s (%s)", h["node_id"], res)
+    return out
+
+
+async def _escalate_node(node_id: str, reason: str) -> None:
+    """Escalate a node OUT of the grind + free its lease slot (one txn, so a crash
+    can't leave an ESCALATED node holding the active slot — the zombie sweep self-heals
+    regardless). promote_pending then advances the line."""
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute(
+                "UPDATE git_nodes SET state = 'ESCALATED', last_error = $2, updated_at = now() "
+                "WHERE id = $1 AND state NOT IN ('MERGED', 'ABANDONED')",
+                node_id, reason[:500])
+            await conn.execute(
+                "UPDATE git_merge_queue SET status = 'parked' WHERE node_id = $1", node_id)
+
+
+async def _grind_one(h: dict, out: dict) -> None:
+    owner, name = h["owner"], h["name"]
+    trunk_branch = h["trunk_branch"] or "main"
+    branch = h["branch_name"]
+    # GitHub I/O first (no DB conn held).
+    token = await gh.mint_repo_token(name, _GRIND_PERMS)
+
+    # §3 pre-flight protection gate (read once; reused for the required-checks scope).
+    try:
+        prot = await gh.get_effective_protection(token, owner, name, trunk_branch)
+    except Exception:
+        prot = {}
+    if prot.get("required_signatures"):
+        # Signing is DEFERRED in v1 (§0/§3.2): the assistant's pushes are UNSIGNED and a
+        # required-signing trunk would reject them forever → escalate, don't grind.
+        await _escalate_node(
+            h["node_id"],
+            f"trunk {trunk_branch} requires SIGNED commits (deferred in v1) — the engine "
+            f"cannot land it; reconfigure the trunk or enable gateway commit signing")
+        out["escalated"] += 1
+        return
+    if prot and not prot.get("manageable", False):
+        # No require-up-to-date + required check = the no-stale-merge backbone is missing
+        # (§3.1). We warn rather than refuse (many dev trunks intentionally lack strict
+        # checks); a stale merge is still bounded by GitHub's own behind/required-review.
+        _log.warning("git-engine: trunk %s/%s %s lacks require-up-to-date + a required "
+                     "check (no-stale-merge backbone, §3.1) — managing anyway",
+                     owner, name, trunk_branch)
+
+    trunk_sha = await gh.get_trunk_sha(token, owner, name, trunk_branch)
+    cmp = await gh.compare(token, owner, name, trunk_sha, branch)
+
+    # TOCTOU guard (web vs engine): the active-holder snapshot was read at the top of
+    # run_grind_pass, but a web-tier "Cancel lane" runs concurrently and can ABANDON this
+    # node + park its lease in between. Re-assert it still holds the active lease before
+    # any GitHub WRITE (open PR) or assistant story spawn, so we never act on a node a
+    # human just cancelled. (Reads above are harmless; the writes below are what matter.)
+    if not await get_pool().fetchval(
+        "SELECT 1 FROM git_merge_queue q JOIN git_nodes n ON n.id = q.node_id "
+        "WHERE q.node_id = $1 AND q.status = 'active' "
+        "  AND n.state NOT IN ('ABANDONED', 'MERGED', 'ESCALATED')",
+        h["node_id"],
+    ):
+        return
+
+    if cmp["behind_by"] > 0 and cmp["ahead_by"] > 0:
+        # Trunk has MOVED under this branch AND the branch still has its own un-merged
+        # work → hand integration to the assistant via a diff story — never an engine-
+        # side server merge. A clean *textual* merge is NOT proof the code is still
+        # correct: trunk may have changed an API, a signature, a shared file, or a
+        # contract this branch depends on, which git merges without conflict but leaves
+        # semantically broken. The assistant must merge trunk in, RECONCILE its work
+        # with the new trunk, and run the tests — work the engine can't do. (Idempotent:
+        # one diff story per trunk_sha; a fresh trunk movement supersedes it.)
+        #
+        # The `ahead_by > 0` gate is essential: the instant a human MERGES this branch's
+        # PR, trunk advances to the merge commit and the branch reads "behind_by >= 1"
+        # (its own merge commit) with ahead_by == 0 — it carries nothing trunk lacks.
+        # Without this gate, grind racing detection (grind ticks before detection
+        # finalizes the node) spawns a SPURIOUS integrate story for work that JUST
+        # landed. ahead_by == 0 means "fully contained in trunk" → fall through to the
+        # no-op/merged finalize below, never a diff story.
+        if h.get("pr_number"):
+            # FIRST: if the PR already MERGED/closed, the branch has LANDED (or been
+            # cancelled) — do NOT spawn a diff story; let detection finalize the node.
+            # Covers the SQUASH/REBASE merge race the ahead_by gate misses: those leave
+            # the branch's commits as non-ancestors of the new trunk, so ahead_by stays
+            # > 0 even though the branch just merged. `merged` is completion truth
+            # (verify-by-read), not SHA reachability.
+            try:
+                pr = await gh.get_pr(token, owner, name, h["pr_number"])
+            except Exception:
+                pr = {}
+            if pr.get("merged") or pr.get("state") == "closed":
+                out["ready"] += 1
+                return
+            try:
+                ms = await gh.get_merge_state_status(token, owner, name, h["pr_number"])
+            except Exception:
+                ms = {}
+            # Don't disrupt a PR a human has already APPROVED or that's IN THE MERGE
+            # QUEUE (a new push dismisses the approval / bumps it out). Leave it for the
+            # human to "Update branch" + re-review; GitHub surfaces the out-of-date banner.
+            if ms.get("review_decision") == "APPROVED" or ms.get("in_merge_queue"):
+                out["ready"] += 1
+                return
+        if await _ensure_diff_story(h, trunk_sha):   # assistant integrates + reconciles + tests
+            out["diffs_spawned"] += 1
+        return
+    # Branch carries nothing trunk lacks (ahead_by == 0) — either an empty branch, or
+    # one that's already FULLY MERGED into trunk (behind only by its own merge commit
+    # after a human merged the PR). Either way there's nothing to land or integrate →
+    # no-op finalize (mark MERGED, advance trunk, merge story done). Reuses the
+    # detection sink; idempotent if detection's own finalize also fires for the merge.
+    if cmp["ahead_by"] == 0:
+        await _finalize_merged(h["git_repo_id"], h["node_id"], trunk_sha,
+                               token, owner, name, trunk_branch)
+        out["noop_merged"] += 1
+        return
+    # Ahead + up-to-date → ensure a PR is open. The HUMAN reviews + merges it;
+    # detection finalizes. PR-open is idempotent (open_or_get_pr).
+    if not h.get("pr_number"):
+        if await _ensure_pr_open(h, trunk_branch):
+            out["prs_opened"] += 1
+            await clear_node_error(get_pool(), h["node_id"])  # recovered → clear stale error
+        return
+    # PR already open → check CI. A failing REQUIRED check spawns a fix story
+    # (dispatched to the assignee's SHCA); idempotent by head sha so a flaky check
+    # doesn't churn. Advisory (non-required) failures don't block merge → ignored.
+    #
+    # The CI gate must NOT be skipped on an auth/permission failure: an unreadable
+    # checks API means we can't prove CI is green. get_check_runs raises on non-2xx
+    # and the run_grind_pass classifier turns a 401/403/404 into ESCALATED+last_error
+    # (held, visible) rather than degrading to "no failures" (which could land
+    # CI-unverified code); a transient error is recorded + retried. So a plain call
+    # here is correct — do NOT swallow it.
+    checks = await gh.get_check_runs(token, owner, name, branch)
+    failed = checks["failed"]
+    if failed:
+        # Scope to REQUIRED checks (the only ones that block the human merge) using the
+        # protection we already read above. No required checks → don't auto-disrupt.
+        required = set(prot.get("required_checks") or [])
+        failed = [f for f in failed if f in required]
+    if failed:
+        pool = get_pool()
+        attempts = await pool.fetchval(
+            "SELECT repark_count FROM git_nodes WHERE id = $1", h["node_id"]) or 0
+        if attempts >= _MAX_FIX_ATTEMPTS:
+            # Perpetually-red CI — stop spawning fix stories; escalate + free the slot.
+            await _escalate_node(
+                h["node_id"], f"CI still failing after {attempts} fix attempts: "
+                              f"{', '.join(str(f) for f in failed[:4])}")
+            out["escalated"] += 1
+            return
+        head_sha = await gh.get_ref_sha(token, owner, name, branch) or ""
+        if head_sha and await _ensure_fix_story(h, head_sha, failed):
+            await pool.execute(
+                "UPDATE git_nodes SET repark_count = repark_count + 1 WHERE id = $1", h["node_id"])
+            out["fixes_spawned"] += 1
+    else:
+        out["ready"] += 1   # PR open + no required failure → awaiting the human merge
+        # Checks are green for this head → clear the stale error AND reset the fix-attempt
+        # counter, so _MAX_FIX_ATTEMPTS counts CONSECUTIVE unresolved failures, not lifetime
+        # pushes (a branch that legitimately needed >5 separate fixes over its life would
+        # otherwise be falsely escalated into the no-exit ESCALATED state).
+        await get_pool().execute(
+            "UPDATE git_nodes SET last_error = NULL, repark_count = 0, updated_at = now() "
+            "WHERE id = $1 AND (last_error IS NOT NULL OR repark_count <> 0)",
+            h["node_id"])
+
+
+async def _spawn_engine_code_story(
+    h: dict, sid: str, title: str, brief: str, thread_label: str, kind_tag: str,
+) -> bool:
+    """Spawn (idempotently) an engine-authored `code` story (a diff or fix) for the
+    active holder, wire it to the merge story, and NOTIFY the web tier to dispatch it
+    to the assignee's SHCA. Returns True iff a NEW story was created.
+
+    `kind_tag` ∈ {'diff','fix'} (ledger only). Only ONE engine story is in flight per
+    node at a time — spawning a new one supersedes any prior non-terminal engine code
+    story on the group (a fresh trunk_sha / head_sha means the old one is stale)."""
+    node_id = h["node_id"]
+    goal_id = h["goal_id"]
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            if await conn.fetchval("SELECT 1 FROM stories WHERE id = $1", sid):
+                return False  # this exact (node, sha, kind) story already exists
+            grp = await conn.fetchrow(
+                "SELECT merge_group_id FROM git_merge_group_nodes WHERE git_node_id = $1 LIMIT 1",
+                node_id,
+            )
+            if grp is None:
+                return False
+            merge_group_id = grp["merge_group_id"]
+            merge = await conn.fetchrow(
+                "SELECT id, assigned_to FROM stories "
+                "WHERE merge_group_id = $1 AND story_kind = 'merge' LIMIT 1",
+                merge_group_id,
+            )
+            last = await conn.fetchrow(
+                "SELECT story_id FROM git_node_stories WHERE git_node_id = $1 "
+                "ORDER BY seq DESC LIMIT 1",
+                node_id,
+            )
+            assignee = (merge["assigned_to"] if merge else "") or ""
+            depends = [last["story_id"]] if last else []
+            thread_id = "th" + sid
+
+            await conn.execute(
+                # execution_mode='operator' is REQUIRED: a diff/fix story must provision
+                # an OPERATOR workspace (single-branch clone of the engine-cut branch +
+                # git creds) so the assistant can pull trunk / commit / push. The column
+                # defaults to 'ia_dispatch' (no git workspace), which would make the story
+                # undispatchable as branch work AND invisible to the listener's
+                # operator-only poll backstop.
+                "INSERT INTO stories (id, goal_id, title, description, assigned_to, "
+                "  state, depends_on, thread_id, created_by, story_kind, merge_group_id, "
+                "  execution_mode) "
+                "VALUES ($1, $2, $3, $4, $5, 'proposed', $6, $7, 'engine', 'code', $8, "
+                "  'operator') "
+                "ON CONFLICT (id) DO NOTHING",
+                sid, goal_id, title, brief, assignee, depends, thread_id, merge_group_id,
+            )
+            await conn.execute(
+                "INSERT INTO threads (id, goal_id, created_by, title) "
+                "VALUES ($1, $2, 'engine', $3) ON CONFLICT (id) DO NOTHING",
+                thread_id, goal_id, thread_label,
+            )
+            # One engine story in flight per node: supersede prior non-terminal engine
+            # code stories on this group. Runs AFTER the INSERT so `id <> $2` excludes
+            # the story we just created.
+            await conn.execute(
+                "UPDATE stories SET state = 'cancelled', updated_at = now() "
+                "WHERE created_by = 'engine' AND story_kind = 'code' "
+                "  AND merge_group_id = $1 AND id <> $2 "
+                "  AND state NOT IN ('done', 'reviewed', 'cancelled', 'rejected')",
+                merge_group_id, sid,
+            )
+            # The merge story waits on this story (edge SEQUENCES dispatch; the live
+            # behind_by==0 + checks-green gate is the real merge authorization — §0).
+            if merge:
+                await conn.execute(
+                    "UPDATE stories SET depends_on = array_append(depends_on, $2) "
+                    "WHERE id = $1 AND NOT ($2 = ANY(depends_on))",
+                    merge["id"], sid,
+                )
+            # Link to the engine-cut branch resource so dispatch provisions ONTO the branch.
+            br = await conn.fetchrow(
+                "SELECT id FROM goal_resources WHERE goal_id = $1 AND kind = 'branch' "
+                "  AND repo_name = $2 AND branch_name = $3 AND status = 'active' LIMIT 1",
+                goal_id, h["name"], h["branch_name"],
+            )
+            if br:
+                await conn.execute(
+                    "INSERT INTO story_resources (story_id, resource_id, relation) "
+                    "VALUES ($1, $2, 'produces') ON CONFLICT DO NOTHING",
+                    sid, br["id"],
+                )
+            await append_event(
+                conn,
+                actor_id=_SYSTEM_ACTOR_ID, actor_type="system",
+                event_type="story.created",
+                payload={"story_id": sid, "title": title, "story_kind": "code",
+                         "engine_authored": kind_tag, "merge_group_id": merge_group_id,
+                         "assigned_user_id": assignee or ""},
+                context_goal_id=goal_id,
+            )
+    # Wake the web-tier branch-ready listener to bind this story to its assignee's SHCA
+    # + dispatch it (the engine worker can't provision/dispatch). Best-effort + the
+    # listener's poll backstop covers a missed NOTIFY.
+    try:
+        await notify_story_branch_ready(goal_id, sid)
+    except Exception:
+        _log.warning("git-engine: notify for engine %s story %s failed", kind_tag, sid)
+    _log.info("git-engine: spawned %s story %s for node %s", kind_tag, sid, node_id)
+    return True
+
+
+async def _ensure_diff_story(h: dict, trunk_sha: str) -> bool:
+    """Spawn (idempotently) a diff story for an active holder whose branch is BEHIND
+    trunk. Spawned for ANY behind state (not only conflicts): the assistant must bring
+    trunk in AND reconcile + test, because a clean text merge can still be semantically
+    broken. The brief IS the dispatch message the SHCA receives."""
+    branch, trunk = h["branch_name"], h["trunk_branch"]
+    sid = _diff_story_id(h["node_id"], trunk_sha)
+    # Name the workstream's OWN stories (the work we're trying to land) so the assistant
+    # knows what its branch contains and what it must keep working after integrating.
+    pool = get_pool()
+    members = await pool.fetch(
+        "SELECT s.title FROM git_node_stories gns JOIN stories s ON s.id = gns.story_id "
+        "WHERE gns.git_node_id = $1 AND s.created_by <> 'engine' AND s.story_kind = 'code' "
+        "ORDER BY gns.seq",
+        h["node_id"],
+    )
+    work = "; ".join(m["title"] for m in members if m["title"]) or "this branch's work"
+    title = f"Integrate {trunk} into {branch}"
+    brief = (
+        f"Your branch `{branch}` holds the work for: {work}. That work is finished and "
+        f"ready to merge into trunk `{trunk}` — but trunk has ADVANCED since your branch "
+        f"was cut: OTHER stories and/or humans have landed their own changes on `{trunk}` "
+        f"in the meantime. So `{branch}` is now BEHIND `{trunk}` and must be brought up to "
+        f"date before it can merge cleanly.\n"
+        f"Your job: bring those newer trunk changes into your branch and make sure your "
+        f"work still integrates with them. Stay ON `{branch}` — merging trunk INTO your "
+        f"branch does NOT count as switching branches and is exactly what you should do "
+        f"here (do not create or check out a different branch). Your git credentials are "
+        f"already configured.\n"
+        f"1. Pull trunk into your branch. Your clone is single-branch, so fetch the trunk "
+        f"ref BY NAME (a bare `git fetch` / `origin/{trunk}` won't have it):\n"
+        f"     git pull origin {trunk}\n"
+        f"   (equivalently: `git fetch origin {trunk}` then `git merge FETCH_HEAD`). This "
+        f"merges `{trunk}` into `{branch}`; you stay on `{branch}`.\n"
+        f"2. Resolve any merge conflicts.\n"
+        f"3. RECONCILE your work with what others changed on `{trunk}` — EVEN IF the merge "
+        f"was clean. Their changes may have moved/renamed files, changed an API/signature/"
+        f"contract your code calls, added a required step, or updated shared types. Read "
+        f"the incoming `{trunk}` changes and adapt your work so it still builds and behaves "
+        f"correctly against them.\n"
+        f"4. Run the build/tests and repair anything the integration broke.\n"
+        f"5. Commit and push: `git push origin {branch}`.\n"
+        f"Do NOT open a pull request — the engine opens/updates the merge PR once your "
+        f"branch is current with trunk and green."
+    )
+    return await _spawn_engine_code_story(
+        h, sid, title, brief, f"Sync: {branch[:60]}", "diff")
+
+
+async def _ensure_fix_story(h: dict, head_sha: str, failed: list) -> bool:
+    """Spawn (idempotently) a fix story for an active holder whose OPEN PR has failing
+    checks. Idempotent by head_sha so a flaky check on the same head doesn't churn."""
+    sid = _fix_story_id(h["node_id"], head_sha)
+    names = ", ".join(str(f) for f in failed[:6]) or "required checks"
+    title = f"Fix failing checks on {h['branch_name']}"
+    brief = (
+        f"The open PR for `{h['branch_name']}` has FAILING checks: {names}. Reproduce and "
+        f"fix the failures so the checks pass, then commit + push. Do NOT open a pull "
+        f"request — it is already open; pushing updates it."
+    )
+    return await _spawn_engine_code_story(
+        h, sid, title, brief, f"Fix: {h['branch_name'][:60]}", "fix")
+
+
+async def _ensure_pr_open(h: dict, trunk_branch: str) -> bool:
+    """Open the merge PR for a clean (up-to-date, ahead) active holder and pin its
+    pr_number on the node. The engine opens it via `open_or_get_pr` (idempotent —
+    422 → finds the existing open PR); the HUMAN reviews + merges on GitHub, and
+    detection finalizes. Returns True iff a PR is now pinned.
+
+    PR ATTRIBUTION (spec §0): the title/body name the workstream owner + goal + story.
+    (The commit AUTHOR = the assistant identity is set gateway-side when the assistant
+    commits — a deferred §7b gateway concern.)"""
+    pool = get_pool()
+    owner, name = h["owner"], h["name"]
+    branch, node_id, goal_id = h["branch_name"], h["node_id"], h["goal_id"]
+
+    merge = await pool.fetchrow(
+        "SELECT s.id, s.assigned_to FROM git_merge_group_nodes gmn "
+        "JOIN stories s ON s.merge_group_id = gmn.merge_group_id AND s.story_kind = 'merge' "
+        "WHERE gmn.git_node_id = $1 LIMIT 1",
+        node_id,
+    )
+    assignee = (merge["assigned_to"] if merge else "") or ""
+    who = assignee or "the workstream owner"
+    if assignee:
+        # Best-effort display name (users PK is `uid`; columns display_name/email).
+        try:
+            disp = await pool.fetchval(
+                "SELECT COALESCE(NULLIF(display_name, ''), NULLIF(email, '')) "
+                "FROM users WHERE uid = $1",
+                assignee,
+            )
+            if disp:
+                who = disp
+        except Exception:
+            pass
+
+    token = await gh.mint_repo_token(name, _PR_OPEN_PERMS)
+
+    # Merge-queue split (§8): on a trunk that REQUIRES a merge queue, the human
+    # ENQUEUES ("Merge when ready") and GitHub's queue lands it; the engine never
+    # enqueues/merges, only detects (merged / dequeued). Read it fresh from the trunk's
+    # effective protection (the `merge_queue` ruleset rule, readable with metadata) to
+    # word the PR body. NOT cached on git_repos — that flag is repo-scoped while the
+    # queue requirement is per-(repo,trunk); §10 can persist it per-trunk if needed.
+    queue_required = False
+    try:
+        prot = await gh.get_effective_protection(token, owner, name, trunk_branch)
+        queue_required = bool(prot.get("merge_queue_required"))
+    except Exception:
+        pass
+    merge_instr = (
+        "add this PR to the **merge queue** (\"Merge when ready\")" if queue_required
+        else "review and **merge this PR**"
+    )
+
+    title = f"Merge {branch} → {trunk_branch}"
+    body = (
+        f"Automated merge PR opened by the **Git Engine** for goal `{goal_id}`, "
+        f"workstream `{branch}`.\n\n"
+        f"Worked by **{who}**. To land the workstream, {merge_instr} — the engine "
+        f"detects the merge and unblocks dependents. Do not merge from the engine; "
+        f"the merge is yours."
+    )
+    pr = await gh.open_or_get_pr(token, owner, name, branch, trunk_branch, title, body)
+    status = await pool.execute(
+        "UPDATE git_nodes SET pr_number = $2, updated_at = now() "
+        "WHERE id = $1 AND pr_number IS NULL",
+        node_id, pr["number"],
+    )
+    _log.info("git-engine: opened merge PR #%s for node %s (%s → %s)",
+              pr["number"], node_id, branch, trunk_branch)
+    # Fire the one-time "PR opened" notice ONLY when THIS call flipped pr_number
+    # NULL->set ("UPDATE 1"); a re-grind or concurrent pass that finds it already
+    # pinned ("UPDATE 0") doesn't re-notify. The web-tier listener is also flag-gated
+    # (pr_opened_notified_at), so this is belt-and-suspenders. DB-only here — the
+    # engine worker has no session access; the web tier posts the chat card.
+    if isinstance(status, str) and status.strip().endswith(" 1"):
+        try:
+            from .dispatch import notify_git_pr_opened
+            await notify_git_pr_opened(goal_id, node_id)
+        except Exception:
+            _log.warning("git-engine: pr-opened notify failed for node %s", node_id)
+    return True

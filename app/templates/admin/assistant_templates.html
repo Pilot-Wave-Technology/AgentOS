@@ -1,0 +1,83 @@
+{% extends "base.html" %}
+{% block title %}Assistant Templates{% endblock %}
+{% block content %}
+<div class="p-6 lg:p-8 max-w-4xl mx-auto">
+  <div class="flex items-center justify-between mb-6">
+    <div>
+      <h1 class="text-xl font-semibold text-gray-100">Assistant Templates</h1>
+      <p class="text-sm text-gray-500 mt-0.5">Manage assistant templates available to all users</p>
+    </div>
+    <button onclick="document.getElementById('modal-create-template').classList.remove('hidden')"
+      class="btn btn-primary btn-sm">
+      <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"/>
+      </svg>
+      New Template
+    </button>
+  </div>
+
+  {% if templates %}
+  <div class="space-y-3">
+    {% for t in templates %}
+    <a href="/admin/assistant-templates/{{ t.id }}" class="card card-interactive block p-5 group">
+      <div class="flex items-center justify-between">
+        <div>
+          <div class="font-medium text-gray-200 group-hover:text-brand-light transition-colors">{{ t.name }}</div>
+          <div class="text-2xs text-gray-600 font-mono mt-0.5">{{ t.id }}</div>
+          {% if t.description %}
+          <div class="text-sm text-gray-500 mt-1">{{ t.description }}</div>
+          {% endif %}
+        </div>
+        <span class="pill pill-info">{{ t.model }}</span>
+      </div>
+    </a>
+    {% endfor %}
+  </div>
+  {% else %}
+  <div class="card p-12 text-center">
+    <p class="text-gray-500 text-sm">No templates yet. Create one to get started.</p>
+  </div>
+  {% endif %}
+</div>
+
+<!-- Create template modal -->
+<div id="modal-create-template" class="hidden fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50 p-4 overflow-y-auto"
+     onclick="if(event.target===this) this.classList.add('hidden')">
+  <div class="card w-full max-w-lg p-6 my-8">
+    <h2 class="text-lg font-semibold mb-4 text-gray-100">Create Assistant Template</h2>
+    <form action="/admin/assistant-templates" method="post" class="space-y-4" data-toast-submit data-fail="Failed to create template.">
+      <div class="grid grid-cols-2 gap-3">
+        <div>
+          <label class="block text-sm text-gray-400 mb-1.5">Template ID</label>
+          <input name="template_id" required class="input" placeholder="e.g., alpha-assistant" />
+        </div>
+        <div>
+          <label class="block text-sm text-gray-400 mb-1.5">Name</label>
+          <input name="name" required class="input" placeholder="e.g., Alpha Assistant" />
+        </div>
+      </div>
+      <div>
+        <label class="block text-sm text-gray-400 mb-1.5">Description</label>
+        <input name="description" class="input" placeholder="What makes this template special?" />
+      </div>
+      <div>
+        <label class="block text-sm text-gray-400 mb-1.5">Model</label>
+        <input name="model" class="input" value="google-flash-100k/gemini-2.5-flash-100k" />
+      </div>
+      <div>
+        <label class="block text-sm text-gray-400 mb-1.5">AGENTS.md (behavior instructions)</label>
+        <textarea name="agents_md" rows="6" class="input font-mono text-xs" placeholder="# Assistant: Project Manager Agent..."></textarea>
+      </div>
+      <div>
+        <label class="block text-sm text-gray-400 mb-1.5">SOUL.md (personality)</label>
+        <textarea name="soul_md" rows="4" class="input font-mono text-xs" placeholder="# Soul..."></textarea>
+      </div>
+      <div class="flex justify-end gap-2 pt-2">
+        <button type="button" onclick="document.getElementById('modal-create-template').classList.add('hidden')"
+          class="btn btn-secondary btn-sm">Cancel</button>
+        <button type="submit" class="btn btn-primary btn-sm">Create Template</button>
+      </div>
+    </form>
+  </div>
+</div>
+{% endblock %}

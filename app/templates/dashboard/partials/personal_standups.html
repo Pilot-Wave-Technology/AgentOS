@@ -1,0 +1,29 @@
+{% if personal.standups %}
+<div class="bg-gray-900 border border-gray-800 rounded-xl p-5">
+  <div class="flex items-center justify-between mb-3">
+    <h3 class="font-semibold">Recent Standups</h3>
+    <span class="text-xs text-gray-500">from your goals</span>
+  </div>
+  <div class="space-y-3">
+    {% for s in personal.standups %}
+    <div class="border-b border-gray-800 last:border-0 pb-3 last:pb-0">
+      <div class="flex items-baseline justify-between gap-2 mb-1">
+        <a href="/goals/{{ s.goal_id }}/orchestrator"
+           class="text-sm font-medium text-indigo-400 hover:text-indigo-300 transition-colors truncate">
+          {{ s.goal_name }}
+        </a>
+        <span class="text-xs text-gray-600 flex-shrink-0">{{ s.ago }}</span>
+      </div>
+      {% if s.summary %}
+      <p class="text-xs text-gray-400 line-clamp-2">{{ s.summary }}</p>
+      {% else %}
+      <p class="text-xs text-gray-600 italic">
+        <a href="/goals/{{ s.goal_id }}/orchestrator"
+           class="hover:text-gray-400 transition-colors">View standup →</a>
+      </p>
+      {% endif %}
+    </div>
+    {% endfor %}
+  </div>
+</div>
+{% endif %}

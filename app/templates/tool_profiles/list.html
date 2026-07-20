@@ -1,0 +1,101 @@
+{% extends "base.html" %}
+{% block title %}Tool Profiles{% endblock %}
+{% block content %}
+<div class="p-8 max-w-6xl mx-auto">
+
+  {# Page header #}
+  <div class="flex items-center justify-between mb-8">
+    <div>
+      <h1 class="text-2xl font-bold">Tool Profiles</h1>
+      <p class="text-gray-400 text-sm mt-1">
+        Named bundles of tools assigned to agent templates.
+        <a href="/settings/tools" class="text-indigo-400 hover:text-indigo-300 ml-2">→ Tool Catalog</a>
+      </p>
+    </div>
+    <a href="/settings/tool-profiles/new" class="btn btn-primary btn-sm">+ New Profile</a>
+  </div>
+
+  {% if profiles %}
+  {# Search + count #}
+  <div class="flex items-center justify-between mb-4">
+    <input id="profile-search" type="text" placeholder="Filter by ID or name…"
+      oninput="filterProfiles(this.value)"
+      class="px-3 py-1.5 bg-gray-800 border border-gray-700 rounded-lg text-sm focus:outline-none focus:border-indigo-500 w-80" />
+    <span class="text-xs text-gray-500">{{ profiles | length }} active profile{{ 's' if profiles | length != 1 else '' }}</span>
+  </div>
+
+  {# Profiles table #}
+  <div class="overflow-x-auto mb-10">
+    <table class="w-full text-sm">
+      <thead class="text-xs text-gray-500 uppercase border-b border-gray-800">
+        <tr>
+          <th class="text-left pb-3 pr-6">ID</th>
+          <th class="text-left pb-3 pr-6">Name</th>
+          <th class="text-left pb-3 pr-6">Tools</th>
+          <th class="text-left pb-3 pr-6">Description</th>
+          <th class="text-left pb-3">Actions</th>
+        </tr>
+      </thead>
+      <tbody class="divide-y divide-gray-800/60">
+        {% for p in profiles %}
+        <tr class="hover:bg-gray-900/40 profile-row transition-colors"
+            data-search="{{ p.id }} {{ p.name }} {{ p.description }}">
+          <td class="py-3 pr-6">
+            <span class="font-mono text-indigo-300 text-xs">{{ p.id }}</span>
+          </td>
+          <td class="py-3 pr-6 text-gray-200 font-medium">{{ p.name | replace('SHCA Coordinator', 'Assistant Coordinator') }}</td>
+          <td class="py-3 pr-6">
+            <span class="pill pill-info">{{ p.tool_names | length }} tool{{ 's' if p.tool_names | length != 1 else '' }}</span>
+          </td>
+          <td class="py-3 pr-6 text-gray-400 text-xs max-w-xs truncate">{{ p.description or 'Not Set' }}</td>
+          <td class="py-3">
+            <a href="/settings/tool-profiles/{{ p.id }}" class="btn btn-secondary btn-sm">Edit</a>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <div class="text-center py-16 border border-gray-800 rounded-xl mb-10">
+    <p class="text-gray-400 mb-4">No profiles defined yet.</p>
+    <a href="/settings/tool-profiles/new" class="btn btn-primary btn-sm">+ Create first profile</a>
+  </div>
+  {% endif %}
+
+  {# Deprecated profiles #}
+  {% if deprecated %}
+  <details class="border border-gray-800 rounded-lg">
+    <summary class="px-4 py-3 text-sm text-gray-500 cursor-pointer hover:text-gray-300 select-none">
+      {{ deprecated | length }} deprecated profile{{ 's' if deprecated | length != 1 else '' }}
+    </summary>
+    <div class="overflow-x-auto border-t border-gray-800">
+      <table class="w-full text-sm">
+        <tbody class="divide-y divide-gray-800/60">
+          {% for p in deprecated %}
+          <tr class="hover:bg-gray-900/40 transition-colors">
+            <td class="py-3 px-4 font-mono text-gray-600 text-xs">{{ p.id }}</td>
+            <td class="py-3 pr-4 text-gray-600">{{ p.name | replace('SHCA Coordinator', 'Assistant Coordinator') }}</td>
+            <td class="py-3 pr-4"><span class="pill pill-neutral">{{ p.tool_names | length }} tools</span></td>
+            <td class="py-3 pr-4"><span class="pill pill-neutral">deprecated</span></td>
+            <td class="py-3 pr-4"><a href="/settings/tool-profiles/{{ p.id }}" class="btn btn-secondary btn-sm">View</a></td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </details>
+  {% endif %}
+
+</div>
+
+<script>
+function filterProfiles(query) {
+  const q = (query || "").toLowerCase().trim();
+  for (const row of document.querySelectorAll(".profile-row")) {
+    const hay = (row.dataset.search || "").toLowerCase();
+    row.style.display = !q || hay.includes(q) ? "" : "none";
+  }
+}
+</script>
+{% endblock %}

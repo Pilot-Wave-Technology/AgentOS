@@ -1,0 +1,242 @@
+{% set tx = system.taximeter %}
+{# Non-sort query tail: window/view/goal only, no sort/sort_dir - so every
+   control can safely append its OWN sort/sort_dir once with no duplicate
+   query keys (duplicate keys' resolution order isn't guaranteed). #}
+{% set tx_base_qs = "view=" ~ tx.view ~ "&window_weeks=" ~ tx.window_weeks ~ (("&goal_id=" ~ tx.goal_id) if tx.goal_id else "") %}
+{% macro sort_th(key, label, tooltip) %}
+<th class="font-medium pb-2" title="{{ tooltip }}">
+  <button type="button"
+          hx-get="/dashboard/panel/taximeter?{{ tx_base_qs }}&sort={{ key }}&sort_dir={{ tx.sort_next.get(key, 'desc') }}"
+          hx-target="#taximeter-panel" hx-swap="outerHTML"
+          class="flex items-center gap-1 hover:text-gray-300 transition-colors {% if tx.sort == key %}text-indigo-400{% endif %}">
+    {{ label }}{% if tx.sort == key %}<span class="text-2xs">{{ '↓' if tx.dir == 'desc' else '↑' }}</span>{% endif %}
+  </button>
+</th>
+{% endmacro %}
+{# Scores are multipliers of "fair share" (1.0 = 100%): shown as a
+   percentage so "your fair share" reads as 100%, not 1.000. Color signals
+   direction at a glance: above fair share (green) vs. below it (blue) -
+   deliberately not red/amber/green grading, this isn't a pass/fail. #}
+{% macro score_pct(value, extra_classes="") %}
+<span class="tabular-nums tx-score {{ extra_classes }} {% if value > 1.0 %}text-green-400{% elif value < 1.0 %}text-blue-400{% else %}text-gray-300{% endif %}" data-tx-score="{{ value }}">{{ "%.1f"|format(value * 100) }}%</span>
+{% endmacro %}
+<div id="taximeter-panel" class="bg-gray-900 border border-gray-800 rounded-xl p-5">
+  <div class="flex items-center justify-between mb-1 flex-wrap gap-2">
+    <div class="flex items-center gap-3">
+      <h3 class="font-semibold">Taximeter</h3>
+    </div>
+    <div class="flex items-center gap-2">
+      <button onclick="document.getElementById('modal-taximeter-info').classList.remove('hidden')"
+        type="button" title="How is this calculated?"
+        class="btn btn-secondary btn-sm">
+        <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8.228 9c.549-1.165 2.03-2 3.772-2 2.21 0 4 1.343 4 3 0 1.4-1.278 2.575-3.006 2.907-.542.104-.994.54-.994 1.093m0 3h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/>
+        </svg>
+        How is this calculated?
+      </button>
+      {# Display-only toggle: same underlying multiplier either way, just
+         formatted as a percentage (200%) or a plain score (2.0). Applies to
+         every element carrying data-tx-score, on this page and in the
+         goal-breakdown modal's "Compare" tab (see toggleTaximeterScoreMode
+         in the script block below): never the "Contribute" tab's numbers,
+         which are already shares-of-100% and have no multiplier reading. #}
+      <button type="button" onclick="toggleTaximeterScoreMode()"
+        id="tx-score-mode-btn" title="Switch between percentage and plain score display"
+        class="btn btn-secondary btn-sm font-mono">
+        <span id="tx-score-mode-label">%</span>
+      </button>
+      <select name="goal_id"
+              hx-get="/dashboard/panel/taximeter?view=people"
+              hx-include="[name='goal_id'], [name='window_weeks'], [name='sort'], [name='sort_dir']"
+              hx-trigger="change"
+              hx-target="#taximeter-panel"
+              hx-swap="outerHTML"
+              title="Scope to one goal"
+              class="bg-gray-800 border border-gray-700 rounded text-xs text-gray-300 px-2 py-1">
+        <option value="">All goals</option>
+        {% for g in tx.goals %}
+        <option value="{{ g.goal_id }}" {% if tx.goal_id == g.goal_id %}selected{% endif %}>{{ g.name }}</option>
+        {% endfor %}
+      </select>
+      <input type="hidden" name="window_weeks" value="{{ tx.window_weeks }}" />
+      <input type="hidden" name="sort" value="{{ tx.sort }}" />
+      <input type="hidden" name="sort_dir" value="{{ tx.dir }}" />
+      {# Fixed presets only: no free-form week input. The underlying data
+         is weekly-grain, so these four cover the useful range without
+         needing a custom picker. #}
+      <div class="flex items-center gap-1">
+        {% for weeks in [2, 4, 12, 26] %}
+        <button type="button"
+                hx-get="/dashboard/panel/taximeter?window_weeks={{ weeks }}&view={{ tx.view }}&sort={{ tx.sort }}&sort_dir={{ tx.dir }}{% if tx.goal_id %}&goal_id={{ tx.goal_id }}{% endif %}"
+                hx-target="#taximeter-panel"
+                hx-swap="outerHTML"
+                class="px-2 py-1 text-xs rounded border transition-colors
+                  {% if tx.window_weeks == weeks %}border-indigo-500 text-indigo-400 bg-indigo-500/10
+                  {% else %}border-gray-700 text-gray-400 hover:border-gray-600{% endif %}">
+          {{ weeks }}w
+        </button>
+        {% endfor %}
+      </div>
+    </div>
+  </div>
+  {# Short always-visible framing line: the full explanation is one click
+     away in the modal, but this much stays in view at all times so the
+     numbers are never seen without it. #}
+  {# Both phrasings render server-side; the toggle just shows/hides
+     whichever matches the current mode (tx-mode-percent / tx-mode-score):
+     simpler and more robust than rewriting text with JS string logic. #}
+  <p class="text-2xs text-gray-600 mb-4">
+    Each score is relative to the platform average that period:
+    <span class="tx-mode-percent">100% means exactly your fair share of the total, <span class="text-green-400">above 100%</span> means more than that, <span class="text-blue-400">below 100%</span> means less.</span><span class="tx-mode-score hidden">1.0 means exactly your fair share of the total, <span class="text-green-400">above 1.0</span> means more than that, <span class="text-blue-400">below 1.0</span> means less.</span>
+    Overall blends Throughput at 50%, Oversight at 30%, and Efficiency at 20%. Click "How is this calculated?" before reading it as a performance ranking.
+  </p>
+
+    {% if tx and tx.rows %}
+    <table class="w-full text-sm">
+      <thead>
+        <tr class="text-2xs text-gray-600 uppercase text-left border-b border-gray-800">
+          {{ sort_th('name', 'Name', 'Sort by name') }}
+          {{ sort_th('overall', 'Overall', '30% Oversight + 50% Throughput + 20% Efficiency, blended into one number') }}
+          {{ sort_th('oversight', 'Oversight', 'Goal and team management, plus goal thread interactions, relative to the platform average') }}
+          {{ sort_th('throughput', 'Throughput', 'Stories completed and weighted output, relative to the platform average') }}
+          {{ sort_th('efficiency', 'Efficiency', 'Speed and cost of completed work, relative to the platform average') }}
+        </tr>
+      </thead>
+      <tbody class="divide-y divide-gray-800">
+        {% for row in tx.rows %}
+        <tr>
+          <td class="py-3 pr-4">
+            <button type="button"
+                    hx-get="/dashboard/panel/taximeter/{{ row.uid }}/goals?window_weeks={{ tx.window_weeks }}&name={{ row.name | urlencode }}{% if tx.goal_id %}&goal_id={{ tx.goal_id }}{% endif %}"
+                    hx-target="#taximeter-goal-breakdown-content"
+                    hx-swap="innerHTML"
+                    onclick="document.getElementById('modal-taximeter-goal-breakdown').classList.remove('hidden')"
+                    title="{% if row.email %}{{ row.email }} — {% endif %}See how this breaks down{% if not tx.goal_id %} across their goals{% endif %}"
+                    class="font-medium text-gray-200 hover:text-indigo-400 transition-colors text-left">
+              {{ row.name }}
+            </button>
+            {# Breadth/depth signal: someone spreading light activity across
+               7-8 goals and someone doing heavy work in 1-2 goals can land on
+               similar scores: this is what tells those two situations
+               apart without needing to click into the drill-down. Always
+               platform-wide, even when this table itself is scoped to one
+               goal via the goal picker. #}
+            <div class="text-gray-600 text-2xs">
+              active in {{ row.goal_count }} goal{{ "s" if row.goal_count != 1 else "" }}
+            </div>
+          </td>
+          <td class="py-3 pr-4 font-semibold text-xs">{{ score_pct(row.overall) }}</td>
+          <td class="py-3 pr-4 text-xs">{{ score_pct(row.oversight) }}</td>
+          <td class="py-3 pr-4 text-xs">{{ score_pct(row.throughput) }}</td>
+          <td class="py-3 pr-4 text-xs">{{ score_pct(row.efficiency) }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <p class="text-sm text-gray-500">No activity recorded in this period.</p>
+    {% endif %}
+
+  {# Modal lives INSIDE the panel div, not as a sibling: the period
+     selector does hx-swap="outerHTML" on #taximeter-panel, so anything
+     outside it would leave a stale duplicate behind after a window switch. #}
+  <div id="modal-taximeter-info" class="hidden fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50 p-4"
+       onclick="if(event.target===this) this.classList.add('hidden')">
+    <div class="card w-full max-w-2xl p-6 max-h-[85vh] overflow-y-auto">
+      <div class="flex items-start justify-between mb-1">
+        <h2 class="text-lg font-semibold text-gray-100">How the Taximeter works</h2>
+        <button onclick="document.getElementById('modal-taximeter-info').classList.add('hidden')"
+          class="text-gray-500 hover:text-gray-300 -mt-1 -mr-1 p-1" aria-label="Close">
+          <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/></svg>
+        </button>
+      </div>
+      <div class="space-y-3 mb-4">
+        <div>
+          <h3 class="text-sm font-medium text-gray-200">Oversight</h3>
+          <p class="text-xs text-gray-500">How actively you're steering the work: creating goals, managing who's on the team, and having interactions within the goal thread.</p>
+        </div>
+        <div>
+          <h3 class="text-sm font-medium text-gray-200">Throughput</h3>
+          <p class="text-xs text-gray-500">How many stories you've completed: stories are given a weightage based on how impactful a story is.</p>
+        </div>
+        <div>
+          <h3 class="text-sm font-medium text-gray-200">Efficiency</h3>
+          <p class="text-xs text-gray-500">How fast and how cost-effectively those stories were completed.</p>
+        </div>
+      </div>
+
+      <p class="text-2xs text-gray-600 mt-2">
+        This reflects activity patterns across the platform, not a
+        performance ranking - different roles naturally show different
+        patterns across these three areas by design.
+      </p>
+    </div>
+  </div>
+
+  {# Per-person goal breakdown: one shared modal shell, content lazy-loaded
+     per click rather than pre-rendering a breakdown for every row up front. #}
+  <div id="modal-taximeter-goal-breakdown" class="hidden fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50 p-4"
+       onclick="if(event.target===this) this.classList.add('hidden')">
+    <div class="card w-full max-w-lg p-6 max-h-[85vh] overflow-y-auto relative">
+      <button onclick="document.getElementById('modal-taximeter-goal-breakdown').classList.add('hidden')"
+        class="absolute top-4 right-4 text-gray-500 hover:text-gray-300 p-1" aria-label="Close">
+        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/></svg>
+      </button>
+      <div id="taximeter-goal-breakdown-content">
+        <p class="text-sm text-gray-500">Loading…</p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+  // Percent <-> plain-score display toggle for every Taximeter score on the
+  // page: the main table AND the goal-breakdown modal's "Compare" tab
+  // (never "Contribute", which is already a share-of-100% with no
+  // multiplier reading). Purely a display transform: the underlying
+  // multiplier (data-tx-score) never changes, only how it's formatted.
+  // Persisted in localStorage so the choice survives a page reload; reapplied
+  // after every htmx swap (window/sort/goal-picker changes on this panel, or
+  // the goal-breakdown modal loading its content) since each swap re-renders
+  // fresh percent-formatted markup from the server.
+  (function () {
+    function currentMode() {
+      return localStorage.getItem('taximeterScoreMode') === 'score' ? 'score' : 'percent';
+    }
+
+    window.applyTaximeterScoreMode = function () {
+      const mode = currentMode();
+      document.querySelectorAll('[data-tx-score]').forEach(function (el) {
+        const value = parseFloat(el.getAttribute('data-tx-score'));
+        el.textContent = mode === 'score' ? value.toFixed(3) : (value * 100).toFixed(1) + '%';
+      });
+      document.querySelectorAll('.tx-mode-percent').forEach(function (el) {
+        el.classList.toggle('hidden', mode === 'score');
+      });
+      document.querySelectorAll('.tx-mode-score').forEach(function (el) {
+        el.classList.toggle('hidden', mode === 'percent');
+      });
+      const label = document.getElementById('tx-score-mode-label');
+      if (label) label.textContent = mode === 'score' ? 'x' : '%';
+    };
+
+    window.toggleTaximeterScoreMode = function () {
+      localStorage.setItem('taximeterScoreMode', currentMode() === 'score' ? 'percent' : 'score');
+      window.applyTaximeterScoreMode();
+    };
+
+    window.applyTaximeterScoreMode();
+
+    // This whole <script> re-runs every time #taximeter-panel is swapped
+    // (hx-swap="outerHTML" re-inserts it), so the afterSwap listener below
+    // must only ever be registered once: document.body itself is never
+    // swapped, so without this guard each panel refresh would stack another
+    // duplicate listener.
+    if (!window.__taximeterSwapListenerAdded) {
+      document.body.addEventListener('htmx:afterSwap', function () {
+        window.applyTaximeterScoreMode();
+      });
+      window.__taximeterSwapListenerAdded = true;
+    }
+  })();
+</script>

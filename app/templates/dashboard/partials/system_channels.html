@@ -1,0 +1,29 @@
+{% set ch = system.channels %}
+<div class="bg-gray-900 border border-gray-800 rounded-xl p-5">
+  <div class="flex items-center justify-between mb-4">
+    <h3 class="font-semibold">Platform Channels</h3>
+    <span class="text-xs text-gray-500">Slack, Notion &amp; others</span>
+  </div>
+  {% if ch and ch.channels %}
+  <div class="space-y-2">
+    {% for c in ch.channels %}
+    <div class="flex items-center gap-3 text-sm">
+      <span class="w-2 h-2 rounded-full flex-shrink-0
+        {% if c.connected %}bg-green-500{% else %}bg-red-500{% endif %}"></span>
+      <span class="font-medium text-gray-200 capitalize flex-shrink-0 w-20">{{ c.label }}</span>
+      <span class="text-gray-500 text-xs flex-1 truncate">{{ c.name }}</span>
+      {% if c.connected %}
+      <span class="text-2xs text-gray-600 whitespace-nowrap">{{ c.detail }}</span>
+      {% else %}
+      <span class="text-2xs text-red-400/80 truncate max-w-[10rem]"
+            title="{{ c.error or 'disconnected' }}">
+        {{ (c.error or "disconnected")[:30] }}
+      </span>
+      {% endif %}
+    </div>
+    {% endfor %}
+  </div>
+  {% else %}
+  <p class="text-sm text-gray-500">No platform channels configured.</p>
+  {% endif %}
+</div>

@@ -1,0 +1,535 @@
+{% extends "base.html" %}
+{% block title %}Resources: {{ goal.name }}{% endblock %}
+{% block content %}
+<div class="px-6 py-6 max-w-5xl">
+  <div class="flex items-center justify-between mb-6">
+    <div>
+      <h1 class="text-xl font-bold">Artifact Registry</h1>
+      <p class="text-sm text-gray-500 mt-1">Manage goal resources: repos, buckets, APIs, datasets</p>
+    </div>
+    {% if role == 'admin' or user.system_role == 'admin' %}
+    <button onclick="openAddModal()"
+      class="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 rounded-lg text-sm font-medium transition-colors">
+      + Add Resource
+    </button>
+    {% endif %}
+  </div>
+
+  {% if resources %}
+  <div class="bg-gray-900 rounded-xl border border-gray-800 overflow-hidden">
+    <table class="w-full text-sm">
+      <thead>
+        <tr class="border-b border-gray-800 text-gray-500 text-xs uppercase tracking-wider">
+          <th class="px-4 py-3 text-left">Name</th>
+          <th class="px-4 py-3 text-left">Type</th>
+          <th class="px-4 py-3 text-left">URI</th>
+          <th class="px-4 py-3 text-left">Access</th>
+          <th class="px-4 py-3 text-left">Protected</th>
+          <th class="px-4 py-3 text-right">Actions</th>
+        </tr>
+      </thead>
+      <tbody class="divide-y divide-gray-800">
+        {% for r in resources %}
+        <tr class="hover:bg-gray-800/50 transition-colors">
+          <td class="px-4 py-3 font-medium">{{ r.name }}</td>
+          <td class="px-4 py-3 text-gray-400">
+            <span class="px-2 py-0.5 rounded bg-gray-800 text-xs">{{ r.type }}</span>
+          </td>
+          <td class="px-4 py-3 text-gray-400 font-mono text-xs truncate max-w-xs">{{ r.uri }}</td>
+          <td class="px-4 py-3">
+            <span class="px-2 py-0.5 rounded text-xs
+              {% if r.type == 'git_repo' %}bg-green-900/30 text-green-400">read-write
+              {% else %}bg-blue-900/30 text-blue-400">read-only
+              {% endif %}</span>
+            <span class="text-xs text-gray-600 ml-1">auto-assigned per task</span>
+          </td>
+          <td class="px-4 py-3 text-gray-500 text-xs">
+            {% if r.protected_branches %}{{ r.protected_branches | join(', ') }}{% else %}None{% endif %}
+          </td>
+          <td class="px-4 py-3 text-right">
+            {% if role == 'admin' or user.system_role == 'admin' %}
+            <button onclick="deleteResource('{{ r.id }}')"
+              class="text-xs text-red-400 hover:text-red-300 transition-colors">Delete</button>
+            {% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <div class="text-center py-16 text-gray-500">
+    <div class="text-4xl mb-3">📦</div>
+    <div class="text-sm">No resources registered yet</div>
+    <div class="text-xs text-gray-600 mt-1">Add Git repos, GCS buckets, APIs, or datasets that agents can access</div>
+  </div>
+  {% endif %}
+</div>
+
+<!-- ═══ Add Resource Modal ═══════════════════════════════════════════════════ -->
+<div id="add-modal" class="hidden fixed inset-0 bg-black/60 z-50 flex items-center justify-center">
+  <div class="bg-gray-900 border border-gray-700 rounded-2xl w-full max-w-lg p-6 max-h-[90vh] overflow-y-auto">
+    <div class="flex items-center justify-between mb-4">
+      <h2 class="font-semibold">Add Resource</h2>
+      <button onclick="document.getElementById('add-modal').classList.add('hidden')"
+        class="text-gray-500 hover:text-white">✕</button>
+    </div>
+    <form action="/goals/{{ pid }}/resources" method="post" class="space-y-4" id="add-form">
+      <!-- Step 1: Choose type -->
+      <div>
+        <label class="block text-xs text-gray-400 mb-1">Resource Type</label>
+        <select name="type" id="add-type"
+          class="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-indigo-500">
+          <option value="git_repo">Git Repository</option>
+          <option value="gcs_bucket">GCS Bucket</option>
+          <option value="bigquery_dataset">BigQuery Dataset</option>
+        </select>
+      </div>
+
+      <!-- ── Git Repo Section ────────────────────────────────────────────── -->
+      <div id="git-section">
+        <div id="gh-repo-section">
+          <label class="block text-xs text-gray-400 mb-1">Select GitHub Repository</label>
+          <div class="relative">
+            <select id="gh-repo-select"
+              class="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-indigo-500">
+              <option value="">-- Loading repos... --</option>
+            </select>
+            <button type="button" onclick="withLoadingState(this, fetchGitHubRepos, {loadingLabel: '…'})"
+              class="absolute right-2 top-1/2 -translate-y-1/2 text-xs text-indigo-400 hover:text-indigo-300">
+              Refresh
+            </button>
+          </div>
+          <p id="gh-repo-error" class="text-xs text-red-400 mt-1 hidden"></p>
+        </div>
+        <div id="gh-branch-section" class="hidden mt-3">
+          <label class="block text-xs text-gray-400 mb-1">Protected Branches (agents can NEVER push to these)</label>
+          <div id="gh-branch-list" class="flex flex-wrap gap-2 p-3 bg-gray-800/50 rounded-lg border border-gray-700 min-h-[40px]">
+            <span class="text-xs text-gray-500">Select a repo first</span>
+          </div>
+          <input type="hidden" name="protected_branches" id="gh-protected-input" />
+        </div>
+      </div>
+
+      <!-- ── GCS Bucket Section ──────────────────────────────────────────── -->
+      <div id="gcs-section" class="hidden space-y-3">
+        <div>
+          <label class="block text-xs text-gray-400 mb-1">GCP Project</label>
+          <div class="flex gap-2">
+            <select id="gcs-project"
+              class="flex-1 bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-indigo-500">
+              <option value="">-- Select project --</option>
+            </select>
+            <button type="button" onclick="discoverGcsBuckets()"
+              class="px-3 py-2 bg-indigo-600 hover:bg-indigo-500 rounded-lg text-xs font-medium transition-colors">
+              Load Buckets</button>
+          </div>
+        </div>
+        <div id="gcs-bucket-picker" class="hidden">
+          <label class="block text-xs text-gray-400 mb-1">Select Bucket</label>
+          <select id="gcs-bucket-select"
+            class="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-indigo-500">
+          </select>
+        </div>
+        <div id="gcs-prefix-section" class="hidden">
+          <label class="block text-xs text-gray-400 mb-1">Path Prefix (optional - scope to subfolder)</label>
+          <input id="gcs-prefix" placeholder="data/exports/"
+            class="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-indigo-500" />
+        </div>
+        <div class="text-xs text-gray-500 bg-gray-800/50 rounded-lg px-3 py-2 border border-gray-700">
+          Access: <span class="text-blue-400 font-medium">Read Only</span> - agents can download files but cannot upload
+        </div>
+        <p id="gcs-error" class="text-xs text-red-400 hidden"></p>
+        <p id="gcs-status" class="text-xs text-gray-500 hidden"></p>
+      </div>
+
+      <!-- ── BigQuery Section ────────────────────────────────────────────── -->
+      <div id="bq-section" class="hidden space-y-3">
+        <div>
+          <label class="block text-xs text-gray-400 mb-1">GCP Project</label>
+          <div class="flex gap-2">
+            <select id="bq-project"
+              class="flex-1 bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-indigo-500">
+              <option value="">-- Select project --</option>
+            </select>
+            <button type="button" onclick="discoverBqDatasets()"
+              class="px-3 py-2 bg-indigo-600 hover:bg-indigo-500 rounded-lg text-xs font-medium transition-colors">
+              Load Datasets</button>
+          </div>
+        </div>
+        <div id="bq-dataset-picker" class="hidden">
+          <label class="block text-xs text-gray-400 mb-1">Select Dataset</label>
+          <select id="bq-dataset-select"
+            class="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-indigo-500">
+          </select>
+        </div>
+        <div id="bq-tables-info" class="hidden">
+          <div class="text-xs text-gray-500 bg-gray-800/50 rounded-lg p-3 border border-gray-700 max-h-40 overflow-y-auto" id="bq-tables-list">
+          </div>
+        </div>
+        <div class="text-xs text-gray-500 bg-gray-800/50 rounded-lg px-3 py-2 border border-gray-700">
+          Access: <span class="text-blue-400 font-medium">Read Only</span> - agents can run SELECT queries only (no INSERT/UPDATE/DELETE)
+        </div>
+        <p id="bq-error" class="text-xs text-red-400 hidden"></p>
+        <p id="bq-status" class="text-xs text-gray-500 hidden"></p>
+      </div>
+
+      <!-- ── Common fields ───────────────────────────────────────────────── -->
+      <div>
+        <label class="block text-xs text-gray-400 mb-1">Display Name</label>
+        <input name="name" id="add-name" required
+          class="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-indigo-500" />
+      </div>
+      <div id="uri-section">
+        <label class="block text-xs text-gray-400 mb-1">URI</label>
+        <input name="uri" id="add-uri" placeholder="auto-filled from selection"
+          class="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-500 focus:outline-none focus:border-indigo-500" readonly />
+      </div>
+      <input type="hidden" name="default_access" value="read" />
+      <input type="hidden" name="gcp_project" id="add-gcp-project" />
+      <input type="hidden" name="bucket" id="add-bucket" />
+      <input type="hidden" name="path_prefix" id="add-path-prefix" />
+      <input type="hidden" name="dataset" id="add-dataset" />
+      <div>
+        <label class="block text-xs text-gray-400 mb-1">Notes</label>
+        <textarea name="notes" rows="2"
+          class="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-indigo-500 resize-none"></textarea>
+      </div>
+      <div class="flex justify-end gap-2 pt-2">
+        <button type="button" onclick="document.getElementById('add-modal').classList.add('hidden')"
+          class="px-4 py-2 text-sm text-gray-400 hover:text-white transition-colors">Cancel</button>
+        <button type="submit"
+          class="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 rounded-lg text-sm font-medium transition-colors">
+          Add Resource</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<!-- Agent access is now task-scoped - no per-agent access modal needed -->
+
+<script>
+const pid = '{{ pid }}';
+const accessMap = {{ access_map | tojson }};
+let currentResourceId = null;
+let currentResourceType = null;
+
+// ── GitHub repo/branch picker state ──────────────────────────────────────
+let ghRepos = [];
+let ghBranches = [];
+let selectedProtected = new Set();
+let ghAppConfigured = false;
+
+// ── Type switching ───────────────────────────────────────────────────────
+const addType = document.getElementById('add-type');
+addType.addEventListener('change', () => toggleSections());
+
+function toggleSections() {
+  const t = addType.value;
+  document.getElementById('git-section').classList.toggle('hidden', t !== 'git_repo');
+  document.getElementById('gcs-section').classList.toggle('hidden', t !== 'gcs_bucket');
+  document.getElementById('bq-section').classList.toggle('hidden', t !== 'bigquery_dataset');
+
+  // Reset URI
+  const uri = document.getElementById('add-uri');
+  uri.value = '';
+  uri.readOnly = true;
+}
+
+// ── Fetch repos from GitHub App ──────────────────────────────────────────
+async function fetchGitHubRepos() {
+  const select = document.getElementById('gh-repo-select');
+  const errEl = document.getElementById('gh-repo-error');
+  errEl.classList.add('hidden');
+  select.innerHTML = '<option value="">-- Loading... --</option>';
+
+  try {
+    const resp = await fetch('/api/github/repos');
+    if (!resp.ok) {
+      const data = await resp.json().catch(() => ({}));
+      throw new Error(data.error || `HTTP ${resp.status}`);
+    }
+    ghRepos = await resp.json();
+    ghAppConfigured = true;
+
+    select.innerHTML = '<option value="">-- Select a repository --</option>';
+    for (const repo of ghRepos) {
+      const opt = document.createElement('option');
+      opt.value = repo.full_name;
+      opt.textContent = `${repo.full_name}${repo.private ? ' (private)' : ''}`;
+      opt.dataset.url = repo.html_url;
+      opt.dataset.name = repo.name;
+      opt.dataset.defaultBranch = repo.default_branch;
+      select.appendChild(opt);
+    }
+    toggleSections();
+  } catch (err) {
+    ghAppConfigured = false;
+    errEl.textContent = `GitHub App not available: ${err.message}`;
+    errEl.classList.remove('hidden');
+    select.innerHTML = '<option value="">-- Not available --</option>';
+    toggleSections();
+  }
+}
+
+// ── Repo selection → auto-fill name/URI + fetch branches ─────────────────
+document.getElementById('gh-repo-select').addEventListener('change', async (e) => {
+  const fullName = e.target.value;
+  if (!fullName) return;
+
+  const opt = e.target.selectedOptions[0];
+  document.getElementById('add-name').value = opt.dataset.name;
+  document.getElementById('add-uri').value = opt.dataset.url;
+
+  // Fetch branches
+  const branchList = document.getElementById('gh-branch-list');
+  branchList.innerHTML = '<span class="text-xs text-gray-500">Loading branches...</span>';
+  selectedProtected.clear();
+  document.getElementById('gh-protected-input').value = '';
+
+  try {
+    const resp = await fetch(`/api/github/repos/${fullName}/branches`);
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    ghBranches = await resp.json();
+
+    branchList.innerHTML = '';
+    if (ghBranches.length === 0) {
+      branchList.innerHTML = '<span class="text-xs text-gray-500">No branches found</span>';
+      return;
+    }
+
+    for (const branch of ghBranches) {
+      const chip = document.createElement('button');
+      chip.type = 'button';
+      chip.className = 'branch-chip px-2.5 py-1 rounded-lg text-xs border transition-colors cursor-pointer '
+        + 'border-gray-600 text-gray-400 hover:border-gray-500';
+      chip.textContent = branch.name;
+      chip.dataset.branch = branch.name;
+
+      // Auto-select branches that GitHub already marks as protected, or default branch
+      if (branch.protected || branch.name === opt.dataset.defaultBranch) {
+        chip.className = 'branch-chip px-2.5 py-1 rounded-lg text-xs border transition-colors cursor-pointer '
+          + 'border-red-500/50 bg-red-900/30 text-red-400';
+        selectedProtected.add(branch.name);
+      }
+
+      chip.addEventListener('click', () => toggleBranchProtection(chip, branch.name));
+      branchList.appendChild(chip);
+    }
+    syncProtectedInput();
+
+    document.getElementById('gh-branch-section').classList.remove('hidden');
+  } catch (err) {
+    branchList.innerHTML = `<span class="text-xs text-red-400">Failed to load branches: ${err.message}</span>`;
+  }
+});
+
+function toggleBranchProtection(chip, name) {
+  if (selectedProtected.has(name)) {
+    selectedProtected.delete(name);
+    chip.className = 'branch-chip px-2.5 py-1 rounded-lg text-xs border transition-colors cursor-pointer '
+      + 'border-gray-600 text-gray-400 hover:border-gray-500';
+  } else {
+    selectedProtected.add(name);
+    chip.className = 'branch-chip px-2.5 py-1 rounded-lg text-xs border transition-colors cursor-pointer '
+      + 'border-red-500/50 bg-red-900/30 text-red-400';
+  }
+  syncProtectedInput();
+}
+
+function syncProtectedInput() {
+  document.getElementById('gh-protected-input').value = [...selectedProtected].join(', ');
+}
+
+// ── GCS Discovery ────────────────────────────────────────────────────────
+async function discoverGcsBuckets() {
+  const project = document.getElementById('gcs-project').value.trim();
+  if (!project) return;
+  const errEl = document.getElementById('gcs-error');
+  const statusEl = document.getElementById('gcs-status');
+  errEl.classList.add('hidden');
+  statusEl.textContent = 'Discovering buckets...';
+  statusEl.classList.remove('hidden');
+
+  try {
+    const resp = await fetch(`/goals/${pid}/resources/discover`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ type: 'gcs', gcp_project: project }),
+    });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const data = await resp.json();
+
+    const select = document.getElementById('gcs-bucket-select');
+    select.innerHTML = '<option value="">-- Select a bucket --</option>';
+    for (const b of data.buckets || []) {
+      const opt = document.createElement('option');
+      opt.value = b.name;
+      opt.textContent = `${b.name} (${b.location}, ${b.storage_class})`;
+      select.appendChild(opt);
+    }
+    document.getElementById('gcs-bucket-picker').classList.remove('hidden');
+    statusEl.textContent = `Found ${data.buckets?.length || 0} buckets`;
+
+    select.addEventListener('change', () => {
+      const bucket = select.value;
+      if (bucket) {
+        document.getElementById('gcs-prefix-section').classList.remove('hidden');
+        document.getElementById('add-name').value = bucket;
+        document.getElementById('add-uri').value = `gs://${bucket}/`;
+        document.getElementById('add-gcp-project').value = project;
+        document.getElementById('add-bucket').value = bucket;
+      }
+    });
+  } catch (err) {
+    errEl.textContent = `Discovery failed: ${err.message}`;
+    errEl.classList.remove('hidden');
+    statusEl.classList.add('hidden');
+  }
+}
+
+// ── BigQuery Discovery ───────────────────────────────────────────────────
+async function discoverBqDatasets() {
+  const project = document.getElementById('bq-project').value.trim();
+  if (!project) return;
+  const errEl = document.getElementById('bq-error');
+  const statusEl = document.getElementById('bq-status');
+  errEl.classList.add('hidden');
+  statusEl.textContent = 'Discovering datasets...';
+  statusEl.classList.remove('hidden');
+
+  try {
+    const resp = await fetch(`/goals/${pid}/resources/discover`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ type: 'bigquery', gcp_project: project }),
+    });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const data = await resp.json();
+
+    const select = document.getElementById('bq-dataset-select');
+    select.innerHTML = '<option value="">-- Select a dataset --</option>';
+    for (const ds of data.datasets || []) {
+      const opt = document.createElement('option');
+      opt.value = ds.name;
+      opt.textContent = `${ds.name} (${ds.table_count} tables, ${ds.location})`;
+      select.appendChild(opt);
+    }
+    document.getElementById('bq-dataset-picker').classList.remove('hidden');
+    statusEl.textContent = `Found ${data.datasets?.length || 0} datasets`;
+
+    select.addEventListener('change', async () => {
+      const dataset = select.value;
+      if (!dataset) return;
+      document.getElementById('add-name').value = `${project}.${dataset}`;
+      document.getElementById('add-uri').value = `bigquery://${project}/${dataset}`;
+      document.getElementById('add-gcp-project').value = project;
+      document.getElementById('add-dataset').value = dataset;
+
+      // Fetch tables for preview
+      try {
+        const tResp = await fetch(`/goals/${pid}/resources/discover`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ type: 'bigquery_tables', gcp_project: project, dataset }),
+        });
+        if (tResp.ok) {
+          const tData = await tResp.json();
+          const list = document.getElementById('bq-tables-list');
+          list.innerHTML = (tData.tables || []).map(t =>
+            `<div class="flex justify-between py-0.5"><span>${t.name}</span><span class="text-gray-600">${t.row_count?.toLocaleString() || '?'} rows</span></div>`
+          ).join('');
+          document.getElementById('bq-tables-info').classList.remove('hidden');
+        }
+      } catch (e) {}
+    });
+  } catch (err) {
+    errEl.textContent = `Discovery failed: ${err.message}`;
+    errEl.classList.remove('hidden');
+    statusEl.classList.add('hidden');
+  }
+}
+
+// ── Form submission ─────────────────────────────────────────────────────
+document.getElementById('add-form').addEventListener('submit', (e) => {
+  const t = addType.value;
+
+  // For GCS: set path_prefix from input
+  if (t === 'gcs_bucket') {
+    const prefix = document.getElementById('gcs-prefix')?.value?.trim() || '';
+    document.getElementById('add-path-prefix').value = prefix;
+    if (prefix) {
+      document.getElementById('add-uri').value = `gs://${document.getElementById('add-bucket').value}/${prefix}`;
+    }
+  }
+
+  // For Git: merge protected branch sources
+  const hiddenInput = document.getElementById('gh-protected-input');
+  if (t === 'git_repo' && hiddenInput) {
+    // Already set by branch picker
+  }
+});
+
+// ── Open Add modal and fetch repos if needed ─────────────────────────────
+let reposFetched = false;
+
+let projectsFetched = false;
+
+async function fetchGcpProjects() {
+  if (projectsFetched) return;
+  projectsFetched = true;
+  try {
+    const resp = await fetch(`/goals/${pid}/resources/discover`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ type: 'projects' }),
+    });
+    if (!resp.ok) return;
+    const data = await resp.json();
+    const projects = data.projects || [];
+    for (const sel of [document.getElementById('gcs-project'), document.getElementById('bq-project')]) {
+      sel.innerHTML = '<option value="">-- Select project --</option>';
+      for (const p of projects) {
+        const opt = document.createElement('option');
+        opt.value = p.project_id;
+        opt.textContent = `${p.name} (${p.project_id})`;
+        sel.appendChild(opt);
+      }
+    }
+  } catch (e) {
+    console.warn('Failed to fetch GCP projects:', e);
+  }
+}
+
+function openAddModal() {
+  document.getElementById('add-modal').classList.remove('hidden');
+  toggleSections();
+  if (addType.value === 'git_repo' && !reposFetched) {
+    reposFetched = true;
+    fetchGitHubRepos();
+  }
+  fetchGcpProjects();
+}
+
+addType.addEventListener('change', () => {
+  if (addType.value === 'git_repo' && !reposFetched) {
+    reposFetched = true;
+    fetchGitHubRepos();
+  }
+});
+
+async function deleteResource(rid) {
+  const result = await window.confirmAction({
+    title: 'Delete this resource',
+    body: 'This cannot be undone.',
+    phrase: 'Delete this resource',
+    danger: true,
+  });
+  if (!result) return;
+  await fetch(`/goals/${pid}/resources/${rid}`, { method: 'DELETE' });
+  location.reload();
+}
+
+// Agent access is now task-scoped - no per-agent access control needed
+</script>
+{% endblock %}

@@ -1,0 +1,105 @@
+{% extends "base.html" %}
+{% block title %}Admin · Memory Prompts{% endblock %}
+{% block content %}
+<div class="p-6 lg:p-8 max-w-5xl mx-auto">
+  <a href="/settings" class="inline-flex items-center gap-1 text-xs text-gray-500 hover:text-gray-300 transition-colors mb-5">
+    <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"/></svg>
+    Settings
+  </a>
+  <div class="mb-6">
+    <h1 class="text-xl font-semibold text-gray-100">Admin · Memory Prompts</h1>
+    <p class="text-sm text-gray-500 mt-0.5">
+      Edit + version the prompts Assistant + GO use during memory flushes and compaction.
+      New versions only apply to newly-provisioned agents: existing agents keep their
+      provisioning-time prompts until you re-push with the button below.
+    </p>
+  </div>
+
+  <div class="mb-8 card p-5">
+    <div class="flex items-center justify-between gap-4 flex-wrap">
+      <div>
+        <div class="font-medium text-gray-200">Re-push active prompts to all live agents</div>
+        <div class="text-2xs text-gray-600 mt-1 max-w-2xl">
+          Pushes the current active flush + consolidation + summary prompts to every active
+          Assistant &amp; GO agent on the gateway. Only updates each agent's compaction / memory
+          prompts: it does <span class="text-gray-400">not</span> touch identity, soul,
+          system prompt, model, tools, or MEMORY.md content. No gateway restart needed; new
+          prompts apply on each agent's next turn. Safe to re-run.
+        </div>
+      </div>
+      <button id="repush-all-btn" type="button" onclick="repushAllPrompts()"
+              class="shrink-0 inline-flex items-center px-3 py-2 rounded-md text-sm font-medium
+                     border border-brand-light/30 text-brand-light bg-brand-light/10
+                     hover:bg-brand-light/20 disabled:opacity-50 disabled:cursor-not-allowed transition-colors">
+        Re-push to all live agents
+      </button>
+    </div>
+    <div id="repush-all-status" class="text-xs text-gray-500 mt-3 hidden"></div>
+  </div>
+
+  <script>
+    async function repushAllPrompts() {
+      const btn = document.getElementById('repush-all-btn');
+      const status = document.getElementById('repush-all-status');
+      const result = await window.confirmAction({
+        title: 'Re-push prompts to all live agents',
+        body: "Re-pushes the current active prompts to every active Assistant + GO agent. This only updates each agent's compaction / memory prompts. It does NOT touch identity, soul, system prompt, model, tools, or memory content.",
+      });
+      if (!result) return;
+      btn.disabled = true;
+      status.classList.remove('hidden');
+      status.textContent = 'Re-pushing…';
+      status.className = 'text-xs text-gray-400 mt-3';
+      try {
+        const r = await fetch('/settings/memory/prompts/repush-all', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          credentials: 'same-origin',
+          body: '',
+        });
+        const data = await r.json();
+        if (!r.ok) {
+          status.textContent = 'Request rejected (HTTP ' + r.status + ').';
+          status.className = 'text-xs text-red-400 mt-3';
+        } else if (data.ok) {
+          status.textContent = 'Done: pushed to ' + data.pushed_count + '/' + data.total + ' agent(s).';
+          status.className = 'text-xs text-green-400 mt-3';
+        } else {
+          const failedIds = (data.failed || []).map(function (f) { return f.agent_id; }).join(', ');
+          status.textContent = 'Pushed ' + data.pushed_count + '/' + data.total + '; ' +
+            data.failed_count + ' failed' + (failedIds ? ' (' + failedIds + ')' : '') + ': see server logs.';
+          status.className = 'text-xs text-yellow-400 mt-3';
+        }
+      } catch (e) {
+        status.textContent = 'Request failed: ' + e;
+        status.className = 'text-xs text-red-400 mt-3';
+      } finally {
+        btn.disabled = false;
+      }
+    }
+  </script>
+
+  {% for agent_type, kinds in by_agent.items() %}
+  <div class="mb-8">
+    <h2 class="text-lg font-medium text-gray-200 mb-3">{{ 'Assistant' if agent_type == 'SHCA' else agent_type }}</h2>
+    {% if kinds %}
+    <div class="space-y-3">
+      {% for kind, content in kinds.items() %}
+      <a href="/settings/memory/prompts/{{ agent_type }}/{{ kind }}" class="card card-interactive block p-5 group">
+        <div class="flex items-center justify-between">
+          <div>
+            <div class="font-medium text-gray-200 group-hover:text-brand-light transition-colors">{{ kind }}</div>
+            <div class="text-2xs text-gray-600 mt-1">{{ content|length }} chars · active</div>
+          </div>
+          <span class="text-xs text-brand-light">Edit →</span>
+        </div>
+      </a>
+      {% endfor %}
+    </div>
+    {% else %}
+    <p class="text-sm text-gray-600">No active prompts for {{ agent_type }}.</p>
+    {% endif %}
+  </div>
+  {% endfor %}
+</div>
+{% endblock %}

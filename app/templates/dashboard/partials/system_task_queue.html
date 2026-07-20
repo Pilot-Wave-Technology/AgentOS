@@ -1,0 +1,119 @@
+{# Task Queue panel — DAG concurrency ceiling. Rendered by
+   GET /dashboard/panel/task-queue; the root div is swapped (outerHTML) by both
+   the tab's lazy-load and the Refresh button. #}
+<div id="task-queue-panel" class="space-y-4">
+
+  <div class="bg-gray-900 border border-gray-800 rounded-xl p-5">
+    <div class="flex items-start justify-between gap-4 mb-1">
+      <h3 class="font-semibold">Task Queue
+        <span class="text-sm font-normal text-gray-500">— claude-code DAG concurrency</span>
+      </h3>
+      <button hx-get="/dashboard/panel/task-queue"
+              hx-target="#task-queue-panel"
+              hx-swap="outerHTML"
+              hx-disabled-elt="this"
+              class="text-xs text-gray-500 hover:text-indigo-400 transition-colors flex-shrink-0 disabled:opacity-50 disabled:cursor-not-allowed">↻ Refresh</button>
+    </div>
+    <p class="text-xs text-gray-500 mb-4">
+      At most <b>N</b> DAGs execute at once; the rest wait (FIFO). A DAG frees its
+      slot when all phases reach an end state (→ awaiting approval) or it fails.
+    </p>
+
+    {% if enforce %}
+    <div class="mb-4 rounded-lg border border-emerald-600/40 bg-emerald-600/10 px-4 py-2.5 text-sm text-emerald-300">
+      <b>ENFORCING</b> — ceiling N={{ n }} is active. A new DAG is held while {{ n }} are executing.
+    </div>
+    {% else %}
+    <div class="mb-4 rounded-lg border border-amber-600/40 bg-amber-600/10 px-4 py-2.5 text-sm text-amber-300">
+      <b>SHADOW</b> — logging only, <b>not</b> enforcing. Turn on <b>Enforce</b> to actually hold over-ceiling DAGs.
+    </div>
+    {% endif %}
+
+    <form method="post" action="/dashboard/task-queue/config"
+          class="flex flex-wrap items-end gap-4">
+      <label class="text-sm text-gray-300">
+        <span class="block text-xs text-gray-500 mb-1">Ceiling N</span>
+        <input type="number" name="n" min="1" value="{{ n }}"
+               class="w-24 bg-gray-950 border border-gray-700 rounded px-2 py-1 text-gray-100">
+      </label>
+      <label class="text-sm text-gray-300 inline-flex items-center gap-2">
+        <input type="checkbox" name="enforce" value="on" {% if enforce %}checked{% endif %}
+               class="w-4 h-4 accent-emerald-500">
+        Enforce
+      </label>
+      <button type="submit" class="btn btn-primary btn-sm">Save</button>
+      <span class="text-2xs text-gray-500">Applies within ~one dispatch tick — no redeploy.</span>
+    </form>
+  </div>
+
+  <!-- Executing -->
+  <div class="bg-gray-900 border border-gray-800 rounded-xl p-5">
+    <h3 class="font-semibold mb-3">Executing
+      <span class="text-gray-500 font-normal">({{ executing|length }}/{{ n }})</span>
+    </h3>
+    <div class="overflow-x-auto">
+      <table class="w-full text-sm">
+        <thead class="text-2xs uppercase text-gray-500 border-b border-gray-800">
+          <tr>
+            <th class="text-left py-2 pr-4">Goal</th>
+            <th class="text-left py-2 pr-4">Story</th>
+            <th class="text-left py-2 pr-4">DAG</th>
+            <th class="text-left py-2 pr-4">Phases</th>
+            <th class="text-left py-2 pr-4">State</th>
+          </tr>
+        </thead>
+        <tbody class="text-gray-300">
+          {% for d in executing %}
+          <tr class="border-b border-gray-800/60">
+            <td class="py-2 pr-4"><a href="/goals/{{ d.goal_id }}" class="text-indigo-400 hover:text-indigo-300">{{ d.goal_name or d.goal_id }}</a></td>
+            <td class="py-2 pr-4">{{ d.story_title or (d.story_id[:8] if d.story_id else '-') }}</td>
+            <td class="py-2 pr-4 font-mono text-2xs text-gray-500">{{ d.dag_id[:8] if d.dag_id else '-' }}</td>
+            <td class="py-2 pr-4">{{ d.done_phases }}/{{ d.total_phases }}</td>
+            <td class="py-2 pr-4">
+              {% if d.has_blocked %}
+              <span class="text-amber-400 text-xs font-medium">● BLOCKED (holding)</span>
+              {% else %}<span class="text-emerald-400 text-xs">● running</span>{% endif %}
+            </td>
+          </tr>
+          {% else %}
+          <tr><td colspan="5" class="py-3 text-gray-600 text-center text-xs">No DAGs executing.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- Waiting -->
+  <div class="bg-gray-900 border border-gray-800 rounded-xl p-5">
+    <h3 class="font-semibold mb-3">Waiting
+      <span class="text-gray-500 font-normal">({{ waiting|length }}, FIFO)</span>
+    </h3>
+    <div class="overflow-x-auto">
+      <table class="w-full text-sm">
+        <thead class="text-2xs uppercase text-gray-500 border-b border-gray-800">
+          <tr>
+            <th class="text-left py-2 pr-4">#</th>
+            <th class="text-left py-2 pr-4">Goal</th>
+            <th class="text-left py-2 pr-4">Story</th>
+            <th class="text-left py-2 pr-4">DAG</th>
+            <th class="text-left py-2 pr-4">Queued since</th>
+          </tr>
+        </thead>
+        <tbody class="text-gray-300">
+          {% for d in waiting %}
+          <tr class="border-b border-gray-800/60">
+            <td class="py-2 pr-4 text-gray-500">{{ loop.index }}</td>
+            <td class="py-2 pr-4"><a href="/goals/{{ d.goal_id }}" class="text-indigo-400 hover:text-indigo-300">{{ d.goal_name or d.goal_id }}</a></td>
+            <td class="py-2 pr-4">{{ d.story_title or (d.story_id[:8] if d.story_id else '-') }}</td>
+            <td class="py-2 pr-4 font-mono text-2xs text-gray-500">{{ d.dag_id[:8] if d.dag_id else '-' }}</td>
+            <td class="py-2 pr-4 text-xs text-gray-400">{{ d.queued_since }}</td>
+          </tr>
+          {% else %}
+          <tr><td colspan="5" class="py-3 text-gray-600 text-center text-xs">Nothing waiting.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+</div>

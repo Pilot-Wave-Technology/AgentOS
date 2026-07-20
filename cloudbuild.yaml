@@ -1,0 +1,184 @@
+# AgentOS control plane — build, migrate, deploy — SPLIT profile (the default).
+#
+# Deploys FOUR Cloud Run services from one image, each with its own entrypoint:
+#   <prefix>-web         app.main:app              (public: web + chat + agent callbacks)
+#   <prefix>-council     app.council_worker:app    (council + security + research loops)
+#   <prefix>-git         app.git_engine_worker:app (git dependency-graph engine)
+#   <prefix>-management  app.management_worker:app (settings/dashboard/admin backends)
+#
+# Use cloudbuild-single.yaml instead if you set service_profile="single" in tfvars
+# (one service runs everything in-process — cheaper).
+#
+# Ownership split (see terraform/README.md):
+#   • Terraform owns the service CONFIG (env vars, secrets, SA, connector, Cloud
+#     SQL, sizing, cross-service URLs) — created once by `terraform apply`.
+#   • This pipeline owns the IMAGE + MIGRATIONS + per-service entrypoint. It never
+#     clobbers the terraform-managed env/secrets.
+#
+# Substitutions default to terraform's naming with name_prefix="agentos". If you
+# set a different name_prefix / region / network_name, pass the matching values.
+
+substitutions:
+  _REGION: us-central1
+  _SERVICE: agentos                 # = terraform name_prefix (image + job base name)
+  _DB_INSTANCE: agentos-db          # = <name_prefix>-db
+  _VPC_CONNECTOR: agentos-vpc-conn  # = <network_name>-conn
+  _RUNTIME_SA_NAME: agentos-runtime # = <name_prefix>-runtime
+  _TASK_RUNNER_JOB: agentos-task-runner
+
+steps:
+  # ── Build images ─────────────────────────────────────────────────────────
+  - id: build
+    name: gcr.io/cloud-builders/docker
+    env: ['DOCKER_BUILDKIT=1']
+    args: [build, -t, "gcr.io/$PROJECT_ID/${_SERVICE}:$COMMIT_SHA",
+                  -t, "gcr.io/$PROJECT_ID/${_SERVICE}:latest", "."]
+
+  - id: build-task-runner
+    name: gcr.io/cloud-builders/docker
+    env: ['DOCKER_BUILDKIT=1']
+    waitFor: ['-']
+    args: [build, -t, "gcr.io/$PROJECT_ID/${_TASK_RUNNER_JOB}:$COMMIT_SHA",
+                  -t, "gcr.io/$PROJECT_ID/${_TASK_RUNNER_JOB}:latest",
+                  -f, Dockerfile.task-runner, "."]
+
+  # ── Push ─────────────────────────────────────────────────────────────────
+  - id: push-sha
+    name: gcr.io/cloud-builders/docker
+    args: [push, "gcr.io/$PROJECT_ID/${_SERVICE}:$COMMIT_SHA"]
+  - id: push-latest
+    name: gcr.io/cloud-builders/docker
+    args: [push, "gcr.io/$PROJECT_ID/${_SERVICE}:latest"]
+  - id: push-tr-sha
+    name: gcr.io/cloud-builders/docker
+    waitFor: ['build-task-runner']
+    args: [push, "gcr.io/$PROJECT_ID/${_TASK_RUNNER_JOB}:$COMMIT_SHA"]
+
+  # ── Migrate: deploy an ephemeral job at the new image, run it, --wait ──────
+  # Uses the DDL migrate DSN. Fails the build (and skips deploy) on any error.
+  - id: migrate-deploy
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: gcloud
+    waitFor: ['push-sha']
+    args:
+      - run
+      - jobs
+      - deploy
+      - "${_SERVICE}-migrate"
+      - --image=gcr.io/$PROJECT_ID/${_SERVICE}:$COMMIT_SHA
+      - --region=${_REGION}
+      - --vpc-connector=${_VPC_CONNECTOR}
+      - --vpc-egress=private-ranges-only
+      - --service-account=${_RUNTIME_SA_NAME}@$PROJECT_ID.iam.gserviceaccount.com
+      - --set-cloudsql-instances=$PROJECT_ID:${_REGION}:${_DB_INSTANCE}
+      - --set-secrets=DATABASE_URL=database-url-migrate:latest
+      - --set-env-vars=APP_ENV=production,BUILD_ID=$BUILD_ID
+      - --command=python
+      - --args=migrations/apply.py
+      - --max-retries=0
+      - --task-timeout=600
+      - --quiet
+
+  - id: migrate-execute
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: gcloud
+    waitFor: ['migrate-deploy']
+    args: [run, jobs, execute, "${_SERVICE}-migrate", "--region=${_REGION}", --wait]
+
+  # ── Deploy: image + per-service entrypoint on each of the 4 services ───────
+  # Terraform owns env/secrets/config; this sets only image + command/args. The
+  # custom ^@^ delimiter keeps --host/--port from being parsed as gcloud flags.
+  #
+  # deploy-web additionally stamps PLATFORM_BUILD_SHA=$COMMIT_SHA via
+  # --update-env-vars (MERGES — does not clobber terraform's env). The platform
+  # bootstrap (app.main, web service) recreates the platform agents once per
+  # distinct build sha (atomic claim on platform_recreate_state) — the only way
+  # to refresh their model + gateway tool scope, since agents.update is a no-op
+  # for model/tools. Without a sha it would recreate on every container boot
+  # (scale-ups included), disrupting the live steward; with it, exactly once
+  # per deploy. Requires the gateway to be READY (Anthropic key + control-panel
+  # URL loaded) before this build runs — see deploy/07 — otherwise the recreate
+  # falls back to the gemini default.
+  - id: deploy-web
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: gcloud
+    waitFor: ['migrate-execute']
+    args:
+      - run
+      - services
+      - update
+      - "${_SERVICE}-web"
+      - --image=gcr.io/$PROJECT_ID/${_SERVICE}:$COMMIT_SHA
+      - --region=${_REGION}
+      - --update-env-vars=PLATFORM_BUILD_SHA=$COMMIT_SHA
+      - --command=uvicorn
+      - "--args=^@^app.main:app@--host@0.0.0.0@--port@8080"
+      - --quiet
+
+  - id: deploy-council
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: gcloud
+    waitFor: ['migrate-execute']
+    args:
+      - run
+      - services
+      - update
+      - "${_SERVICE}-council"
+      - --image=gcr.io/$PROJECT_ID/${_SERVICE}:$COMMIT_SHA
+      - --region=${_REGION}
+      - --command=uvicorn
+      - "--args=^@^app.council_worker:app@--host@0.0.0.0@--port@8080"
+      - --quiet
+
+  - id: deploy-git
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: gcloud
+    waitFor: ['migrate-execute']
+    args:
+      - run
+      - services
+      - update
+      - "${_SERVICE}-git"
+      - --image=gcr.io/$PROJECT_ID/${_SERVICE}:$COMMIT_SHA
+      - --region=${_REGION}
+      - --command=uvicorn
+      - "--args=^@^app.git_engine_worker:app@--host@0.0.0.0@--port@8080"
+      - --quiet
+
+  - id: deploy-management
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: gcloud
+    waitFor: ['migrate-execute']
+    args:
+      - run
+      - services
+      - update
+      - "${_SERVICE}-management"
+      - --image=gcr.io/$PROJECT_ID/${_SERVICE}:$COMMIT_SHA
+      - --region=${_REGION}
+      - --command=uvicorn
+      - "--args=^@^app.management_worker:app@--host@0.0.0.0@--port@8080"
+      - --quiet
+
+  # ── Update the task-runner job image ──────────────────────────────────────
+  - id: deploy-task-runner
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: gcloud
+    waitFor: ['migrate-execute', 'push-tr-sha']
+    args:
+      - run
+      - jobs
+      - update
+      - "${_TASK_RUNNER_JOB}"
+      - --image=gcr.io/$PROJECT_ID/${_TASK_RUNNER_JOB}:$COMMIT_SHA
+      - --region=${_REGION}
+      - --quiet
+
+images:
+  - "gcr.io/$PROJECT_ID/${_SERVICE}:$COMMIT_SHA"
+  - "gcr.io/$PROJECT_ID/${_SERVICE}:latest"
+  - "gcr.io/$PROJECT_ID/${_TASK_RUNNER_JOB}:$COMMIT_SHA"
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+  machineType: E2_HIGHCPU_8

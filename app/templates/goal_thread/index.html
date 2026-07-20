@@ -1,0 +1,707 @@
+{% extends "base.html" %}
+{% from "partials/_tour_trigger.html" import tour_trigger %}
+{% block title %}Goal Thread: {{ goal.name }}{% endblock %}
+{% block content %}
+<script src="https://cdn.jsdelivr.net/npm/marked@15/marked.min.js"></script>
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11/build/highlight.min.js"></script>
+<script src="/static/js/markdown_renderer.js"></script>
+<!-- XSS: DOMPurify sanitizes rendered markdown before innerHTML (see safe_markdown.js) -->
+<script src="https://cdn.jsdelivr.net/npm/dompurify@3/dist/purify.min.js"></script>
+<script src="/static/js/safe_markdown.js"></script>
+
+<style>
+  .agent-prose h1, .agent-prose h2, .agent-prose h3,
+  .agent-prose h4, .agent-prose h5, .agent-prose h6 {
+    color: #e2e8f0; font-weight: 600; margin-top: 1em; margin-bottom: 0.4em; line-height: 1.3;
+  }
+  .agent-prose h1 { font-size: 1.25rem; }
+  .agent-prose h2 { font-size: 1.1rem; }
+  .agent-prose h3 { font-size: 1rem; }
+  .agent-prose p { margin: 0.4em 0; line-height: 1.6; }
+  .agent-prose ul, .agent-prose ol { margin: 0.4em 0; padding-left: 1.5em; }
+  .agent-prose ul { list-style-type: disc; }
+  .agent-prose ol { list-style-type: decimal; }
+  .agent-prose li { margin: 0.2em 0; }
+  .agent-prose strong { color: #f1f5f9; font-weight: 600; }
+  .agent-prose em { color: #cbd5e1; }
+  .agent-prose a { color: #818cf8; text-decoration: underline; }
+  .agent-prose blockquote {
+    border-left: 3px solid #4f46e5; padding: 0.3em 0.8em; margin: 0.5em 0;
+    color: #94a3b8; background: rgba(99,102,241,0.06); border-radius: 0 0.375rem 0.375rem 0;
+  }
+  .agent-prose code:not(pre code) {
+    background: rgba(255,255,255,0.08); padding: 0.15em 0.35em; border-radius: 0.25rem;
+    font-size: 0.85em; color: #e2e8f0;
+  }
+  .agent-prose pre {
+    background: #0d1117; border: 1px solid #1e293b; border-radius: 0.5rem;
+    padding: 0.8em 1em; margin: 0.6em 0; overflow-x: auto;
+  }
+  .agent-prose pre code { background: none; padding: 0; font-size: 0.82em; color: #e2e8f0; }
+  .agent-prose table { width: 100%; border-collapse: collapse; margin: 0.6em 0; font-size: 0.85em; }
+  .agent-prose th, .agent-prose td { border: 1px solid #1e293b; padding: 0.4em 0.7em; text-align: left; }
+  .agent-prose th { background: rgba(255,255,255,0.04); font-weight: 600; color: #e2e8f0; }
+  .member-msg { border-left: 3px solid #6366f1; }
+  .go-msg { border-left: 3px solid #10b981; }
+  .system-msg { border-left: 3px solid #64748b; }
+</style>
+
+<div class="flex flex-col h-screen">
+  <!-- Header -->
+  <div id="goal-thread-header" class="flex items-center justify-between px-6 py-3 border-b border-slate-700 bg-slate-800/50">
+    <div class="flex items-center gap-3">
+      <a href="/goals/{{ pid }}" class="text-slate-400 hover:text-white">
+        <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"/></svg>
+      </a>
+      <div>
+        <h1 class="text-lg font-semibold text-white">{{ goal.name }}</h1>
+        <p class="text-xs text-slate-400">
+          Goal Thread &middot;
+          {{ members|length }} member{{ 's' if members|length != 1 else '' }} &middot;
+          {% if goal.state %}{{ goal.state }}{% endif %}
+          {% if goal.completion_pct %} &middot; {{ goal.completion_pct }}% complete{% endif %}
+        </p>
+      </div>
+    </div>
+    <div class="flex items-center gap-2">
+      <!-- Members indicator -->
+      <div class="flex -space-x-2">
+        {% for m in members[:5] %}
+        <div class="w-7 h-7 rounded-full bg-indigo-600 border-2 border-slate-800 flex items-center justify-center text-xs text-white font-medium" title="{{ m.display_name or m.email }}">
+          {{ (m.display_name or m.email)[:1]|upper }}
+        </div>
+        {% endfor %}
+        {% if members|length > 5 %}
+        <div class="w-7 h-7 rounded-full bg-slate-600 border-2 border-slate-800 flex items-center justify-center text-xs text-white">
+          +{{ members|length - 5 }}
+        </div>
+        {% endif %}
+      </div>
+      <!-- Context-usage ring (fills as tokens accumulate; turns amber, then red, near compaction). -->
+      <div id="usage-ring" class="relative w-7 h-7 flex items-center justify-center opacity-40"
+           title="Context usage: send a message to populate">
+        <svg viewBox="0 0 28 28" class="w-7 h-7 -rotate-90">
+          <circle cx="14" cy="14" r="11" stroke="currentColor" stroke-width="2.5" fill="none" class="text-slate-700"/>
+          <circle id="usage-ring-fg" cx="14" cy="14" r="11" stroke="currentColor" stroke-width="2.5" fill="none"
+                  stroke-dasharray="69.115" stroke-dashoffset="69.115" stroke-linecap="round"
+                  class="text-emerald-400 transition-all duration-300"/>
+        </svg>
+      </div>
+      {% if goal.id == '__platform__' %}
+      <!-- Platform Research Council v2: run a research sweep (model + tool research → independent review) -->
+      <button id="prc-run-btn" type="button" onclick="platformResearchRun('{{ goal.id }}')"
+        title="Run a research sweep: model + tool/MCP research in parallel, then independent integration review; the steward posts a digest here"
+        class="px-2.5 h-7 flex items-center gap-1.5 rounded-md text-xs font-medium border border-sky-500/30 text-sky-300 bg-sky-500/10 hover:bg-sky-500/20 transition-colors">
+        <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-5.197-5.197m0 0A7.5 7.5 0 105.196 5.196a7.5 7.5 0 0010.607 10.607z"/>
+        </svg>
+        Run research sweep
+      </button>
+      <span id="prc-status" class="text-xs text-sky-300 hidden"></span>
+      <!-- Story board for the Platform goal: steward-created integration stories -->
+      <a href="/goals/{{ goal.id }}/stories"
+        title="Open the Platform story board: steward-created integration stories worked by the Platform assistant"
+        class="px-2.5 h-7 flex items-center gap-1.5 rounded-md text-xs font-medium border border-slate-600 text-slate-300 hover:text-white hover:bg-slate-700/50 transition-colors">
+        <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2"/>
+        </svg>
+        Story board
+      </a>
+      {% endif %}
+      {% if goal.id != '__platform__' and user.preferences.get("startup_wizard_enabled", True) %}
+      {{ tour_trigger("goal-thread-intro", "What is the Goal Thread?") }}
+      {% endif %}
+      <span id="ws-status" class="text-xs text-slate-500">connecting...</span>
+    </div>
+  </div>
+
+  {% if goal.id == '__platform__' %}
+  <script>
+  // Platform Research Council v2: trigger + running indicator.
+  async function platformResearchRun(goalId) {
+    const result = await window.confirmAction({
+      title: 'Run a research sweep?',
+      body: 'Model and tool/MCP research workers run in parallel, then an independent reviewer assesses each finding for adoptability. The steward posts a digest into this thread when done.',
+    });
+    if (!result?.confirmed) return;
+    const btn = document.getElementById('prc-run-btn');
+    btn.disabled = true;
+    try {
+      const r = await fetch(`/goals/${goalId}/research/run`, { method: 'POST', credentials: 'same-origin' });
+      const data = await r.json().catch(() => ({}));
+      if (r.ok && data.ok) {
+        prcPoll();  // start showing the indicator immediately
+      } else {
+        showToast("Could not start research: " + (data.reason || `HTTP ${r.status}`), 'error');
+        btn.disabled = false;
+      }
+    } catch (e) { showToast("Could not start research: " + e, 'error'); btn.disabled = false; }
+  }
+  async function prcPoll() {
+    const el = document.getElementById('prc-status');
+    const btn = document.getElementById('prc-run-btn');
+    try {
+      const r = await fetch(`/goals/{{ goal.id }}/research/status`, { credentials: 'same-origin' });
+      const s = await r.json();
+      if (s.running) {
+        el.classList.remove('hidden');
+        const phase = s.reviewing
+          ? 'reviewing findings'
+          : `researching${s.producers_progress ? ': producers ' + s.producers_progress : ''}`;
+        el.textContent = `● ${phase}: new research blocked until done`;
+        if (btn) { btn.disabled = true; btn.title = 'A research sweep is already running'; }
+        setTimeout(prcPoll, 5000);
+      } else {
+        el.classList.add('hidden');
+        if (btn) btn.disabled = false;
+      }
+    } catch (e) { setTimeout(prcPoll, 10000); }
+  }
+  document.addEventListener('DOMContentLoaded', prcPoll);  // reflect an in-flight run on load
+  </script>
+  {% endif %}
+
+  <script>
+  // Context-usage ring (mirrors chat/index.html)
+  const USAGE_RING_CIRCUMFERENCE = 69.115;
+  async function refreshUsageRing() {
+    const ring = document.getElementById('usage-ring');
+    const fg = document.getElementById('usage-ring-fg');
+    if (!ring || !fg) return;
+    const goalId = '{{ goal.id }}';
+    // Use the goal's ACTUAL agent id (the platform goal's agent is 'platform-steward',
+    // not 'go-__platform__'); fall back to the GO naming for normal goals.
+    const agentId = '{{ (goal.go_agent_id or ("go-" + goal.id)).lower() }}';
+    const threadId = '{{ thread_id or "" }}';
+    if (!threadId) return;
+    try {
+      const qs = new URLSearchParams({goal_id: goalId, agent_id: agentId, thread_id: threadId});
+      const resp = await fetch(`/api/memory/usage?${qs}`);
+      const data = await resp.json().catch(() => ({}));
+      if (!data.ok || !data.contextTokens || !data.totalTokens) {
+        fg.style.strokeDashoffset = String(USAGE_RING_CIRCUMFERENCE);
+        ring.classList.add('opacity-40');
+        ring.title = 'Context usage: no data yet';
+        return;
+      }
+      ring.classList.remove('opacity-40');
+      const tokens = data.totalTokens, cap = data.contextTokens;
+      const ratio = Math.min(1, tokens / cap);
+      fg.style.strokeDashoffset = String(USAGE_RING_CIRCUMFERENCE * (1 - ratio));
+      const soft = data.softThresholdTokens && data.softThresholdTokens > 0
+        ? data.softThresholdTokens : Math.floor(cap * 0.9);
+      fg.classList.remove('text-emerald-400', 'text-amber-400', 'text-red-500');
+      if (tokens >= soft) fg.classList.add('text-red-500');
+      else if (tokens >= soft * 0.6) fg.classList.add('text-amber-400');
+      else fg.classList.add('text-emerald-400');
+      const pct = (ratio * 100).toFixed(1);
+      const stale = data.totalTokensFresh === false ? ' (stale)' : '';
+      let title = `Context: ${tokens.toLocaleString()} / ${cap.toLocaleString()} tokens (${pct}%)${stale}\n`
+                + `Soft flush at: ${soft.toLocaleString()}\n`
+                + `Compactions so far: ${data.compactionCount || 0}\n`
+                + `Model: ${data.model || 'unknown'}`;
+      if (typeof data.memoryFileChars === 'number' && typeof data.memoryFileLimitChars === 'number') {
+        const mPct = (data.memoryFileChars / data.memoryFileLimitChars * 100).toFixed(1);
+        title += `\nMEMORY.md: ${data.memoryFileChars.toLocaleString()} / ${data.memoryFileLimitChars.toLocaleString()} chars (${mPct}%)`;
+      }
+      ring.title = title;
+    } catch (err) {}
+  }
+  window.addEventListener('DOMContentLoaded', refreshUsageRing);
+  // Auto-poll while tab is visible. The WS event-driven path
+  // (token_stream_end / lifecycle:end) only fires on chat:final and
+  // can miss interim gateway counter updates (tool calls, streaming
+  // pauses, post-final aggregation). 8s is cheap: sessions.status
+  // just reads in-memory counters, no transcript scan.
+  setInterval(() => {
+    if (document.visibilityState === 'visible') refreshUsageRing();
+  }, 8000);
+  </script>
+
+  <!-- Messages area -->
+  <div id="messages" class="flex-1 overflow-y-auto px-6 py-4 space-y-3">
+    {% if goal.objective %}
+    <div class="system-msg pl-4 py-2 text-sm text-slate-400 bg-slate-800/30 rounded-r-lg">
+      <span class="font-medium text-slate-300">Objective:</span> {{ goal.objective }}
+      {% if goal.deadline %}<br><span class="font-medium text-slate-300">Deadline:</span> {{ goal.deadline.strftime('%Y-%m-%d') if goal.deadline else 'Not set' }} UTC{% endif %}
+    </div>
+    {% endif %}
+
+    {% for msg in messages %}
+    <div class="{% if msg.role == 'agent' %}go-msg{% else %}member-msg{% endif %} pl-4 py-2 rounded-r-lg" data-msg-id="{{ msg.id }}">
+      <div class="flex items-center gap-2 mb-1">
+        <span class="text-xs font-semibold {% if msg.sender_name == 'Goal Review Council' %}text-amber-300{% elif msg.sender_name == 'Security Council' %}text-rose-300{% elif msg.role == 'agent' %}text-emerald-400{% else %}text-indigo-400{% endif %}">
+          {{ msg.sender_name if msg.sender_name else msg.sender }}
+          {# Role clarifier for the GO only: council messages already name themselves. #}
+          {% if msg.role == 'agent' and msg.sender_name not in ('Goal Review Council', 'Security Council') %}<span class="text-slate-500 font-normal">(Goal Orchestrator)</span>{% endif %}
+        </span>
+        <span class="text-xs text-slate-500" data-utc="{{ msg.created_at.isoformat() if msg.created_at else '' }}">
+          {{ msg.created_at.strftime('%b %d, %H:%M') if msg.created_at else '' }} UTC
+        </span>
+      </div>
+      <div class="text-sm text-slate-200 agent-prose">
+        <div class="rendered-md">{{ msg.content }}</div>
+      </div>
+    </div>
+    {% endfor %}
+
+    <!-- Compaction indicator: shows when the gateway is compacting context.
+         Can take several minutes for large sessions; this prevents the UI
+         from looking frozen ("your message isn't lost"). -->
+    <div id="go-compacting" class="hidden pl-4 py-2 my-2 rounded-r-lg bg-amber-900/20 border-l-2 border-amber-500">
+      <div class="flex items-center gap-2">
+        <svg class="w-4 h-4 text-amber-400 animate-spin" fill="none" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+          <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+          <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.4 0 0 5.4 0 12h4zm2 5.3A8 8 0 014 12H0c0 3 1.1 5.8 3 7.9l3-2.6z"></path>
+        </svg>
+        <span class="text-xs font-semibold text-amber-300">Compacting conversation history</span>
+        <span class="text-xs text-amber-400/70">This can take a few minutes on long sessions. Your message will be processed once compaction completes.</span>
+      </div>
+    </div>
+
+    <!-- GO thinking indicator -->
+    <div id="go-thinking" class="hidden go-msg pl-4 py-2 rounded-r-lg">
+      <div class="flex items-center gap-2">
+        <span class="text-xs font-semibold text-emerald-400">Goal Orchestrator <span class="text-slate-500 font-normal">is thinking...</span></span>
+        <div class="flex space-x-1">
+          <div class="w-1.5 h-1.5 bg-emerald-400 rounded-full animate-bounce" style="animation-delay: 0ms"></div>
+          <div class="w-1.5 h-1.5 bg-emerald-400 rounded-full animate-bounce" style="animation-delay: 150ms"></div>
+          <div class="w-1.5 h-1.5 bg-emerald-400 rounded-full animate-bounce" style="animation-delay: 300ms"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Streaming GO response -->
+    <div id="go-streaming" class="hidden go-msg pl-4 py-2 rounded-r-lg">
+      <div class="flex items-center gap-2 mb-1">
+        <span class="text-xs font-semibold text-emerald-400">Goal Orchestrator</span>
+      </div>
+      <div id="go-streaming-content" class="text-sm text-slate-200 agent-prose"></div>
+    </div>
+  </div>
+
+  <!-- Input area -->
+  <div class="px-6 py-3 border-t border-slate-700 bg-slate-800/50">
+    <div id="upload-status" class="hidden mb-2 px-3 py-1.5 text-xs rounded-lg"></div>
+    <div class="flex gap-3 items-end">
+      <input id="file-input" type="file" class="hidden" multiple
+        accept=".pdf,.xlsx,.xls,.docx,.doc,.md,.txt,.csv,.json,.yaml,.yml,.png,.jpg,.jpeg"
+        onchange="uploadFiles(this.files)">
+      <button type="button" onclick="document.getElementById('file-input').click()"
+        class="px-3 py-2.5 bg-slate-700 hover:bg-slate-600 text-white rounded-xl flex-shrink-0"
+        title="Attach file (becomes a goal-wide read-only resource)">
+        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+            d="M15.172 7l-6.586 6.586a2 2 0 102.828 2.828l6.414-6.586a4 4 0 00-5.656-5.656l-6.415 6.585a6 6 0 108.486 8.486L20.5 13"/>
+        </svg>
+      </button>
+      <textarea
+        id="msg-input"
+        rows="1"
+        placeholder="Type a message to the team and GO… (paste/drop files to attach)"
+        class="flex-1 bg-slate-700 text-white rounded-xl px-4 py-2.5 text-sm border border-slate-600 focus:border-indigo-500 focus:outline-none resize-none"
+        style="max-height: 120px"
+        onpaste="handlePaste(event)"
+      ></textarea>
+      <button
+        id="send-btn"
+        onclick="sendMessage()"
+        class="px-4 py-2.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl text-sm font-medium transition-colors"
+      >Send</button>
+    </div>
+  </div>
+</div>
+
+<script>
+const pid = "{{ pid }}";
+const threadId = "{{ thread_id }}";
+const currentUid = "{{ user.uid }}";
+const currentName = "{{ user.display_name or user.email }}";
+const firebaseToken = "{{ firebase_token }}";
+
+let ws = null;
+let goIsThinking = false;
+// Tracks the last message ID received (live or on page load). Used on WS
+// reconnect to fetch any messages that arrived while the socket was down.
+let lastMsgId = '';
+
+// ── Markdown renderer config lives in /static/js/markdown_renderer.js (shared
+// with chat/orchestrator/council_thread/security_thread) ──────────────────────
+
+// Render existing agent messages
+document.querySelectorAll('.rendered-md').forEach(el => {
+  try {
+    const html = safeMarkdown(el.textContent);  // XSS: sanitized before innerHTML
+    if (typeof html === 'string' && html.trim()) el.innerHTML = html;
+  } catch (e) {
+    console.warn('safeMarkdown failed for element:', e);
+  }
+});
+
+// Seed lastMsgId from the last server-rendered message so reconnect catch-up
+// only fetches messages that arrived after the page load.
+{% if messages %}lastMsgId = "{{ messages[-1].id }}";{% endif %}
+
+// Auto-scroll to bottom
+const messagesDiv = document.getElementById('messages');
+messagesDiv.scrollTop = messagesDiv.scrollHeight;
+
+// ── Missed-message catch-up (called on WS reconnect) ──
+async function catchUpMissedMessages() {
+  if (!lastMsgId) return;
+  try {
+    const resp = await fetch(`/goals/${pid}/thread/messages?after=${encodeURIComponent(lastMsgId)}`, {
+      headers: { 'Authorization': `Bearer ${firebaseToken}` },
+    });
+    if (!resp.ok) return;
+    const data = await resp.json();
+    if (!data.messages || !data.messages.length) return;
+    for (const msg of data.messages) {
+      // Skip if we already rendered it live (msg ID check against DOM)
+      if (document.querySelector(`[data-msg-id="${msg.id}"]`)) continue;
+      const _label = msg.sender_name || (msg.origin === 'slack' ? 'Slack' : msg.sender);
+      appendMessage(_label, msg.content, msg.role || 'human', msg.sender === currentUid, msg.id);
+    }
+    hideThinking();
+  } catch (e) {
+    console.warn('catch-up fetch failed:', e);
+  }
+}
+
+// ── WebSocket ──
+let _wsConnectCount = 0;
+function connect() {
+  const wsUrl = `${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/goals/${pid}/thread/ws?token=${firebaseToken}`;
+  ws = new WebSocket(wsUrl);
+  const connectIndex = ++_wsConnectCount;
+
+  ws.onopen = () => {
+    // Mark this thread as actively viewed so the sidebar badge JS skips
+    // unread notifications for it while the user is watching live.
+    window.CURRENT_THREAD_ID = threadId;
+    document.getElementById('ws-status').textContent = 'connected';
+    document.getElementById('ws-status').className = 'text-xs text-emerald-400';
+    // On reconnects (not the first connection), fetch any messages that
+    // arrived while the socket was closed.
+    if (connectIndex > 1) catchUpMissedMessages();
+  };
+
+  ws.onclose = () => {
+    if (window.CURRENT_THREAD_ID === threadId) window.CURRENT_THREAD_ID = null;
+    document.getElementById('ws-status').textContent = 'disconnected';
+    document.getElementById('ws-status').className = 'text-xs text-red-400';
+    setTimeout(connect, 3000);
+  };
+
+  ws.onerror = () => {
+    document.getElementById('ws-status').textContent = 'error';
+    document.getElementById('ws-status').className = 'text-xs text-red-400';
+  };
+
+  ws.onmessage = (event) => {
+    try {
+      const msg = JSON.parse(event.data);
+      handleMessage(msg);
+    } catch (e) {
+      console.warn('Non-JSON WS frame:', event.data);
+    }
+  };
+}
+
+function handleMessage(msg) {
+  if (msg.type === 'message') {
+    // Human message from another member (or echo of own), OR an agent message
+    // delivered as a plain message (e.g. council review, cross-instance fanout).
+    // Only an AGENT message means the turn produced output: hide the loader.
+    // A human message (including the echo of your own send) must NOT hide it,
+    // or the loader vanishes the instant the send echoes back and never shows.
+    const _role = msg.role || 'human';
+    if (_role === 'agent') hideThinking();
+    const _goLabel = msg.sender_name || (msg.origin === 'slack' ? 'Slack' : '');
+    appendMessage(_goLabel, msg.content, _role, msg.sender === currentUid, msg.id);
+  } else if (msg.type === 'thinking') {
+    // GO is thinking: broadcast to all members
+    showThinking();
+  } else if (msg.type === 'token') {
+    // GO streaming response
+    showStreaming(msg.token || '');
+  } else if (msg.type === 'token_stream_end') {
+    // GO finished responding (lifecycle:end with content)
+    finalizeStreaming();
+    if (typeof refreshUsageRing === 'function') refreshUsageRing();
+  } else if (msg.type === 'agent_event' && msg.stream === 'compaction' && msg.data) {
+    // Compaction can take minutes on large contexts: show an indicator
+    // so the UI doesn't look frozen during the wait. (Gateway-side
+    // attempt.ts:2121 COMPACTION_RETRY_AGGREGATE_TIMEOUT_MS = 5 min.)
+    const compactingEl = document.getElementById('go-compacting');
+    if (compactingEl) {
+      if (msg.data.phase === 'start') {
+        compactingEl.classList.remove('hidden');
+      } else if (msg.data.phase === 'end') {
+        compactingEl.classList.add('hidden');
+        if (typeof refreshUsageRing === 'function') refreshUsageRing();
+      }
+    }
+  } else if (msg.type === 'agent_event' && msg.stream === 'lifecycle' && msg.data && msg.data.phase === 'end') {
+    // GO finished responding (agent event)
+    finalizeStreaming();
+    if (typeof refreshUsageRing === 'function') refreshUsageRing();
+  } else if (msg.type === 'tool_start') {
+    // GO is using a tool: replace "is thinking" with "is using <tool>"
+    showThinking();
+    const label = document.querySelector('#go-thinking span.text-xs span');
+    if (label) label.textContent = `is using ${msg.name || 'a tool'}…`;
+  } else if (msg.type === 'tool_result') {
+    // Tool finished: revert label to generic thinking
+    const label = document.querySelector('#go-thinking span.text-xs span');
+    if (label) label.textContent = 'is thinking...';
+  } else if (msg.type === 'agent_event' && msg.stream === 'tool') {
+    // (Legacy format, kept as fallback)
+    if (msg.data && msg.data.phase === 'start') {
+      showThinking();
+      const label = document.querySelector('#go-thinking span.text-xs span');
+      if (label) label.textContent = `is using ${msg.data.name || 'a tool'}…`;
+    }
+  } else if (msg.type === 'human_message') {
+    // Message sent from another surface (e.g. Slack) on this thread.
+    // Strip state-context block appended for SHCA's LLM: not meant for display.
+    const rawContent = (msg.content || '');
+    const ctxIdx = rawContent.indexOf('<!--shca-state-context-->');
+    const displayContent = ctxIdx !== -1 ? rawContent.slice(0, ctxIdx).trimEnd() : rawContent;
+    const label = msg.sender_name || (msg.origin === 'slack' ? 'Slack' : null);
+    appendMessage(label || 'Member', displayContent, 'human', false, msg.message_id);
+  } else if (msg.type === 'system_notice') {
+    // Server rejected this turn without a reply: most commonly the kill switch
+    // (code EXECUTION_PAUSED): the message was dropped, not queued. Stop the
+    // "is thinking" indicator (nothing is coming) and surface why, so a member
+    // doesn't sit waiting on a frozen goal.
+    hideThinking();
+    appendSystemMessage(
+      msg.message || 'Execution is paused: your message was not delivered. Resume to continue.',
+      { tone: 'warn' },
+    );
+  } else if (msg.type === 'error') {
+    appendSystemMessage('Error: ' + (msg.message || 'Unknown error'));
+  }
+}
+
+function appendMessage(sender, content, role, isOwn, msgId) {
+  const div = document.createElement('div');
+  const isGO = role === 'agent';
+  div.className = `${isGO ? 'go-msg' : 'member-msg'} pl-4 py-2 rounded-r-lg`;
+  if (msgId) { div.dataset.msgId = msgId; lastMsgId = msgId; }
+
+  // Council reviews arrive as role='agent' too: honor the real sender name
+  // instead of hardcoding the GO. `sender` here is already the resolved
+  // sender_name ("Goal Orchestrator", "Goal Review Council", a member, …).
+  const isCouncil = isGO && sender === 'Goal Review Council';
+  const isSecurity = isGO && sender === 'Security Council';
+  const colorClass = isCouncil ? 'text-amber-300'
+                   : (isSecurity ? 'text-rose-300'
+                   : (isGO ? 'text-emerald-400' : 'text-indigo-400'));
+  const displayName = escapeHtml(sender || (isGO ? 'Goal Orchestrator' : ''));
+  const nowDate = new Date();
+  const now = nowDate.toLocaleString([], {month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false, timeZone: 'UTC'});
+
+  let rendered = '';
+  try { rendered = safeMarkdown(content) || ''; } catch(e) { rendered = escapeHtml(content); }  // XSS: sanitized
+
+  div.innerHTML = `
+    <div class="flex items-center gap-2 mb-1">
+      <span class="text-xs font-semibold ${colorClass}">${displayName}</span>
+      <span class="text-xs text-slate-500" data-utc="${nowDate.toISOString()}">${now} UTC</span>
+    </div>
+    <div class="text-sm text-slate-200 agent-prose">${rendered}</div>
+  `;
+
+  const container = document.getElementById('messages');
+  const thinkingEl = document.getElementById('go-thinking');
+  container.insertBefore(div, thinkingEl);
+  container.scrollTop = container.scrollHeight;
+}
+
+function appendSystemMessage(text, opts = {}) {
+  const div = document.createElement('div');
+  // 'warn' tone (amber) is used for the kill-switch pause notice so it reads
+  // as an actionable state, distinct from a plain gray info/error line.
+  const warn = (opts.tone || '') === 'warn';
+  div.className = warn
+    ? 'system-msg pl-4 py-2 text-sm text-amber-200 bg-amber-900/25 border-l-2 border-amber-600 rounded-r-lg'
+    : 'system-msg pl-4 py-2 text-sm text-slate-400 bg-slate-800/30 rounded-r-lg';
+  div.textContent = (warn ? '⏸ ' : '') + text;
+  const container = document.getElementById('messages');
+  container.insertBefore(div, document.getElementById('go-thinking'));
+  container.scrollTop = container.scrollHeight;
+}
+
+function showThinking() {
+  goIsThinking = true;
+  document.getElementById('go-thinking').classList.remove('hidden');
+  messagesDiv.scrollTop = messagesDiv.scrollHeight;
+}
+
+function hideThinking() {
+  goIsThinking = false;
+  document.getElementById('go-thinking').classList.add('hidden');
+  // Reset label for next run
+  const label = document.querySelector('#go-thinking span.text-xs span');
+  if (label) label.textContent = 'is thinking...';
+}
+
+function showStreaming(text) {
+  hideThinking();
+  const el = document.getElementById('go-streaming');
+  const content = document.getElementById('go-streaming-content');
+  el.classList.remove('hidden');
+  try { content.innerHTML = safeMarkdown(text) || escapeHtml(text); } catch(e) { content.textContent = text; }  // XSS: sanitized
+  messagesDiv.scrollTop = messagesDiv.scrollHeight;
+}
+
+function finalizeStreaming() {
+  const el = document.getElementById('go-streaming');
+  const content = document.getElementById('go-streaming-content');
+  if (!el.classList.contains('hidden') && content.innerHTML.trim()) {
+    // Move streaming content to a permanent message
+    appendMessage('Goal Orchestrator', content.textContent, 'agent', false);
+  }
+  el.classList.add('hidden');
+  content.innerHTML = '';
+  hideThinking();
+}
+
+function sendMessage() {
+  const input = document.getElementById('msg-input');
+  const text = input.value.trim();
+  if (!text || !ws || ws.readyState !== WebSocket.OPEN) return;
+
+  ws.send(JSON.stringify({type: 'message', content: text}));
+  input.value = '';
+  input.style.height = 'auto';
+  // "GO is thinking" is broadcast from server to all members
+}
+
+function escapeHtml(str) {
+  const div = document.createElement('div');
+  div.textContent = str;
+  return div.innerHTML;
+}
+
+// ── Auto-resize textarea ──
+const input = document.getElementById('msg-input');
+input.addEventListener('input', () => {
+  input.style.height = 'auto';
+  input.style.height = Math.min(input.scrollHeight, 120) + 'px';
+});
+
+input.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    sendMessage();
+  }
+});
+
+// ── File upload (chat → goal_resources, refresh all sessions) ──────────────
+const SENDER_AGENT_GO = "go";
+
+function showUploadStatus(msg, kind) {
+  const el = document.getElementById('upload-status');
+  if (!el) return;
+  el.classList.remove('hidden', 'bg-emerald-900/40', 'bg-red-900/40', 'bg-blue-900/40', 'text-emerald-300', 'text-red-300', 'text-blue-300');
+  if (kind === 'success') el.classList.add('bg-emerald-900/40', 'text-emerald-300');
+  else if (kind === 'error') el.classList.add('bg-red-900/40', 'text-red-300');
+  else el.classList.add('bg-blue-900/40', 'text-blue-300');
+  el.textContent = msg;
+}
+
+function hideUploadStatus(delayMs) {
+  setTimeout(() => {
+    const el = document.getElementById('upload-status');
+    if (el) el.classList.add('hidden');
+  }, delayMs || 4000);
+}
+
+async function uploadOneFile(file) {
+  const fd = new FormData();
+  fd.append('file', file);
+  fd.append('sender_agent', SENDER_AGENT_GO);
+  showUploadStatus(`⬆ Uploading ${file.name} (${Math.round(file.size/1024)} KB)…`, 'info');
+  try {
+    const resp = await fetch(`/goals/${pid}/chat/upload`, { method: 'POST', body: fd });
+    if (!resp.ok) {
+      const err = await resp.text();
+      showUploadStatus(`✗ ${file.name}: ${err.substring(0, 200)}`, 'error');
+      hideUploadStatus(8000);
+      return null;
+    }
+    const data = await resp.json();
+    const r = data.refresh || {};
+    showUploadStatus(
+      `✓ ${file.name} (${data.file_type.toUpperCase()}). Refreshed → GO:${r.go ? '✓' : '–'}, Assistants:${r.assistants ?? r.shcas ?? 0}, IAs:${r.ia_workers || 0}`,
+      'success',
+    );
+    hideUploadStatus(6000);
+    return data;
+  } catch (e) {
+    showUploadStatus(`✗ ${file.name}: ${e.message}`, 'error');
+    hideUploadStatus(8000);
+    return null;
+  }
+}
+
+async function uploadFiles(fileList) {
+  if (!fileList || fileList.length === 0) return;
+  for (const f of fileList) await uploadOneFile(f);
+  document.getElementById('file-input').value = '';
+}
+
+function handlePaste(e) {
+  if (!e.clipboardData || !e.clipboardData.files || e.clipboardData.files.length === 0) return;
+  e.preventDefault();
+  uploadFiles(e.clipboardData.files);
+}
+
+// Drag & drop on the page
+document.addEventListener('dragover', (e) => { e.preventDefault(); });
+document.addEventListener('drop', (e) => {
+  e.preventDefault();
+  if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+    uploadFiles(e.dataTransfer.files);
+  }
+});
+
+// Start connection
+connect();
+
+// ── Restore "GO is running" indicator on page load ────────────────────────
+// If the GO is mid-run, restore the thinking indicator (or a tool-use
+// label) from chat_run_state so reloads don't lose the indicator.
+(async function restoreGoRunState() {
+  try {
+    const resp = await fetch(`/goals/${pid}/thread/run-state`);
+    if (!resp.ok) return;
+    const r = await resp.json();
+    if (r.status === 'using_tool' && r.tool) {
+      showThinking();
+      // Replace the "thinking..." label with the tool name inline
+      const label = document.querySelector('#go-thinking span.text-xs span');
+      if (label) label.textContent = `is using ${r.tool}…`;
+    } else if (r.status === 'thinking') {
+      showThinking();
+    }
+  } catch (e) { /* idle / ignore */ }
+})();
+</script>
+{% endblock %}
+
+{% block extra_js %}
+{% if auto_fire_tour %}
+<script>
+// Milestone tour: first-ever visit to this goal's thread. The route already
+// skips the reserved __platform__ goal (its agent is the Platform Steward,
+// not a per-goal GO, and the tour's copy talks specifically about GO). Must
+// run in extra_js (after tour.js loads) — content renders inside <main>,
+// before the bottom-of-body script tags.
+autoFireTour('goal-thread-intro', 800);
+</script>
+{% endif %}
+{% endblock %}

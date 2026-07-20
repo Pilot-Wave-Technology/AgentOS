@@ -1,0 +1,612 @@
+{% extends "base.html" %}
+{% from "partials/_info_popover.html" import info_popover %}
+{% block title %}{% if tool %}{{ tool.name }}{% else %}New TypeScript Tool{% endif %}{% endblock %}
+
+{% block content %}
+{% set _back_tab = 'system-tools' if (tool and tool.is_core) else 'custom-tools' %}
+{% set _back_label = 'System Tools' if (tool and tool.is_core) else 'Custom Tools' %}
+<div class="p-8 max-w-3xl mx-auto">
+
+  <div class="mb-6">
+    <a href="/settings/tools?tab={{ _back_tab }}" class="inline-flex items-center gap-1 text-sm text-indigo-400 hover:text-indigo-300">
+      <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"/></svg>
+      Tool Registry / {{ _back_label }}
+    </a>
+  </div>
+
+  <!-- Header -->
+  <div class="flex items-center justify-between mb-6">
+    <div>
+      {% if tool %}
+      <h1 class="text-2xl font-bold">
+        <span class="font-mono text-indigo-400">{{ tool.name }}</span>
+      </h1>
+      <p class="text-xs text-gray-500 mt-1">
+        TypeScript &middot;
+        {% if tool.status == 'enabled' %}<span class="text-green-400">enabled</span>
+        {% elif tool.status == 'disabled' %}<span class="text-gray-400">disabled</span>
+        {% else %}<span class="text-amber-400">{{ tool.status }}</span>{% endif %}
+      </p>
+      {% else %}
+      <h1 class="text-2xl font-bold">New TypeScript Tool</h1>
+      <p class="text-gray-500 text-sm mt-1">Executed in an isolated Deno sandbox. Can call external APIs.</p>
+      {% endif %}
+    </div>
+    {% if tool and can_edit %}
+    <div class="flex gap-2">
+      {% if tool.status == 'enabled' %}
+      <button onclick="setStatus('disabled')" class="btn btn-sm border border-gray-700 text-gray-400 hover:bg-gray-800">Disable</button>
+      {% else %}
+      <button onclick="setStatus('enabled')" class="btn btn-sm border border-green-800 text-green-400 hover:bg-green-900/30">Enable</button>
+      {% endif %}
+    </div>
+    {% endif %}
+  </div>
+
+  {% if not can_edit %}
+  {# Read-only view: capabilities are already shown by _manifest_review.html below. #}
+  <div class="space-y-4">
+    <div class="bg-gray-900 border border-gray-800 rounded-xl p-5">
+      <h2 class="text-xs font-semibold uppercase tracking-wider text-gray-500 mb-3">Description</h2>
+      <p class="text-sm text-gray-300">{{ tool.description or 'Not Set' }}</p>
+    </div>
+    {% if tool.parameters_schema and tool.parameters_schema.get('properties') %}
+    <div class="bg-gray-900 border border-gray-800 rounded-xl p-5">
+      <h2 class="text-xs font-semibold uppercase tracking-wider text-gray-500 mb-3">Parameters</h2>
+      <div class="space-y-1.5">
+        {% for pname, pdef in tool.parameters_schema.properties.items() %}
+        <div class="flex items-center gap-2 text-sm">
+          <span class="font-mono text-gray-300">{{ pname }}</span>
+          <span class="pill pill-neutral text-2xs">{{ pdef.type }}</span>
+          {% if pname in (tool.parameters_schema.required or []) %}<span class="text-2xs text-amber-400">required</span>{% endif %}
+          {% if pdef.description %}<span class="text-xs text-gray-500">: {{ pdef.description }}</span>{% endif %}
+        </div>
+        {% endfor %}
+      </div>
+    </div>
+    {% endif %}
+    <div class="bg-gray-900 border border-gray-800 rounded-xl p-5">
+      <h2 class="text-xs font-semibold uppercase tracking-wider text-gray-500 mb-3">Code</h2>
+      <pre class="text-xs text-gray-300 bg-gray-800 rounded p-3 overflow-x-auto whitespace-pre-wrap">{{ tool.source_code or '' }}</pre>
+    </div>
+    <div class="flex justify-end">
+      <a href="/settings/tools?tab={{ _back_tab }}" class="btn btn-secondary">Back</a>
+    </div>
+  </div>
+  {% else %}
+
+  <div id="save-banner" class="hidden mb-4 px-4 py-3 bg-green-900/30 border border-green-800 rounded-lg text-sm text-green-300">
+    Saved. Tool cache refreshed.
+  </div>
+  <div id="err-banner" class="hidden mb-4 px-4 py-3 bg-red-900/30 border border-red-800 rounded-lg text-sm text-red-300"></div>
+
+  <!-- Step 1: Identity -->
+  <div class="bg-gray-900 border border-gray-800 rounded-xl p-5 mb-4">
+    <h2 class="text-xs font-semibold uppercase tracking-wider text-gray-500 mb-4">1: Identity</h2>
+    <div class="space-y-4">
+      <div>
+        <label class="block text-xs text-gray-400 mb-1.5">
+          Name <span class="text-red-400">*</span>
+          {% if tool %}<span class="text-gray-600 ml-1">(immutable)</span>{% endif %}
+        </label>
+        <input id="f-name" type="text"
+          value="{{ tool.name if tool else '' }}"
+          {% if tool %}readonly{% endif %}
+          placeholder="my_tool  (lowercase, underscores only)"
+          class="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm font-mono focus:outline-none focus:border-indigo-500 {% if tool %}opacity-60 cursor-not-allowed{% endif %}" />
+      </div>
+      <div>
+        <label class="block text-xs text-gray-400 mb-1.5">Label <span class="text-red-400">*</span></label>
+        <input id="f-label" type="text"
+          value="{{ tool.label if tool else '' }}"
+          placeholder="Human-readable name shown to agents"
+          class="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm focus:outline-none focus:border-indigo-500" />
+      </div>
+      <div>
+        <label class="block text-xs text-gray-400 mb-1.5">Description <span class="text-red-400">*</span></label>
+        <textarea id="f-description" rows="2" placeholder="1–2 sentences describing what this tool does."
+          class="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm focus:outline-none focus:border-indigo-500 resize-none">{{ tool.description if tool else '' }}</textarea>
+      </div>
+    </div>
+  </div>
+
+  <!-- Step 2: Parameters -->
+  <div class="bg-gray-900 border border-gray-800 rounded-xl p-5 mb-4">
+    <h2 class="text-xs font-semibold uppercase tracking-wider text-gray-500 mb-1">2: Parameters</h2>
+    <p class="text-xs text-gray-600 mb-4">What information the agent must provide when calling this tool.</p>
+    <div id="params-header" class="hidden grid grid-cols-[1fr_120px_1fr_64px_32px] gap-2 mb-1 px-1">
+      <span class="text-xs text-gray-600">Name</span>
+      <span class="text-xs text-gray-600">Type</span>
+      <span class="text-xs text-gray-600">Description</span>
+      <span class="text-xs text-gray-600 text-center">Required</span>
+      <span></span>
+    </div>
+    <div id="params-list" class="space-y-2"></div>
+    <button type="button" onclick="addParam()" class="mt-3 text-xs text-indigo-400 hover:text-indigo-300">+ Add parameter</button>
+  </div>
+
+  <!-- Step 3: Code -->
+  <div class="bg-gray-900 border border-gray-800 rounded-xl p-5 mb-4">
+    <h2 class="text-xs font-semibold uppercase tracking-wider text-gray-500 mb-1">3: Code</h2>
+    <p class="text-xs text-gray-600 mb-4">
+      Can use <code class="text-gray-400">fetch()</code> to call external URLs.
+      No filesystem, environment, or subprocess access.
+      Max 50 KB. Max execution time: 120 s.
+    </p>
+    <textarea id="f-code" rows="14" spellcheck="false"
+      class="w-full px-4 py-3 bg-gray-800 border border-gray-700 rounded-lg text-sm font-mono focus:outline-none focus:border-indigo-500 resize-y">{{ tool.source_code if tool and tool.source_code else '' }}</textarea>
+
+    <div class="flex items-center gap-4 mt-3">
+      <div class="flex items-center gap-2">
+        <label class="text-xs text-gray-400">Max execution time</label>
+        <input id="f-timeout" type="range" min="5" max="120" step="5"
+          value="{{ tool.config.timeout_seconds if tool and tool.config else 30 }}"
+          oninput="document.getElementById('timeout-val').textContent = this.value + 's'"
+          class="w-28 accent-indigo-500" />
+        <span id="timeout-val" class="text-xs text-gray-300 w-8">
+          {{ (tool.config.timeout_seconds if tool and tool.config else 30) }}s
+        </span>
+      </div>
+    </div>
+  </div>
+
+  <!-- Step 4: Capabilities -->
+  <div class="bg-gray-900 border border-gray-800 rounded-xl p-5 mb-4">
+    <h2 class="text-xs font-semibold uppercase tracking-wider text-gray-500 mb-1 flex items-center gap-1.5">4: Capabilities
+      {{ info_popover(
+        "This code runs on the gateway VM, so it can't be trusted with the run of the place by default. Nothing you don't explicitly check below even exists inside the sandbox: there's no way for the code to reach the network, disk, or a credential unless you grant it, so a bug or a malicious paste can't do more than what you tick here."
+      ) }}
+    </h2>
+    <p class="text-xs text-gray-600 mb-4">
+      Declare what this tool is allowed to do at runtime. Capabilities you
+      <em>don't</em> grant are <strong>not injected</strong> into the isolate: calling
+      <code class="text-gray-400">net.fetch</code> (or <code class="text-gray-400">storage</code>,
+      <code class="text-gray-400">secrets</code>, <code class="text-gray-400">mcp</code>) without the grant
+      throws <code class="text-gray-400">ReferenceError</code>.
+    </p>
+
+    <div class="space-y-3">
+
+      <!-- net -->
+      <div class="border border-gray-800 rounded-lg p-4">
+        <label class="flex items-center gap-2 cursor-pointer">
+          <input id="cap-net" type="checkbox" onchange="toggleCap('net')" class="w-4 h-4 accent-indigo-500" />
+          <span class="text-sm">Network access</span>
+          <span class="text-xs text-gray-600 ml-1">: <code>net.fetch(url, init)</code> + <code>http.call</code> + <code>openapi.call</code></span>
+        </label>
+        <div id="cap-net-body" class="hidden mt-3 ml-6 space-y-2">
+          <label class="block text-xs text-gray-400">Allowed hosts (exact-match, no wildcards)</label>
+          <div id="net-hosts-list" class="space-y-2"></div>
+          <button type="button" onclick="addNetHost('')" class="text-xs text-indigo-400 hover:text-indigo-300">+ Add host</button>
+        </div>
+      </div>
+
+      <!-- secrets -->
+      <div class="border border-gray-800 rounded-lg p-4">
+        <label class="flex items-center gap-2 cursor-pointer">
+          <input id="cap-secrets" type="checkbox" onchange="toggleCap('secrets')" class="w-4 h-4 accent-indigo-500" />
+          <span class="text-sm">Secrets</span>
+          <span class="text-xs text-gray-600 ml-1">: <code>secrets.get(name)</code> returns plaintext</span>
+        </label>
+        <div id="cap-secrets-body" class="hidden mt-3 ml-6 space-y-2">
+          <label class="block text-xs text-gray-400">Credentials this tool may resolve</label>
+          <div id="secrets-list" class="space-y-2"></div>
+          <button type="button" onclick="addSecret('')" class="text-xs text-indigo-400 hover:text-indigo-300">+ Add credential</button>
+          {% if not credentials %}
+          <p class="text-xs text-amber-400">No credentials defined yet: <a href="/custom-tools/credentials/new" class="underline">add one</a> first.</p>
+          {% endif %}
+        </div>
+      </div>
+
+      <!-- storage -->
+      <div class="border border-gray-800 rounded-lg p-4">
+        <label class="flex items-center gap-2 cursor-pointer">
+          <input id="cap-storage" type="checkbox" onchange="toggleCap('storage')" class="w-4 h-4 accent-indigo-500" />
+          <span class="text-sm">Workspace files</span>
+          <span class="text-xs text-gray-600 ml-1">: <code>storage.{list,read,stat[,write,mkdir,remove]}</code></span>
+        </label>
+        <div id="cap-storage-body" class="hidden mt-3 ml-6 space-y-2">
+          <p class="text-xs text-gray-500">Paths scoped to the calling agent's workspace: escape is impossible.</p>
+          <div class="flex gap-4 text-sm">
+            <label class="flex items-center gap-2 cursor-pointer">
+              <input type="radio" name="storage-mode" value="read" checked class="accent-indigo-500" />
+              <span>Read only</span>
+              <span class="text-xs text-gray-600">(list, read, stat)</span>
+            </label>
+            <label class="flex items-center gap-2 cursor-pointer">
+              <input type="radio" name="storage-mode" value="readwrite" class="accent-indigo-500" />
+              <span>Read + write</span>
+              <span class="text-xs text-gray-600">(adds write, mkdir, remove)</span>
+            </label>
+          </div>
+        </div>
+      </div>
+
+      <!-- mcp -->
+      <div class="border border-gray-800 rounded-lg p-4">
+        <label class="flex items-center gap-2 cursor-pointer">
+          <input id="cap-mcp" type="checkbox" onchange="toggleCap('mcp')" class="w-4 h-4 accent-indigo-500" />
+          <span class="text-sm">MCP servers</span>
+          <span class="text-xs text-gray-600 ml-1">: <code>mcp.call(serverUrl, toolName, args, {headers})</code></span>
+        </label>
+        <div id="cap-mcp-body" class="hidden mt-3 ml-6 space-y-2">
+          <label class="block text-xs text-gray-400">Allowed SSE server URLs (exact match)</label>
+          <div id="mcp-servers-list" class="space-y-2"></div>
+          <button type="button" onclick="addMcpServer('')" class="text-xs text-indigo-400 hover:text-indigo-300">+ Add server</button>
+        </div>
+      </div>
+
+    </div>
+
+    <p id="manifest-err" class="hidden mt-3 text-xs text-red-400"></p>
+  </div>
+
+  <div class="flex gap-3 mb-8">
+    <button id="btn-save" onclick="saveTool()" class="btn btn-primary">
+      {% if tool %}Save Changes{% else %}Create Tool{% endif %}
+    </button>
+    <a href="/settings/tools?tab={{ _back_tab }}" class="btn btn-secondary">Cancel</a>
+  </div>
+
+  <!-- Test panel -->
+  {% if tool %}
+  <details class="bg-gray-900 border border-gray-800 rounded-xl" open>
+    <summary class="px-5 py-4 text-xs font-semibold uppercase tracking-wider text-gray-500 cursor-pointer hover:text-gray-300 select-none">
+      Test this tool
+    </summary>
+    <div class="px-5 pb-5 space-y-4">
+      <div>
+        <label class="block text-xs text-gray-400 mb-1.5">Arguments (JSON)</label>
+        <textarea id="test-args" rows="4" spellcheck="false"
+          class="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm font-mono focus:outline-none focus:border-indigo-500 resize-y">{}</textarea>
+      </div>
+      <div class="flex gap-3 items-center">
+        <button id="btn-test" onclick="runTest()" class="btn btn-secondary btn-sm">Run Test</button>
+        <span id="test-duration" class="text-xs text-gray-600 hidden"></span>
+      </div>
+      <div id="test-result" class="hidden">
+        <label class="block text-xs text-gray-400 mb-1.5">Result</label>
+        <pre id="test-output" class="px-4 py-3 bg-gray-800 border border-gray-700 rounded-lg text-xs font-mono overflow-x-auto whitespace-pre-wrap"></pre>
+      </div>
+    </div>
+  </details>
+  {% endif %}
+
+  {% endif %}{# end can_edit #}
+
+  {% if tool %}
+  {% include "custom_tools/_manifest_review.html" %}
+  {% endif %}
+
+</div>
+
+{% if can_edit %}
+<script>
+const TOOL_NAME = {{ ('"%s"' % tool.name) | safe if tool else 'null' }};
+const TOOL_PARAMS_SCHEMA = {{ (tool.parameters_schema if (tool and tool.parameters_schema) else {"type": "object", "properties": {}}) | tojson }};
+const STARTER_TEMPLATE = `export default async function execute(args: {
+  // your_param: string;
+}) {
+  // Your logic here. Call external APIs with fetch().
+  // Return a plain object: it will be shown to the agent.
+  return { result: "hello from custom tool" };
+}`;
+
+// ── Parameter rows ──────────────────────────────────────────────────────────
+
+let paramCount = 0;
+function addParam(name='', type='string', description='', required=false) {
+  const id = ++paramCount;
+  document.getElementById('params-header').classList.remove('hidden');
+  const row = document.createElement('div');
+  row.id = 'param-' + id;
+  row.className = 'grid grid-cols-[1fr_120px_1fr_64px_32px] gap-2 items-center';
+  row.innerHTML = `
+    <input type="text" value="${esc(name)}" placeholder="param_name" data-param-name
+      class="px-3 py-1.5 bg-gray-800 border border-gray-700 rounded-lg text-xs font-mono focus:outline-none focus:border-indigo-500" />
+    <select data-param-type
+      class="px-2 py-1.5 bg-gray-800 border border-gray-700 rounded-lg text-xs focus:outline-none focus:border-indigo-500">
+      ${['string','number','boolean','array','object'].map(t =>
+        `<option value="${t}" ${type===t?'selected':''}>${t}</option>`).join('')}
+    </select>
+    <input type="text" value="${esc(description)}" placeholder="What this parameter is" data-param-desc
+      class="px-3 py-1.5 bg-gray-800 border border-gray-700 rounded-lg text-xs focus:outline-none focus:border-indigo-500" />
+    <div class="flex justify-center">
+      <input type="checkbox" ${required ? 'checked' : ''} data-param-req class="w-4 h-4 accent-indigo-500" />
+    </div>
+    <button onclick="removeParam(${id})" class="text-gray-600 hover:text-red-400 text-xs px-1">✕</button>`;
+  document.getElementById('params-list').appendChild(row);
+}
+function removeParam(id) {
+  document.getElementById('param-' + id)?.remove();
+  if (!document.querySelector('[data-param-name]')) {
+    document.getElementById('params-header').classList.add('hidden');
+  }
+}
+function getParamsSchema() {
+  const props = {};
+  const required = [];
+  document.querySelectorAll('#params-list > div').forEach(row => {
+    const name = row.querySelector('[data-param-name]').value.trim();
+    if (!name) return;
+    const type = row.querySelector('[data-param-type]').value;
+    const desc = row.querySelector('[data-param-desc]').value.trim();
+    const req  = row.querySelector('[data-param-req]').checked;
+    props[name] = { type };
+    if (desc) props[name].description = desc;
+    if (req) required.push(name);
+  });
+  const schema = { type: 'object', properties: props };
+  if (required.length) schema.required = required;
+  return schema;
+}
+
+// ── Save ────────────────────────────────────────────────────────────────────
+
+async function saveTool() {
+  const errEl = document.getElementById('err-banner');
+  const saveEl = document.getElementById('save-banner');
+  const btn = document.getElementById('btn-save');
+  errEl.classList.add('hidden');
+  saveEl.classList.add('hidden');
+
+  const name = document.getElementById('f-name').value.trim();
+  const label = document.getElementById('f-label').value.trim();
+  const description = document.getElementById('f-description').value.trim();
+  const code = document.getElementById('f-code').value;
+  const timeout = parseInt(document.getElementById('f-timeout').value, 10);
+
+  if (!name) { showErr('Name is required.'); return; }
+  if (!label) { showErr('Label is required.'); return; }
+  if (!description) { showErr('Description is required.'); return; }
+  if (!code.trim()) { showErr('Code is required.'); return; }
+  if (new Blob([code]).size > 50 * 1024) { showErr('Code exceeds 50 KB limit.'); return; }
+
+  // Serialise the capability builder into the manifest shape. No grants
+  // toggled = tool runs fully sandboxed (only console + validate globals).
+  const manifestErrEl = document.getElementById('manifest-err');
+  manifestErrEl.classList.add('hidden');
+  const capResult = readCapabilities();
+  if (capResult.error) {
+    manifestErrEl.textContent = capResult.error;
+    manifestErrEl.classList.remove('hidden');
+    return;
+  }
+  const manifest = capResult.manifest;
+
+  const body = {
+    label,
+    description,
+    tier: 'typescript',
+    parameters_schema: getParamsSchema(),
+    source_code: code,
+    config: { timeout_seconds: timeout, allow_net: true },
+    manifest,
+  };
+  if (!TOOL_NAME) body.name = name;
+
+  btn.disabled = true;
+  btn.textContent = 'Saving…';
+  try {
+    const r = TOOL_NAME
+      ? await fetch('/api/custom-tools/' + TOOL_NAME, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+      : await fetch('/api/custom-tools', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    if (!r.ok) { throw new Error(await extractErrorDetail(r, 'Save failed')); }
+    const data = await r.json();
+    if (!TOOL_NAME) { window.location.href = '/custom-tools/' + data.name; return; }
+    saveEl.classList.remove('hidden');
+    setTimeout(() => saveEl.classList.add('hidden'), 4000);
+  } catch(e) {
+    showErr(e.message);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = TOOL_NAME ? 'Save Changes' : 'Create Tool';
+  }
+}
+
+async function setStatus(status) {
+  if (!TOOL_NAME) return;
+  const ep = status === 'disabled' ? 'disable' : 'enable';
+  try {
+    const r = await fetch('/api/custom-tools/' + TOOL_NAME + '/' + ep, { method: 'POST' });
+    if (!r.ok) { throw new Error(await extractErrorDetail(r, 'Failed')); }
+    window.location.reload();
+  } catch(e) { showErr(e.message); }
+}
+
+// ── Test ────────────────────────────────────────────────────────────────────
+
+async function runTest() {
+  if (!TOOL_NAME) return;
+  const btn = document.getElementById('btn-test');
+  const durEl = document.getElementById('test-duration');
+  const resultEl = document.getElementById('test-result');
+  const outputEl = document.getElementById('test-output');
+  let args;
+  try { args = JSON.parse(document.getElementById('test-args').value || '{}'); }
+  catch(e) { outputEl.textContent = 'Invalid JSON: ' + e.message; resultEl.classList.remove('hidden'); return; }
+
+  btn.disabled = true; btn.textContent = 'Running…';
+  durEl.classList.add('hidden');
+  const t0 = Date.now();
+  try {
+    const r = await fetch('/api/custom-tools/' + TOOL_NAME + '/test', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ args }),
+    });
+    const d = await r.json();
+    outputEl.textContent = JSON.stringify(d, null, 2);
+    durEl.textContent = (Date.now() - t0) + 'ms';
+    durEl.classList.remove('hidden');
+    resultEl.classList.remove('hidden');
+    outputEl.style.color = d.ok === false ? '#f87171' : '#86efac';
+  } catch(e) {
+    outputEl.textContent = e.message; outputEl.style.color = '#f87171';
+    resultEl.classList.remove('hidden');
+  } finally { btn.disabled = false; btn.textContent = 'Run Test'; }
+}
+
+// ── Capability builder ──────────────────────────────────────────────────────
+//
+// Each capability has a checkbox that toggles its body, plus per-capability
+// inputs:
+//   net:     dynamic list of host rows
+//   secrets: dynamic list of credential dropdowns (sourced from CREDENTIALS)
+//   storage: read / readwrite radio
+//   mcp:     dynamic list of server URL rows
+//
+// State lives in the DOM. readCapabilities() serialises the current form into
+// the { capabilities: { ... } } manifest shape that the backend generator
+// stores as-is. initCapabilities() does the reverse on edit.
+
+// `credentials_for_js` is pre-filtered server-side in admin_routes.py to the
+// two fields the dropdown needs (name + credential_type). The full
+// `credentials` list also exists in scope but contains datetime fields that
+// would break `tojson`, plus metadata we don't want to leak to the browser.
+const CREDENTIALS = {{ credentials_for_js | tojson if credentials_for_js else '[]' }};
+const TOOL_MANIFEST = {{ tool.manifest | tojson if tool and tool.manifest else 'null' }};
+
+function toggleCap(key) {
+  const checked = document.getElementById('cap-' + key).checked;
+  document.getElementById('cap-' + key + '-body').classList.toggle('hidden', !checked);
+  // First-toggle nicety: seed an empty row so the admin sees what to fill in.
+  if (checked) {
+    if (key === 'net' && !document.querySelector('#net-hosts-list .net-host-row')) addNetHost('');
+    if (key === 'secrets' && !document.querySelector('#secrets-list .secret-row')) addSecret('');
+    if (key === 'mcp' && !document.querySelector('#mcp-servers-list .mcp-server-row')) addMcpServer('');
+  }
+}
+
+function addNetHost(value) {
+  const row = document.createElement('div');
+  row.className = 'net-host-row flex gap-2';
+  row.innerHTML = `
+    <input type="text" value="${escAttr(value)}" placeholder="api.example.com"
+      class="net-host-input flex-1 px-2 py-1.5 bg-gray-800 border border-gray-700 rounded text-xs font-mono focus:outline-none focus:border-indigo-500" />
+    <button type="button" onclick="this.parentElement.remove()" class="text-gray-500 hover:text-red-400 text-xs px-2">×</button>`;
+  document.getElementById('net-hosts-list').appendChild(row);
+}
+
+function addSecret(name) {
+  const opts = CREDENTIALS.map(c =>
+    `<option value="${escAttr(c.name)}"${c.name === name ? ' selected' : ''}>${esc(c.name)} (${esc(c.credential_type)})</option>`
+  ).join('');
+  const row = document.createElement('div');
+  row.className = 'secret-row flex gap-2';
+  row.innerHTML = `
+    <select class="secret-input flex-1 px-2 py-1.5 bg-gray-800 border border-gray-700 rounded text-xs focus:outline-none focus:border-indigo-500">
+      <option value="" disabled${!name ? ' selected' : ''}>- pick a credential -</option>
+      ${opts}
+    </select>
+    <button type="button" onclick="this.parentElement.remove()" class="text-gray-500 hover:text-red-400 text-xs px-2">×</button>`;
+  document.getElementById('secrets-list').appendChild(row);
+}
+
+function addMcpServer(value) {
+  const row = document.createElement('div');
+  row.className = 'mcp-server-row flex gap-2';
+  row.innerHTML = `
+    <input type="text" value="${escAttr(value)}" placeholder="https://mcp.example.com/sse"
+      class="mcp-server-input flex-1 px-2 py-1.5 bg-gray-800 border border-gray-700 rounded text-xs font-mono focus:outline-none focus:border-indigo-500" />
+    <button type="button" onclick="this.parentElement.remove()" class="text-gray-500 hover:text-red-400 text-xs px-2">×</button>`;
+  document.getElementById('mcp-servers-list').appendChild(row);
+}
+
+function escAttr(s) { return String(s ?? '').replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;'); }
+
+/**
+ * Read the capability builder back into the manifest shape, or return null if
+ * nothing is enabled (= tool runs fully sandboxed).
+ */
+function readCapabilities() {
+  const caps = {};
+
+  if (document.getElementById('cap-net').checked) {
+    const hosts = [...document.querySelectorAll('.net-host-input')]
+      .map(i => i.value.trim()).filter(Boolean);
+    if (!hosts.length) return { error: 'Network access is enabled but no hosts were added.' };
+    caps.net = { hosts };
+  }
+
+  if (document.getElementById('cap-secrets').checked) {
+    const names = [...document.querySelectorAll('.secret-input')]
+      .map(s => s.value.trim()).filter(Boolean);
+    if (!names.length) return { error: 'Secrets access is enabled but no credentials were picked.' };
+    caps.secrets = { names };
+  }
+
+  if (document.getElementById('cap-storage').checked) {
+    const mode = document.querySelector('input[name="storage-mode"]:checked')?.value || 'read';
+    caps.storage = { mode };
+  }
+
+  if (document.getElementById('cap-mcp').checked) {
+    const servers = [...document.querySelectorAll('.mcp-server-input')]
+      .map(i => i.value.trim()).filter(Boolean);
+    if (!servers.length) return { error: 'MCP capability is enabled but no servers were added.' };
+    caps.mcp = { servers };
+  }
+
+  if (!Object.keys(caps).length) return { manifest: null };
+  return { manifest: { capabilities: caps } };
+}
+
+/**
+ * Pre-populate the builder from an existing tool's manifest on edit.
+ */
+function initCapabilities() {
+  const caps = (TOOL_MANIFEST && TOOL_MANIFEST.capabilities) || {};
+
+  if (caps.net && Array.isArray(caps.net.hosts)) {
+    document.getElementById('cap-net').checked = true;
+    document.getElementById('cap-net-body').classList.remove('hidden');
+    caps.net.hosts.forEach(h => addNetHost(h));
+  }
+
+  if (caps.secrets && Array.isArray(caps.secrets.names)) {
+    document.getElementById('cap-secrets').checked = true;
+    document.getElementById('cap-secrets-body').classList.remove('hidden');
+    caps.secrets.names.forEach(n => addSecret(n));
+  }
+
+  if (caps.storage) {
+    document.getElementById('cap-storage').checked = true;
+    document.getElementById('cap-storage-body').classList.remove('hidden');
+    const radio = document.querySelector(`input[name="storage-mode"][value="${caps.storage.mode || 'read'}"]`);
+    if (radio) radio.checked = true;
+  }
+
+  if (caps.mcp && Array.isArray(caps.mcp.servers)) {
+    document.getElementById('cap-mcp').checked = true;
+    document.getElementById('cap-mcp-body').classList.remove('hidden');
+    caps.mcp.servers.forEach(s => addMcpServer(s));
+  }
+}
+
+function showErr(msg) {
+  const el = document.getElementById('err-banner');
+  el.textContent = msg; el.classList.remove('hidden');
+  el.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+function esc(s) { return String(s).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;'); }
+
+// ── Init ────────────────────────────────────────────────────────────────────
+
+(function init() {
+  const schema = TOOL_PARAMS_SCHEMA;
+  const props = schema.properties || {};
+  const req = schema.required || [];
+  Object.entries(props).forEach(([name, def]) => {
+    addParam(name, def.type || 'string', def.description || '', req.includes(name));
+  });
+  // Pre-fill starter template for new tools
+  if (!TOOL_NAME) {
+    document.getElementById('f-code').value = STARTER_TEMPLATE;
+  }
+  // Capability builder: restore from existing tool's manifest on edit,
+  // leave empty (all checkboxes off) for new tools.
+  initCapabilities();
+})();
+</script>
+{% endif %}{# end can_edit script #}
+{% endblock %}

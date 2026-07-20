@@ -1,0 +1,22 @@
+{
+  "id": "platform-discovery",
+  "type": "PlatformResearch",
+  "name": "Independent Platform Research",
+  "description": "Weekly breadth-first scout: what LLMs/skills/tools shipped in the last ~2 weeks, logged to the discovery feed.",
+  "model": "google-flash-500k/gemini-2.5-flash-500k",
+  "emoji": "🔭",
+  "tools_allow": [
+    "read",
+    "web_search",
+    "web_fetch",
+    "discovery_search",
+    "discovery_write"
+  ],
+  "tools_deny": [],
+  "memory_enabled": false,
+  "max_tokens": null,
+  "notes": "Platform Research Council v2 — discovery scout. Seeded by platform_discovery_worker_template.sql.",
+  "status": "active",
+  "version": 1,
+  "tool_profiles": []
+}

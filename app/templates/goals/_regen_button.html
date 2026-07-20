@@ -1,0 +1,43 @@
+{# Regenerate button / in-progress indicator for a goal document.
+   Included by summary.html on full page load, and returned as an HTMX
+   fragment by both POST /summary/regenerate and GET /summary/{doc_type}/regen-status
+   (goals.py) — one markup source, so the two never drift out of sync.
+
+   While regen_in_progress, this self-polls via hx-trigger="load, every 5s"
+   against regen-status, which recomputes regen_in_progress fresh from the DB
+   (see _is_regen_in_progress in goals.py). Once it flips false, the returned
+   fragment is the plain Regenerate button with no polling trigger, so htmx
+   stops polling on its own — no page reload needed to recover from a stuck
+   "Generating…" state. #}
+{% if regen_in_progress %}
+<span class="text-xs text-yellow-500 inline-flex items-center gap-1.5 px-1"
+      hx-get="/goals/{{ pid }}/summary/{{ doc_type }}/regen-status"
+      hx-trigger="load, every 5s"
+      hx-target="#regen-btn-wrap"
+      hx-swap="innerHTML">
+  <svg class="w-3.5 h-3.5 animate-spin" fill="none" viewBox="0 0 24 24">
+    <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"/>
+    <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4l3-3-3-3v4a8 8 0 000 16v-4l-3 3 3 3v-4a8 8 0 01-8-8z"/>
+  </svg>
+  Generating… refresh in ~30 s
+</span>
+{% else %}
+<button
+  hx-post="/goals/{{ pid }}/summary/regenerate?doc_type={{ doc_type }}"
+  hx-target="#regen-btn-wrap"
+  hx-swap="innerHTML"
+  hx-disabled-elt="this"
+  hx-confirm="Regenerate this document now? This calls the LLM directly and takes ~20-30s."
+  class="btn btn-secondary btn-sm flex items-center gap-1.5"
+>
+  <svg class="icon-idle w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+          d="M13 10V3L4 14h7v7l9-11h-7z"/>
+  </svg>
+  <svg class="icon-loading w-3.5 h-3.5 animate-spin" fill="none" viewBox="0 0 24 24">
+    <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"/>
+    <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4l3-3-3-3v4a8 8 0 000 16v-4l-3 3 3 3v-4a8 8 0 01-8-8z"/>
+  </svg>
+  Regenerate
+</button>
+{% endif %}

@@ -1,0 +1,235 @@
+{% from "partials/_info_popover.html" import info_popover %}
+{% set c = system.cost %}
+{# summary_only=true → Overview tile (totals + provider list only, no charts)  #}
+{# summary_only=false/unset → Cost tab (full detail with charts and breakdowns) #}
+{% set _summary = summary_only if summary_only is defined else false %}
+<div class="bg-gray-900 border border-gray-800 rounded-xl p-5">
+  <div class="flex items-center justify-between mb-4">
+    <h3 class="font-semibold">Cost &amp; Usage</h3>
+    <span class="text-xs text-gray-500">last 30 days</span>
+  </div>
+
+  {% if c.month_str %}
+  {# Numbers left, provider doughnut right #}
+  <div class="flex items-start gap-6">
+    <div class="flex-1 min-w-0">
+      <div class="text-3xl font-bold text-green-400">{{ c.month_str }}</div>
+      <div class="text-xs text-gray-500 mt-1 space-y-0.5">
+        <div><span class="text-gray-400 font-medium">{{ c.week_str }}</span> this week</div>
+        <div><span class="text-gray-400 font-medium">{{ c.today_str }}</span> today</div>
+        <div class="text-gray-600 mt-1">{{ c.tokens_str }} tokens total</div>
+        {% if c.input_tokens_str or c.cache_read_tokens_str or c.cache_write_tokens_str or c.output_tokens_str %}
+        <div class="flex gap-3 mt-1 text-2xs text-gray-600">
+          {% if c.input_tokens_str %}<span title="Fresh input tokens">in {{ c.input_tokens_str }}</span>{% endif %}
+          {% if c.cache_read_tokens_str %}<span title="Cache-read tokens (cheaper, reused from prior context)">cached read {{ c.cache_read_tokens_str }}</span>{% endif %}
+          {% if c.cache_write_tokens_str %}<span title="Cache-write tokens (first write to cache)">cached write {{ c.cache_write_tokens_str }}</span>{% endif %}
+          {% if c.output_tokens_str %}<span title="Output tokens">out {{ c.output_tokens_str }}</span>{% endif %}
+        </div>
+        {% endif %}
+        {% if c.cache_savings_str %}
+        <div class="text-emerald-400/90 mt-1" title="Estimated saving vs paying full input price for cache-read tokens">
+          {{ c.cache_savings_str }} saved via caching
+        </div>
+        {% endif %}
+      </div>
+    </div>
+
+    {% if c.providers %}
+    <div class="flex-shrink-0 w-28 h-28">
+      <canvas id="model-cost-chart"
+        data-labels='{{ c.model_labels_json }}'
+        data-values='{{ c.model_values_json }}'
+        title="Cost by provider"></canvas>
+    </div>
+    {% endif %}
+  </div>
+
+  {# Provider → model hierarchy #}
+  {% if c.providers %}
+  {% set dot_colors = ['bg-indigo-500','bg-emerald-500','bg-blue-500','bg-amber-500','bg-purple-500'] %}
+  <div class="mt-4 pt-3 border-t border-gray-800 space-y-2.5">
+    {% for p in c.providers %}
+    {% set ci = loop.index0 % 5 %}
+    <div>
+      {# Provider row #}
+      <div class="flex items-center gap-2 text-sm">
+        <span class="w-2 h-2 rounded-full flex-shrink-0 {{ dot_colors[ci] }}"></span>
+        <span class="flex-1 font-medium text-gray-200 capitalize">{{ p.provider }}</span>
+        <span class="font-medium text-gray-200">{{ p.cost_str }}</span>
+        <span class="text-gray-600 text-xs w-16 text-right">{{ p.tokens_str }}</span>
+      </div>
+      {# Model rows nested under provider #}
+      {% if p.models %}
+      <div class="ml-4 mt-0.5 space-y-0.5 border-l border-gray-800 pl-3">
+        {% for m in p.models %}
+        <div class="flex items-center gap-2 text-xs text-gray-500">
+          <span class="flex-1 truncate">{{ m.model }}</span>
+          <span class="text-gray-400">{{ m.cost_str }}</span>
+          <span class="text-gray-600 w-16 text-right">{{ m.tokens_str }}</span>
+        </div>
+        {% endfor %}
+      </div>
+      {% endif %}
+    </div>
+    {% endfor %}
+  </div>
+  {% endif %}
+
+  {# Everything below is Cost-tab-only: hidden on Overview #}
+  {% if not _summary %}
+
+  {# Daily spend stacked by provider (30d) #}
+  {% if c.stacked_labels_json and c.stacked_labels_json != '[]' %}
+  <div class="mt-4 pt-3 border-t border-gray-800">
+    <div class="text-xs text-gray-500 mb-2 font-medium uppercase tracking-wide">Daily spend by provider (30d)</div>
+    <div class="h-64">
+      <canvas id="cost-stacked-chart"
+        data-labels='{{ c.stacked_labels_json }}'
+        data-datasets='{{ c.stacked_datasets_json }}'></canvas>
+    </div>
+  </div>
+  {% endif %}
+
+  {# Top agents: full-width horizontal bar #}
+  {% if c.agent_labels_json and c.agent_labels_json != '[]' %}
+  <div class="mt-4 pt-3 border-t border-gray-800">
+    <div class="flex items-baseline justify-between mb-2">
+      <div class="text-xs text-gray-500 font-medium uppercase tracking-wide">Top {{ c.agents_shown_count }} agents</div>
+      {% if c.agents_other_str %}
+      <div class="text-2xs text-gray-600" title="Remaining 30-day spend across agents outside the top 5">
+        + {{ c.agents_other_str }} across other agents
+      </div>
+      {% endif %}
+    </div>
+    <div class="h-36">
+      <canvas id="cost-agents-chart"
+        data-labels='{{ c.agent_labels_json }}'
+        data-values='{{ c.agent_costs_json }}'></canvas>
+    </div>
+  </div>
+  {% endif %}
+
+  {# Story cost chart. "Cost by task" used to sit alongside this in a 2-col
+     grid, but it's always empty under operator mode (the only mode in real
+     use; see research/dashboard_cost_goal_attribution_gap.md Finding 3) --
+     removed entirely (both here and the mv_cost_by_task query in
+     _db_cost_data) rather than leave permanently-dead UI/query around. #}
+  {% if c.story_labels_json and c.story_labels_json != '[]' %}
+  <div class="mt-4 pt-3 border-t border-gray-800">
+    <div class="flex items-baseline justify-between mb-2">
+      <div class="text-xs text-gray-500 font-medium uppercase tracking-wide">Cost by top {{ c.stories_shown_count }} stories</div>
+      {% if c.stories_other_str %}
+      <div class="text-2xs text-gray-600" title="Remaining cost among the next few stories not shown here (this chart's own top-10 cap may hide more beyond that)">
+        + {{ c.stories_other_str }}
+      </div>
+      {% endif %}
+    </div>
+    <div class="h-32">
+      <canvas id="cost-stories-chart"
+        data-labels='{{ c.story_labels_json }}'
+        data-values='{{ c.story_costs_json }}'></canvas>
+    </div>
+  </div>
+  {% endif %}
+
+  {# Top goals by cost with per-agent breakdown (from agent_metrics DB) #}
+  {% if c.top_goals %}
+  <div class="mt-4 pt-3 border-t border-gray-800 space-y-2.5">
+    <div class="flex items-baseline justify-between">
+      <div class="text-xs text-gray-500 font-medium uppercase tracking-wide">Top goals by cost</div>
+      {% if c.goals_other_str %}
+      <div class="text-2xs text-gray-600" title="Remaining 30-day spend across goals outside the top 5, plus any spend this window couldn't attribute to a goal">
+        + {{ c.goals_other_str }} across other goals
+      </div>
+      {% endif %}
+    </div>
+    {% for g in c.top_goals %}
+    {% if g.agents %}
+    {# Collapsed by default -- same <details>/<summary> pattern already used
+       for "N inactive tools" (tools/list.html) -- so a goal with many agents
+       doesn't force the whole panel to render every agent row up front. #}
+    <details class="group">
+      <summary class="flex items-center gap-2 text-sm cursor-pointer list-none [&::-webkit-details-marker]:hidden">
+        <svg class="w-2.5 h-2.5 text-gray-600 flex-shrink-0 transition-transform group-open:rotate-90"
+             fill="currentColor" viewBox="0 0 8 8"><path d="M1 0l6 4-6 4z"/></svg>
+        <span class="flex-1 truncate font-medium text-gray-200">{{ g.title }}</span>
+        <span class="text-gray-600 text-xs">{{ g.tokens_str }}</span>
+        <span class="font-medium text-gray-200 w-16 text-right">{{ g.cost_str }}</span>
+      </summary>
+      <div class="ml-4 mt-0.5 space-y-0.5 border-l border-gray-800 pl-3">
+        {% for a in g.agents %}
+        {% if a.phases %}
+        {# claude-code-phase work for this person -- nested phase breakdown,
+           same pattern as goal_cost_breakdown.html's Agent Detail table. #}
+        <details class="group/agent">
+          <summary class="flex items-center gap-2 text-xs text-gray-500 cursor-pointer list-none [&::-webkit-details-marker]:hidden">
+            <svg class="w-2 h-2 text-gray-600 flex-shrink-0 transition-transform group-open/agent:rotate-90"
+                 fill="currentColor" viewBox="0 0 8 8"><path d="M1 0l6 4-6 4z"/></svg>
+            <span class="flex-1 truncate">{{ a.agent_id }}</span>
+            {% if a.model_str %}<span class="text-gray-600 text-2xs">{{ a.model_str }}</span>{% endif %}
+            <span class="text-gray-600">{{ a.tokens_str }}</span>
+            <span class="text-gray-400 w-16 text-right">{{ a.cost_str }}</span>
+          </summary>
+          <div class="ml-4 mt-0.5 space-y-0.5 border-l border-gray-800 pl-3">
+            {% for p in a.phases %}
+            <div class="flex items-center gap-2 text-2xs text-gray-600">
+              <span class="flex-1 truncate">{{ p.phase }}</span>
+              {% if p.phase == 'Other work' %}
+              {{ info_popover("Couldn't be matched to a specific phase (coder/reviewer/tester/etc.) -- either the task record is missing or has no phase set. Still real spend attributed to this person, just not broken out further.", label="Other work") }}
+              {% endif %}
+              <span>{{ p.tokens_str }}</span>
+              <span class="w-16 text-right">{{ p.cost_str }}</span>
+            </div>
+            {% endfor %}
+          </div>
+        </details>
+        {% else %}
+        <div class="flex items-center gap-2 text-xs text-gray-500 pl-[14px]">
+          <span class="flex-1 truncate">{{ a.agent_id }}</span>
+          {% if a.model_str %}<span class="text-gray-600 text-2xs">{{ a.model_str }}</span>{% endif %}
+          <span class="text-gray-600">{{ a.tokens_str }}</span>
+          <span class="text-gray-400 w-16 text-right">{{ a.cost_str }}</span>
+        </div>
+        {% endif %}
+        {% endfor %}
+      </div>
+    </details>
+    {% else %}
+    <div class="flex items-center gap-2 text-sm">
+      <span class="flex-1 truncate font-medium text-gray-200 pl-[18px]">{{ g.title }}</span>
+      <span class="text-gray-600 text-xs">{{ g.tokens_str }}</span>
+      <span class="font-medium text-gray-200 w-16 text-right">{{ g.cost_str }}</span>
+    </div>
+    {% endif %}
+    {% endfor %}
+  </div>
+  {% endif %}
+
+  {# Re-run chart init when this panel arrives via HTMX lazy load.
+     The main initCostCharts() in index.html runs on tab swap (before
+     the skeleton is replaced), so it finds no canvas elements. This
+     inline script fires once the real DOM is present. #}
+  {% if not _summary %}
+  <script>if (typeof initCostCharts === 'function') initCostCharts();</script>
+  {% endif %}
+
+  {% endif %}{# end not _summary #}
+
+  {% else %}
+  {# Gateway unavailable: show DB token fallback #}
+  {% if c.tokens_str %}
+  <div class="text-3xl font-bold text-gray-400">{{ c.tokens_str }}</div>
+  <div class="text-xs text-gray-500 mt-1">tokens tracked (all-time)</div>
+  {% endif %}
+  {% if c.note %}
+  <div class="flex items-center gap-2 text-xs text-amber-400/80 mt-3">
+    <svg class="w-3.5 h-3.5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+        d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874
+           1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126zM12 15.75h.007v.008H12v-.008z"/>
+    </svg>
+    {{ c.note }}
+  </div>
+  {% endif %}
+  {% endif %}
+</div>

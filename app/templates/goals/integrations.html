@@ -1,0 +1,233 @@
+{% extends "base.html" %}
+{% block title %}Integrations: {{ goal.name }}{% endblock %}
+{% block content %}
+<div class="p-6 lg:p-8 max-w-4xl mx-auto">
+  <a href="/goals/{{ pid }}" class="inline-flex items-center gap-1 text-xs text-gray-500 hover:text-gray-300 transition-colors mb-5">
+    <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"/></svg>
+    {{ goal.name }}
+  </a>
+  <div class="mb-6">
+    <h1 class="text-xl font-semibold text-gray-100">Integrations</h1>
+    <p class="text-sm text-gray-500 mt-0.5">{{ goal.name }}</p>
+  </div>
+
+  {% set can_manage = (role == 'admin') %}
+
+  <!-- Slack Integration -->
+  <section class="card p-6 mb-5">
+    <h2 class="text-sm font-semibold text-gray-200 mb-1">Slack Integration</h2>
+    <p class="text-xs text-gray-500 mb-4">
+      Connect this goal to a Slack channel. The bot will create a Goal Thread and Orchestrator Thread automatically.
+    </p>
+
+    {% if slack_config and slack_config.enabled %}
+    <div class="space-y-2 text-sm">
+      <div class="flex items-center gap-2">
+        <span class="w-2 h-2 bg-emerald-400 rounded-full"></span>
+        <span class="text-emerald-400 font-medium">Connected</span>
+      </div>
+      <div class="text-gray-400">
+        Workspace: <span class="text-gray-200">{{ slack_config.workspace_name or slack_config.workspace_id }}</span>
+      </div>
+      <div class="text-gray-400">
+        Goal channel: <span class="text-gray-200">#{{ slack_config.goal_channel_name or slack_config.goal_channel_id }}</span>
+      </div>
+      {% if slack_config.orch_channel_id %}
+      <div class="text-gray-400">
+        Orchestrator channel: <span class="text-gray-200">#{{ slack_config.orch_channel_name or slack_config.orch_channel_id }}</span>
+      </div>
+      {% endif %}
+      <div class="flex items-center gap-2 pt-2">
+        {% if can_manage %}
+        <form action="/goals/{{ pid }}/settings/channels/slack/disable" method="post" data-confirm="Disable Slack for this goal?">
+          <button type="submit" class="btn btn-secondary btn-sm">
+            Disable Slack
+          </button>
+        </form>
+        {% endif %}
+        <form action="/goals/{{ pid }}/settings/channels/slack/reprovision-member" method="post" data-toast-submit data-fail="Failed to re-provision channel." data-success="Slack channel re-provisioned.">
+          <button type="submit" class="btn btn-secondary btn-sm">Re-provision my Slack channel</button>
+        </form>
+      </div>
+    </div>
+    {% else %}
+    {% if can_manage %}
+    {% if slack_workspaces %}
+    <form action="/goals/{{ pid }}/settings/channels/slack/enable" method="post" class="space-y-3" data-toast-submit data-fail="Failed to enable Slack.">
+      <div>
+        <label class="block text-sm text-gray-400 mb-1.5">Workspace</label>
+        <select name="workspace_id" class="input" required>
+          {% for ws in slack_workspaces %}
+          <option value="{{ ws.workspace_id }}">{{ ws.workspace_name }} ({{ ws.workspace_id }})</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div class="text-sm text-gray-400">
+        <p>Channels will be created as:</p>
+        <ul class="mt-1.5 ml-4 list-disc text-gray-500 text-xs space-y-0.5">
+          <li><code>#{{ pid | lower }}</code>: goal channel</li>
+          <li><code>#{{ pid | lower }}-orchestrator</code>: read-only coordination log</li>
+          <li><code>#{{ pid | lower }}-&lt;story&gt;</code>: created on demand per story</li>
+        </ul>
+      </div>
+      <button type="submit" class="btn btn-primary btn-sm">Enable Slack</button>
+    </form>
+    {% else %}
+    <p class="text-sm text-gray-500 mb-3">No Slack workspaces connected yet.</p>
+    <a href="/channels/slack/oauth/install" class="btn btn-primary btn-sm">Connect Slack Workspace</a>
+    {% endif %}
+    {% else %}
+    <p class="text-sm text-gray-500">Slack isn't enabled for this goal yet. Only a goal manager can enable it.</p>
+    {% endif %}
+    {% endif %}
+  </section>
+
+  {# ── generic channel integration macro ───────────────────────────────────── #}
+  {% macro channel_display_name(platform) %}
+    {%- if platform == 'notion' %}Notion
+    {%- elif platform == 'notion_bot' %}Notion Bot
+    {%- elif platform == 'telegram' %}Telegram
+    {%- elif platform == 'google_chat' %}Google Chat
+    {%- elif platform == 'teams' %}Microsoft Teams
+    {%- else %}{{ platform | replace('_', ' ') | title }}
+    {%- endif %}
+  {%- endmacro %}
+
+  {% macro channel_display_suffix(platform) %}
+    {%- if platform == 'notion_bot' %}<span class="text-gray-500 font-normal text-xs">(internal token)</span>{%- endif %}
+  {%- endmacro %}
+
+  {% macro channel_description(platform) %}
+    {%- if platform == 'notion' %}When enabled, the agent receives Notion page comments and updates for this goal.
+    {%- elif platform == 'notion_bot' %}Use an internal Notion token for testing. Comments are attributed to the bot, not individual users.
+    {%- else %}When enabled, the agent receives events from {{ channel_display_name(platform) }} for this goal.
+    {%- endif %}
+  {%- endmacro %}
+
+  {% macro channel_section(ch) %}
+  <section class="card p-6 mb-5">
+    <h2 class="text-sm font-semibold text-gray-200 mb-1">
+      {{ channel_display_name(ch.platform) }} {{ channel_display_suffix(ch.platform) }}
+    </h2>
+    <p class="text-xs text-gray-500 mb-4">{{ channel_description(ch.platform) }}</p>
+
+    {% if not ch.available %}
+    <p class="text-sm text-gray-500">
+      {{ channel_display_name(ch.platform) }} is not configured for this deployment.
+      {% if user.system_role == 'admin' %}
+      <a href="/settings/integrations" class="text-brand hover:text-brand-light">Set it up &rarr;</a>
+      {% endif %}
+    </p>
+
+    {% elif ch.enabled %}
+    <div class="flex items-center gap-2 mb-4">
+      <span class="w-2 h-2 bg-emerald-400 rounded-full"></span>
+      <span class="text-emerald-400 text-sm font-medium">Enabled</span>
+    </div>
+
+    <!-- Linked channels / pages -->
+    <div class="mb-4">
+      <p class="text-xs text-gray-500 mb-2">Linked to this goal:</p>
+      {% if ch.bindings %}
+      <div class="space-y-1.5 mb-3">
+        {% for b in ch.bindings %}
+        <div class="flex items-center justify-between text-sm py-2 px-3 rounded-lg bg-surface border border-border">
+          <div>
+            {% if b.resource_kind %}
+            <span class="text-gray-200">{{ b.resource_kind }}</span>
+            <span class="text-gray-600 text-xs ml-2 font-mono">{{ b.external_channel_id }}</span>
+            {% else %}
+            <span class="text-gray-400 font-mono text-xs">{{ b.external_channel_id }}</span>
+            {% endif %}
+          </div>
+          {% if can_manage %}
+          <form action="/goals/{{ pid }}/settings/channels/{{ ch.platform }}/bindings/{{ b.id }}/remove" method="post" data-toast-submit data-fail="Failed to remove binding.">
+            <button type="submit" class="text-xs text-gray-600 hover:text-red-400 transition-colors">Remove</button>
+          </form>
+          {% endif %}
+        </div>
+        {% endfor %}
+      </div>
+      {% else %}
+      <p class="text-xs text-gray-600 mb-3">
+        Nothing linked yet.
+        {% if ch.has_auto_provision %}A channel will be created automatically.{% endif %}
+      </p>
+      {% endif %}
+
+      {% if not ch.has_auto_provision and can_manage %}
+      <form action="/goals/{{ pid }}/settings/channels/{{ ch.platform }}/bindings" method="post" class="space-y-2" data-toast-submit data-fail="Failed to add channel binding.">
+        <div class="flex gap-2">
+          <input name="page_url" type="text" class="input flex-1 font-mono text-xs"
+            placeholder="Paste URL or ID" required />
+          <input name="label" type="text" class="input w-36 text-xs" placeholder="Label (optional)" />
+          <button type="submit" class="btn btn-primary btn-sm flex-shrink-0">Add</button>
+        </div>
+        <p class="text-2xs text-gray-600">Events on linked channels will be routed to the Goal Thread.</p>
+      </form>
+      {% endif %}
+    </div>
+
+    {# Notion-only: email domain allowlist #}
+    {% if ch.platform == 'notion' %}
+    {% if can_manage %}
+    <form action="/goals/{{ pid }}/settings/channels/{{ ch.platform }}/allowlist" method="post" class="space-y-3 mb-4" data-toast-submit data-fail="Failed to save allowlist.">
+      <div>
+        <label class="block text-sm text-gray-400 mb-1.5">Email domain allowlist</label>
+        <input name="domains" type="text" class="input"
+          value="{{ ch.email_domain_allowlist | join(', ') if ch.email_domain_allowlist else '' }}"
+          placeholder="example.com, myorg.io  (comma-separated, empty = allow all)" />
+        <p class="text-2xs text-gray-600 mt-1">Only users with these email domains can trigger the agent. Leave empty to allow any verified user.</p>
+      </div>
+      <button type="submit" class="btn btn-secondary btn-sm">Save allowlist</button>
+    </form>
+    {% else %}
+    <p class="text-xs text-gray-500 mb-4">
+      Email domain allowlist:
+      <span class="text-gray-300">{{ ch.email_domain_allowlist | join(', ') if ch.email_domain_allowlist else 'any verified user' }}</span>
+    </p>
+    {% endif %}
+    {% endif %}
+
+    <div class="flex items-center gap-2">
+      {% if can_manage %}
+      <form action="/goals/{{ pid }}/settings/channels/{{ ch.platform }}/disable" method="post" data-toast-submit data-fail="Failed to disable channel.">
+        <button type="submit" class="btn btn-secondary btn-sm">Disable</button>
+      </form>
+      {% endif %}
+      {% if ch.platform in ('notion', 'notion_bot') %}
+      <form action="/goals/{{ pid }}/settings/channels/{{ ch.platform }}/reprovision-member" method="post" data-toast-submit data-fail="Failed to re-provision channel." data-success="Channel re-provisioned.">
+        <button type="submit" class="btn btn-secondary btn-sm">Re-provision my page</button>
+      </form>
+      {% endif %}
+    </div>
+
+    {% else %}
+    {# Enable form: notion shows allowlist field at enable time #}
+    {% if can_manage %}
+    <form action="/goals/{{ pid }}/settings/channels/{{ ch.platform }}/enable" method="post" class="space-y-3" data-toast-submit data-fail="Failed to enable channel.">
+      {% if ch.platform == 'notion' %}
+      <div>
+        <label class="block text-sm text-gray-400 mb-1.5">Email domain allowlist <span class="text-gray-600">(optional)</span></label>
+        <input name="domains" type="text" class="input"
+          placeholder="example.com, myorg.io  (comma-separated, empty = allow all)" />
+        <p class="text-2xs text-gray-600 mt-1">Only users with these email domains can trigger the agent.</p>
+      </div>
+      {% endif %}
+      <button type="submit" class="btn btn-primary btn-sm">Enable {{ channel_display_name(ch.platform) }}</button>
+    </form>
+    {% else %}
+    <p class="text-sm text-gray-500">{{ channel_display_name(ch.platform) }} isn't enabled for this goal yet. Only a goal manager can enable it.</p>
+    {% endif %}
+    {% endif %}
+  </section>
+  {% endmacro %}
+
+  {# Slack has a dedicated hardcoded section above; notion and notion_bot are parked (beta).
+     This loop renders any other channels (telegram, google_chat, teams, etc). #}
+  {% for ch in channels if ch.platform not in ('slack', 'notion', 'notion_bot') %}
+  {{ channel_section(ch) }}
+  {% endfor %}
+
+</div>
+{% endblock %}

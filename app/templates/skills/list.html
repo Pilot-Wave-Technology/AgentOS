@@ -1,0 +1,100 @@
+{% extends "base.html" %}
+{% block title %}Skill Registry{% endblock %}
+{% block content %}
+<div class="p-8 max-w-6xl mx-auto">
+  <a href="/settings" class="inline-flex items-center gap-1 text-xs text-gray-500 hover:text-gray-300 transition-colors mb-5">
+    <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"/></svg>
+    Settings
+  </a>
+  <div class="flex items-center justify-between mb-8">
+    <div>
+      <h1 class="text-2xl font-bold">Skill Registry</h1>
+      <p class="text-gray-400 text-sm mt-1">
+        Reusable prompt fragments. Each skill targets one or more agent templates
+        (GO, Assistant, IA, RA) and is pushed into the agent's workspace at provisioning time.
+      </p>
+    </div>
+    {% if can_edit %}
+    <a href="/settings/skills/new" class="btn btn-primary btn-sm whitespace-nowrap">+ New Skill</a>
+    {% endif %}
+  </div>
+
+  {% if skills %}
+  <div class="flex items-center justify-between mb-4">
+    <input id="skill-search" type="text" placeholder="Filter by name, title, or applicable type…"
+      oninput="filterSkills(this.value)"
+      class="px-3 py-1.5 bg-gray-800 border border-gray-700 rounded-lg text-sm focus:outline-none focus:border-indigo-500 w-80" />
+    <span class="text-xs text-gray-500">{{ skills | length }} skills</span>
+  </div>
+
+  <div class="overflow-x-auto">
+    <table class="w-full text-sm">
+      <thead class="text-xs text-gray-500 uppercase border-b border-gray-800">
+        <tr>
+          <th class="text-left pb-3 pr-6">Name / Title</th>
+          <th class="text-left pb-3 pr-6">Applicable to</th>
+          <th class="text-left pb-3 pr-6">Version</th>
+          <th class="text-left pb-3 pr-6">Status</th>
+          <th class="text-left pb-3 pr-6">Updated</th>
+          <th class="text-left pb-3">Actions</th>
+        </tr>
+      </thead>
+      <tbody class="divide-y divide-gray-800/60">
+        {% for s in skills %}
+        <tr class="hover:bg-gray-900/40 skill-row transition-colors"
+            data-search="{{ s.name }} {{ s.title }} {{ s.applicable_to | join(' ') }}">
+          <td class="py-3 pr-6">
+            <div class="font-mono text-xs text-indigo-400 leading-tight">{{ s.name }}</div>
+            <div class="font-medium text-gray-100 mt-0.5">{{ s.title }}</div>
+            {% if s.description %}
+            <div class="text-xs text-gray-500 mt-1 max-w-md truncate">{{ s.description }}</div>
+            {% endif %}
+          </td>
+          <td class="py-3 pr-6">
+            <div class="flex flex-wrap gap-1">
+              {% for t in s.applicable_to %}
+              <span class="pill {% if t == 'GO' %}pill-success{% elif t == 'SHCA' %}pill-info{% elif t == 'RA' %}bg-amber-900/40 text-amber-300{% else %}bg-purple-900/40 text-purple-300{% endif %}">{{ 'Assistant' if t == 'SHCA' else ('Council' if t == 'RA' else t) }}</span>
+              {% endfor %}
+            </div>
+          </td>
+          <td class="py-3 pr-6">
+            <span class="font-mono text-xs text-gray-300">v{{ s.version }}</span>
+          </td>
+          <td class="py-3 pr-6">
+            {% if s.status == 'active' %}
+            <span class="pill pill-success">active</span>
+            {% else %}
+            <span class="pill pill-neutral">{{ s.status }}</span>
+            {% endif %}
+          </td>
+          <td class="py-3 pr-6">
+            <span class="text-xs text-gray-400" {% if s.updated_at %}data-utc="{{ s.updated_at.isoformat() }}"{% endif %}>{{ s.updated_at.strftime("%Y-%m-%d %H:%M") if s.updated_at else "" }}{% if s.updated_at %} UTC{% endif %}</span>
+          </td>
+          <td class="py-3">
+            <a href="/settings/skills/{{ s.name }}" class="btn btn-secondary btn-sm">{{ 'Edit' if can_edit else 'View' }}</a>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <div class="text-center py-16">
+    <p class="text-gray-400 mb-4">No skills yet.</p>
+    {% if can_edit %}
+    <a href="/settings/skills/new" class="btn btn-primary">+ Create your first skill</a>
+    {% endif %}
+  </div>
+  {% endif %}
+</div>
+
+<script>
+function filterSkills(query) {
+  const q = (query || "").toLowerCase().trim();
+  for (const row of document.querySelectorAll(".skill-row")) {
+    const hay = (row.dataset.search || "").toLowerCase();
+    row.style.display = !q || hay.includes(q) ? "" : "none";
+  }
+}
+</script>
+{% endblock %}

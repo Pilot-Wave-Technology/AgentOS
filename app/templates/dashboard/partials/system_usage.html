@@ -1,0 +1,44 @@
+{% set u = system.cost %}
+<div class="bg-gray-900 border border-gray-800 rounded-xl p-5">
+  <div class="flex items-center justify-between mb-4">
+    <h3 class="font-semibold">Usage Hotspots</h3>
+    <span class="text-xs text-gray-500">last 30 days</span>
+  </div>
+  <div class="grid grid-cols-2 gap-5">
+
+    {# Most-used tools #}
+    <div>
+      <div class="text-xs text-gray-500 mb-2">Most-used tools</div>
+      {% if u.top_tools %}
+      <ul class="space-y-1.5">
+        {% for t in u.top_tools %}
+        <li class="flex items-center gap-2 text-sm">
+          <span class="flex-1 truncate text-gray-300">{{ t.name }}</span>
+          <span class="text-gray-500 text-xs">{{ t.count }}</span>
+        </li>
+        {% endfor %}
+      </ul>
+      {% else %}
+      <p class="text-sm text-gray-600">No tool usage recorded.</p>
+      {% endif %}
+    </div>
+
+    {# Top agents by cost #}
+    <div>
+      <div class="text-xs text-gray-500 mb-2">Top agents by cost</div>
+      {% if u.top_agents %}
+      <ul class="space-y-1.5">
+        {% for a in u.top_agents %}
+        <li class="flex items-center gap-2 text-sm">
+          <span class="flex-1 truncate text-gray-300">{{ a.agent }}</span>
+          <span class="text-gray-400 text-xs">{{ a.cost_str }}</span>
+        </li>
+        {% endfor %}
+      </ul>
+      {% else %}
+      <p class="text-sm text-gray-600">No per-agent usage.</p>
+      {% endif %}
+    </div>
+
+  </div>
+</div>

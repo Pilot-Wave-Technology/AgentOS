@@ -1,0 +1,212 @@
+{% extends "base.html" %}
+{% block title %}Integrations{% endblock %}
+{% block content %}
+<div class="p-6 lg:p-8 max-w-3xl mx-auto">
+  <a href="/settings" class="inline-flex items-center gap-1 text-xs text-gray-500 hover:text-gray-300 transition-colors mb-5">
+    <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"/></svg>
+    Settings
+  </a>
+  <div class="mb-6">
+    <h1 class="text-xl font-semibold text-gray-100">Integrations</h1>
+    <p class="text-sm text-gray-500 mt-0.5">Manage platform connections for this deployment.</p>
+  </div>
+
+  {% if success == '1' %}
+  <div class="mb-4 px-4 py-3 rounded-lg bg-emerald-900/40 border border-emerald-700 text-emerald-300 text-sm">
+    Notion workspace connected successfully.
+  </div>
+  {% elif success == 'slack_installed' %}
+  <div class="mb-4 px-4 py-3 rounded-lg bg-emerald-900/40 border border-emerald-700 text-emerald-300 text-sm">
+    Slack workspace connected successfully.
+  </div>
+  {% endif %}
+
+  {% if error %}
+  <div class="mb-4 px-4 py-3 rounded-lg bg-red-900/40 border border-red-700 text-red-300 text-sm">
+    {% if error == "token_exchange_failed" %}OAuth token exchange failed: check your Slack client credentials.
+    {% elif error == "missing_token" %}Slack returned a response without an access token.
+    {% elif error == "missing_client_credentials" %}Slack client credentials not configured: fill in the setup form below first.
+    {% elif error == "storage_failed" %}Failed to store credentials.
+    {% else %}OAuth error: {{ error }}
+    {% endif %}
+  </div>
+  {% endif %}
+
+  <!-- Slack -->
+  <section class="card p-6 mb-5">
+    <div class="flex items-center gap-3 mb-3">
+      <div class="w-7 h-7 flex items-center justify-center rounded-md bg-[#4A154B]">
+        <svg class="w-4 h-4" viewBox="0 0 24 24" fill="white">
+          <path d="M5.042 15.165a2.528 2.528 0 01-2.52 2.523A2.528 2.528 0 010 15.165a2.527 2.527 0 012.522-2.52h2.52v2.52zM6.313 15.165a2.527 2.527 0 012.521-2.52 2.527 2.527 0 012.521 2.52v6.313A2.528 2.528 0 018.834 24a2.528 2.528 0 01-2.521-2.522v-6.313zM8.834 5.042a2.528 2.528 0 01-2.521-2.52A2.528 2.528 0 018.834 0a2.527 2.527 0 012.521 2.522v2.52H8.834zM8.834 6.313a2.527 2.527 0 012.521 2.521 2.527 2.527 0 01-2.521 2.521H2.522A2.528 2.528 0 010 8.834a2.528 2.528 0 012.522-2.521h6.312zM18.956 8.834a2.528 2.528 0 012.522-2.521A2.528 2.528 0 0124 8.834a2.528 2.528 0 01-2.522 2.521h-2.522V8.834zM17.688 8.834a2.528 2.528 0 01-2.523 2.521 2.527 2.527 0 01-2.52-2.521V2.522A2.527 2.527 0 0115.165 0a2.528 2.528 0 012.523 2.522v6.312zM15.165 18.956a2.528 2.528 0 012.523 2.522A2.528 2.528 0 0115.165 24a2.527 2.527 0 01-2.52-2.522v-2.522h2.52zM15.165 17.688a2.527 2.527 0 01-2.52-2.523 2.526 2.526 0 012.52-2.52h6.313A2.527 2.527 0 0124 15.165a2.528 2.528 0 01-2.522 2.523h-6.313z"/>
+        </svg>
+      </div>
+      <h2 class="text-sm font-semibold text-gray-200">Slack</h2>
+    </div>
+
+    {% if can_edit %}
+    <!-- Step 0: Create Slack app from manifest -->
+    <div class="mb-5">
+      <p class="text-xs font-medium text-gray-400 uppercase tracking-wide mb-3">Step 0: Create Slack app</p>
+      <p class="text-sm text-gray-500 mb-3">
+        Go to <a href="https://api.slack.com/apps" target="_blank" class="text-blue-400 hover:underline">api.slack.com/apps</a>
+        → Create New App → From an app manifest → paste the JSON below.
+      </p>
+      <div class="relative">
+        <pre id="slack-manifest-pre" class="bg-gray-900 border border-border rounded-md p-3 text-xs font-mono text-gray-400 overflow-auto max-h-48">Loading…</pre>
+        <button onclick="copyManifest()" class="absolute top-2 right-2 btn btn-secondary btn-xs">Copy</button>
+      </div>
+      <a href="/settings/integrations/slack/manifest" download="slack-app-manifest.json" class="inline-block mt-2 text-xs text-blue-400 hover:underline">Download as file</a>
+      <p class="mt-3 text-xs text-yellow-400">
+        After applying the manifest, go to <strong>Features → App Manifest</strong> in your Slack app settings - Slack will show a verification prompt for the event subscriptions URL. Click <em>verify</em> to confirm the app is reachable.
+      </p>
+    </div>
+    <script>
+      fetch('/settings/integrations/slack/manifest')
+        .then(r => r.json())
+        .then(data => { document.getElementById('slack-manifest-pre').textContent = JSON.stringify(data, null, 2); })
+        .catch(() => { document.getElementById('slack-manifest-pre').textContent = 'Failed to load manifest.'; });
+      function copyManifest() {
+        const text = document.getElementById('slack-manifest-pre').textContent;
+        navigator.clipboard.writeText(text).then(() => {
+          const btn = event.target; btn.textContent = 'Copied!';
+          setTimeout(() => { btn.textContent = 'Copy'; }, 2000);
+        });
+      }
+    </script>
+
+    <!-- Step 1: App credentials setup -->
+    <div class="mb-5">
+      <p class="text-xs font-medium text-gray-400 uppercase tracking-wide mb-3">Step 1: App credentials</p>
+      <form method="POST" action="/settings/integrations/slack/setup" class="space-y-3" data-toast-submit data-fail="Failed to save Slack credentials." data-success="Slack app credentials saved.">
+        <div>
+          <label class="block text-xs text-gray-400 mb-1" for="slack_client_id">Client ID</label>
+          <input id="slack_client_id" name="client_id" type="text" autocomplete="off"
+                 value="{{ slack_app.client_id if slack_app else '' }}"
+                 placeholder="Your Slack app client ID"
+                 class="input input-sm w-full font-mono text-xs">
+        </div>
+        <div>
+          <label class="block text-xs text-gray-400 mb-1" for="slack_client_secret">
+            Client Secret
+            {% if slack_app and slack_app.has_secret %}
+            <span class="ml-1 text-emerald-400">(saved)</span>
+            {% endif %}
+          </label>
+          <input id="slack_client_secret" name="client_secret" type="password" autocomplete="off"
+                 placeholder="{% if slack_app and slack_app.has_secret %}Leave blank to keep existing{% else %}Your Slack app client secret{% endif %}"
+                 class="input input-sm w-full font-mono text-xs">
+        </div>
+        <div>
+          <label class="block text-xs text-gray-400 mb-1" for="slack_signing_secret">
+            Signing Secret
+            {% if slack_app and slack_app.has_signing_secret %}
+            <span class="ml-1 text-emerald-400">(saved)</span>
+            {% endif %}
+          </label>
+          <p class="text-xs text-gray-600 mb-1">Found under <strong class="text-gray-500">Basic Information → App Credentials</strong> in your Slack app: same page as Client ID and Client Secret.</p>
+          <input id="slack_signing_secret" name="signing_secret" type="password" autocomplete="off"
+                 placeholder="{% if slack_app and slack_app.has_signing_secret %}Leave blank to keep existing{% else %}Your Slack app signing secret{% endif %}"
+                 class="input input-sm w-full font-mono text-xs">
+        </div>
+        <button type="submit" class="btn btn-secondary btn-sm">Save credentials</button>
+      </form>
+    </div>
+    {% else %}
+    <!-- Read-only summary: no raw secrets exist here to show either way -->
+    <div class="mb-5 space-y-2 text-sm">
+      <p class="text-gray-400">Client ID <span class="text-gray-200 font-mono ml-2">{{ slack_app.client_id if slack_app and slack_app.client_id else 'Not Set' }}</span></p>
+      <p class="text-gray-400">Client Secret
+        <span class="ml-2 {% if slack_app and slack_app.has_secret %}text-emerald-400{% else %}text-gray-500{% endif %}">
+          {{ 'saved' if slack_app and slack_app.has_secret else 'not set' }}
+        </span>
+      </p>
+      <p class="text-gray-400">Signing Secret
+        <span class="ml-2 {% if slack_app and slack_app.has_signing_secret %}text-emerald-400{% else %}text-gray-500{% endif %}">
+          {{ 'saved' if slack_app and slack_app.has_signing_secret else 'not set' }}
+        </span>
+      </p>
+    </div>
+    {% endif %}
+
+    <!-- Bot token stale warning -->
+    {% if slack_token_stale %}
+    <div class="mb-5 px-4 py-3 rounded-lg bg-amber-900/40 border border-amber-700 flex items-start gap-3">
+      <svg class="w-4 h-4 text-amber-400 mt-0.5 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/>
+      </svg>
+      <div>
+        <p class="text-sm text-amber-300 font-medium">Bot token needs updating</p>
+        <p class="text-xs text-amber-400/80 mt-0.5">
+          {% if not slack_workspaces %}
+            App credentials are saved but no workspace has been connected yet.
+          {% else %}
+            The bot token was issued by a different Slack app. Reconnect the workspace to sync it with the current credentials.
+          {% endif %}
+        </p>
+      </div>
+    </div>
+    {% endif %}
+
+    <!-- Step 2: OAuth install -->
+    <div class="border-t border-border pt-4">
+      <p class="text-xs font-medium text-gray-400 uppercase tracking-wide mb-3">Step 2: Connect workspace</p>
+      {% if slack_workspaces %}
+      <div class="space-y-2 mb-4">
+        {% for ws in slack_workspaces %}
+        <div class="flex items-center justify-between text-sm py-2 border-b border-border last:border-0">
+          <div>
+            <span class="text-gray-200 font-medium">{{ ws.workspace_name }}</span>
+            <span class="text-gray-600 ml-2 font-mono text-xs">{{ ws.workspace_id }}</span>
+          </div>
+          <span class="pill pill-success">active</span>
+        </div>
+        {% endfor %}
+      </div>
+      {% else %}
+      <p class="text-sm text-gray-500 mb-3">No Slack workspaces connected.</p>
+      {% endif %}
+      {% if can_edit %}
+      <a href="/channels/slack/oauth/install"
+         class="btn btn-secondary btn-sm {% if not slack_app or not slack_app.client_id %}opacity-50 pointer-events-none{% endif %}">
+        {% if slack_workspaces %}Add workspace{% else %}Connect Slack{% endif %}
+      </a>
+      {% if not slack_app or not slack_app.client_id %}
+      <p class="text-xs text-gray-500 mt-2">Save app credentials first to enable this button.</p>
+      {% endif %}
+      {% endif %}
+    </div>
+  </section>
+
+  {#
+  PARKED: Notion integrations - beta feature, hidden 2026-06-15.
+  Both Notion OAuth and Notion Bot are functional but still in beta.
+  The long-term vision is a full one-on-one AgentOS replica in Notion
+  (goals, stories, tasks as databases, bidirectional sync). That design
+  is not finalised, so we're keeping these sections hidden until the
+  feature is ready for broader use.
+  Re-enable by removing this comment block.
+
+  Also update the Integrations card description in settings/index.html
+  (currently reads "Platform connections: Slack and others") to
+  re-mention Notion when these are re-enabled.
+
+  When building the real credentials-save forms, give each `<form>`
+  data-toast-submit + data-fail="..." like the Slack setup form above —
+  but do NOT also add data-success here. notion_setup/notion_bot_setup
+  already embed the success message server-side via flash_redirect()
+  (unlike Slack's handler, which redirects bare and relies entirely on
+  the form's own data-success), so pairing that with a client-side
+  data-success would inject a second, duplicate `_flash` param.
+
+  <!-- Notion (OAuth): Recommended -->
+  <section class="card p-6 mb-5">
+    ... full OAuth section ...
+  </section>
+
+  <!-- Notion Bot (internal token) -->
+  <section class="card p-6 mb-5">
+    ... full bot section ...
+  </section>
+  #}
+</div>
+{% endblock %}

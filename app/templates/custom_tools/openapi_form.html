@@ -1,0 +1,316 @@
+{% extends "base.html" %}
+{% block title %}{% if tool %}{{ tool.name }}{% else %}New OpenAPI Tool{% endif %}{% endblock %}
+
+{% block content %}
+{% set _back_tab = 'system-tools' if (tool and tool.is_core) else 'custom-tools' %}
+{% set _back_label = 'System Tools' if (tool and tool.is_core) else 'Custom Tools' %}
+<div class="p-8 max-w-3xl mx-auto">
+
+  <div class="mb-6">
+    <a href="/settings/tools?tab={{ _back_tab }}" class="inline-flex items-center gap-1 text-sm text-indigo-400 hover:text-indigo-300">
+      <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"/></svg>
+      Tool Registry / {{ _back_label }}
+    </a>
+  </div>
+
+  <!-- Header -->
+  <div class="flex items-center justify-between mb-6">
+    <div>
+      {% if tool %}
+      <h1 class="text-2xl font-bold">
+        <span class="font-mono text-indigo-400">{{ tool.name }}</span>
+      </h1>
+      <p class="text-xs text-gray-500 mt-1">
+        OpenAPI &middot;
+        {% if tool.status == 'enabled' %}<span class="text-green-400">enabled</span>
+        {% elif tool.status == 'disabled' %}<span class="text-gray-400">disabled</span>
+        {% else %}<span class="text-amber-400">{{ tool.status }}</span>{% endif %}
+      </p>
+      {% else %}
+      <h1 class="text-2xl font-bold">OpenAPI Tool</h1>
+      <p class="text-gray-500 text-sm mt-1">Generated from an OpenAPI spec import.</p>
+      {% endif %}
+    </div>
+    {% if tool and can_edit %}
+    <div class="flex gap-2">
+      {% if tool.status == 'enabled' %}
+      <button onclick="setStatus('disabled')" class="btn btn-sm border border-gray-700 text-gray-400 hover:bg-gray-800">Disable</button>
+      {% else %}
+      <button onclick="setStatus('enabled')" class="btn btn-sm border border-green-800 text-green-400 hover:bg-green-900/30">Enable</button>
+      {% endif %}
+    </div>
+    {% endif %}
+  </div>
+
+  {% if can_edit %}
+  <div id="save-banner" class="hidden mb-4 px-4 py-3 bg-green-900/30 border border-green-800 rounded-lg text-sm text-green-300">
+    Saved. Tool cache refreshed.
+  </div>
+  <div id="err-banner" class="hidden mb-4 px-4 py-3 bg-red-900/30 border border-red-800 rounded-lg text-sm text-red-300"></div>
+  {% endif %}
+
+  <!-- Identity -->
+  <div class="bg-gray-900 border border-gray-800 rounded-xl p-5 mb-4">
+    <h2 class="text-xs font-semibold uppercase tracking-wider text-gray-500 mb-4">Identity</h2>
+    <div class="space-y-4">
+      <div>
+        <label class="block text-xs text-gray-400 mb-1.5">
+          Name <span class="text-gray-600 ml-1">(immutable)</span>
+        </label>
+        <input type="text" readonly value="{{ tool.name if tool else '' }}"
+          class="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm font-mono opacity-60 cursor-not-allowed" />
+      </div>
+      {% if can_edit %}
+      <div>
+        <label class="block text-xs text-gray-400 mb-1.5">Label</label>
+        <input id="f-label" type="text" value="{{ tool.label if tool else '' }}"
+          placeholder="Human-readable name shown to agents"
+          class="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm focus:outline-none focus:border-indigo-500" />
+      </div>
+      <div>
+        <label class="block text-xs text-gray-400 mb-1.5">Description</label>
+        <textarea id="f-description" rows="2"
+          placeholder="What this operation does and when the agent should use it."
+          class="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm focus:outline-none focus:border-indigo-500 resize-none">{{ tool.description if tool else '' }}</textarea>
+      </div>
+      {% else %}
+      <div>
+        <p class="text-xs text-gray-400 mb-1.5">Label</p>
+        <p class="text-sm text-gray-300">{{ tool.label or 'Not Set' }}</p>
+      </div>
+      <div>
+        <p class="text-xs text-gray-400 mb-1.5">Description</p>
+        <p class="text-sm text-gray-300">{{ tool.description or 'Not Set' }}</p>
+      </div>
+      {% endif %}
+    </div>
+  </div>
+
+  <!-- Config (read-only overview) -->
+  {% if tool and tool.config %}
+  <div class="bg-gray-900 border border-gray-800 rounded-xl p-5 mb-4">
+    <h2 class="text-xs font-semibold uppercase tracking-wider text-gray-500 mb-1">Operation</h2>
+    <p class="text-xs text-gray-600 mb-4">Read-only: generated from the imported OpenAPI spec. Click Regenerate below to re-sync after the spec changes.</p>
+    <dl class="grid grid-cols-2 gap-x-6 gap-y-3 text-sm">
+      <div>
+        <dt class="text-xs text-gray-500 mb-0.5">Method</dt>
+        <dd class="font-mono text-blue-300">{{ tool.config.method or 'Not Set' }}</dd>
+      </div>
+      <div>
+        <dt class="text-xs text-gray-500 mb-0.5">Path</dt>
+        <dd class="font-mono text-gray-200">{{ tool.config.path or 'Not Set' }}</dd>
+      </div>
+      <div class="col-span-2">
+        <dt class="text-xs text-gray-500 mb-0.5">Server URL</dt>
+        <dd class="font-mono text-gray-400 text-xs truncate">{{ tool.config.server_url or 'Not Set' }}</dd>
+      </div>
+    </dl>
+
+    <!-- Credential override -->
+    <div class="mt-4 pt-4 border-t border-gray-800">
+      <label class="block text-xs text-gray-400 mb-1.5">Credential</label>
+      {% if can_edit %}
+      <select id="f-credential"
+        class="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm focus:outline-none focus:border-indigo-500">
+        <option value="">- None -</option>
+        {% for c in credentials %}
+        <option value="{{ c.id }}"
+          {% if tool.credential_id == c.id|string %}selected{% endif %}>
+          {{ c.name }} ({{ c.credential_type }})
+        </option>
+        {% endfor %}
+      </select>
+      {% else %}
+      {% set ns = namespace(found=none) %}
+      {% for c in credentials %}
+        {% if c.id|string == (tool.credential_id or '')|string %}{% set ns.found = c %}{% endif %}
+      {% endfor %}
+      <p class="text-sm text-gray-300">{% if ns.found %}{{ ns.found.name }} ({{ ns.found.credential_type }}){% else %}None{% endif %}</p>
+      {% endif %}
+    </div>
+  </div>
+  {% endif %}
+
+  <!-- Parameters (read-only schema display) -->
+  {% if tool and tool.parameters_schema %}
+  <div class="bg-gray-900 border border-gray-800 rounded-xl p-5 mb-4">
+    <h2 class="text-xs font-semibold uppercase tracking-wider text-gray-500 mb-2">Parameters</h2>
+    <p class="text-xs text-gray-600 mb-3">Generated from the OpenAPI spec. Edit via re-import if changes are needed.</p>
+    {% set props = tool.parameters_schema.get('properties', {}) %}
+    {% set req_list = tool.parameters_schema.get('required', []) %}
+    {% if props %}
+    <table class="w-full text-xs">
+      <thead class="text-gray-600 border-b border-gray-800">
+        <tr>
+          <th class="text-left pb-2 pr-4">Name</th>
+          <th class="text-left pb-2 pr-4">Type</th>
+          <th class="text-left pb-2 pr-4">Description</th>
+          <th class="text-left pb-2">Required</th>
+        </tr>
+      </thead>
+      <tbody class="divide-y divide-gray-800/40">
+        {% for name, def in props.items() %}
+        <tr>
+          <td class="py-2 pr-4 font-mono text-indigo-300">{{ name }}</td>
+          <td class="py-2 pr-4 text-gray-400">{{ def.type or 'Not Set' }}</td>
+          <td class="py-2 pr-4 text-gray-500">{{ def.description or 'None' }}</td>
+          <td class="py-2 text-center">{{ '✓' if name in req_list else '' }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <p class="text-gray-600 text-xs">No parameters defined.</p>
+    {% endif %}
+  </div>
+  {% endif %}
+
+  {% if can_edit %}
+  <div class="flex gap-3 mb-8">
+    <button id="btn-save" onclick="saveTool()" class="btn btn-primary">Save Changes</button>
+    {% if tool %}
+    <button onclick="regenerate()" class="btn btn-secondary" title="Re-run the openapi generator against current config: picks up generator improvements without changing operations">
+      Regenerate
+    </button>
+    {% endif %}
+    <a href="/settings/tools?tab={{ _back_tab }}" class="btn btn-secondary">Cancel</a>
+  </div>
+
+  <div id="regen-err" class="hidden mb-4 px-4 py-3 bg-red-900/30 border border-red-800 rounded-lg text-sm text-red-300"></div>
+  <div id="regen-ok"  class="hidden mb-4 px-4 py-3 bg-green-900/30 border border-green-800 rounded-lg text-sm text-green-300"></div>
+  {% else %}
+  <div class="flex justify-end mb-8">
+    <a href="/settings/tools?tab={{ _back_tab }}" class="btn btn-secondary">Back</a>
+  </div>
+  {% endif %}
+
+  {% if tool %}
+  {% include "custom_tools/_manifest_review.html" %}
+  {% endif %}
+
+  {% if can_edit %}
+  <!-- Test panel -->
+  {% if tool %}
+  <details class="bg-gray-900 border border-gray-800 rounded-xl" open>
+    <summary class="px-5 py-4 text-xs font-semibold uppercase tracking-wider text-gray-500 cursor-pointer hover:text-gray-300 select-none">
+      Test this tool
+    </summary>
+    <div class="px-5 pb-5 space-y-4">
+      <div>
+        <label class="block text-xs text-gray-400 mb-1.5">Arguments (JSON)</label>
+        <textarea id="test-args" rows="4" spellcheck="false"
+          class="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm font-mono focus:outline-none focus:border-indigo-500 resize-y">{}</textarea>
+      </div>
+      <div class="flex gap-3 items-center">
+        <button id="btn-test" onclick="runTest()" class="btn btn-secondary btn-sm">Run Test</button>
+        <span id="test-duration" class="text-xs text-gray-600 hidden"></span>
+      </div>
+      <div id="test-result" class="hidden">
+        <label class="block text-xs text-gray-400 mb-1.5">Result</label>
+        <pre id="test-output" class="px-4 py-3 bg-gray-800 border border-gray-700 rounded-lg text-xs font-mono overflow-x-auto whitespace-pre-wrap"></pre>
+      </div>
+    </div>
+  </details>
+  {% endif %}
+  {% endif %}{# end can_edit test panel #}
+
+</div>
+
+{% if can_edit %}
+<script>
+const TOOL_NAME = {{ ('"%s"' % tool.name) | safe if tool else 'null' }};
+
+async function saveTool() {
+  const errEl = document.getElementById('err-banner');
+  const saveEl = document.getElementById('save-banner');
+  const btn = document.getElementById('btn-save');
+  errEl.classList.add('hidden'); saveEl.classList.add('hidden');
+
+  const label = document.getElementById('f-label').value.trim();
+  const description = document.getElementById('f-description').value.trim();
+  const credEl = document.getElementById('f-credential');
+  const credentialId = credEl ? credEl.value : '';
+
+  const body = {};
+  if (label) body.label = label;
+  if (description) body.description = description;
+  body.credential_id = credentialId || null;
+
+  btn.disabled = true; btn.textContent = 'Saving…';
+  try {
+    const r = await fetch('/api/custom-tools/' + TOOL_NAME, {
+      method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+    });
+    if (!r.ok) { throw new Error(await extractErrorDetail(r, 'Save failed')); }
+    saveEl.classList.remove('hidden');
+    setTimeout(() => saveEl.classList.add('hidden'), 4000);
+  } catch(e) {
+    errEl.textContent = e.message; errEl.classList.remove('hidden');
+  } finally {
+    btn.disabled = false; btn.textContent = 'Save Changes';
+  }
+}
+
+async function setStatus(status) {
+  if (!TOOL_NAME) return;
+  try {
+    const r = await fetch('/api/custom-tools/' + TOOL_NAME + '/' + (status === 'disabled' ? 'disable' : 'enable'), { method: 'POST' });
+    if (!r.ok) { throw new Error(await extractErrorDetail(r, 'Failed')); }
+    window.location.reload();
+  } catch(e) {
+    document.getElementById('err-banner').textContent = e.message;
+    document.getElementById('err-banner').classList.remove('hidden');
+  }
+}
+
+async function runTest() {
+  if (!TOOL_NAME) return;
+  const btn = document.getElementById('btn-test');
+  const durEl = document.getElementById('test-duration');
+  const resultEl = document.getElementById('test-result');
+  const outputEl = document.getElementById('test-output');
+  let args;
+  try { args = JSON.parse(document.getElementById('test-args').value || '{}'); }
+  catch(e) { outputEl.textContent = 'Invalid JSON: ' + e.message; resultEl.classList.remove('hidden'); return; }
+
+  btn.disabled = true; btn.textContent = 'Running…';
+  durEl.classList.add('hidden');
+  const t0 = Date.now();
+  try {
+    const r = await fetch('/api/custom-tools/' + TOOL_NAME + '/test', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ args }),
+    });
+    const d = await r.json();
+    outputEl.textContent = JSON.stringify(d, null, 2);
+    durEl.textContent = (Date.now() - t0) + 'ms';
+    durEl.classList.remove('hidden');
+    resultEl.classList.remove('hidden');
+    outputEl.style.color = d.ok === false ? '#f87171' : '#86efac';
+  } catch(e) {
+    outputEl.textContent = e.message; outputEl.style.color = '#f87171';
+    resultEl.classList.remove('hidden');
+  } finally { btn.disabled = false; btn.textContent = 'Run Test'; }
+}
+
+async function regenerate() {
+  const errEl = document.getElementById('regen-err');
+  const okEl  = document.getElementById('regen-ok');
+  errEl.classList.add('hidden');
+  okEl.classList.add('hidden');
+  try {
+    const r = await fetch(`/api/custom-tools/${TOOL_NAME}/regenerate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    });
+    if (!r.ok) { throw new Error(await extractErrorDetail(r, 'Regenerate failed')); }
+    okEl.textContent = 'Regenerated and tools.reload signalled. Reloading…';
+    okEl.classList.remove('hidden');
+    setTimeout(() => window.location.reload(), 800);
+  } catch(e) {
+    errEl.textContent = e.message; errEl.classList.remove('hidden');
+  }
+}
+</script>
+{% endif %}{# end can_edit script #}
+{% endblock %}

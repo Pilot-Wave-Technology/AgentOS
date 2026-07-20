@@ -1,0 +1,21 @@
+FROM python:3.11-slim
+
+# tesseract-ocr: OCR engine for image-based PDFs
+# poppler-utils: pdf2image uses pdftoppm from poppler to rasterize PDF pages
+# antiword: extracts text from old binary .doc files (pre-Office 2007)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    tesseract-ocr \
+    poppler-utils \
+    antiword \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY task_runner/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy the whole package so the dispatcher can import its task handlers.
+COPY task_runner/ ./task_runner/
+
+# Run as a module so package-relative imports (task_runner.config, .tasks) resolve.
+CMD ["python", "-m", "task_runner.main"]

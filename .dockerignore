@@ -1,0 +1,63 @@
+# ─── Version Control ──────────────────────────────────────────────────────────
+# Git history and metadata — never needed inside a container
+.git
+.gitignore
+
+# ─── Environment & Secrets ────────────────────────────────────────────────────
+# Real env files must be injected at runtime, not baked into the image
+.env
+.env.*
+!.env.example
+
+# ─── Python Build Artifacts ───────────────────────────────────────────────────
+# Compiled bytecode and cache — regenerated automatically at runtime
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+*.egg-info
+*.egg
+dist/
+build/
+.eggs/
+
+# ─── Documentation ────────────────────────────────────────────────────────────
+# Human/agent reference docs — not required for the app to run
+documentation/
+README.md
+CLAUDE.md
+*.md
+
+# ─── CI / Cloud Build Configs ─────────────────────────────────────────────────
+# Build pipeline configs are for CI systems, not the runtime container
+cloudbuild*.yaml
+
+# ─── Utility Scripts ──────────────────────────────────────────────────────────
+# One-off ops scripts — not part of the application runtime
+scripts/
+
+# ─── Logs ─────────────────────────────────────────────────────────────────────
+*.log
+logs/
+
+# ─── IDE & OS Metadata ────────────────────────────────────────────────────────
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# ─── Tests ────────────────────────────────────────────────────────────────────
+# Tests run in CI, not inside the production image
+tests/
+test_*
+*_test.py
+pytest.ini
+.pytest_cache/
+coverage.xml
+.coverage
+htmlcov/
+
+# ─── Node (if any tooling exists) ─────────────────────────────────────────────
+node_modules/
+npm-debug.log
+yarn-error.log

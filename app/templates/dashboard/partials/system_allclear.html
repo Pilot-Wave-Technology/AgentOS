@@ -1,0 +1,25 @@
+<div class="rounded-xl border border-green-800/40 bg-green-900/10 px-5 py-3">
+  <div class="flex flex-wrap items-center gap-x-8 gap-y-2">
+    <span class="w-2.5 h-2.5 rounded-full bg-green-400 flex-shrink-0"></span>
+    <div>
+      <div class="text-2xs text-gray-500 uppercase tracking-wide">Gateway</div>
+      <div class="text-xs text-green-400 font-medium">Online</div>
+    </div>
+    <div>
+      <div class="text-2xs text-gray-500 uppercase tracking-wide">Database</div>
+      <div class="text-xs text-green-400 font-medium">OK</div>
+    </div>
+    {% if system.health.nodes is not none %}
+    <div>
+      <div class="text-2xs text-gray-500 uppercase tracking-wide">Active sessions</div>
+      <div class="text-xs text-gray-200 font-medium">{{ system.health.nodes }}</div>
+    </div>
+    {% endif %}
+    {% if system.health.uptime %}
+    <div>
+      <div class="text-2xs text-gray-500 uppercase tracking-wide">Uptime</div>
+      <div class="text-xs text-gray-200 font-medium">{{ system.health.uptime }}</div>
+    </div>
+    {% endif %}
+  </div>
+</div>

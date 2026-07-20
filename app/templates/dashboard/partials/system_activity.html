@@ -1,0 +1,8 @@
+<div class="bg-gray-900 border border-gray-800 rounded-xl p-5">
+  <div class="flex items-center justify-between mb-3">
+    <h3 class="font-semibold">Recent Activity</h3>
+    <span class="text-xs text-gray-500">across all goals</span>
+  </div>
+  {% set activity_rows = system.activity %}
+  {% include "dashboard/partials/_activity_list.html" %}
+</div>

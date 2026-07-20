@@ -1,0 +1,7 @@
+# Local terraform artifacts — never commit (contain state, DB password, config).
+.terraform/
+*.tfstate
+*.tfstate.*
+terraform.tfvars
+*.auto.tfvars
+.terraform.lock.hcl

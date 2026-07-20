@@ -1,0 +1,29 @@
+{
+  "id": "platform-convener",
+  "type": "Platform",
+  "name": "Platform Research Convener",
+  "description": "Persistent admins-only research convener for the Platform Improvement goal.",
+  "model": "anthropic-sonnet-100k/claude-sonnet-4-5-100k",
+  "emoji": "🔭",
+  "tools_allow": [
+    "read",
+    "pdf",
+    "image",
+    "web_search",
+    "web_fetch",
+    "memory_search",
+    "memory_get",
+    "memory_save",
+    "spawn_research",
+    "record_suggestion",
+    "list_suggestions",
+    "update_suggestion"
+  ],
+  "tools_deny": [],
+  "memory_enabled": true,
+  "max_tokens": null,
+  "notes": "Platform Research Council convener. Seeded by platform_council_templates.sql.",
+  "status": "active",
+  "version": 1,
+  "tool_profiles": []
+}

@@ -1,0 +1,22 @@
+{% set at = system.audit_trail %}
+<div class="bg-gray-900 border {% if at.intact %}border-gray-800{% else %}border-red-800/50{% endif %} rounded-xl p-5">
+  <div class="flex items-center justify-between mb-3">
+    <h3 class="font-semibold">Audit Trail</h3>
+    <span class="text-xs {% if at.intact %}text-green-400{% else %}text-red-400{% endif %}">
+      {% if at.intact %}Chain intact{% else %}⚠ Gap detected{% endif %}
+    </span>
+  </div>
+  <div class="flex items-end gap-6">
+    <div>
+      <div class="text-2xl font-bold text-gray-200">{{ at.total_str }}</div>
+      <div class="text-xs text-gray-500 mt-0.5">events recorded</div>
+    </div>
+    <div class="text-xs text-gray-600 mb-0.5">Last: {{ at.last_event_ago }}</div>
+  </div>
+  {% if not at.intact %}
+  <div class="text-xs text-red-400/80 mt-2">
+    chain_head.event_count ({{ at.total }}) ≠ ledger row count ({{ at.actual_count }}):
+    rows may have been deleted from the append-only ledger. Investigate.
+  </div>
+  {% endif %}
+</div>

@@ -1,0 +1,22 @@
+{
+  "id": "research-skill",
+  "type": "PlatformResearch",
+  "name": "Research: Agent Skills",
+  "description": "Finds new AI-agent skills (coding/debugging/deployment/review/...) addable to our templates as no-code prompt fragments.",
+  "model": "google-flash-1m/gemini-2.5-flash-1m",
+  "emoji": "📚",
+  "tools_allow": [
+    "read",
+    "web_search",
+    "web_fetch",
+    "registry_search",
+    "registry_write"
+  ],
+  "tools_deny": [],
+  "memory_enabled": false,
+  "max_tokens": null,
+  "notes": "Platform Research Council v2 — skill research lane. Seeded by platform_skill_research_template.sql.",
+  "status": "active",
+  "version": 1,
+  "tool_profiles": []
+}

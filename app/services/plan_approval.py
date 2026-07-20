@@ -1,0 +1,437 @@
+"""Plan approval flow (SHCA Phase 4 Stage 3-d/3-e).
+
+On human approve:
+  1. Read the latest plan file from the story workspace via gateway RPC.
+     Recognized locations (most-preferred first):
+       - repo/stories/<story_id>/plans/cycle-NN-<slug>.md  (current)
+       - repo/docs/plans/<name>.md                        (prior)
+       - docs/plans/<name>.md                              (legacy, workspace root)
+  2. Run dag_ingest to validate + persist the DAG
+  3. Push the plan to git so the team can see it (failure to push is
+     non-fatal — plan ingestion still succeeds; SHCA surfaces a warning).
+     Push only happens for paths under repo/.
+  4. Trigger task_controller wake so the first ready subtask dispatches
+
+On reject (with feedback):
+  Just record the rejection; the human continues iterating with Claude
+  in chat. No task rows touched.
+"""
+from __future__ import annotations
+
+import logging
+import re
+
+from app.database import get_pool
+from app.openclaw import gateway_admin, GatewayError
+from app.services.dag_ingest import ingest_approved_plan
+from app.services.dag_parser import DagParseError
+
+
+_log = logging.getLogger(__name__)
+
+
+# Match plan path references. CANONICAL convention (one everywhere — planning
+# skill, CLAUDE.md, validate-plan hook):
+#   repo/stories/<story_id>/plans/cycle-NN-<slug>.md
+# Also accepted for transition/legacy safety: the interim `plan_<name>` filename in
+# the same stories/.../plans/ dir, and the pre-059 repo/docs/plans/ + workspace-root
+# docs/plans/ forms.
+_PLAN_REF_RE = re.compile(
+    r"(?:repo/stories/[A-Za-z0-9_.-]+/plans/(?:cycle-\d+-|plan_)[A-Za-z0-9_.-]+\.md"
+    r"|repo/docs/plans/[A-Za-z0-9_.-]+\.md"
+    r"|docs/plans/[A-Za-z0-9_.-]+\.md)",
+)
+
+
+def _is_plan_path(path: str, story_id: str | None = None) -> bool:
+    """True if `path` looks like a plan file under a supported convention.
+
+    Canonical: repo/stories/<id>/plans/cycle-NN-<slug>.md (also accepts the interim
+    plan_<name> filename in that dir). Plus the legacy repo/docs/plans/ + docs/plans/.
+    Any `.md` in a story's plans/ subdir counts (except INDEX.md) — cycle-NN and
+    plan_ alike."""
+    if not path.endswith(".md") or path.endswith("INDEX.md"):
+        return False
+    if path.startswith("repo/stories/") and "/plans/" in path:
+        return True
+    if path.startswith("repo/docs/plans/") or path.startswith("docs/plans/"):
+        return True
+    return False
+
+
+def _plan_path_rank(path: str, story_id: str | None) -> int:
+    """TIEBREAKER ONLY — the scan sorts by recency (mtime) first, so this only
+    decides between two plan files with identical mtimes (rare). The canonical
+    convention (what the planning skill instructs Claude to write and what the
+    validate-plan hook enforces) is
+    `repo/stories/<story_id>/plans/cycle-NN-<slug>.md`, so a plan under THIS story's
+    plans/ subdir ranks highest; another story's subdir (shared repo), the prior
+    `repo/docs/plans/` form, and the legacy workspace-root `docs/plans/` form rank
+    below it.
+
+    Recency is the PRIMARY key (see _find_latest_plan_path), so on a hook-miss
+    fallback the most-recently-written plan wins regardless of convention — this
+    rank only breaks exact-mtime ties and keeps the canonical convention on top.
+    """
+    if path.startswith("repo/stories/") and "/plans/" in path:
+        if story_id and f"repo/stories/{story_id}/" in path:
+            return 3  # this story's canonical subdir
+        return 2      # another story's subdir (shared repo)
+    if path.startswith("repo/docs/plans/"):
+        return 1      # prior convention, still accepted
+    return 0          # docs/plans/ at workspace root (legacy)
+
+
+async def _find_latest_plan_path(
+    instance_id: str, story_id: str,
+) -> str | None:
+    """Find the most recently modified plan file in the workspace.
+
+    Recognizes three conventions in order of preference:
+      1. NEW (migration 059+): repo/stories/<story_id>/plans/plan_*.md
+      2. PRIOR: repo/docs/plans/*.md
+      3. LEGACY: docs/plans/*.md (workspace root, pre-Phase-4)
+
+    Among matching files, prefers the newer convention, then ties broken
+    by mtime (most-recently-modified wins).
+    """
+    try:
+        result = await gateway_admin.call(
+            "shca.workspace.listFiles",
+            {"agentId": instance_id, "storyId": story_id},
+            timeout=30,
+        )
+    except GatewayError as exc:
+        _log.warning("listFiles failed: %s", exc)
+        return None
+    entries = result.get("entries") or []
+    plan_files = [
+        e for e in entries
+        if e.get("type") == "file" and _is_plan_path(e.get("path", ""), story_id)
+    ]
+    if not plan_files:
+        return None
+    # Sort by RECENCY first (the most-recently-written plan is where Claude just
+    # wrote — that's what "approve" must ingest), convention rank only as a tiebreaker.
+    def _rank(e):
+        return (e.get("mtimeMs", 0), _plan_path_rank(e.get("path", ""), story_id))
+    plan_files.sort(key=_rank, reverse=True)
+    return plan_files[0]["path"]
+
+
+async def _read_plan_file(
+    instance_id: str, story_id: str, path: str,
+) -> tuple[str, bool]:
+    """Returns (content, truncated). Raises on RPC failure."""
+    result = await gateway_admin.call(
+        "shca.workspace.readFile",
+        {"agentId": instance_id, "storyId": story_id, "path": path},
+        timeout=30,
+    )
+    # Strip null bytes that the gateway's readFile RPC can inject as
+    # binary-padding artifacts from the underlying filesystem/CLI.
+    content = (result.get("content") or "").replace('\x00', '')
+    return content, bool(result.get("truncated"))
+
+
+async def _push_plan_to_repo(
+    *, instance_id: str, story_id: str, plan_path: str, version: int,
+) -> tuple[bool, str | None]:
+    """Commit + push the plan file to the user's branch.
+
+    gitCommit runs `git add` inside <workspace>/stories/<sid>/repo/, so
+    the path must be repo-relative. Plans are stored at
+    `repo/stories/<story_id>/plans/cycle-NN-<slug>.md` from the workspace, which
+    becomes `stories/<story_id>/plans/cycle-NN-<slug>.md` from the repo's
+    perspective (the leading `repo/` is stripped below).
+
+    Returns (pushed, error_message). Errors are non-fatal — plan
+    approval still succeeds.
+    """
+    if not plan_path.startswith("repo/"):
+        msg = (
+            f"plan file at workspace root ({plan_path}); not in repo/ — "
+            f"skipping push. Move plans to repo/stories/<story_id>/plans/ "
+            f"to enable."
+        )
+        _log.info("plan_approval: %s", msg)
+        return False, msg
+
+    repo_relative_path = plan_path[len("repo/"):]
+
+    # Refresh the GitHub installation token inline so the credential
+    # helper holds a fresh password right before push. The 50-min loop
+    # may not have run yet for this story (e.g. first dispatch).
+    from app.services.token_refresh import refresh_story_token
+    refreshed, refresh_err = await refresh_story_token(story_id)
+    if not refreshed:
+        _log.info(
+            "plan_approval: pre-push token refresh skipped/failed "
+            "(story=%s): %s — attempting push with existing credentials",
+            story_id, refresh_err,
+        )
+
+    try:
+        result = await gateway_admin.call(
+            "shca.workspace.gitCommit",
+            {
+                "agentId": instance_id,
+                "storyId": story_id,
+                "paths": [repo_relative_path],
+                "message": f"plan: v{version} — {repo_relative_path}",
+                "push": True,
+            },
+            timeout=60,
+        )
+    except GatewayError as exc:
+        _log.warning(
+            "plan_approval: gitCommit RPC failed (story=%s plan=%s): %s",
+            story_id, plan_path, exc,
+        )
+        return False, f"gitCommit RPC failed: {exc}"
+    except Exception as exc:
+        _log.exception("plan_approval: gitCommit raised (story=%s)", story_id)
+        return False, f"unexpected: {exc}"
+
+    if result.get("nothing_to_commit"):
+        _log.info(
+            "plan_approval: nothing to commit (story=%s plan=%s) — already pushed",
+            story_id, plan_path,
+        )
+        return True, None
+    if result.get("pushed"):
+        _log.info(
+            "plan_approval: plan pushed (story=%s plan=%s commit=%s)",
+            story_id, plan_path, (result.get("commit") or "")[:12],
+        )
+        return True, None
+    push_err = result.get("push_error") or "unknown push failure"
+    _log.warning(
+        "plan_approval: gitCommit returned pushed=false (story=%s plan=%s): %s "
+        "[full result keys=%s]",
+        story_id, plan_path, push_err, sorted(result.keys()),
+    )
+    return False, push_err
+
+
+async def approve_plan(
+    *,
+    goal_id: str,
+    story_id: str,
+    approved_by_uid: str,
+    plan_path: str | None = None,
+) -> dict:
+    """Run the full approval flow. Returns:
+      { ok, dag_task_id, plan_version_id, version, task_count,
+        plan_path, plan_pushed, push_error? }
+    On failure (parse error / read failure): {ok: False, error}
+    """
+    # Kill switch — a plan approval ingests a DAG and dispatches the first tasks,
+    # which would bypass a system/goal freeze just like autonomous dispatch does.
+    # Shared with the web "Approve plan" button and the Slack ctrl_approve_plan
+    # button, so one check covers both surfaces. dispatch_block fails closed.
+    from app.services import execution_control  # noqa: PLC0415
+    _frozen = await execution_control.frozen_response(goal_id)
+    if _frozen is not None:
+        _log.info(
+            "approve_plan refused — execution paused, goal=%s story=%s uid=%s",
+            goal_id, story_id, approved_by_uid,
+        )
+        return _frozen
+
+    pool = get_pool()
+    story = await pool.fetchrow(
+        """SELECT shca_instance_id, current_phase, current_claude_session_id,
+                  current_plan_id, current_plan_path, active_thread_id
+             FROM stories WHERE id = $1 AND goal_id = $2""",
+        story_id, goal_id,
+    )
+    if not story:
+        return {"ok": False, "error": "story not found"}
+    instance_id = (story.get("shca_instance_id") or "").strip()
+    claude_session_id = (story.get("current_claude_session_id") or "").strip()
+    if not instance_id:
+        return {"ok": False, "error": "story has no SHCA instance — workspace not provisioned"}
+
+    # If the session id wasn't captured at spawn time (no code path writes
+    # it yet — known gap), discover it by listing ~/.claude/projects/<...>/.
+    # Persist the discovered id so subsequent dispatches don't need to look
+    # it up again.
+    if not claude_session_id:
+        try:
+            find_result = await gateway_admin.call(
+                "shca.workspace.findClaudeSession",
+                {"agentId": instance_id, "storyId": story_id},
+                timeout=15,
+            )
+        except GatewayError as exc:
+            return {
+                "ok": False,
+                "error": (
+                    "story has no current_claude_session_id and findClaudeSession "
+                    f"RPC failed: {exc}"
+                ),
+            }
+        discovered = (find_result.get("sessionId") or "").strip()
+        if not discovered:
+            return {
+                "ok": False,
+                "error": (
+                    "no Claude session found on disk for this story — Claude may "
+                    "not have been spawned yet, or the workspace path is wrong"
+                ),
+            }
+        await pool.execute(
+            "UPDATE stories SET current_claude_session_id = $1, updated_at = NOW() "
+            "WHERE id = $2",
+            discovered, story_id,
+        )
+        _log.info(
+            "plan_approval: recovered claude_session_id=%s for story=%s (was empty in DB)",
+            discovered, story_id,
+        )
+        claude_session_id = discovered
+
+    # 1. Locate the plan file. Priority:
+    #    (a) plan_path passed explicitly by caller (UI button, replan flow)
+    #    (b) stories.current_plan_path — set by /internal/shca/validate-plan
+    #        on every successful plan-file write Claude makes. Authoritative
+    #        because it's written at the moment Claude touches the file;
+    #        no mtime races, no chat-history parsing.
+    #    (c) Workspace mtime scan — legacy fallback for stories whose
+    #        plans predate migration 060 / the validator-hook tracking.
+    if plan_path is None:
+        plan_path = (story.get("current_plan_path") or "").strip() or None
+    if plan_path is None:
+        plan_path = await _find_latest_plan_path(instance_id, story_id)
+    if not plan_path:
+        return {
+            "ok": False,
+            "error": (
+                f"no plan file found in the workspace. Expected one of:\n"
+                f"  - repo/stories/{story_id}/plans/cycle-NN-<slug>.md (current convention)\n"
+                f"  - repo/docs/plans/<name>.md (prior convention)\n"
+                f"  - docs/plans/<name>.md (legacy)\n"
+                f"Tell Claude to write the plan and try Approve again."
+            ),
+        }
+    _log.info(
+        "plan_approval: using plan_path=%s (in_repo=%s) story=%s",
+        plan_path, plan_path.startswith("repo/"), story_id,
+    )
+
+    # 2. Read the plan content. If the recorded path 404s (e.g. validator
+    # stored a path that doesn't resolve), fall back to a workspace mtime
+    # scan to recover gracefully — same fallback we use when current_plan_path
+    # is empty.
+    try:
+        plan_md, truncated = await _read_plan_file(instance_id, story_id, plan_path)
+    except GatewayError as exc:
+        if "file not found" in str(exc).lower():
+            _log.warning(
+                "plan_approval: recorded plan_path=%s 404'd (story=%s) — "
+                "falling back to workspace scan",
+                plan_path, story_id,
+            )
+            fallback = await _find_latest_plan_path(instance_id, story_id)
+            if fallback and fallback != plan_path:
+                _log.info(
+                    "plan_approval: workspace scan recovered plan_path=%s "
+                    "(story=%s, original=%s)",
+                    fallback, story_id, plan_path,
+                )
+                plan_path = fallback
+                try:
+                    plan_md, truncated = await _read_plan_file(
+                        instance_id, story_id, plan_path,
+                    )
+                except GatewayError as exc2:
+                    return {
+                        "ok": False,
+                        "error": (
+                            f"failed to read plan file: {exc2} "
+                            f"(also tried fallback path={fallback})"
+                        ),
+                    }
+            else:
+                return {"ok": False, "error": f"failed to read plan file: {exc}"}
+        else:
+            return {"ok": False, "error": f"failed to read plan file: {exc}"}
+    if truncated:
+        _log.warning(
+            "plan_approval: plan file %s was truncated at the 1MB cap — "
+            "DAG parsing may miss tail content",
+            plan_path,
+        )
+
+    # 3. Run DAG ingestion (validates + inserts tasks).
+    try:
+        ingest_result = await ingest_approved_plan(
+            goal_id=goal_id,
+            story_id=story_id,
+            plan_path=plan_path,
+            plan_md=plan_md,
+            claude_session_id=claude_session_id,
+            approved_by_uid=approved_by_uid,
+        )
+    except DagParseError as exc:
+        return {"ok": False, "error": f"plan DAG invalid: {exc}", "plan_path": plan_path}
+    except Exception as exc:
+        _log.exception("plan_approval ingest crashed (story=%s): %s", story_id, exc)
+        return {"ok": False, "error": f"DAG ingestion failed: {exc}"}
+
+    # 4. Commit + push the plan file (best-effort).
+    plan_pushed, push_error = await _push_plan_to_repo(
+        instance_id=instance_id, story_id=story_id,
+        plan_path=plan_path, version=ingest_result["version"],
+    )
+
+    # 5. Trigger task controller wake so first task dispatches (trigger is async — await it).
+    try:
+        from app.task_controller import trigger as tc_trigger
+        await tc_trigger()
+    except Exception:
+        # Non-fatal — controller will pick it up on next tick anyway.
+        pass
+
+    # 6. Broadcast a live notification to any open SHCA chat tab so the user
+    #    can see execution started without having to type or refresh.
+    try:
+        _thread_id = story.get("active_thread_id")
+        if _thread_id:
+            _thread_row = await pool.fetchrow(
+                "SELECT agent_id FROM threads WHERE id = $1", _thread_id,
+            )
+            _agent_id = _thread_row["agent_id"] if _thread_row else None
+            if _agent_id:
+                from app.openclaw import session_manager
+                await session_manager.broadcast_to_thread(
+                    goal_id, _agent_id, _thread_id,
+                    {
+                        "type": "plan_approved_notify",
+                        "task_count": ingest_result["task_count"],
+                        "story_id": story_id,
+                    },
+                )
+                _log.info(
+                    "plan_approval: broadcast plan_approved_notify "
+                    "(story=%s thread=%s tasks=%d)",
+                    story_id, _thread_id, ingest_result["task_count"],
+                )
+    except Exception:
+        _log.debug(
+            "plan_approval: plan_approved_notify broadcast failed (non-fatal, story=%s)",
+            story_id, exc_info=True,
+        )
+
+    return {
+        "ok": True,
+        "dag_task_id": ingest_result["dag_task_id"],
+        "plan_version_id": ingest_result["plan_version_id"],
+        "version": ingest_result["version"],
+        "task_count": ingest_result["task_count"],
+        "task_ids": ingest_result["task_ids"],
+        "plan_path": plan_path,
+        "plan_pushed": plan_pushed,
+        "push_error": push_error,
+    }

@@ -1,0 +1,44 @@
+{% set rq = system.review_quality %}
+{% set is_phases = rq and rq.mode == "phases" %}
+<div class="bg-gray-900 border border-gray-800 rounded-xl p-5">
+  <div class="flex items-center justify-between mb-4">
+    <h3 class="font-semibold">{% if is_phases %}Phase Success Rate{% else %}Reviewer Quality{% endif %}</h3>
+    <span class="text-xs text-gray-500">last 30 days</span>
+  </div>
+  {% if rq and rq.rows %}
+  <table class="w-full text-sm">
+    <thead>
+      <tr class="text-xs text-gray-500 text-left">
+        <th class="font-normal pb-2">{% if is_phases %}Phase{% else %}Reviewer{% endif %}</th>
+        <th class="font-normal pb-2 text-right">{% if is_phases %}Runs{% else %}Reviews{% endif %}</th>
+        <th class="font-normal pb-2 text-right" title="{% if is_phases %}% of runs that completed successfully{% else %}Share of reviews that approved the work{% endif %}">
+          {% if is_phases %}Success rate{% else %}Pass rate{% endif %}
+        </th>
+        {% if not is_phases %}
+        <th class="font-normal pb-2 text-right" title="Average quality score (0–100)">Avg score</th>
+        {% endif %}
+      </tr>
+    </thead>
+    <tbody>
+      {% for r in rq.rows %}
+      <tr class="border-t border-gray-800">
+        <td class="py-1.5 truncate max-w-[10rem] font-mono text-xs text-gray-300">{{ r.agent }}</td>
+        <td class="py-1.5 text-right text-gray-400">{{ r.reviews }}</td>
+        <td class="py-1.5 text-right font-medium
+          {% if r.approval_pct >= 80 %}text-green-400
+          {% elif r.approval_pct >= 50 %}text-amber-400
+          {% else %}text-red-400{% endif %}">{{ r.approval_pct }}%</td>
+        {% if not is_phases %}
+        <td class="py-1.5 text-right font-medium
+          {% if r.avg_score >= 70 %}text-green-400
+          {% elif r.avg_score >= 40 %}text-amber-400
+          {% else %}text-red-400{% endif %}">{{ r.avg_score }}</td>
+        {% endif %}
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="text-sm text-gray-500">No {% if is_phases %}phase completions{% else %}automated reviews{% endif %} in the last 30 days.</p>
+  {% endif %}
+</div>

@@ -1,0 +1,632 @@
+[
+  {
+    "name": "agents_list",
+    "label": "agents_list",
+    "description": "List agents",
+    "group_name": "Agents",
+    "tags": [],
+    "source": "core",
+    "status": "enabled"
+  },
+  {
+    "name": "apply_add_skill",
+    "label": "Add a skill",
+    "description": "Add a reusable skill (prompt fragment). applicable_to is a JSON array string of agent types, e.g. [\"SHCA\",\"GO\"].",
+    "group_name": "",
+    "tags": [],
+    "source": "custom",
+    "status": "enabled"
+  },
+  {
+    "name": "apply_add_tool",
+    "label": "Add a tool / MCP server",
+    "description": "Add a custom tool. tier = http_action|mcp_server|openapi|typescript. `spec` is a JSON object string, tier-specific: http_action {url, method, parameters_schema, body_template}; mcp_server {server_url, transport?, tools:[names]}; openapi {server_url, operations:[{operation_id,method,path,description}]}; typescript {source_code, parameters_schema}. `credential` (optional JSON object {name,type,header_name}) scaffolds a pending credential.",
+    "group_name": "",
+    "tags": [],
+    "source": "custom",
+    "status": "enabled"
+  },
+  {
+    "name": "apply_create_credential",
+    "label": "Scaffold a credential",
+    "description": "Create a credential SHELL (no secret) for a tool to use. A human enters the secret later in Settings → Credentials. type = bearer|api_key|basic; header_name is required for api_key.",
+    "group_name": "",
+    "tags": [],
+    "source": "custom",
+    "status": "enabled"
+  },
+  {
+    "name": "apply_model_change",
+    "label": "Change a template's model",
+    "description": "Change an agent template's model (template-only; future instances). template_id is 'go' (GO) or 'default-shca' (SHCA). model must be a supported model id.",
+    "group_name": "",
+    "tags": [],
+    "source": "custom",
+    "status": "enabled"
+  },
+  {
+    "name": "apply_patch",
+    "label": "apply_patch",
+    "description": "Patch files (OpenAI)",
+    "group_name": "Files",
+    "tags": [],
+    "source": "core",
+    "status": "enabled"
+  },
+  {
+    "name": "browser",
+    "label": "browser",
+    "description": "Control web browser",
+    "group_name": "UI",
+    "tags": [],
+    "source": "core",
+    "status": "enabled"
+  },
+  {
+    "name": "cancel_story",
+    "label": "Cancel Story",
+    "description": "Cancel an existing story",
+    "group_name": "story",
+    "tags": [],
+    "source": "platform",
+    "status": "enabled"
+  },
+  {
+    "name": "canvas",
+    "label": "canvas",
+    "description": "Control canvases",
+    "group_name": "UI",
+    "tags": [],
+    "source": "core",
+    "status": "enabled"
+  },
+  {
+    "name": "claude_code_communication",
+    "label": "Claude Code",
+    "description": "Send a message to the story's Claude Code session and get its reply. Session, workspace, and phase-gating are resolved server-side — the assistant passes only the message.",
+    "group_name": "agent-mgmt",
+    "tags": [],
+    "source": "platform",
+    "status": "enabled"
+  },
+  {
+    "name": "create_branch",
+    "label": "Create Branch",
+    "description": "Create a feature branch for a story",
+    "group_name": "story",
+    "tags": [],
+    "source": "platform",
+    "status": "enabled"
+  },
+  {
+    "name": "create_story",
+    "label": "Create Story",
+    "description": "Create a new story in the goal",
+    "group_name": "story",
+    "tags": [],
+    "source": "platform",
+    "status": "enabled"
+  },
+  {
+    "name": "create_task",
+    "label": "Create Task",
+    "description": "Create a new task under the current story",
+    "group_name": "task",
+    "tags": [],
+    "source": "platform",
+    "status": "enabled"
+  },
+  {
+    "name": "critical_path",
+    "label": "Critical Path",
+    "description": "Identify and display the goal critical path",
+    "group_name": "story",
+    "tags": [],
+    "source": "platform",
+    "status": "enabled"
+  },
+  {
+    "name": "cron",
+    "label": "cron",
+    "description": "Schedule tasks",
+    "group_name": "Automation",
+    "tags": [],
+    "source": "core",
+    "status": "enabled"
+  },
+  {
+    "name": "discovery_get",
+    "label": "Get a discovery",
+    "description": "Fetch one discovery by id (full detail + link + status).",
+    "group_name": "",
+    "tags": [],
+    "source": "custom",
+    "status": "enabled"
+  },
+  {
+    "name": "discovery_search",
+    "label": "Search the discovery feed",
+    "description": "List recent discoveries (what shipped lately). Filters optional: category(model|tool|skill), status(new|researching|reviewed|failed|dismissed). 'reviewed' = fully researched + verdicted; 'failed' = research/review failed.",
+    "group_name": "",
+    "tags": [],
+    "source": "custom",
+    "status": "enabled"
+  },
+  {
+    "name": "discovery_write",
+    "label": "Log platform discoveries",
+    "description": "Independent Platform Research finish-tool (ends your turn): log up to 15 newly-released items. `entries` is a JSON ARRAY STRING; each item: {fingerprint, category(model|tool|skill), title, summary, url, released_at, source}. fingerprint is the dedup key e.g. 'model:gpt-5' — re-logging refreshes, never duplicates.",
+    "group_name": "",
+    "tags": [],
+    "source": "custom",
+    "status": "enabled"
+  },
+  {
+    "name": "edit",
+    "label": "edit",
+    "description": "Make precise edits",
+    "group_name": "Files",
+    "tags": [],
+    "source": "core",
+    "status": "enabled"
+  },
+  {
+    "name": "exec",
+    "label": "exec",
+    "description": "Run shell commands",
+    "group_name": "Runtime",
+    "tags": [],
+    "source": "core",
+    "status": "enabled"
+  },
+  {
+    "name": "gateway",
+    "label": "gateway",
+    "description": "Gateway control",
+    "group_name": "Automation",
+    "tags": [],
+    "source": "core",
+    "status": "enabled"
+  },
+  {
+    "name": "grant_resource",
+    "label": "Grant Resource Access",
+    "description": "Grant an agent access to a resource",
+    "group_name": "story",
+    "tags": [],
+    "source": "platform",
+    "status": "enabled"
+  },
+  {
+    "name": "image",
+    "label": "image",
+    "description": "Image understanding",
+    "group_name": "Media",
+    "tags": [],
+    "source": "core",
+    "status": "enabled"
+  },
+  {
+    "name": "list_allocations",
+    "label": "List Allocations",
+    "description": "List current resource allocations for the goal",
+    "group_name": "story",
+    "tags": [],
+    "source": "platform",
+    "status": "enabled"
+  },
+  {
+    "name": "list_decisions",
+    "label": "List Decisions",
+    "description": "Read all recorded decisions for the goal",
+    "group_name": "story",
+    "tags": [],
+    "source": "platform",
+    "status": "enabled"
+  },
+  {
+    "name": "list_suggestions",
+    "label": "List suggestions",
+    "description": "List tracked suggestions (optional status/category filters).",
+    "group_name": "",
+    "tags": [],
+    "source": "custom",
+    "status": "enabled"
+  },
+  {
+    "name": "memory_get",
+    "label": "memory_get",
+    "description": "Read memory files",
+    "group_name": "Memory",
+    "tags": [],
+    "source": "core",
+    "status": "enabled"
+  },
+  {
+    "name": "memory_search",
+    "label": "memory_search",
+    "description": "Semantic search",
+    "group_name": "Memory",
+    "tags": [],
+    "source": "core",
+    "status": "enabled"
+  },
+  {
+    "name": "message",
+    "label": "message",
+    "description": "Send messages",
+    "group_name": "Messaging",
+    "tags": [],
+    "source": "core",
+    "status": "enabled"
+  },
+  {
+    "name": "message_assistant",
+    "label": "Message Assistant",
+    "description": "Send a message from an IA or RA agent to the assistant",
+    "group_name": "comms",
+    "tags": [],
+    "source": "platform",
+    "status": "enabled"
+  },
+  {
+    "name": "message_go",
+    "label": "Message Goal Orchestrator",
+    "description": "Send a message from SHCA to the Goal Orchestrator",
+    "group_name": "comms",
+    "tags": [],
+    "source": "platform",
+    "status": "enabled"
+  },
+  {
+    "name": "nodes",
+    "label": "nodes",
+    "description": "Nodes + devices",
+    "group_name": "Nodes",
+    "tags": [],
+    "source": "core",
+    "status": "enabled"
+  },
+  {
+    "name": "pdf",
+    "label": "PDF Processing",
+    "description": "Read, parse, and process PDF documents",
+    "group_name": "media",
+    "tags": [],
+    "source": "platform",
+    "status": "enabled"
+  },
+  {
+    "name": "process",
+    "label": "process",
+    "description": "Manage background processes",
+    "group_name": "Runtime",
+    "tags": [],
+    "source": "core",
+    "status": "enabled"
+  },
+  {
+    "name": "read",
+    "label": "read",
+    "description": "Read file contents",
+    "group_name": "Files",
+    "tags": [],
+    "source": "core",
+    "status": "enabled"
+  },
+  {
+    "name": "record_decision",
+    "label": "Record Decision",
+    "description": "Record an architectural or design decision",
+    "group_name": "story",
+    "tags": [],
+    "source": "platform",
+    "status": "enabled"
+  },
+  {
+    "name": "record_suggestion",
+    "label": "Record suggestion",
+    "description": "Record a tracked platform-improvement suggestion (status=proposed).",
+    "group_name": "",
+    "tags": [],
+    "source": "custom",
+    "status": "enabled"
+  },
+  {
+    "name": "register_resource",
+    "label": "Register Resource",
+    "description": "Register a new resource in the goal",
+    "group_name": "story",
+    "tags": [],
+    "source": "platform",
+    "status": "enabled"
+  },
+  {
+    "name": "registry_get",
+    "label": "Get a registry finding",
+    "description": "Fetch one finding by id, with full detail, evidence, impact, verdict and adoption_path.",
+    "group_name": "",
+    "tags": [],
+    "source": "custom",
+    "status": "enabled"
+  },
+  {
+    "name": "registry_search",
+    "label": "Search the platform registry",
+    "description": "List registry findings. All filters optional (empty = no filter). Returns lean rows; use registry_get for full detail. Call this BEFORE researching to avoid duplicating existing findings.",
+    "group_name": "",
+    "tags": [],
+    "source": "custom",
+    "status": "enabled"
+  },
+  {
+    "name": "registry_verdict",
+    "label": "Record integration verdict",
+    "description": "Integration reviewer: write your INDEPENDENT verdict into a finding's row. verdict=adopt_now ONLY if the finding maps to one of the 4 no-code ops (change_template_model|add_skill|add_tool|create_credential) — then you MUST also set op_type + op_params (the execution spec). Anything needing code, a migration, infra, or a new provider = out_of_scope. op_params is a JSON object string. For models, supported_today=true only if provider family is gemini/anthropic.",
+    "group_name": "",
+    "tags": [],
+    "source": "custom",
+    "status": "enabled"
+  },
+  {
+    "name": "registry_write",
+    "label": "Write research findings",
+    "description": "Producer finish-tool (ends your turn): submit your ranked findings for this run. `entries` is a JSON ARRAY STRING; each item: {fingerprint, category(model|tool|mcp|skill), title, summary, detail, evidence(list of urls), impact(object), provider_family, target_role}. fingerprint is the role-aware dedup key e.g. 'model:claude-haiku-5:GO', 'mcp:firecrawl' or 'skill:tdd' — re-using one updates that finding instead of duplicating. Cap: at most 2 models PER ROLE for model_research; 5 total for tool_research / skill_research.",
+    "group_name": "",
+    "tags": [],
+    "source": "custom",
+    "status": "enabled"
+  },
+  {
+    "name": "reply_assistant",
+    "label": "Reply to Assistant",
+    "description": "Send a reply from GO back to the SHCA",
+    "group_name": "story",
+    "tags": [],
+    "source": "platform",
+    "status": "enabled"
+  },
+  {
+    "name": "research_spawn",
+    "label": "Queue on-demand research",
+    "description": "Steward only: request research on a SPECIFIC topic. This ENQUEUES it at the FRONT of the research queue (kind=model|tool|skill); the deterministic drainer runs it one-at-a-time end-to-end and the reviewer verdicts it — you do NOT run or review it yourself. Just tell the user it is queued. Use only when a human asks for NEW research; for 'what can we integrate?' read the registry instead.",
+    "group_name": "",
+    "tags": [],
+    "source": "custom",
+    "status": "enabled"
+  },
+  {
+    "name": "research_status",
+    "label": "Check research queue status",
+    "description": "Steward: check whether a research/review sweep is already in flight. Call this BEFORE research_spawn/review_spawn — if busy=true, do NOT dispatch; tell the user a research is already running and they must wait.",
+    "group_name": "",
+    "tags": [],
+    "source": "custom",
+    "status": "enabled"
+  },
+  {
+    "name": "review_spawn",
+    "label": "Spawn integration review",
+    "description": "Steward only: run integration review. Pass `sweep_id` (from a research_spawn you started) to review that research's findings; or `finding_id` to review one finding; or neither to review ALL pending findings.",
+    "group_name": "",
+    "tags": [],
+    "source": "custom",
+    "status": "enabled"
+  },
+  {
+    "name": "revoke_resource",
+    "label": "Revoke Resource Access",
+    "description": "Revoke an agent's access to a resource",
+    "group_name": "story",
+    "tags": [],
+    "source": "platform",
+    "status": "enabled"
+  },
+  {
+    "name": "sessions_history",
+    "label": "sessions_history",
+    "description": "Session history",
+    "group_name": "Sessions",
+    "tags": [],
+    "source": "core",
+    "status": "enabled"
+  },
+  {
+    "name": "sessions_list",
+    "label": "sessions_list",
+    "description": "List sessions",
+    "group_name": "Sessions",
+    "tags": [],
+    "source": "core",
+    "status": "enabled"
+  },
+  {
+    "name": "sessions_send",
+    "label": "sessions_send",
+    "description": "Send to session",
+    "group_name": "Sessions",
+    "tags": [],
+    "source": "core",
+    "status": "enabled"
+  },
+  {
+    "name": "sessions_spawn",
+    "label": "sessions_spawn",
+    "description": "Spawn sub-agent",
+    "group_name": "Sessions",
+    "tags": [],
+    "source": "core",
+    "status": "enabled"
+  },
+  {
+    "name": "session_status",
+    "label": "session_status",
+    "description": "Session status",
+    "group_name": "Sessions",
+    "tags": [],
+    "source": "core",
+    "status": "enabled"
+  },
+  {
+    "name": "spawn_research",
+    "label": "Spawn research worker",
+    "description": "Spawn/redispatch a research worker for a dimension (model|agent|tooling|infra).",
+    "group_name": "",
+    "tags": [],
+    "source": "custom",
+    "status": "enabled"
+  },
+  {
+    "name": "story_create",
+    "label": "Create implementation story",
+    "description": "Steward only: create a platform-improvement story. For a registry finding pass `finding_id` (allowed ONLY if the reviewer marked it adopt_now); for a free-form request pass `title` + `description`. The story enters the normal board → planning → execution pipeline.",
+    "group_name": "",
+    "tags": [],
+    "source": "custom",
+    "status": "enabled"
+  },
+  {
+    "name": "story_detail",
+    "label": "Story Detail",
+    "description": "Get full context and status of a story",
+    "group_name": "story",
+    "tags": [],
+    "source": "platform",
+    "status": "enabled"
+  },
+  {
+    "name": "story_list",
+    "label": "List Stories",
+    "description": "List all stories in the current goal",
+    "group_name": "story",
+    "tags": [],
+    "source": "platform",
+    "status": "enabled"
+  },
+  {
+    "name": "story_update",
+    "label": "Post Story Update",
+    "description": "Post a progress update to a story",
+    "group_name": "story",
+    "tags": [],
+    "source": "platform",
+    "status": "enabled"
+  },
+  {
+    "name": "subagents",
+    "label": "subagents",
+    "description": "Manage sub-agents",
+    "group_name": "Sessions",
+    "tags": [],
+    "source": "core",
+    "status": "enabled"
+  },
+  {
+    "name": "submit_research",
+    "label": "Submit research finding",
+    "description": "Worker submits a structured research finding (ends the turn).",
+    "group_name": "",
+    "tags": [],
+    "source": "custom",
+    "status": "enabled"
+  },
+  {
+    "name": "submit_review",
+    "label": "Submit Review",
+    "description": "Submit a council review; the control panel validates review_details per agent_type and returns errors to correct.",
+    "group_name": "council",
+    "tags": [],
+    "source": "platform",
+    "status": "enabled"
+  },
+  {
+    "name": "submit_security_review",
+    "label": "Submit Security Review",
+    "description": "Submit a security aspect/convener review + structured findings; the control panel validates and returns errors to correct.",
+    "group_name": "council",
+    "tags": [],
+    "source": "platform",
+    "status": "enabled"
+  },
+  {
+    "name": "task_activity",
+    "label": "Task Activity Log",
+    "description": "Read the full activity timeline for a task",
+    "group_name": "task",
+    "tags": [],
+    "source": "platform",
+    "status": "enabled"
+  },
+  {
+    "name": "task_report",
+    "label": "Report Task Progress",
+    "description": "Report progress on the current task",
+    "group_name": "task",
+    "tags": [],
+    "source": "platform",
+    "status": "enabled"
+  },
+  {
+    "name": "task_status",
+    "label": "Task Status",
+    "description": "Get the current status of a task",
+    "group_name": "task",
+    "tags": [],
+    "source": "platform",
+    "status": "enabled"
+  },
+  {
+    "name": "tts",
+    "label": "tts",
+    "description": "Text-to-speech conversion",
+    "group_name": "Media",
+    "tags": [],
+    "source": "core",
+    "status": "enabled"
+  },
+  {
+    "name": "update_story",
+    "label": "Modify Story",
+    "description": "Update story fields (title, description, state)",
+    "group_name": "story",
+    "tags": [],
+    "source": "platform",
+    "status": "enabled"
+  },
+  {
+    "name": "update_suggestion",
+    "label": "Update suggestion status",
+    "description": "Change a suggestion's status (accepted|in_progress|implemented|rejected|superseded).",
+    "group_name": "",
+    "tags": [],
+    "source": "custom",
+    "status": "enabled"
+  },
+  {
+    "name": "web_fetch",
+    "label": "web_fetch",
+    "description": "Fetch web content",
+    "group_name": "Web",
+    "tags": [],
+    "source": "core",
+    "status": "enabled"
+  },
+  {
+    "name": "web_search",
+    "label": "web_search",
+    "description": "Search the web",
+    "group_name": "Web",
+    "tags": [],
+    "source": "core",
+    "status": "enabled"
+  },
+  {
+    "name": "write",
+    "label": "write",
+    "description": "Create or overwrite files",
+    "group_name": "Files",
+    "tags": [],
+    "source": "core",
+    "status": "enabled"
+  }
+]

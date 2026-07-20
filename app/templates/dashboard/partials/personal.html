@@ -1,0 +1,69 @@
+<div class="grid grid-cols-1 lg:grid-cols-3 gap-4">
+
+  <!-- My goals -->
+  <div class="bg-gray-900 border border-gray-800 rounded-xl p-5">
+    <div class="flex items-baseline justify-between mb-3">
+      <h3 class="font-semibold">My Goals</h3>
+      <span class="text-2xl font-bold text-indigo-400">{{ personal.goals_count }}</span>
+    </div>
+    {% if personal.goals %}
+    <div class="flex flex-wrap gap-1.5">
+      {% for g in personal.goals[:8] %}
+      <a href="/goals/{{ g.id }}"
+         class="text-xs px-2 py-1 rounded-md bg-gray-800 hover:bg-gray-700 transition-colors truncate max-w-[10rem]"
+         style="border-left: 3px solid {{ g.color_tag }}">{{ g.name }}</a>
+      {% endfor %}
+      {% if personal.goals_count > 8 %}
+      <a href="/goals" class="text-xs px-2 py-1 text-gray-500 hover:text-gray-300">+{{ personal.goals_count - 8 }} more</a>
+      {% endif %}
+    </div>
+    {% else %}
+    <p class="text-sm text-gray-500">You're not part of any goals yet. <a href="/goals" class="text-indigo-400 hover:text-indigo-300">Browse goals →</a></p>
+    {% endif %}
+  </div>
+
+  <!-- My open tasks -->
+  <div class="bg-gray-900 border border-gray-800 rounded-xl p-5">
+    <div class="flex items-baseline justify-between mb-3">
+      <h3 class="font-semibold">My Open Tasks</h3>
+      <span class="text-2xl font-bold text-blue-400">{{ personal.open_tasks_total }}</span>
+    </div>
+    {% if personal.open_tasks_blocked > 0 %}
+    <p class="text-sm text-amber-400/90">{{ personal.open_tasks_blocked }} blocked: may need your input.</p>
+    {% elif personal.open_tasks_total > 0 %}
+    <p class="text-sm text-gray-500">All moving along - none blocked.</p>
+    {% else %}
+    <p class="text-sm text-gray-500">No open tasks assigned to you.</p>
+    {% endif %}
+  </div>
+
+  <!-- My agents -->
+  <div class="bg-gray-900 border border-gray-800 rounded-xl p-5">
+    <div class="flex items-baseline justify-between mb-3">
+      <h3 class="font-semibold">My Assistants</h3>
+      <span class="text-2xl font-bold text-purple-400">{{ personal.agents_count }}</span>
+    </div>
+    {% if personal.agents %}
+    <ul class="space-y-1.5">
+      {% for a in personal.agents[:5] %}
+      <li class="flex items-center gap-2 text-sm">
+        <span class="w-1.5 h-1.5 rounded-full {% if a.status == 'active' %}bg-green-500{% else %}bg-gray-600{% endif %} flex-shrink-0"></span>
+        <span class="flex-1 truncate">{{ a.display_name }}</span>
+        <span class="text-xs text-gray-500">{{ a.model_label or a.model }}</span>
+      </li>
+      {% endfor %}
+    </ul>
+    <a href="/settings/my-agents" class="text-xs text-indigo-400 hover:text-indigo-300 mt-3 inline-block">Manage my assistants →</a>
+    {% else %}
+    <p class="text-sm text-gray-500">No assistants yet. <a href="/settings/my-agents" class="text-indigo-400 hover:text-indigo-300">Set one up →</a></p>
+    {% endif %}
+  </div>
+
+</div>
+
+<!-- My recent activity -->
+<div class="bg-gray-900 border border-gray-800 rounded-xl p-5 mt-4">
+  <h3 class="font-semibold mb-3">My Recent Activity</h3>
+  {% set activity_rows = personal.activity %}
+  {% include "dashboard/partials/_activity_list.html" %}
+</div>

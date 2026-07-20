@@ -1,0 +1,16 @@
+# AgentOS migration order — the single source of truth for apply.py.
+#
+# This is the PUBLIC (squashed) baseline. A fresh install applies:
+#   0001_baseline_schema  — full schema (structure only), squashed from the
+#                           internal migration history.
+#   0002_baseline_seed    — the platform ship-set: templates (GO, assistant,
+#                           IAs, RA/security councils, platform agents), their
+#                           prompt files, active skills, tools, tool profiles,
+#                           and all linkages. No user data / secrets.
+#
+# Rules going forward (same as the internal repo):
+#   • Additive only. Never edit an applied migration — add a new one.
+#   • Append new migration names BELOW, in apply order. One name per line.
+#   • Each name maps to <name>.sql (or <name>.py) in this directory.
+0001_baseline_schema
+0002_baseline_seed

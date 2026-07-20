@@ -1,0 +1,130 @@
+{% extends "base.html" %}
+{% from "partials/_tour_trigger.html" import tour_trigger %}
+{% block title %}{{ goal.name }}{% endblock %}
+{% block content %}
+<div id="goal-dashboard-page" class="p-6 lg:p-8 max-w-7xl mx-auto">
+
+  <!-- Header -->
+  <div class="flex items-start justify-between mb-6">
+    <div class="flex items-center gap-3">
+      <span class="w-3 h-3 rounded-full flex-shrink-0" style="background:{{ goal.color_tag }};"></span>
+      <div>
+        <h1 class="text-xl font-semibold text-gray-100">{{ goal.name }}</h1>
+        {% if goal.description %}
+        <p class="text-sm text-gray-500 mt-0.5">{{ goal.description }}</p>
+        {% endif %}
+      </div>
+    </div>
+    {% if user.preferences.get("startup_wizard_enabled", True) %}
+    {{ tour_trigger("goal-dashboard-intro", "What is this page?") }}
+    {% endif %}
+  </div>
+
+  <!-- Goal info bar -->
+  {% if goal.objective or goal.deadline or goal.priority != 'medium' %}
+  <div class="card p-4 mb-5 flex flex-wrap gap-x-6 gap-y-2 text-sm">
+    {% if goal.objective %}
+    <div><span class="text-gray-500">Objective:</span> <span class="text-gray-200">{{ goal.objective }}</span></div>
+    {% endif %}
+    {% if goal.deadline %}
+    <div><span class="text-gray-500">Deadline:</span> <span class="text-gray-200" {% if goal.deadline %}data-utc="{{ goal.deadline.isoformat() }}"{% endif %}>{{ goal.deadline.strftime('%Y-%m-%d') if goal.deadline else 'Not set' }}{% if goal.deadline %} UTC{% endif %}</span></div>
+    {% endif %}
+    {% if goal.priority and goal.priority != 'medium' %}
+    <div><span class="text-gray-500">Priority:</span> <span class="text-gray-200 uppercase">{{ goal.priority }}</span></div>
+    {% endif %}
+    {% if goal.state %}
+    <div><span class="text-gray-500">Status:</span> <span class="text-gray-200">{{ goal.state }}</span></div>
+    {% endif %}
+    {% if goal.completion_pct %}
+    <div><span class="text-gray-500">Progress:</span> <span class="text-gray-200">{{ goal.completion_pct }}%</span></div>
+    {% endif %}
+  </div>
+  {% endif %}
+
+  <!-- Quick-action cards -->
+  <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3 mb-8">
+    {% set actions = [
+      ("Monitor", "/goals/" ~ pid ~ "/monitor", "M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z", "Live dashboard"),
+      ("Members", "/goals/" ~ pid ~ "/members", "M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0z", "Members and access"),
+      ("Integrations", "/goals/" ~ pid ~ "/integrations", "M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1", "Slack"),
+      ("Model Config", "/goals/" ~ pid ~ "/model-config", "M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z", "LLM model settings"),
+    ] %}
+    {# Git Engine surfaces here only when the git dependency-graph engine is enabled (settings.gitgraph_enabled). #}
+    {% if gitgraph_enabled %}
+    {% set actions = actions + [("Git Engine", "/goals/" ~ pid ~ "/git", "M6 3v12m0 0a3 3 0 103 3 3 3 0 00-3-3zm12-6a3 3 0 11-3 3 3 3 0 013-3zm0 0V9a3 3 0 01-3 3H9", "Branch & merge graph")] %}
+    {% endif %}
+    {% for label, href, path_d, desc in actions %}
+    <a href="{{ href }}" class="card card-interactive p-4 group">
+      <svg class="w-5 h-5 text-gray-600 group-hover:text-brand transition-colors mb-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="{{ path_d }}"/>
+      </svg>
+      <div class="font-medium text-sm text-gray-200">{{ label }}</div>
+      <div class="text-2xs text-gray-600 mt-0.5">{{ desc }}</div>
+    </a>
+    {% endfor %}
+  </div>
+
+
+  <!-- Shared Conversations -->
+  {% if shared_threads %}
+  <div class="card p-4 mb-4">
+    <div class="flex items-center justify-between mb-3">
+      <h2 class="text-xs font-semibold uppercase tracking-wider text-gray-500">Shared with Me</h2>
+    </div>
+    <div class="grid grid-cols-1 sm:grid-cols-2 gap-1.5">
+      {% for t in shared_threads %}
+      <a href="/goals/{{ pid }}/chat/{{ t.id }}"
+         class="flex items-center gap-2 px-3 py-2 rounded-md hover:bg-white/5 transition-colors group">
+        <svg class="w-3.5 h-3.5 text-gray-600 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z"/>
+        </svg>
+        <span class="flex-1 text-xs text-gray-400 group-hover:text-gray-200 truncate transition-colors">{{ t.title or t.agent_name or 'Untitled' }}</span>
+        {% if t.owner_name %}
+        <span class="text-2xs text-gray-600 truncate flex-shrink-0">{{ t.owner_name }}</span>
+        {% endif %}
+      </a>
+      {% endfor %}
+    </div>
+  </div>
+  {% endif %}
+
+  <!-- Former Members' Conversations: read-only, visible to any current member -->
+  {% if left_goal_threads %}
+  <div class="card p-4 mb-4">
+    <div class="flex items-center justify-between mb-3">
+      <h2 class="text-xs font-semibold uppercase tracking-wider text-gray-500">Former Members' Conversations</h2>
+    </div>
+    <div class="grid grid-cols-1 sm:grid-cols-2 gap-1.5">
+      {% for t in left_goal_threads %}
+      <a href="/goals/{{ pid }}/chat/{{ t.agent_id }}?thread_id={{ t.id }}"
+         class="flex items-center gap-2 px-3 py-2 rounded-md hover:bg-white/5 transition-colors group">
+        <svg class="w-3.5 h-3.5 text-gray-600 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"/>
+        </svg>
+        <span class="flex-1 text-xs text-gray-400 group-hover:text-gray-200 truncate transition-colors">{{ t.title or 'Untitled' }}</span>
+        {% if t.owner_name %}
+        <span class="text-2xs text-gray-600 truncate flex-shrink-0">{{ t.owner_name }}</span>
+        {% endif %}
+      </a>
+      {% endfor %}
+    </div>
+    <p class="text-2xs text-gray-600 mt-3">Read-only — these members have left the goal. Their conversation stays visible to the team but no one can post to it.</p>
+  </div>
+  {% endif %}
+
+</div>
+{% endblock %}
+
+{% block extra_js %}
+{% if auto_fire_tour %}
+<script>
+// Milestone tour: first-ever visit to this goal's dashboard - the page a
+// user actually lands on after selecting a goal (the sidebar's own
+// Goal Thread/Stories/Tasks/Resources tour milestones only fire once the
+// user has navigated into each of those, which this page points them to).
+// Must run in extra_js (after tour.js loads) — content renders inside
+// <main>, before the bottom-of-body script tags.
+autoFireTour('goal-dashboard-intro', 900);
+</script>
+{% endif %}
+{% endblock %}

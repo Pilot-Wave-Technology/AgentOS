@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# git-hooks/pre-push
+#
+# Validates migrations/SEQUENCE before any push reaches the remote.
+# Catches missing .sql files, orphaned .sql files, and duplicate entries
+# without needing a database connection.
+#
+# Install once per developer checkout:
+#   cp git-hooks/pre-push .git/hooks/pre-push
+#   chmod +x .git/hooks/pre-push
+#
+# Or configure git to use the repo hooks directory globally:
+#   git config core.hooksPath git-hooks
+#
+# WHY THIS RUNS HERE
+# ------------------
+# Cloud Build also runs check_sequence.py as its first step, but that catches
+# errors only after the code is already pushed. This hook catches them on your
+# machine before the push, giving you immediate feedback with no pipeline wait.
+
+set -euo pipefail
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+SEQUENCE_CHECK="$REPO_ROOT/migrations/check_sequence.sh"
+
+if [ ! -f "$SEQUENCE_CHECK" ]; then
+    # No check script found — likely not a migration-bearing repo, skip.
+    exit 0
+fi
+
+echo "pre-push: validating migrations/SEQUENCE..."
+if ! bash "$SEQUENCE_CHECK"; then
+    echo ""
+    echo "Push blocked. Fix SEQUENCE errors above, then push again."
+    echo "See migrations/SEQUENCE for the rules on adding new migrations."
+    exit 1
+fi

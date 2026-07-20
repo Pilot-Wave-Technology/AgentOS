@@ -1,0 +1,141 @@
+###############################################################################
+# AgentOS control plane — YOUR configuration.
+#
+#   cp terraform.tfvars.example terraform.tfvars   # then edit this copy
+#
+# This is the ONE file you edit. It has two kinds of entries:
+#   • INPUTS you must / may provide (project, org, emails, sizes)
+#   • FLAGS that turn service behaviour on/off (defaults = current config)
+#
+# Secret *values* are NOT here — prerequisites.sh creates + fills every secret;
+# overwrite any you left blank later with ../set-secret.sh (see
+# deploy/06-fill-in-secrets.md).
+###############################################################################
+
+# ─── 1. Project / region (REQUIRED) ────────────────────────────────────────
+project_id            = "my-agentos-project"     # <-- your GCP project (you own it)
+region                = "us-central1"
+name_prefix           = "agentos"                # short lowercase; prefixes resources
+
+# ─── 2. External services ──────────────────────────────────────────────────
+firebase_project_id   = "my-agentos-project"     # usually same as project_id
+firebase_web_api_key  = "AIza...FILL_ME"         # Firebase console > Project settings (public key)
+bootstrap_admin_email = "you@example.com"        # first login becomes platform admin
+
+# Your AgentOS FORK — the SAME URL as the gateway stack's repo_url. See FORKING.md.
+repo_url                   = "https://github.com/YOUR_ORG/AgentOS.git"
+
+# GitHub App (REQUIRED) — the org where AGENTS create + work on goal repos (NOT
+# the fork). Create + install the App on that org, then fill in all three. Full
+# steps: deploy/02-github-app.md.
+github_org                 = "my-github-org"      # REQUIRED
+github_app_id              = "1234567"            # REQUIRED
+github_app_installation_id = "98765432"           # REQUIRED
+
+# Slack (optional)
+slack_enabled         = false
+slack_client_id       = ""
+slack_command_suffix  = ""                        # e.g. "prod" -> /goal-prod
+
+# ─── 3. LLM providers ──────────────────────────────────────────────────────
+# Toggle which provider key secrets are created + wired. Put the actual keys in
+# Secret Manager after apply. Anthropic + Gemini power agents/summaries; OpenAI
+# is optional. (The gateway VM also consumes these — see agent_os_openclaw.)
+anthropic_enabled     = true
+gemini_enabled        = true
+openai_enabled        = false                     # set true to provision an OpenAI key slot
+
+# Models shown in the UI — must match what the gateway registers (see the
+# gateway's scripts/gateway-provision.sh model registry).
+available_models = [
+  "google/gemini-2.5-flash",
+  "google/gemini-2.5-pro",
+  "anthropic/claude-sonnet-4-5",
+  "anthropic/claude-haiku-4-5",
+  "anthropic/claude-opus-4-7",
+]
+
+# ─── 4. Database (Cloud SQL Postgres) ──────────────────────────────────────
+# Created by prerequisites.sh (its [db] step) — NOT here. To change sizing, set
+# DB_TIER / DB_DISK_GB when you run prerequisites.sh (defaults: db-custom-2-8192,
+# 250 GB, POSTGRES_17, database "control_panel").
+
+# ─── 5. Networking ─────────────────────────────────────────────────────────
+# Standard 2-stage deploy: the GATEWAY (Stage ①) already created this VPC, so the
+# platform REUSES it -> keep this false and set network_name to the gateway's
+# `network_name` output. Only set true if you are NOT deploying the gateway stack.
+create_network        = false                     # false = reuse the gateway's VPC
+network_name          = "agentos-vpc"             # = gateway output: network_name
+connector_cidr        = "10.8.0.0/28"             # /28 for the Serverless VPC connector
+
+# ─── 6. Storage buckets (globally unique; empty = auto-derived) ─────────────
+workspace_bucket_prefix = ""                      # default: <name_prefix>-agent-ws
+resource_bucket         = ""                      # default: <name_prefix>-agent-resources-<project>
+archive_bucket          = ""                      # default: <name_prefix>-agent-data-<project>
+
+# ─── 7. Gateway (OpenClaw VM) ──────────────────────────────────────────────
+# Deploy the gateway first (agent_os_openclaw branch), then paste its internal
+# WebSocket URL here and re-apply.
+openclaw_ws_url       = "ws://REPLACE_WITH_GATEWAY_VM_IP:18789"
+
+# ─── 8. Cloud Run sizing + profile ─────────────────────────────────────────
+# Container images. Build + push first (Cloud Build), then set these to the real
+# refs for the apply that creates the service. The hello default only lets an
+# infra-only `terraform plan` run before you have an image. See
+# deploy/07-build-and-deploy.md.
+# image             = "gcr.io/my-agentos-project/agentos:latest"
+# task_runner_image = "gcr.io/my-agentos-project/agentos-task-runner:latest"
+
+service_profile       = "split"                   # "split" (default: 4 services — web/council/git/management) or "single" (1 service, cheaper)
+service_cpu           = "2"
+service_memory        = "4Gi"
+service_min_instances = 1                          # keep >=1 so co-located loops stay warm
+service_max_instances = 3
+enable_task_runner    = true
+
+# ─── 9. Feature flags (defaults = current running config) ───────────────────
+# In "single" profile ALL of these run in the one service. Turn things off here
+# for a leaner deployment; single-run loops are DB-lock guarded so it's safe.
+flags = {
+  # -- security / auth (leave ON for a secure deployment) --
+  agent_scoped_tokens_enabled   = true    # per-agent JWTs on /internal/*
+  agent_authz_enforce           = true    # 403 on cross-goal access
+  custom_tools_broker_enforce   = true    # tools may only fetch declared credentials
+
+  # -- chat delivery --
+  chat_queue_enabled            = true
+  chat_gateway_id               = "gw-1"
+
+  # -- memory v2 --
+  memory_v2_bridge_enabled      = true    # ledger events -> memory files
+  memory_v2_flush_enabled       = true    # flush memory on story-complete / reap
+
+  # -- goal review council (reviews stories, reports to the GO) --
+  council_dispatcher_enabled    = true
+  council_schedule_enabled      = true
+
+  # -- security council (branch security review) --
+  security_dispatcher_enabled   = true
+  security_ui_enabled           = true    # show the manual "run security review" button
+  security_schedule_enabled     = true
+  security_schedule_hours       = 12
+
+  # -- platform research council (self-improvement research) --
+  platform_council_enabled             = true
+  platform_research_dispatcher_enabled = true
+  platform_agents_recreate_on_build    = true   # refresh platform agents each deploy
+
+  # -- goal progress summaries --
+  goal_summary_enabled          = true
+
+  # -- git dependency-graph engine (branch cut / merge queue) --
+  gitgraph_enabled              = true
+
+  # -- claude-code story DAG concurrency ceiling --
+  task_dag_ceiling              = 4
+  task_dag_ceiling_enforce      = false   # shadow-only until you want hard limits
+
+  # -- misc --
+  ledger_actor_audit            = true
+  log_level                     = "INFO"  # DEBUG for verbose gateway/DB logs
+}

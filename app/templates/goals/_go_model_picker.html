@@ -1,0 +1,74 @@
+{#
+  GO model + context-window picker (two dropdowns -> one hidden field).
+
+  Params (set by the including template):
+    go_model_tree  : llm_models.go_model_tree() output
+    field_name     : name of the hidden input carrying the full synthetic model id
+                     (route handlers read this unchanged: "go_model" or "model")
+    picker_current : currently-selected full id (edit case); "" -> tree default
+    widget_id      : unique DOM id prefix (safe with multiple pickers on a page)
+
+  The visible selects are display-only; the hidden field is the source of truth
+  the form submits, so the server contract (is_supported(full_id)) is unchanged.
+#}
+<div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+  <div>
+    <label class="block text-sm text-gray-400 mb-1.5">Model</label>
+    <select id="{{ widget_id }}-model" class="input">
+      {% for b in go_model_tree.bases %}
+        <option value="{{ b.key }}">{{ b.label }}</option>
+      {% endfor %}
+    </select>
+  </div>
+  <div>
+    <label class="block text-sm text-gray-400 mb-1.5">Context window</label>
+    <select id="{{ widget_id }}-size" class="input"></select>
+  </div>
+</div>
+<input type="hidden" id="{{ widget_id }}-hidden" name="{{ field_name }}" />
+<script>
+(function() {
+  const tree = {{ go_model_tree | tojson }};
+  const current = {{ (picker_current or go_model_tree.default_id) | tojson }};
+  const modelSel = document.getElementById("{{ widget_id }}-model");
+  const sizeSel  = document.getElementById("{{ widget_id }}-size");
+  const hidden   = document.getElementById("{{ widget_id }}-hidden");
+  if (!modelSel || !sizeSel || !hidden) return;
+
+  // Resolve the starting base + tokens from the current full id.
+  let initBase = tree.default_base, initTokens = tree.default_context;
+  for (const base of Object.keys(tree.variants)) {
+    const hit = (tree.variants[base] || []).find(v => v.id === current);
+    if (hit) { initBase = base; initTokens = hit.tokens; break; }
+  }
+
+  function updateHidden() {
+    const base = modelSel.value;
+    const tokens = parseInt(sizeSel.value, 10);
+    const hit = (tree.variants[base] || []).find(v => v.tokens === tokens);
+    hidden.value = hit ? hit.id : "";
+  }
+
+  function fillSizes(base, preferTokens) {
+    const variants = tree.variants[base] || [];
+    sizeSel.innerHTML = "";
+    for (const v of variants) {
+      const opt = document.createElement("option");
+      opt.value = String(v.tokens);
+      opt.textContent = v.label;
+      sizeSel.appendChild(opt);
+    }
+    // Prefer the requested size, else the default (100K), else the smallest.
+    const wanted = [preferTokens, tree.default_context].find(
+      t => variants.some(v => v.tokens === t));
+    const chosen = (wanted != null) ? wanted : (variants[0] && variants[0].tokens);
+    if (chosen != null) sizeSel.value = String(chosen);
+    updateHidden();
+  }
+
+  modelSel.value = initBase;
+  modelSel.addEventListener("change", () => fillSizes(modelSel.value, tree.default_context));
+  sizeSel.addEventListener("change", updateHidden);
+  fillSizes(initBase, initTokens);
+})();
+</script>

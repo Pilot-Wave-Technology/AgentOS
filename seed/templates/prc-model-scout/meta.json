@@ -1,0 +1,23 @@
+{
+  "id": "prc-model-scout",
+  "type": "PlatformResearch",
+  "name": "Research: Models & Pricing",
+  "description": "Researches best LLM per agent role (cost/reasoning/latency/context).",
+  "model": "google-flash-500k/gemini-2.5-flash-500k",
+  "emoji": "🔬",
+  "tools_allow": [
+    "read",
+    "pdf",
+    "image",
+    "web_search",
+    "web_fetch",
+    "submit_research"
+  ],
+  "tools_deny": [],
+  "memory_enabled": false,
+  "max_tokens": null,
+  "notes": "PRC worker.",
+  "status": "active",
+  "version": 1,
+  "tool_profiles": []
+}

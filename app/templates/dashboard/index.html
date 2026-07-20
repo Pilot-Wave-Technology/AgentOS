@@ -1,0 +1,203 @@
+{% extends "base.html" %}
+{% block title %}Dashboard{% endblock %}
+{% block content %}
+<div class="p-8 max-w-6xl mx-auto">
+
+  <div class="mb-6">
+    <h1 class="text-2xl font-bold">Dashboard</h1>
+    <p class="text-sm text-gray-500 mt-0.5">
+      {% if is_operator %}Platform health, cost, and your work at a glance.
+      {% else %}Your work at a glance.{% endif %}
+    </p>
+  </div>
+
+  <!-- "Since your last visit" banner: client-side, survives tab switches -->
+  <div id="since-last-visit"
+       class="hidden mb-4 px-4 py-2.5 bg-indigo-900/20 border border-indigo-800/40
+              rounded-lg flex items-center gap-3 text-sm text-indigo-300">
+    <span class="w-2 h-2 rounded-full bg-indigo-400 animate-pulse flex-shrink-0"></span>
+    <span>New activity since your last visit:
+      <button hx-get="/dashboard/body?tab=overview"
+              hx-target="#dashboard-body"
+              hx-swap="innerHTML"
+              hx-sync="#dashboard-body:replace"
+              hx-push-url="/dashboard?tab=overview"
+              onclick="document.getElementById('since-last-visit').classList.add('hidden')"
+              class="underline text-indigo-300 hover:text-indigo-200">
+        go to Overview → Recent Activity
+      </button>
+    </span>
+    <button onclick="document.getElementById('since-last-visit').classList.add('hidden')"
+            class="ml-auto text-gray-600 hover:text-gray-400 text-lg leading-none">×</button>
+  </div>
+
+  <div id="dashboard-body">
+    {% include "dashboard/partials/body.html" %}
+  </div>
+
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
+<script>
+// ── "Since your last visit" ────────────────────────────────────────────────
+(function () {
+  const STORE_KEY = 'agentos_dashboard_seq';
+  {% if system and system.latest_seq %}
+  const currentSeq = {{ system.latest_seq }};
+  {% elif personal and personal.latest_seq %}
+  const currentSeq = {{ personal.latest_seq }};
+  {% else %}
+  const currentSeq = null;
+  {% endif %}
+  if (!currentSeq) return;
+  const stored = parseInt(localStorage.getItem(STORE_KEY) || '0', 10);
+  if (stored > 0 && currentSeq > stored) {
+    const banner = document.getElementById('since-last-visit');
+    if (banner) banner.classList.remove('hidden');
+  }
+  setTimeout(() => localStorage.setItem(STORE_KEY, String(currentSeq)), 2000);
+})();
+
+// ── Provider cost doughnut chart ───────────────────────────────────────────
+let _modelChart = null;
+
+function initModelChart() {
+  const canvas = document.getElementById('model-cost-chart');
+  if (!canvas || !window.Chart) return;
+  const labels = JSON.parse(canvas.dataset.labels || '[]');
+  const values = JSON.parse(canvas.dataset.values || '[]');
+  if (!labels.length) return;
+  if (_modelChart) { _modelChart.destroy(); _modelChart = null; }
+  _modelChart = new Chart(canvas, {
+    type: 'doughnut',
+    data: {
+      labels,
+      datasets: [{
+        data: values,
+        backgroundColor: ['#818cf8','#34d399','#60a5fa','#f59e0b','#a78bfa'],
+        borderWidth: 0,
+        hoverOffset: 6,
+      }],
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: true,
+      cutout: '68%',
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          callbacks: {
+            label: ctx => ' ' + ctx.label + ': $' + ctx.parsed.toFixed(2),
+          },
+        },
+      },
+    },
+  });
+}
+
+// ── Daily cost bar chart ───────────────────────────────────────────────────
+let _dailyChart = null;
+function initDailyChart() {
+  const canvas = document.getElementById('cost-daily-chart');
+  if (!canvas || !window.Chart) return;
+  const labels = JSON.parse(canvas.dataset.labels || '[]');
+  const values = JSON.parse(canvas.dataset.values || '[]');
+  if (!labels.length) return;
+  if (_dailyChart) { _dailyChart.destroy(); _dailyChart = null; }
+  _dailyChart = new Chart(canvas, {
+    type: 'bar',
+    data: {
+      labels: labels.map(d => d.slice(5)),  // show MM-DD only
+      datasets: [{ data: values, backgroundColor: '#818cf8', borderRadius: 2, borderWidth: 0 }],
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: { legend: { display: false },
+        tooltip: { callbacks: { label: ctx => ' $' + ctx.parsed.y.toFixed(4) } } },
+      scales: {
+        x: { grid: { display: false }, ticks: { color: '#6b7280', font: { size: 10 } } },
+        y: { grid: { color: '#1f2937' }, ticks: { color: '#6b7280', font: { size: 10 },
+             callback: v => '$' + v.toFixed(3) } },
+      },
+    },
+  });
+}
+
+// ── Top agents + top goals horizontal bar charts ───────────────────────────
+let _agentsChart = null, _goalsChart = null;
+function initHBarChart(id, chartRef, color) {
+  const canvas = document.getElementById(id);
+  if (!canvas || !window.Chart) return null;
+  const labels = JSON.parse(canvas.dataset.labels || '[]');
+  const values = JSON.parse(canvas.dataset.values || '[]');
+  if (!labels.length) return null;
+  if (chartRef) { chartRef.destroy(); }
+  return new Chart(canvas, {
+    type: 'bar',
+    data: {
+      labels,
+      datasets: [{ data: values, backgroundColor: color, borderRadius: 2, borderWidth: 0 }],
+    },
+    options: {
+      indexAxis: 'y', responsive: true, maintainAspectRatio: false,
+      plugins: { legend: { display: false },
+        tooltip: { callbacks: { label: ctx => ' $' + ctx.parsed.x.toFixed(4) } } },
+      scales: {
+        x: { grid: { color: '#1f2937' }, ticks: { color: '#6b7280', font: { size: 10 },
+             callback: v => '$' + v.toFixed(3) } },
+        y: { grid: { display: false }, ticks: { color: '#9ca3af', font: { size: 10 } } },
+      },
+    },
+  });
+}
+
+// ── Stacked provider chart ─────────────────────────────────────────────────
+let _stackedChart = null;
+function initStackedChart() {
+  const canvas = document.getElementById('cost-stacked-chart');
+  if (!canvas || !window.Chart) return;
+  const labels   = JSON.parse(canvas.dataset.labels   || '[]');
+  const datasets = JSON.parse(canvas.dataset.datasets || '[]');
+  if (!labels.length) return;
+  if (_stackedChart) { _stackedChart.destroy(); _stackedChart = null; }
+  _stackedChart = new Chart(canvas, {
+    type: 'bar',
+    data: { labels: labels.map(d => d.slice(5)), datasets },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: { legend: { position: 'bottom', labels: { color: '#9ca3af', font: { size: 10 }, boxWidth: 10 } },
+        tooltip: { callbacks: { label: ctx => ' ' + ctx.dataset.label + ': $' + ctx.parsed.y.toFixed(4) } } },
+      scales: {
+        x: { stacked: true, grid: { display: false }, ticks: { color: '#6b7280', font: { size: 10 } } },
+        y: { stacked: true, grid: { color: '#1f2937' }, ticks: { color: '#6b7280', font: { size: 10 },
+             callback: v => '$' + v.toFixed(3) } },
+      },
+    },
+  });
+}
+
+// ── Story + task horizontal bar charts ────────────────────────────────────
+let _storiesChart = null, _tasksChart = null;
+
+function initCostCharts() {
+  initModelChart();
+  initDailyChart();
+  initStackedChart();
+  _agentsChart  = initHBarChart('cost-agents-chart',  _agentsChart,  '#34d399');
+  _goalsChart   = initHBarChart('cost-goals-chart',   _goalsChart,   '#60a5fa');
+  _storiesChart = initHBarChart('cost-stories-chart', _storiesChart, '#f59e0b');
+  _tasksChart   = initHBarChart('cost-tasks-chart',   _tasksChart,   '#a78bfa');
+}
+
+// Re-init chart after each HTMX tab swap.
+document.addEventListener('htmx:afterSettle', function(e) {
+  if (e.detail.target && e.detail.target.id === 'dashboard-body') {
+    initCostCharts();
+  }
+});
+
+initCostCharts();
+</script>
+{% endblock %}

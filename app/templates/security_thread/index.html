@@ -1,0 +1,264 @@
+{% extends "base.html" %}
+{% from "partials/_tour_trigger.html" import tour_trigger %}
+{% block title %}Security Council: {{ goal.name }}{% endblock %}
+{% block content %}
+<!-- Markdown rendering: marked.js + highlight.js, same pattern as chat/index.html -->
+<script src="https://cdn.jsdelivr.net/npm/marked@15/marked.min.js"></script>
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11/build/highlight.min.js"></script>
+<script src="/static/js/markdown_renderer.js"></script>
+<style>
+  .agent-prose h1, .agent-prose h2, .agent-prose h3,
+  .agent-prose h4, .agent-prose h5, .agent-prose h6 {
+    color: #e2e8f0; font-weight: 600; margin-top: 1em; margin-bottom: 0.4em; line-height: 1.3;
+  }
+  .agent-prose h1 { font-size: 1.25rem; }
+  .agent-prose h2 { font-size: 1.1rem; }
+  .agent-prose h3 { font-size: 1rem; }
+  .agent-prose p { margin: 0.4em 0; line-height: 1.6; }
+  .agent-prose ul, .agent-prose ol { margin: 0.4em 0; padding-left: 1.5em; }
+  .agent-prose ul { list-style-type: disc; }
+  .agent-prose ol { list-style-type: decimal; }
+  .agent-prose li { margin: 0.2em 0; }
+  .agent-prose strong { color: #f1f5f9; font-weight: 600; }
+  .agent-prose em { color: #cbd5e1; }
+  .agent-prose a { color: #818cf8; text-decoration: underline; }
+  .agent-prose blockquote {
+    border-left: 3px solid #4f46e5; padding: 0.3em 0.8em; margin: 0.5em 0;
+    color: #94a3b8; background: rgba(99,102,241,0.06); border-radius: 0 0.375rem 0.375rem 0;
+  }
+  .agent-prose code:not(pre code) {
+    background: rgba(255,255,255,0.08); padding: 0.15em 0.35em; border-radius: 0.25rem;
+    font-size: 0.85em; color: #e2e8f0;
+  }
+  .agent-prose pre {
+    background: #0d1117; border: 1px solid #1e293b; border-radius: 0.5rem;
+    padding: 0.8em 1em; margin: 0.6em 0; overflow-x: auto;
+  }
+  .agent-prose pre code { background: none; padding: 0; font-size: 0.82em; color: #e2e8f0; }
+  .agent-prose table { width: 100%; border-collapse: collapse; margin: 0.6em 0; font-size: 0.85em; }
+  .agent-prose th, .agent-prose td { border: 1px solid #1e293b; padding: 0.4em 0.7em; text-align: left; }
+  .agent-prose th { background: rgba(255,255,255,0.04); font-weight: 600; color: #e2e8f0; }
+</style>
+<div class="flex flex-col h-screen">
+  <!-- Header -->
+  <div id="security-header" class="px-6 py-3 border-b border-border flex items-center justify-between flex-shrink-0">
+    <div class="flex items-center gap-3">
+      <a href="/goals/{{ pid }}" class="text-gray-500 hover:text-gray-300 transition-colors flex-shrink-0">
+        <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"/></svg>
+      </a>
+      <svg class="w-4 h-4 flex-shrink-0 text-rose-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z"/>
+      </svg>
+      <div>
+        <h1 class="text-sm font-semibold text-gray-100">Security Council</h1>
+        <p class="text-2xs text-gray-600">{{ goal.name }}: branch scan reports (read-only)</p>
+      </div>
+    </div>
+    <div class="flex items-center gap-2">
+      <span class="pill pill-neutral text-2xs">Read-only</span>
+      {% if user.preferences.get("startup_wizard_enabled", True) %}
+      {{ tour_trigger("security-intro", "What is the Security Council?", side="left") }}
+      {% endif %}
+    </div>
+  </div>
+
+  <!-- Messages -->
+  <div id="messages" class="flex-1 overflow-y-auto px-6 py-4 space-y-3">
+    {% for msg in messages %}
+    {% if msg.card_data and msg.card_data.type == 'review' %}
+    <div class="rounded-lg border border-rose-500/30 bg-rose-500/5 px-4 py-3">
+      <div class="flex items-center gap-2 mb-2">
+        <span class="pill pill-neutral text-2xs uppercase tracking-wide">
+          {{ msg.card_data.subtype }} review
+        </span>
+        <span class="text-2xs font-medium text-rose-300">{{ msg.card_data.title }}</span>
+        <span class="text-2xs text-gray-700 ml-auto" data-utc="{{ msg.created_at.isoformat() if msg.created_at else '' }}">{{ msg.created_at.strftime('%b %d, %H:%M') if msg.created_at else '' }} UTC</span>
+      </div>
+      {% if msg.card_data.producer %}
+      <div class="text-2xs text-gray-500 mb-1">by {{ msg.card_data.producer }}</div>
+      {% endif %}
+      <div class="agent-prose text-sm text-gray-300" data-md="{{ msg.card_data.body | e }}">{{ msg.card_data.body }}</div>
+    </div>
+    {% else %}
+    <div class="rounded-lg px-4 py-2.5">
+      <div class="flex items-center gap-2 mb-1">
+        <span class="text-2xs font-medium text-rose-300">{{ msg.sender }}</span>
+        <span class="text-2xs text-gray-700" data-utc="{{ msg.created_at.isoformat() if msg.created_at else '' }}">{{ msg.created_at.strftime('%b %d, %H:%M') if msg.created_at else '' }} UTC</span>
+      </div>
+      <div class="message-body" data-md="{{ msg.content | e }}">{{ msg.content }}</div>
+    </div>
+    {% endif %}
+    {% endfor %}
+
+    {% if not messages %}
+    <div class="text-center py-12">
+      <p class="text-gray-600 text-sm">No reports yet.</p>
+      <p class="text-gray-700 text-2xs mt-1">The Security Council will post here after its next scan.</p>
+    </div>
+    {% endif %}
+  </div>
+
+  <!-- Read-only notice (no input box) -->
+  <div class="px-6 py-3 border-t border-border">
+    <p class="text-2xs text-gray-600 text-center">
+      This is a read-only channel. The Security Council posts here automatically.
+    </p>
+  </div>
+</div>
+
+<script>
+// ── Markdown renderer config lives in /static/js/markdown_renderer.js (shared
+// with chat/orchestrator/council_thread/goal_thread) ─────────────────────────
+
+function renderMd(text) {
+  if (!text) return '';
+  try {
+    const html = marked.parse(text);
+    if (typeof html !== 'string') {
+      throw new Error('marked.parse returned non-string (async mode?)');
+    }
+    return html;
+  } catch (e) {
+    console.warn('renderMd failed:', e);
+    return '';
+  }
+}
+
+function escapeHtml(s) {
+  return (s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+// Many plain (non-card) messages here start with a bracketed header line —
+// e.g. "[Prateek Upadhyay's Assistant · Story: ... · request]\nbody text" or
+// "[GO → Story: ...]\nbody text" (see app/routers/orchestrator.py's
+// internal_orchestrator_message/internal_orchestrator_reply formatting).
+// Render that header as compact segments instead of dumping the brackets
+// into the body text. Falls back to plain renderMd() untouched — including
+// on any parse error — if the content doesn't match this shape.
+function renderMessageBody(raw, accent) {
+  accent = accent || 'rose';
+  const plainFallback = () => {
+    const rendered = renderMd(raw);
+    return rendered && rendered.trim()
+      ? `<div class="agent-prose text-sm text-gray-300">${rendered}</div>`
+      : `<div class="text-sm text-gray-300 whitespace-pre-wrap">${escapeHtml(raw)}</div>`;
+  };
+  if (!raw) return '';
+  try {
+    const m = /^\[([^\]]+)\]\s*([\s\S]*)$/.exec(raw.trim());
+    if (!m) return plainFallback();
+    const header = m[1];
+    const body = m[2].trim();
+    const headerHtml = header.split('·').map((part, i) => {
+      const trimmed = part.trim();
+      if (!trimmed) return '';
+      // First segment is the "who" attribution — give it more visual weight
+      // than the metadata segments that follow (Story:, request, etc.).
+      const weight = i === 0 ? 'font-semibold' : 'font-medium';
+      return `<span class="header-pill header-pill-${accent} ${weight}">${marked.parseInline(trimmed)}</span>`;
+    }).join('');
+    if (!headerHtml.trim()) return plainFallback();
+    const renderedBody = body ? renderMd(body) : '';
+    const bodyHtml = renderedBody && renderedBody.trim()
+      ? `<div class="agent-prose text-sm text-gray-300">${renderedBody}</div>`
+      : (body ? `<div class="text-sm text-gray-300 whitespace-pre-wrap">${escapeHtml(body)}</div>` : '');
+    return `<div class="flex flex-wrap items-center gap-1.5 mb-2 text-2xs">${headerHtml}</div>${bodyHtml}`;
+  } catch (e) {
+    console.warn('renderMessageBody: bracket-header parse failed, falling back to plain text:', e);
+    return plainFallback();
+  }
+}
+
+// Render stored messages on page load (Jinja escapes content; data-md holds raw text).
+// Only overwrite innerHTML if renderMd produced something, else keep the
+// server-rendered fallback so a marked.parse failure never blanks a bubble.
+document.querySelectorAll('.agent-prose[data-md]').forEach(el => {
+  const rendered = renderMd(el.dataset.md);
+  if (rendered && rendered.trim()) {
+    el.innerHTML = rendered;
+  } else if (el.dataset.md) {
+    el.style.whiteSpace = 'pre-wrap';
+    el.textContent = el.dataset.md;
+  }
+});
+
+// Plain (non-card) message bodies — bracket-header aware, see renderMessageBody().
+document.querySelectorAll('.message-body[data-md]').forEach(el => {
+  el.innerHTML = renderMessageBody(el.dataset.md, 'rose');
+});
+
+// Scroll the messages area to the bottom so the latest message is visible
+const _msgEl = document.getElementById('messages');
+if (_msgEl) _msgEl.scrollTop = _msgEl.scrollHeight;
+
+// WebSocket for real-time updates
+const token = '{{ firebase_token }}';
+const wsUrl = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/goals/{{ pid }}/security/ws?token=${token}`;
+let ws;
+
+function connectWs() {
+  ws = new WebSocket(wsUrl);
+  ws.onmessage = (e) => {
+    try {
+      const data = JSON.parse(e.data);
+      if (data.type === 'message' && data.message) {
+        const msg = data.message;
+        const nowDate = msg.created_at ? new Date(msg.created_at) : new Date();
+        const nowIso = nowDate.toISOString();
+        const now = nowDate.toLocaleString('en-US', {month: 'short', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false, timeZone: 'UTC'});
+        const div = document.createElement('div');
+        const esc = (s) => (s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+        // Fall back to escaped pre-wrap text (newlines preserved) if marked fails,
+        // rather than dropping into agent-prose with an empty/unstyled body.
+        const proseOrPlain = (raw) => {
+          const rendered = renderMd(raw);
+          return rendered && rendered.trim()
+            ? `<div class="agent-prose text-sm text-gray-300">${rendered}</div>`
+            : `<div class="text-sm text-gray-300 whitespace-pre-wrap">${esc(raw)}</div>`;
+        };
+
+        if (msg.card_data && msg.card_data.type === 'review') {
+          const c = msg.card_data;
+          div.className = 'rounded-lg border border-rose-500/30 bg-rose-500/5 px-4 py-3';
+          div.innerHTML = `
+            <div class="flex items-center gap-2 mb-2">
+              <span class="pill pill-neutral text-2xs uppercase tracking-wide">${esc(c.subtype)} review</span>
+              <span class="text-2xs font-medium text-rose-300">${esc(c.title)}</span>
+              <span class="text-2xs text-gray-700 ml-auto" data-utc="${nowIso}">${now} UTC</span>
+            </div>
+            ${c.producer ? `<div class="text-2xs text-gray-500 mb-1">by ${esc(c.producer)}</div>` : ''}
+            ${proseOrPlain(c.body)}
+          `;
+        } else {
+          div.className = 'rounded-lg px-4 py-2.5';
+          div.innerHTML = `
+            <div class="flex items-center gap-2 mb-1">
+              <span class="text-2xs font-medium text-rose-300">${esc(msg.sender)}</span>
+              <span class="text-2xs text-gray-700" data-utc="${nowIso}">${now} UTC</span>
+            </div>
+            ${renderMessageBody(msg.content, 'rose')}
+          `;
+        }
+        if (_msgEl) { _msgEl.appendChild(div); _msgEl.scrollTop = _msgEl.scrollHeight; }
+      }
+    } catch (err) {
+      console.error('WS parse error:', err);
+    }
+  };
+  ws.onclose = () => setTimeout(connectWs, 3000);
+}
+if (token) connectWs();
+</script>
+{% endblock %}
+
+{% block extra_js %}
+{% if auto_fire_tour %}
+<script>
+// Milestone tour: first-ever visit to this goal's Security Council thread.
+// Must run in extra_js (after tour.js loads) — content renders inside
+// <main>, before the bottom-of-body script tags.
+autoFireTour('security-intro', 600);
+</script>
+{% endif %}
+{% endblock %}

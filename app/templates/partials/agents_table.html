@@ -1,0 +1,57 @@
+<!--
+  Partial rendered by /goals/{pid}/monitor/agents-partial
+  Re-used by the full monitor page on initial load (via include) and then
+  swapped in-place by HTMX polling every 5s.
+  The endpoint returns 304 when nothing has changed. A 304 has no body, and
+  htmx's default response handling still attempts a swap on any 2xx/3xx
+  status -- base.html's global htmx:beforeSwap listener is what actually
+  cancels the swap on 304, not the empty body. Without that listener this
+  partial would get replaced with nothing every poll.
+
+  NOTE: this partial is re-rendered on every 5s poll, so any interactive
+  element here (e.g. the info_popover below) has its DOM destroyed mid-swap.
+  Popover open-state teardown across that swap is handled globally by the
+  htmx:beforeSwap listener in static/js/app.js (search "Tear down an open
+  popover") -- do not rely on per-element cleanup for anything added here.
+-->
+{% from "partials/_info_popover.html" import info_popover %}
+{% if agents %}
+<div class="space-y-3" id="agents-list">
+  {% for a in agents %}
+  <div class="agent-row flex items-center gap-3" data-idx="{{ loop.index0 }}">
+    <div class="w-2.5 h-2.5 rounded-full flex-shrink-0
+      {% if a.gateway_status == 'busy' %}bg-green-500
+      {% elif a.gateway_status == 'idle' %}bg-yellow-400
+      {% elif a.gateway_status == 'terminated' %}bg-gray-700
+      {% else %}bg-gray-600{% endif %}">
+    </div>
+    <div class="flex-1 min-w-0">
+      <div class="text-sm font-medium truncate {% if a.gateway_status == 'terminated' %}text-gray-600{% endif %}">{{ a.name or a.id }}</div>
+      <div class="text-xs font-mono text-gray-500 flex items-center gap-1 min-w-0">
+        <span class="truncate">{{ a.model or "" }}{% if a.total_instances and a.total_instances > 1 %} &middot; {{ a.total_instances }} instances{% endif %}</span>
+        {% if a.total_instances and a.total_instances > 1 %}
+        {{ info_popover("This agent has " ~ a.total_instances ~ " separate conversation threads or task dispatches (one SHCA thread = one instance; one task dispatch = one instance). The token count shown is summed across all of them.", label=a.total_instances ~ " instances") }}
+        {% endif %}
+      </div>
+    </div>
+    <div class="text-xs {% if a.gateway_status == 'terminated' %}text-gray-600{% else %}text-gray-500{% endif %}">{{ a.gateway_status or "idle" }}</div>
+    <div class="text-xs text-gray-600" title="{{ '{:,}'.format(a.tokens) }}">{{ a.tokens | abbrev_num }} tok</div>
+  </div>
+  {% endfor %}
+</div>
+<div class="flex items-center justify-between mt-4 pt-3 border-t border-gray-800">
+  <button onclick="agentsPrevPage()"
+          id="agents-prev"
+          class="text-2xs px-2 py-1 rounded bg-surface-hover text-gray-400 hover:text-gray-200 disabled:opacity-30 disabled:cursor-not-allowed transition-colors">
+    ← Prev
+  </button>
+  <span id="agents-page-label" class="text-2xs text-gray-500"></span>
+  <button onclick="agentsNextPage()"
+          id="agents-next"
+          class="text-2xs px-2 py-1 rounded bg-surface-hover text-gray-400 hover:text-gray-200 disabled:opacity-30 disabled:cursor-not-allowed transition-colors">
+    Next →
+  </button>
+</div>
+{% else %}
+<p class="text-sm text-gray-500">No agents in goal.</p>
+{% endif %}

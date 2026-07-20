@@ -1,0 +1,46 @@
+{% set a = system.approval_sla %}
+<div class="bg-gray-900 border border-gray-800 rounded-xl p-5">
+  <div class="flex items-center justify-between mb-4">
+    <h3 class="font-semibold">Approval Wait Times</h3>
+    <span class="text-xs text-gray-500">tasks in awaiting_approval</span>
+  </div>
+
+  {% if a.waiting > 0 %}
+  <div class="flex gap-6 mb-4 text-sm">
+    <div>
+      <div class="text-xs text-gray-500 mb-0.5">Currently waiting</div>
+      <div class="text-xl font-bold text-amber-400">{{ a.waiting }}</div>
+    </div>
+    <div>
+      <div class="text-xs text-gray-500 mb-0.5">Avg wait</div>
+      <div class="text-xl font-bold text-gray-200">{{ a.avg_str }}</div>
+    </div>
+    <div>
+      <div class="text-xs text-gray-500 mb-0.5">Longest wait</div>
+      <div class="text-xl font-bold
+        {% if a.max_str.endswith('d') %}text-red-400
+        {% else %}text-gray-200{% endif %}">{{ a.max_str }}</div>
+    </div>
+  </div>
+
+  {% if a.goals %}
+  <div class="space-y-1.5 pt-3 border-t border-gray-800">
+    {% for g in a.goals %}
+    <div class="flex items-center gap-2 text-sm">
+      <a href="/goals/{{ g.goal_id }}/tasks"
+         class="flex-1 truncate text-gray-300 hover:text-white transition-colors">
+        {{ g.goal_name }}
+      </a>
+      <span class="text-gray-500 text-xs">{{ g.waiting }} task{{ "s" if g.waiting != 1 else "" }}</span>
+      <span class="text-xs {% if g.oldest_h and g.oldest_h >= 24 %}text-amber-400{% else %}text-gray-600{% endif %}">
+        {{ g.oldest_h }}h
+      </span>
+    </div>
+    {% endfor %}
+  </div>
+  {% endif %}
+
+  {% else %}
+  <p class="text-sm text-green-400">No tasks waiting for approval.</p>
+  {% endif %}
+</div>

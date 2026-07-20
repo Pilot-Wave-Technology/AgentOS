@@ -1,0 +1,122 @@
+{% extends "base.html" %}
+{% block title %}Signup Requests{% endblock %}
+{% block content %}
+<div class="p-8 max-w-3xl mx-auto">
+  <a href="/settings" class="inline-flex items-center gap-1 text-xs text-gray-500 hover:text-gray-300 transition-colors mb-5">
+    <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"/></svg>
+    Settings
+  </a>
+  <div class="flex items-start justify-between gap-4 mb-8">
+    <h1 class="text-2xl font-bold">Signup Requests</h1>
+    {% include "settings/_platform_role_info_button.html" %}
+  </div>
+
+  <h2 class="text-sm font-semibold text-gray-400 uppercase tracking-wide mb-3">Pending</h2>
+  {% if pending_requests %}
+  <div class="space-y-3">
+    {% for sr in pending_requests %}
+    <div class="card p-5">
+      <div class="flex items-start gap-3">
+        <div class="w-10 h-10 rounded-full flex items-center justify-center text-sm font-semibold flex-shrink-0"
+             style="background: rgba(99,102,241,0.12); color: #818cf8;">
+          {{ (sr.display_name or sr.email)[0] | upper }}
+        </div>
+        <div class="min-w-0 flex-1">
+          <div class="font-medium text-sm">{{ sr.display_name or sr.email }}</div>
+          <div class="text-xs text-gray-500 font-mono mt-0.5">{{ sr.email }}</div>
+          <div class="flex items-center gap-2 mt-2 flex-wrap">
+            <span class="pill pill-info">Requested: {{ SYSTEM_ROLE_LABELS.get(sr.requested_role, sr.requested_role) }}</span>
+            <span class="text-xs text-gray-500" {% if sr.created_at %}data-utc="{{ sr.created_at.isoformat() }}"{% endif %}>
+              {{ sr.created_at.strftime('%b %d, %Y %H:%M') if sr.created_at else '' }}{% if sr.created_at %} UTC{% endif %}
+            </span>
+            {% if sr.request_count and sr.request_count > 1 %}
+            <span class="text-xs text-gray-500">· submitted {{ sr.request_count }}x</span>
+            {% endif %}
+          </div>
+          {% if sr.message %}
+          <div class="text-sm text-gray-400 mt-2 bg-gray-800/50 rounded-lg px-3 py-2">{{ sr.message }}</div>
+          {% endif %}
+        </div>
+      </div>
+
+      <div class="flex items-center justify-end gap-2 mt-4 pt-4 border-t border-gray-800">
+        <form class="flex items-center gap-2" action="/settings/signup-requests/{{ sr.uid }}/review" method="post" data-toast-submit data-fail="Failed to review signup request.">
+          <input type="hidden" name="action" value="approve" />
+          <select name="role" class="input w-40 text-xs py-1.5">
+            {% for r in ['member', 'editor', 'admin'] %}
+            <option value="{{ r }}" {% if sr.requested_role == r %}selected{% endif %}>{{ SYSTEM_ROLE_LABELS.get(r, r) }}</option>
+            {% endfor %}
+          </select>
+          <button class="btn btn-sm bg-green-700 hover:bg-green-600 text-white">
+            Approve
+          </button>
+        </form>
+        <form action="/settings/signup-requests/{{ sr.uid }}/review" method="post" data-toast-submit data-fail="Failed to review signup request.">
+          <input type="hidden" name="action" value="reject" />
+          <button class="btn btn-sm bg-red-800 hover:bg-red-700 text-white">
+            Reject
+          </button>
+        </form>
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+  {% else %}
+  <div class="text-center py-10 text-gray-500">
+    <div class="text-3xl mb-2">✅</div>
+    <p>No pending signup requests.</p>
+  </div>
+  {% endif %}
+
+  <h2 class="text-sm font-semibold text-gray-400 uppercase tracking-wide mt-10 mb-3">Previously Rejected</h2>
+  {% if rejected_requests %}
+  <div class="space-y-3">
+    {% for sr in rejected_requests %}
+    <div class="card p-5 opacity-80">
+      <div class="flex items-start gap-3">
+        <div class="w-10 h-10 rounded-full flex items-center justify-center text-sm font-semibold flex-shrink-0"
+             style="background: rgba(239,68,68,0.12); color: #f87171;">
+          {{ (sr.display_name or sr.email)[0] | upper }}
+        </div>
+        <div class="min-w-0 flex-1">
+          <div class="font-medium text-sm">{{ sr.display_name or sr.email }}</div>
+          <div class="text-xs text-gray-500 font-mono mt-0.5">{{ sr.email }}</div>
+          <div class="flex items-center gap-2 mt-2 flex-wrap">
+            <span class="pill pill-info">Requested: {{ SYSTEM_ROLE_LABELS.get(sr.requested_role, sr.requested_role) }}</span>
+            <span class="text-xs text-gray-500" {% if sr.reviewed_at %}data-utc="{{ sr.reviewed_at.isoformat() }}"{% endif %}>
+              Rejected {{ sr.reviewed_at.strftime('%b %d, %Y %H:%M') if sr.reviewed_at else '' }}{% if sr.reviewed_at %} UTC{% endif %}
+            </span>
+            {% if sr.request_count and sr.request_count > 1 %}
+            <span class="text-xs text-gray-500">· submitted {{ sr.request_count }}x</span>
+            {% endif %}
+          </div>
+          {% if sr.message %}
+          <div class="text-sm text-gray-400 mt-2 bg-gray-800/50 rounded-lg px-3 py-2">{{ sr.message }}</div>
+          {% endif %}
+        </div>
+      </div>
+
+      <div class="flex items-center justify-end gap-2 mt-4 pt-4 border-t border-gray-800">
+        <form class="flex items-center gap-2" action="/settings/signup-requests/{{ sr.uid }}/review" method="post" data-toast-submit data-fail="Failed to review signup request.">
+          <input type="hidden" name="action" value="approve" />
+          <select name="role" class="input w-40 text-xs py-1.5">
+            {% for r in ['member', 'editor', 'admin'] %}
+            <option value="{{ r }}" {% if sr.requested_role == r %}selected{% endif %}>{{ SYSTEM_ROLE_LABELS.get(r, r) }}</option>
+            {% endfor %}
+          </select>
+          <button class="btn btn-sm bg-green-700 hover:bg-green-600 text-white">
+            Approve
+          </button>
+        </form>
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+  {% else %}
+  <div class="text-center py-10 text-gray-500">
+    <p>No rejected signup requests.</p>
+  </div>
+  {% endif %}
+</div>
+{% include "settings/_platform_role_info_modal.html" %}
+{% endblock %}

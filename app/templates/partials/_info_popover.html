@@ -1,0 +1,34 @@
+{# Reusable "ⓘ" info-icon popover: click the icon, a short anchored panel
+   opens with an explanation (and optional "learn more" link), dismisses on
+   outside click / Escape / re-click. Use this instead of a native title=
+   tooltip whenever the explanation is more than a few words, needs a link,
+   or must work on touch devices.
+
+   Usage:
+     {% from "partials/_info_popover.html" import info_popover %}
+     {{ info_popover("Halted tasks are terminal: there is no restart.") }}
+     {{ info_popover("...", link="/help/glossary#halted", link_text="Learn more about task states") }}
+
+   Styling lives entirely in static/css/app.css under "Info-icon popover":
+   all visual knobs (size, colors, panel width) are CSS custom properties on
+   .info-popover-wrap, so retheme by overriding those, not by editing markup
+   or the CSS rules themselves.
+
+   Behavior is a single global function, agentosTogglePopover(), in app.js under
+   the same heading, wired via a plain inline onclick — the same pattern
+   every other interactive element in this app already uses (see the
+   "+ Add Resource" / sidebar toggle buttons). Deliberately NOT a delegated
+   document-level addEventListener: simpler to reason about, and it means
+   this only depends on app.js having defined the function by click time,
+   not on a page-load-time listener registration having taken effect. #}
+{% macro info_popover(text, link=None, link_text="Learn more", label="More info") %}
+<span class="info-popover-wrap">
+  <button type="button" class="info-popover-trigger" aria-label="{{ label }}" onclick="agentosTogglePopover(this)">
+    <span class="info-popover-icon" aria-hidden="true">ⓘ</span>
+  </button>
+  <span class="info-popover-panel" role="tooltip">
+    <span class="info-popover-text">{{ text }}</span>
+    {% if link %}<a href="{{ link }}" class="info-popover-link">{{ link_text }} →</a>{% endif %}
+  </span>
+</span>
+{% endmacro %}

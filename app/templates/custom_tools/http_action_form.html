@@ -1,0 +1,513 @@
+{% extends "base.html" %}
+{% block title %}{% if tool %}{{ tool.name }}{% else %}New HTTP Action{% endif %}{% endblock %}
+
+{% block content %}
+{% set _back_tab = 'system-tools' if (tool and tool.is_core) else 'custom-tools' %}
+{% set _back_label = 'System Tools' if (tool and tool.is_core) else 'Custom Tools' %}
+<div class="p-8 max-w-3xl mx-auto">
+
+  <div class="mb-6">
+    <a href="/settings/tools?tab={{ _back_tab }}" class="inline-flex items-center gap-1 text-sm text-indigo-400 hover:text-indigo-300">
+      <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"/></svg>
+      Tool Registry / {{ _back_label }}
+    </a>
+  </div>
+
+  <!-- Header -->
+  <div class="flex items-center justify-between mb-6">
+    <div>
+      {% if tool %}
+      <h1 class="text-2xl font-bold">
+        <span class="font-mono text-indigo-400">{{ tool.name }}</span>
+      </h1>
+      <p class="text-xs text-gray-500 mt-1">
+        HTTP Action &middot;
+        {% if tool.status == 'enabled' %}<span class="text-green-400">enabled</span>
+        {% elif tool.status == 'disabled' %}<span class="text-gray-400">disabled</span>
+        {% else %}<span class="text-amber-400">{{ tool.status }}</span>{% endif %}
+      </p>
+      {% else %}
+      <h1 class="text-2xl font-bold">New HTTP Action</h1>
+      <p class="text-gray-500 text-sm mt-1">A single authenticated HTTP call: no code required.</p>
+      {% endif %}
+    </div>
+    {% if tool and can_edit %}
+    <div class="flex gap-2">
+      {% if tool.status == 'enabled' %}
+      <button onclick="setStatus('disabled')" class="btn btn-sm border border-gray-700 text-gray-400 hover:bg-gray-800">Disable</button>
+      {% else %}
+      <button onclick="setStatus('enabled')" class="btn btn-sm border border-green-800 text-green-400 hover:bg-green-900/30">Enable</button>
+      {% endif %}
+    </div>
+    {% endif %}
+  </div>
+
+  {% if not can_edit %}
+  {# Read-only view: no form, no inputs. Same underlying data, static rendering. #}
+  <div class="space-y-4">
+    <div class="bg-gray-900 border border-gray-800 rounded-xl p-5">
+      <h2 class="text-xs font-semibold uppercase tracking-wider text-gray-500 mb-3">Description</h2>
+      <p class="text-sm text-gray-300">{{ tool.description or 'Not Set' }}</p>
+    </div>
+    <div class="bg-gray-900 border border-gray-800 rounded-xl p-5">
+      <h2 class="text-xs font-semibold uppercase tracking-wider text-gray-500 mb-3">Request</h2>
+      <p class="text-sm font-mono text-gray-300">{{ (tool.config or {}).get('method', 'GET') }} {{ (tool.config or {}).get('url', 'Not Set') }}</p>
+      {% if (tool.config or {}).get('headers') %}
+      <p class="text-xs text-gray-500 mt-3 mb-1">Headers</p>
+      <pre class="text-xs text-gray-400 bg-gray-800 rounded p-2 overflow-x-auto">{{ tool.config.headers | tojson_pretty | safe }}</pre>
+      {% endif %}
+      {% if (tool.config or {}).get('body_template') %}
+      <p class="text-xs text-gray-500 mt-3 mb-1">Body template</p>
+      <pre class="text-xs text-gray-400 bg-gray-800 rounded p-2 overflow-x-auto">{{ tool.config.body_template | tojson_pretty | safe }}</pre>
+      {% endif %}
+    </div>
+    {% if tool.parameters_schema and tool.parameters_schema.get('properties') %}
+    <div class="bg-gray-900 border border-gray-800 rounded-xl p-5">
+      <h2 class="text-xs font-semibold uppercase tracking-wider text-gray-500 mb-3">Parameters</h2>
+      <div class="space-y-1.5">
+        {% for pname, pdef in tool.parameters_schema.properties.items() %}
+        <div class="flex items-center gap-2 text-sm">
+          <span class="font-mono text-gray-300">{{ pname }}</span>
+          <span class="pill pill-neutral text-2xs">{{ pdef.type }}</span>
+          {% if pname in (tool.parameters_schema.required or []) %}<span class="text-2xs text-amber-400">required</span>{% endif %}
+          {% if pdef.description %}<span class="text-xs text-gray-500">: {{ pdef.description }}</span>{% endif %}
+        </div>
+        {% endfor %}
+      </div>
+    </div>
+    {% endif %}
+    {% if tool.credential_id %}
+    <div class="bg-gray-900 border border-gray-800 rounded-xl p-5">
+      <h2 class="text-xs font-semibold uppercase tracking-wider text-gray-500 mb-3">Authentication</h2>
+      {% for c in credentials %}{% if c.id|string == tool.credential_id|string %}
+      <p class="text-sm text-gray-300">{{ c.name }} <span class="text-gray-600">({{ c.credential_type }})</span></p>
+      {% endif %}{% endfor %}
+    </div>
+    {% endif %}
+    <div class="flex justify-end">
+      <a href="/settings/tools?tab={{ _back_tab }}" class="btn btn-secondary">Back</a>
+    </div>
+  </div>
+  {% else %}
+
+  <div id="save-banner" class="hidden mb-4 px-4 py-3 bg-green-900/30 border border-green-800 rounded-lg text-sm text-green-300">
+    Saved. Tool cache refreshed.
+  </div>
+  <div id="err-banner" class="hidden mb-4 px-4 py-3 bg-red-900/30 border border-red-800 rounded-lg text-sm text-red-300"></div>
+
+  <!-- Section 1: Identity -->
+  <div class="bg-gray-900 border border-gray-800 rounded-xl p-5 mb-4">
+    <h2 class="text-xs font-semibold uppercase tracking-wider text-gray-500 mb-4">1: Identity</h2>
+    <div class="space-y-4">
+      <div>
+        <label class="block text-xs text-gray-400 mb-1.5">
+          Name <span class="text-red-400">*</span>
+          {% if tool %}<span class="text-gray-600 ml-1">(immutable)</span>{% endif %}
+        </label>
+        <input id="f-name" type="text"
+          value="{{ tool.name if tool else '' }}"
+          {% if tool %}readonly{% endif %}
+          placeholder="my_tool  (lowercase, underscores only)"
+          class="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm font-mono focus:outline-none focus:border-indigo-500 {% if tool %}opacity-60 cursor-not-allowed{% endif %}" />
+        <p class="text-xs text-gray-600 mt-1">Used in tool allowlists. Pattern: <code class="text-gray-400">^[a-z][a-z0-9_]{0,63}$</code></p>
+      </div>
+      <div>
+        <label class="block text-xs text-gray-400 mb-1.5">Label <span class="text-red-400">*</span></label>
+        <input id="f-label" type="text"
+          value="{{ tool.label if tool else '' }}"
+          placeholder="Human-readable name shown to agents"
+          class="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm focus:outline-none focus:border-indigo-500" />
+      </div>
+      <div>
+        <label class="block text-xs text-gray-400 mb-1.5">Description <span class="text-red-400">*</span></label>
+        <textarea id="f-description" rows="2" placeholder="1–2 sentences describing what this tool does and when the agent should use it."
+          class="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm focus:outline-none focus:border-indigo-500 resize-none">{{ tool.description if tool else '' }}</textarea>
+      </div>
+    </div>
+  </div>
+
+  <!-- Section 2: Request -->
+  <div class="bg-gray-900 border border-gray-800 rounded-xl p-5 mb-4">
+    <h2 class="text-xs font-semibold uppercase tracking-wider text-gray-500 mb-4">2: Request</h2>
+    <div class="space-y-4">
+      <div class="flex gap-3">
+        <div class="w-28">
+          <label class="block text-xs text-gray-400 mb-1.5">Method</label>
+          <select id="f-method" onchange="onMethodChange()"
+            class="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm focus:outline-none focus:border-indigo-500">
+            {% for m in ['GET','POST','PUT','PATCH','DELETE'] %}
+            <option value="{{ m }}" {% if tool and tool.config and tool.config.method == m %}selected{% endif %}>{{ m }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div class="flex-1">
+          <label class="block text-xs text-gray-400 mb-1.5">URL <span class="text-red-400">*</span></label>
+          <input id="f-url" type="text"
+            value="{{ tool.config.url if tool and tool.config else '' }}"
+            placeholder="https://api.example.com/endpoint"
+            class="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm font-mono focus:outline-none focus:border-indigo-500" />
+        </div>
+      </div>
+
+      <!-- Headers builder -->
+      <div>
+        <div class="flex items-center justify-between mb-2">
+          <label class="text-xs text-gray-400">Headers</label>
+          <button type="button" onclick="addHeader()" class="text-xs text-indigo-400 hover:text-indigo-300">+ Add header</button>
+        </div>
+        <div id="headers-list" class="space-y-2"></div>
+      </div>
+
+      <!-- Body template builder (POST/PUT/PATCH only) -->
+      <div id="body-section">
+        <div class="flex items-center justify-between mb-2">
+          <label class="text-xs text-gray-400">Request body fields</label>
+          <button type="button" onclick="addBodyField()" class="text-xs text-indigo-400 hover:text-indigo-300">+ Add field</button>
+        </div>
+        <p class="text-xs text-gray-600 mb-2">
+          Each field becomes a <code class="text-gray-400">&#123;&#123;param_name&#125;&#125;</code> template placeholder and is automatically added to the Parameters list below.
+        </p>
+        <div id="body-list" class="space-y-2"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Section 3: Parameters -->
+  <div class="bg-gray-900 border border-gray-800 rounded-xl p-5 mb-4">
+    <h2 class="text-xs font-semibold uppercase tracking-wider text-gray-500 mb-1">3: Parameters</h2>
+    <p class="text-xs text-gray-600 mb-4">What information the agent must provide when calling this tool.</p>
+    <div id="params-header" class="hidden grid grid-cols-[1fr_120px_1fr_64px_32px] gap-2 mb-1 px-1">
+      <span class="text-xs text-gray-600">Name</span>
+      <span class="text-xs text-gray-600">Type</span>
+      <span class="text-xs text-gray-600">Description</span>
+      <span class="text-xs text-gray-600 text-center">Required</span>
+      <span></span>
+    </div>
+    <div id="params-list" class="space-y-2"></div>
+    <button type="button" onclick="addParam()" class="mt-3 text-xs text-indigo-400 hover:text-indigo-300">+ Add parameter</button>
+  </div>
+
+  <!-- Section 4: Authentication (collapsible) -->
+  <details class="bg-gray-900 border border-gray-800 rounded-xl mb-6" id="auth-section">
+    <summary class="px-5 py-4 text-xs font-semibold uppercase tracking-wider text-gray-500 cursor-pointer hover:text-gray-300 select-none">
+      4: Authentication (optional)
+    </summary>
+    <div class="px-5 pb-5">
+      <label class="block text-xs text-gray-400 mb-1.5">Credential</label>
+      <select id="f-credential"
+        class="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm focus:outline-none focus:border-indigo-500">
+        <option value="">- None -</option>
+        {% for c in credentials %}
+        <option value="{{ c.id }}"
+          {% if tool and tool.credential_id == c.id|string %}selected{% endif %}>
+          {{ c.name }} ({{ c.credential_type }})
+        </option>
+        {% endfor %}
+      </select>
+      <p class="text-xs text-gray-600 mt-1">
+        Don't see the credential you need?
+        <a href="/custom-tools/credentials/new" target="_blank" class="text-indigo-400 hover:text-indigo-300">Add one →</a>
+      </p>
+    </div>
+  </details>
+
+  <div class="flex gap-3 mb-8">
+    <button id="btn-save" onclick="saveTool()" class="btn btn-primary">
+      {% if tool %}Save Changes{% else %}Create Tool{% endif %}
+    </button>
+    <a href="/settings/tools?tab={{ _back_tab }}" class="btn btn-secondary">Cancel</a>
+  </div>
+
+  <!-- Test panel -->
+  {% if tool %}
+  <details class="bg-gray-900 border border-gray-800 rounded-xl" open>
+    <summary class="px-5 py-4 text-xs font-semibold uppercase tracking-wider text-gray-500 cursor-pointer hover:text-gray-300 select-none">
+      Test this tool
+    </summary>
+    <div class="px-5 pb-5 space-y-4">
+      <div>
+        <label class="block text-xs text-gray-400 mb-1.5">Arguments (JSON)</label>
+        <textarea id="test-args" rows="4" spellcheck="false"
+          class="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm font-mono focus:outline-none focus:border-indigo-500 resize-y">{}</textarea>
+      </div>
+      <div class="flex gap-3 items-center">
+        <button id="btn-test" onclick="runTest()" class="btn btn-secondary btn-sm">Run Test</button>
+        <span id="test-duration" class="text-xs text-gray-600 hidden"></span>
+      </div>
+      <div id="test-result" class="hidden">
+        <label class="block text-xs text-gray-400 mb-1.5">Result</label>
+        <pre id="test-output" class="px-4 py-3 bg-gray-800 border border-gray-700 rounded-lg text-xs font-mono overflow-x-auto whitespace-pre-wrap"></pre>
+      </div>
+    </div>
+  </details>
+  {% endif %}
+
+  {% endif %}{# end can_edit #}
+
+  {% if tool %}
+  {% include "custom_tools/_manifest_review.html" %}
+  {% endif %}
+
+</div>
+
+{% if can_edit %}
+<script>
+// ── Initial state ───────────────────────────────────────────────────────────
+
+const TOOL_NAME = {{ ('"%s"' % tool.name) | safe if tool else 'null' }};
+const TOOL_CREDENTIAL_ID = {{ ('"' + tool.credential_id + '"') | safe if (tool and tool.credential_id) else 'null' }};
+const TOOL_CONFIG = {{ (tool.config if (tool and tool.config) else {}) | tojson }};
+const TOOL_PARAMS_SCHEMA = {{ (tool.parameters_schema if (tool and tool.parameters_schema) else {"type": "object", "properties": {}}) | tojson }};
+
+// ── Header rows ─────────────────────────────────────────────────────────────
+
+let headerCount = 0;
+function addHeader(key='', val='') {
+  const id = ++headerCount;
+  const row = document.createElement('div');
+  row.id = 'hdr-' + id;
+  row.className = 'flex gap-2 items-center';
+  row.innerHTML = `
+    <input type="text" value="${esc(key)}" placeholder="Header name" data-hdr-key
+      class="flex-1 px-3 py-1.5 bg-gray-800 border border-gray-700 rounded-lg text-xs font-mono focus:outline-none focus:border-indigo-500" />
+    <input type="text" value="${esc(val)}" placeholder="Value" data-hdr-val
+      class="flex-1 px-3 py-1.5 bg-gray-800 border border-gray-700 rounded-lg text-xs font-mono focus:outline-none focus:border-indigo-500" />
+    <button onclick="document.getElementById('hdr-${id}').remove()" class="text-gray-600 hover:text-red-400 text-xs px-1">✕</button>`;
+  document.getElementById('headers-list').appendChild(row);
+}
+function getHeaders() {
+  const h = {};
+  document.querySelectorAll('#headers-list > div').forEach(row => {
+    const k = row.querySelector('[data-hdr-key]').value.trim();
+    const v = row.querySelector('[data-hdr-val]').value.trim();
+    if (k) h[k] = v;
+  });
+  return h;
+}
+
+// ── Body field rows ─────────────────────────────────────────────────────────
+
+let bodyCount = 0;
+function addBodyField(name='') {
+  const id = ++bodyCount;
+  const row = document.createElement('div');
+  row.id = 'body-' + id;
+  row.className = 'flex gap-2 items-center';
+  row.innerHTML = `
+    <input type="text" value="${esc(name)}" placeholder="field_name" data-body-field
+      oninput="onBodyFieldChange()" onblur="syncBodyToParams()"
+      class="flex-1 px-3 py-1.5 bg-gray-800 border border-gray-700 rounded-lg text-xs font-mono focus:outline-none focus:border-indigo-500" />
+    <span class="text-xs text-gray-600 font-mono flex-shrink-0">→ &#123;&#123;field_name&#125;&#125;</span>
+    <button onclick="document.getElementById('body-${id}').remove(); syncBodyToParams();"
+      class="text-gray-600 hover:text-red-400 text-xs px-1">✕</button>`;
+  document.getElementById('body-list').appendChild(row);
+}
+function getBodyTemplate() {
+  const fields = [...document.querySelectorAll('[data-body-field]')]
+    .map(i => i.value.trim()).filter(Boolean);
+  if (!fields.length) return null;
+  const obj = {};
+  fields.forEach(f => { obj[f] = '{{' + f + '}}'; });
+  return obj;
+}
+function onBodyFieldChange() {} // triggers as user types
+function syncBodyToParams() {
+  // Add any new body field names as parameters if not already present
+  const bodyFields = [...document.querySelectorAll('[data-body-field]')]
+    .map(i => i.value.trim()).filter(Boolean);
+  const existingNames = [...document.querySelectorAll('[data-param-name]')]
+    .map(i => i.value.trim());
+  bodyFields.forEach(name => {
+    if (!existingNames.includes(name)) addParam(name, 'string', '', true);
+  });
+}
+function onMethodChange() {
+  const m = document.getElementById('f-method').value;
+  document.getElementById('body-section').style.display = ['POST','PUT','PATCH'].includes(m) ? '' : 'none';
+}
+
+// ── Parameter rows ──────────────────────────────────────────────────────────
+
+let paramCount = 0;
+function addParam(name='', type='string', description='', required=false) {
+  const id = ++paramCount;
+  document.getElementById('params-header').classList.remove('hidden');
+  const row = document.createElement('div');
+  row.id = 'param-' + id;
+  row.className = 'grid grid-cols-[1fr_120px_1fr_64px_32px] gap-2 items-center';
+  row.innerHTML = `
+    <input type="text" value="${esc(name)}" placeholder="param_name" data-param-name
+      class="px-3 py-1.5 bg-gray-800 border border-gray-700 rounded-lg text-xs font-mono focus:outline-none focus:border-indigo-500" />
+    <select data-param-type
+      class="px-2 py-1.5 bg-gray-800 border border-gray-700 rounded-lg text-xs focus:outline-none focus:border-indigo-500">
+      ${['string','number','boolean','array','object'].map(t =>
+        `<option value="${t}" ${type===t?'selected':''}>${t}</option>`).join('')}
+    </select>
+    <input type="text" value="${esc(description)}" placeholder="What this parameter is" data-param-desc
+      class="px-3 py-1.5 bg-gray-800 border border-gray-700 rounded-lg text-xs focus:outline-none focus:border-indigo-500" />
+    <div class="flex justify-center">
+      <input type="checkbox" ${required ? 'checked' : ''} data-param-req class="w-4 h-4 accent-indigo-500" />
+    </div>
+    <button onclick="removeParam(${id})" class="text-gray-600 hover:text-red-400 text-xs px-1">✕</button>`;
+  document.getElementById('params-list').appendChild(row);
+}
+function removeParam(id) {
+  document.getElementById('param-' + id)?.remove();
+  if (!document.querySelector('[data-param-name]')) {
+    document.getElementById('params-header').classList.add('hidden');
+  }
+}
+function getParamsSchema() {
+  const props = {};
+  const required = [];
+  document.querySelectorAll('#params-list > div').forEach(row => {
+    const name = row.querySelector('[data-param-name]').value.trim();
+    if (!name) return;
+    const type = row.querySelector('[data-param-type]').value;
+    const desc = row.querySelector('[data-param-desc]').value.trim();
+    const req  = row.querySelector('[data-param-req]').checked;
+    props[name] = { type };
+    if (desc) props[name].description = desc;
+    if (req) required.push(name);
+  });
+  const schema = { type: 'object', properties: props };
+  if (required.length) schema.required = required;
+  return schema;
+}
+
+// ── Save ────────────────────────────────────────────────────────────────────
+
+async function saveTool() {
+  const errEl = document.getElementById('err-banner');
+  const saveEl = document.getElementById('save-banner');
+  const btn = document.getElementById('btn-save');
+  errEl.classList.add('hidden');
+  saveEl.classList.add('hidden');
+
+  const name = document.getElementById('f-name').value.trim();
+  const label = document.getElementById('f-label').value.trim();
+  const description = document.getElementById('f-description').value.trim();
+  const method = document.getElementById('f-method').value;
+  const url = document.getElementById('f-url').value.trim();
+  const credentialId = document.getElementById('f-credential').value;
+
+  if (!name) { showErr('Name is required.'); return; }
+  if (!label) { showErr('Label is required.'); return; }
+  if (!description) { showErr('Description is required.'); return; }
+  if (!url) { showErr('URL is required.'); return; }
+
+  const config = { method, url, headers: getHeaders() };
+  const bodyTemplate = getBodyTemplate();
+  if (bodyTemplate) config.body_template = bodyTemplate;
+
+  const body = {
+    label,
+    description,
+    tier: 'http_action',
+    parameters_schema: getParamsSchema(),
+    config,
+    credential_id: credentialId || null,
+  };
+  if (!TOOL_NAME) body.name = name;
+
+  btn.disabled = true;
+  btn.textContent = 'Saving…';
+  try {
+    const r = TOOL_NAME
+      ? await fetch('/api/custom-tools/' + TOOL_NAME, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+      : await fetch('/api/custom-tools', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    if (!r.ok) { throw new Error(await extractErrorDetail(r, 'Save failed')); }
+    const data = await r.json();
+    if (!TOOL_NAME) { window.location.href = '/custom-tools/' + data.name + '?from=new'; return; }
+    saveEl.classList.remove('hidden');
+    setTimeout(() => saveEl.classList.add('hidden'), 4000);
+  } catch(e) {
+    showErr(e.message);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = TOOL_NAME ? 'Save Changes' : 'Create Tool';
+  }
+}
+
+async function setStatus(status) {
+  if (!TOOL_NAME) return;
+  const ep = status === 'disabled' ? 'disable' : 'enable';
+  try {
+    const r = await fetch('/api/custom-tools/' + TOOL_NAME + '/' + ep, { method: 'POST' });
+    if (!r.ok) { throw new Error(await extractErrorDetail(r, 'Failed')); }
+    window.location.reload();
+  } catch(e) { showErr(e.message); }
+}
+
+// ── Test ────────────────────────────────────────────────────────────────────
+
+async function runTest() {
+  if (!TOOL_NAME) return;
+  const btn = document.getElementById('btn-test');
+  const durEl = document.getElementById('test-duration');
+  const resultEl = document.getElementById('test-result');
+  const outputEl = document.getElementById('test-output');
+  let args;
+  try { args = JSON.parse(document.getElementById('test-args').value || '{}'); }
+  catch(e) { outputEl.textContent = 'Invalid JSON: ' + e.message; resultEl.classList.remove('hidden'); return; }
+
+  btn.disabled = true; btn.textContent = 'Running…';
+  durEl.classList.add('hidden');
+  const t0 = Date.now();
+  try {
+    const r = await fetch('/api/custom-tools/' + TOOL_NAME + '/test', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ args }),
+    });
+    const d = await r.json();
+    outputEl.textContent = JSON.stringify(d, null, 2);
+    durEl.textContent = (Date.now() - t0) + 'ms';
+    durEl.classList.remove('hidden');
+    resultEl.classList.remove('hidden');
+    outputEl.style.color = d.ok === false ? '#f87171' : '#86efac';
+  } catch(e) {
+    outputEl.textContent = e.message; outputEl.style.color = '#f87171';
+    resultEl.classList.remove('hidden');
+  } finally { btn.disabled = false; btn.textContent = 'Run Test'; }
+}
+
+// ── Helpers ─────────────────────────────────────────────────────────────────
+
+function showErr(msg) {
+  const el = document.getElementById('err-banner');
+  el.textContent = msg; el.classList.remove('hidden');
+  el.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+function esc(s) { return String(s).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;'); }
+
+// ── Init: pre-fill from existing tool ───────────────────────────────────────
+
+(function init() {
+  // Pre-fill headers
+  const hdrs = TOOL_CONFIG.headers || {};
+  Object.entries(hdrs).forEach(([k, v]) => addHeader(k, v));
+
+  // Pre-fill body fields
+  const body = TOOL_CONFIG.body_template || {};
+  Object.keys(body).forEach(k => addBodyField(k));
+
+  // Pre-fill parameters
+  const schema = TOOL_PARAMS_SCHEMA;
+  const props = schema.properties || {};
+  const req = schema.required || [];
+  Object.entries(props).forEach(([name, def]) => {
+    addParam(name, def.type || 'string', def.description || '', req.includes(name));
+  });
+
+  // Show/hide body section based on current method
+  onMethodChange();
+
+  // Expand auth section if credential already set
+  if (TOOL_CREDENTIAL_ID) {
+    document.getElementById('auth-section').open = true;
+    document.getElementById('f-credential').value = TOOL_CREDENTIAL_ID;
+  }
+})();
+</script>
+{% endif %}{# end can_edit script #}
+{% endblock %}

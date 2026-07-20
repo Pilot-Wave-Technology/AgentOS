@@ -1,0 +1,44 @@
+{# Kill switch: agent activity read-only panel. Self-polls every 10s.
+   Shows active agent instances and halted tasks for situational awareness.
+
+   AGENT-LEVEL ACTION BUTTONS (Stop / Force-kill / Resume) are intentionally
+   removed from this UI. The underlying endpoints remain fully functional:
+     POST /settings/controls/agents/{instance_id}/stop
+     POST /settings/controls/agents/{instance_id}/resume
+     POST /settings/controls/agents/{instance_id}/force-kill
+     POST /settings/controls/tasks/{task_id}/force-kill
+   They will be re-surfaced in a future iteration.
+
+   Goal-level pause/resume (⏸ Pause / ▶ Resume) is now on the main controls page.
+#}
+<div id="controls-fragment" class="space-y-5">
+
+  <!-- Halted tasks (terminal: kill is a one-way door) -->
+  {% if halted_tasks %}
+  <section class="card p-4">
+    <h2 class="text-sm font-semibold mb-1 text-gray-300">Killed tasks ({{ halted_tasks|length }})</h2>
+    <p class="text-2xs text-gray-500 mb-3">Force-killed agents are terminal: there is no restart. To redo the work, create a new task or start a new plan.</p>
+    <div class="overflow-x-auto">
+      <table class="w-full text-xs">
+        <thead class="text-2xs uppercase text-gray-600 text-left border-b border-gray-800">
+          <tr>
+            <th class="py-1.5 pr-3 pl-1">Task</th>
+            <th class="pr-3">Goal</th>
+            <th>Reason</th>
+          </tr>
+        </thead>
+        <tbody class="divide-y divide-border">
+          {% for t in halted_tasks %}
+          <tr>
+            <td class="py-1.5 pr-3 pl-1 text-gray-300 truncate max-w-[20rem]">{{ t.title or t.id }}</td>
+            <td class="pr-3 font-mono text-xs text-gray-500">{{ t.goal_id }}</td>
+            <td class="text-gray-600 truncate max-w-[28rem]">{{ t.blocked_reason }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+  {% endif %}
+
+</div>

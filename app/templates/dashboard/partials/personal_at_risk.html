@@ -1,0 +1,25 @@
+{% if personal.at_risk %}
+<div class="bg-amber-900/10 border border-amber-800/30 rounded-xl p-4">
+  <div class="flex items-center gap-2 mb-2.5">
+    <svg class="w-4 h-4 text-amber-400 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+        d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126zM12 15.75h.007v.008H12v-.008z"/>
+    </svg>
+    <span class="text-xs font-semibold text-amber-400 uppercase tracking-wider">Goals needing attention</span>
+  </div>
+  <ul class="space-y-1.5">
+    {% for g in personal.at_risk %}
+    <li class="flex items-center gap-3 text-sm">
+      <a href="/goals/{{ g.id }}/tasks" class="flex-1 truncate text-amber-200 hover:text-white transition-colors">
+        {{ g.name }}
+      </a>
+      <span class="text-xs text-gray-500">
+        {% if g.blocked >= 3 %}{{ g.blocked }} blocked{% endif %}
+        {% if g.hours_quiet >= 48 and g.blocked > 0 %} · {% endif %}
+        {% if g.hours_quiet >= 48 %}quiet {{ g.hours_quiet }}h{% endif %}
+      </span>
+    </li>
+    {% endfor %}
+  </ul>
+</div>
+{% endif %}

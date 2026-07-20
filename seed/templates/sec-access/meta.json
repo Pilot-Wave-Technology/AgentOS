@@ -1,0 +1,23 @@
+{
+  "id": "sec-access",
+  "type": "RA",
+  "name": "Security — Access Control & Sensitive Data",
+  "description": "Reviews a checked-out branch for broken auth/authorization, IDOR, session/JWT/crypto misuse, and sensitive-data handling (LLM + ripgrep).",
+  "model": "google-flash-500k/gemini-2.5-flash-500k",
+  "emoji": "🔐",
+  "tools_allow": [
+    "read",
+    "write",
+    "edit",
+    "exec",
+    "process",
+    "submit_security_review"
+  ],
+  "tools_deny": [],
+  "memory_enabled": false,
+  "max_tokens": null,
+  "notes": "",
+  "status": "active",
+  "version": 1,
+  "tool_profiles": []
+}

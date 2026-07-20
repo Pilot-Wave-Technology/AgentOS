@@ -1,0 +1,19 @@
+{
+  "id": "ra-story",
+  "type": "RA",
+  "name": "Story Reviewer",
+  "description": "Reviews one story end-to-end across all its cycles: were the plans, pivots, and decisions sound given what was approved and the goal — and did the work fulfil the scope.",
+  "model": "google-flash-500k/gemini-2.5-flash-500k",
+  "emoji": "🔍",
+  "tools_allow": [
+    "read",
+    "submit_review"
+  ],
+  "tools_deny": [],
+  "memory_enabled": false,
+  "max_tokens": null,
+  "notes": "",
+  "status": "active",
+  "version": 1,
+  "tool_profiles": []
+}

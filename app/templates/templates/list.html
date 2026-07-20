@@ -1,0 +1,97 @@
+{% extends "base.html" %}
+{% block title %}Templates{% endblock %}
+{% block content %}
+<div class="p-8 max-w-6xl mx-auto">
+  <div class="flex items-center justify-between mb-8">
+    <div>
+      <h1 class="text-2xl font-bold">Templates</h1>
+      <p class="text-gray-400 text-sm mt-1">
+        Blueprints for each agent type. Edits to a template's files / metadata
+        propagate to every live instance on its next inference turn.
+      </p>
+    </div>
+  </div>
+
+  {% if templates %}
+  <div class="flex items-center justify-between mb-4">
+    <input id="tmpl-search" type="text" placeholder="Filter by id, type, or name…"
+      oninput="filterTemplates(this.value)"
+      class="px-3 py-1.5 bg-gray-800 border border-gray-700 rounded-lg text-sm focus:outline-none focus:border-indigo-500 w-80" />
+    <span class="text-xs text-gray-500">{{ templates | length }} templates</span>
+  </div>
+
+  <div class="overflow-x-auto">
+    <table class="w-full text-sm">
+      <thead class="text-xs text-gray-500 uppercase border-b border-gray-800">
+        <tr>
+          <th class="text-left pb-3 pr-6">Template</th>
+          <th class="text-left pb-3 pr-6">Type</th>
+          <th class="text-left pb-3 pr-6">Model</th>
+          <th class="text-left pb-3 pr-6">Files</th>
+          <th class="text-left pb-3 pr-6">Skills</th>
+          <th class="text-left pb-3 pr-6">Live</th>
+          <th class="text-left pb-3 pr-6">Version</th>
+          <th class="text-left pb-3 pr-6">Status</th>
+          <th class="text-left pb-3">Actions</th>
+        </tr>
+      </thead>
+      <tbody class="divide-y divide-gray-800/60">
+        {% for t in templates %}
+        <tr class="hover:bg-gray-900/40 tmpl-row transition-colors"
+            data-search="{{ t.id }} {{ t.type }} {{ t.name }}">
+          <td class="py-3 pr-6">
+            <div class="flex items-center gap-2.5">
+              {% if t.emoji %}<span class="text-xl leading-none">{{ t.emoji }}</span>{% endif %}
+              <div>
+                <div class="font-mono text-xs text-indigo-400 leading-tight">{{ t.id }}</div>
+                <div class="font-medium text-gray-100 mt-0.5">{{ t.name }}</div>
+              </div>
+            </div>
+          </td>
+          <td class="py-3 pr-6">
+            <span class="pill {% if t.type == 'GO' %}pill-success{% elif t.type == 'SHCA' %}pill-info{% elif t.type == 'RA' %}bg-amber-900/40 text-amber-300{% else %}bg-purple-900/40 text-purple-300{% endif %}">{{ 'Assistant' if t.type == 'SHCA' else t.type }}</span>
+          </td>
+          <td class="py-3 pr-6">
+            <span class="font-mono text-xs text-gray-300">{{ t.model.split("/")[-1] if "/" in t.model else t.model }}</span>
+          </td>
+          <td class="py-3 pr-6 text-xs text-gray-400">{{ t.file_count }}</td>
+          <td class="py-3 pr-6 text-xs text-gray-400">{{ t.skill_count }}</td>
+          <td class="py-3 pr-6 text-xs">
+            <span class="text-gray-300">{{ t.instance_count }}</span>
+            <span class="text-gray-600"> instance{{ "" if t.instance_count == 1 else "s" }}</span>
+          </td>
+          <td class="py-3 pr-6">
+            <span class="font-mono text-xs text-gray-300">v{{ t.version }}</span>
+          </td>
+          <td class="py-3 pr-6">
+            {% if t.status == 'active' %}
+            <span class="pill pill-success">active</span>
+            {% else %}
+            <span class="pill pill-neutral">{{ t.status }}</span>
+            {% endif %}
+          </td>
+          <td class="py-3">
+            <a href="/templates/{{ t.id }}" class="btn btn-secondary btn-sm">Edit</a>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <div class="text-center py-16">
+    <p class="text-gray-400">No templates yet - run migration 037.</p>
+  </div>
+  {% endif %}
+</div>
+
+<script>
+function filterTemplates(query) {
+  const q = (query || "").toLowerCase().trim();
+  for (const row of document.querySelectorAll(".tmpl-row")) {
+    const hay = (row.dataset.search || "").toLowerCase();
+    row.style.display = !q || hay.includes(q) ? "" : "none";
+  }
+}
+</script>
+{% endblock %}

@@ -1,0 +1,277 @@
+{% extends "base.html" %}
+{% block title %}{% if is_new %}New Profile{% else %}{{ profile.id }}{% endif %}{% endblock %}
+{% block content %}
+<div class="p-8 max-w-4xl mx-auto">
+
+  {# Back link #}
+  <div class="mb-6">
+    <a href="/settings/tool-profiles" class="inline-flex items-center gap-1 text-sm text-indigo-400 hover:text-indigo-300">
+      <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"/></svg>
+      Tool Profiles
+    </a>
+  </div>
+
+  {# Page title + deprecate action #}
+  <div class="flex items-center justify-between mb-6">
+    <div>
+      {% if is_new %}
+      <h1 class="text-2xl font-bold">New Profile</h1>
+      {% else %}
+      <h1 class="text-2xl font-bold">
+        <span class="font-mono text-indigo-400">{{ profile.id | replace('shca-coordinator', 'assistant-coordinator') }}</span>
+      </h1>
+      <p class="text-xs text-gray-500 mt-1">
+        {{ profile.tool_names | length }} tool{{ 's' if profile.tool_names | length != 1 else '' }} assigned
+        &middot; updated <span {% if profile.updated_at %}data-utc="{{ profile.updated_at.isoformat() }}"{% endif %}>{{ profile.updated_at.strftime('%Y-%m-%d') if profile.updated_at else '' }}{% if profile.updated_at %} UTC{% endif %}</span>
+      </p>
+      {% endif %}
+    </div>
+    {% if not is_new and profile.status == 'active' and can_edit %}
+    <form method="post" action="/settings/tool-profiles/{{ profile.id }}/deprecate"
+          data-confirm="Deprecate '{{ profile.id }}'? Templates using this profile will skip it at next sync.">
+      <button type="submit" class="btn btn-danger btn-sm">
+        Deprecate
+      </button>
+    </form>
+    {% elif not is_new and profile.status == 'deprecated' %}
+    <span class="pill pill-neutral">deprecated</span>
+    {% endif %}
+  </div>
+
+  {# Error banner #}
+  {% if error %}
+  <div class="mb-5 px-4 py-3 bg-red-900/30 border border-red-800/50 rounded-lg text-sm text-red-300">
+    {{ error }}
+  </div>
+  {% endif %}
+
+  {% if can_edit %}
+  {# Create path (is_new) intentionally NOT intercepted: on validation failure the
+     server re-renders this same template with `error` set (line 42 banner) and
+     every typed field preserved — better than a toast, which would lose the values
+     the operator just entered. Only the edit path (rare 404-if-deleted-mid-edit
+     race) gets the fetch+toast treatment below. #}
+  <form {% if not is_new %}data-toast-submit data-fail="Failed to save profile."{% endif %} method="post"
+        action="{% if is_new %}/settings/tool-profiles{% else %}/settings/tool-profiles/{{ profile.id }}{% endif %}"
+        class="space-y-6">
+
+    {# Profile ID (immutable after creation) #}
+    <div>
+      <label class="block text-sm text-gray-400 mb-1.5">
+        ID <span class="text-gray-600">(unique slug, immutable after creation)</span>
+      </label>
+      {% if is_new %}
+      <input name="id" required
+             value="{{ profile.id if profile else '' }}"
+             placeholder="e.g. story-orchestrator"
+             class="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm font-mono focus:outline-none focus:border-indigo-500" />
+      <p class="text-xs text-gray-600 mt-1">Lowercase letters, digits, and hyphens. Must start with a letter.</p>
+      {% else %}
+      <input value="{{ profile.id | replace('shca-coordinator', 'assistant-coordinator') }}" disabled
+             class="w-full px-3 py-2 bg-gray-900 border border-gray-800 rounded-lg text-sm font-mono text-gray-500" />
+      {% endif %}
+    </div>
+
+    {# Display name #}
+    <div>
+      <label class="block text-sm text-gray-400 mb-1.5">Name</label>
+      <input name="name" required maxlength="120"
+             value="{{ (profile.name if profile else '') | replace('SHCA Coordinator', 'Assistant Coordinator') }}"
+             placeholder="e.g. Story Orchestrator"
+             class="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm focus:outline-none focus:border-indigo-500" />
+    </div>
+
+    {# Description #}
+    <div>
+      <label class="block text-sm text-gray-400 mb-1.5">Description <span class="text-gray-600">(purpose and intended agent type)</span></label>
+      <textarea name="description" rows="2" maxlength="500"
+                placeholder="What kind of agent should use this profile and why…"
+                class="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm focus:outline-none focus:border-indigo-500">{{ profile.description if profile else '' }}</textarea>
+    </div>
+
+    {# Tool selection: grouped checkboxes #}
+    <div>
+      <div class="flex items-center justify-between mb-3">
+        <label class="block text-sm text-gray-400">
+          Tools
+          <span id="selected-count" class="text-gray-600 ml-1">
+            ({{ selected_tools | length }} selected)
+          </span>
+        </label>
+        <div class="flex gap-2">
+          <button type="button" onclick="selectAll()" class="text-xs text-indigo-400 hover:text-indigo-300">Select all</button>
+          <span class="text-gray-700">·</span>
+          <button type="button" onclick="clearAll()" class="text-xs text-gray-500 hover:text-gray-300">Clear all</button>
+        </div>
+      </div>
+
+      {# Client-side filter for the tool list #}
+      <input id="tool-filter" type="text" placeholder="Filter tools…"
+        oninput="filterToolCheckboxes(this.value)"
+        class="w-full px-3 py-1.5 bg-gray-800 border border-gray-700 rounded-lg text-sm focus:outline-none focus:border-indigo-500 mb-4" />
+
+      {# One section per group #}
+      <div class="space-y-4" id="tool-groups">
+        {% for group_name, group_tools in tools_by_group.items() | sort %}
+        <div class="tool-group border border-gray-800 rounded-lg overflow-hidden">
+          <div class="flex items-center justify-between px-3 py-2 bg-gray-900/60 border-b border-gray-800">
+            <span class="text-xs font-semibold text-gray-500 uppercase tracking-wider">{{ group_name }}</span>
+            <span class="text-xs text-gray-600 group-count">{{ group_tools | length }}</span>
+          </div>
+          <div class="p-3 flex flex-wrap gap-2">
+            {% for tool in group_tools %}
+            <label class="tool-checkbox-label inline-flex items-center gap-2 px-3 py-1.5 bg-gray-800 border rounded-lg cursor-pointer transition-colors
+                          {% if tool.name in selected_tools %}border-indigo-500 bg-indigo-900/20{% else %}border-gray-700 hover:border-indigo-500/60{% endif %}"
+                   data-toolname="{{ tool.name }}"
+                   title="{{ tool.description or tool.name }}">
+              <input type="checkbox" name="tool_names" value="{{ tool.name }}"
+                     {% if tool.name in selected_tools %}checked{% endif %}
+                     onchange="onToolToggle(this)"
+                     class="rounded text-indigo-500 focus:ring-indigo-500 focus:ring-offset-0 flex-shrink-0" />
+              <span class="text-xs font-mono text-gray-300">{{ tool.name }}</span>
+              {% if tool.source != 'core' %}
+              <span class="text-2xs text-amber-500/70">{{ tool.source }}</span>
+              {% endif %}
+            </label>
+            {% endfor %}
+          </div>
+        </div>
+        {% endfor %}
+      </div>
+    </div>
+
+    {# Footer #}
+    <div class="flex items-center justify-end gap-3 pt-3 border-t border-gray-800">
+      <a href="/settings/tool-profiles" class="btn btn-secondary">Cancel</a>
+      <button type="submit" class="btn btn-primary">
+        {% if is_new %}Create profile{% else %}Save changes{% endif %}
+      </button>
+    </div>
+
+  </form>
+  {% else %}
+  {# Read-only view: no form, no inputs #}
+  <div class="space-y-6">
+    <div>
+      <p class="text-sm text-gray-400 mb-1.5">Name</p>
+      <p class="text-gray-100">{{ profile.name | replace('SHCA Coordinator', 'Assistant Coordinator') }}</p>
+    </div>
+    <div>
+      <p class="text-sm text-gray-400 mb-1.5">Description</p>
+      <p class="text-gray-300">{{ profile.description or 'Not Set' }}</p>
+    </div>
+    <div>
+      <p class="text-sm text-gray-400 mb-1.5">Tools ({{ selected_tools | length }})</p>
+      <div class="flex flex-wrap gap-1.5">
+        {% for tool_name in selected_tools | sort %}
+        <span class="pill pill-info font-mono text-xs">{{ tool_name }}</span>
+        {% else %}
+        <span class="text-gray-600 text-sm">No tools assigned.</span>
+        {% endfor %}
+      </div>
+    </div>
+    <div class="flex justify-end pt-3 border-t border-gray-800">
+      <a href="/settings/tool-profiles" class="btn btn-secondary">Back</a>
+    </div>
+  </div>
+  {% endif %}
+
+  {# ── Template Assignments ─────────────────────────────────────────────── #}
+  {% if not is_new and all_templates %}
+  <div class="mt-8 pt-6 border-t border-gray-800">
+    <h2 class="text-sm font-semibold text-gray-300 mb-1">Template Assignments</h2>
+    {% if can_edit %}
+    <p class="text-xs text-gray-500 mb-4">
+      Select which agent templates this profile is active on. Agents provisioned from a
+      checked template will receive this profile's tools in their allowlist.
+    </p>
+    <form method="post" action="/settings/tool-profiles/{{ profile.id }}/templates" data-toast-submit data-fail="Failed to save template assignments.">
+      {# Always-present field: this form's only other inputs are checkboxes, so
+         deselecting every template would otherwise POST an empty FormData —
+         an empty multipart body the server rejects, surfacing as a spurious
+         "Failed to save" toast. This sentinel keeps the body non-empty so
+         clearing all assignments saves correctly. The handler ignores it. #}
+      <input type="hidden" name="_present" value="1" />
+      <div class="space-y-2">
+        {% for tmpl in all_templates %}
+        <label class="flex items-center gap-3 px-3 py-2 bg-gray-800/50 border rounded-lg cursor-pointer transition-colors
+                      {% if tmpl.id in assigned_template_ids %}border-indigo-500/60 bg-indigo-900/10{% else %}border-gray-700 hover:border-gray-600{% endif %}">
+          <input type="checkbox" name="template_ids" value="{{ tmpl.id }}"
+                 {% if tmpl.id in assigned_template_ids %}checked{% endif %}
+                 class="rounded text-indigo-500 focus:ring-indigo-500 focus:ring-offset-0 flex-shrink-0" />
+          <span class="pill pill-neutral text-2xs flex-shrink-0">{{ 'Assistant' if tmpl.type == 'SHCA' else tmpl.type }}</span>
+          <span class="text-sm text-gray-200">{{ tmpl.name }}</span>
+          <span class="font-mono text-xs text-gray-600 ml-auto">{{ tmpl.id }}</span>
+        </label>
+        {% endfor %}
+      </div>
+      <div class="flex justify-end mt-4">
+        <button type="submit" class="btn btn-secondary btn-sm">Save assignments</button>
+      </div>
+    </form>
+    {% else %}
+    {% set assigned_templates = all_templates | selectattr('id', 'in', assigned_template_ids) | list %}
+    {% if assigned_templates %}
+    <div class="space-y-2">
+      {% for tmpl in assigned_templates %}
+      <div class="flex items-center gap-3 px-3 py-2 bg-gray-800/50 border border-gray-700 rounded-lg">
+        <span class="pill pill-neutral text-2xs flex-shrink-0">{{ tmpl.type }}</span>
+        <span class="text-sm text-gray-200">{{ tmpl.name }}</span>
+        <span class="font-mono text-xs text-gray-600 ml-auto">{{ tmpl.id }}</span>
+      </div>
+      {% endfor %}
+    </div>
+    {% else %}
+    <p class="text-xs text-gray-500">Not assigned to any template.</p>
+    {% endif %}
+    {% endif %}
+  </div>
+  {% endif %}
+
+</div>
+
+<script>
+function updateCount() {
+  const total = document.querySelectorAll("input[name='tool_names']:checked").length;
+  document.getElementById("selected-count").textContent = `(${total} selected)`;
+}
+
+function onToolToggle(checkbox) {
+  const label = checkbox.closest("label");
+  if (checkbox.checked) {
+    label.classList.add("border-indigo-500", "bg-indigo-900/20");
+    label.classList.remove("border-gray-700");
+  } else {
+    label.classList.remove("border-indigo-500", "bg-indigo-900/20");
+    label.classList.add("border-gray-700");
+  }
+  updateCount();
+}
+
+function selectAll() {
+  document.querySelectorAll("input[name='tool_names']:not([disabled])").forEach(cb => {
+    if (!cb.checked) { cb.checked = true; onToolToggle(cb); }
+  });
+}
+
+function clearAll() {
+  document.querySelectorAll("input[name='tool_names']:checked").forEach(cb => {
+    cb.checked = false; onToolToggle(cb);
+  });
+}
+
+function filterToolCheckboxes(query) {
+  const q = (query || "").toLowerCase().trim();
+  document.querySelectorAll(".tool-checkbox-label").forEach(label => {
+    const name = (label.dataset.toolname || "").toLowerCase();
+    label.style.display = !q || name.includes(q) ? "" : "none";
+  });
+  // Hide groups where all tools are filtered out
+  document.querySelectorAll(".tool-group").forEach(group => {
+    const visible = group.querySelectorAll(".tool-checkbox-label:not([style*='none'])").length;
+    group.style.display = visible === 0 ? "none" : "";
+  });
+}
+
+</script>
+{% endblock %}

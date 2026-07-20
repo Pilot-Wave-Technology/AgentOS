@@ -1,0 +1,53 @@
+{% set sb = system.sandbox %}
+{% if sb and sb.configured %}
+<div class="bg-gray-900 border border-gray-800 rounded-xl p-5">
+  <div class="flex items-center justify-between mb-4">
+    <h3 class="font-semibold">Sandbox Health</h3>
+    <span class="text-xs text-gray-500">{{ sb.runtime or "container" }} · {{ sb.mode }}</span>
+  </div>
+
+  {# Overall status strip #}
+  <div class="flex items-center gap-3 mb-4">
+    <span class="w-2.5 h-2.5 rounded-full flex-shrink-0
+      {% if sb.runtime_ok and sb.image_available %}bg-green-500
+      {% elif sb.runtime_ok %}bg-amber-500
+      {% else %}bg-red-500{% endif %}"></span>
+    <span class="text-sm font-medium
+      {% if sb.runtime_ok and sb.image_available %}text-green-300
+      {% elif sb.runtime_ok %}text-amber-300
+      {% else %}text-red-300{% endif %}">
+      {% if sb.runtime_ok and sb.image_available %}Sandbox ready
+      {% elif sb.runtime_ok %}Runtime reachable: image not found
+      {% else %}Container runtime unreachable{% endif %}
+    </span>
+  </div>
+
+  <div class="grid grid-cols-2 sm:grid-cols-4 gap-4 text-sm">
+    <div>
+      <div class="text-xs text-gray-500 mb-0.5">Runtime</div>
+      <div class="font-medium {% if sb.runtime_ok %}text-green-400{% else %}text-red-400{% endif %}">
+        {{ sb.runtime or "N/A" }}
+        {{ "✓" if sb.runtime_ok else "✗" }}
+      </div>
+    </div>
+    <div>
+      <div class="text-xs text-gray-500 mb-0.5">Mode</div>
+      <div class="font-medium text-gray-200 capitalize">{{ sb.mode or "N/A" }}</div>
+    </div>
+    <div>
+      <div class="text-xs text-gray-500 mb-0.5">Active containers</div>
+      <div class="font-medium text-gray-200">{{ sb.active }}</div>
+    </div>
+    <div title="{{ sb.image }}">
+      <div class="text-xs text-gray-500 mb-0.5">Image</div>
+      <div class="font-medium {% if sb.image_available %}text-green-400{% else %}text-amber-400{% endif %}">
+        {{ "Present" if sb.image_available else "Missing" }}
+      </div>
+    </div>
+  </div>
+
+  {% if sb.error %}
+  <div class="text-xs text-amber-400/80 mt-3 font-mono break-all">{{ sb.error }}</div>
+  {% endif %}
+</div>
+{% endif %}

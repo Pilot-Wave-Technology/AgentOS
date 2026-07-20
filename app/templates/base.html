@@ -1,0 +1,1026 @@
+<!DOCTYPE html>
+<html lang="en" class="h-full">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>{% block title %}Agent OS{% endblock %}</title>
+  <!-- Theme + scale: runs before stylesheets load to prevent FOUC -->
+  <script>
+  (function() {
+    var stored = localStorage.getItem('theme');
+    var prefersDark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+    var theme = stored || (prefersDark ? 'dark' : 'light');
+    var html = document.documentElement;
+    html.classList.add(theme);
+    if (localStorage.getItem('font-scale') === 'large') html.classList.add('text-large');
+  })();
+  </script>
+  <!-- app.css loads before the Tailwind CDN script below (not after) so its
+       hand-written base rules (e.g. .hidden — see app.css) sit earlier in the
+       cascade than Tailwind's own generated utilities, including responsive
+       overrides like `hidden lg:flex`. Loading it after used to let a plain,
+       later-loaded .hidden silently beat those overrides at every viewport
+       width. -->
+  <link rel="stylesheet" href="/static/css/app.css?v={{ request.state.static_css_version }}" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://unpkg.com/htmx.org@1.9.12"></script>
+  <!-- Firebase SDK: used for silent token refresh on authenticated pages -->
+  <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-auth-compat.js"></script>
+  <!-- highlight.js theme: swapped by toggleTheme() -->
+  <link id="hljs-theme" rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11/build/styles/github-dark.min.css" />
+  <script>
+  (function() {
+    var t = localStorage.getItem('theme') || (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+    if (t === 'light') {
+      document.getElementById('hljs-theme').href =
+        'https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11/build/styles/github.min.css';
+    }
+  })();
+  </script>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        fontFamily: { sans: ['Inter', 'system-ui', 'sans-serif'] },
+        extend: {
+          colors: {
+            brand:   { DEFAULT: '#6366f1', dark: '#4f46e5', light: '#818cf8' },
+            surface: {
+              DEFAULT: 'var(--theme-surface)',
+              hover:   'var(--theme-surface-hover)',
+              active:  'var(--theme-surface-active)',
+            },
+            border:  {
+              DEFAULT: 'var(--theme-border)',
+              hover:   'var(--theme-border-hover)',
+            },
+          },
+          fontSize: { '2xs': '0.65rem' },
+        }
+      }
+    }
+  </script>
+</head>
+<body class="h-full font-sans">
+
+{% if user %}
+<div class="flex h-full">
+
+  <!-- ── Sidebar ──────────────────────────────────────────────────────── -->
+  <nav id="sidebar"
+    class="sidebar-expanded flex-shrink-0 bg-surface border-r border-border flex flex-col transition-all duration-200 ease-in-out overflow-hidden z-30">
+
+    <!-- Header: Logo + Toggle -->
+    <div id="sidebar-header" class="flex items-center justify-between px-4 h-14 flex-shrink-0">
+      <a href="/goals" class="flex items-center gap-2.5 sidebar-label">
+        <span class="text-brand text-lg font-bold">⬡</span>
+        <span class="font-semibold text-sm tracking-wide text-gray-100">Agent OS</span>
+      </a>
+      <button onclick="toggleSidebar()" class="p-1.5 rounded-md hover:bg-surface-hover transition-colors" title="Toggle sidebar">
+        <svg class="w-4 h-4 text-gray-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/>
+        </svg>
+      </button>
+    </div>
+
+    <!-- New Goal button: sits outside the scrollable tree so it stays full-width and visible -->
+    {% if user.system_role in ["admin", "editor"] %}
+    <div class="px-2 pt-1 pb-2 flex-shrink-0">
+      <button type="button"
+         id="btn-new-goal"
+         onclick="document.getElementById('modal-new-goal').classList.remove('hidden')"
+         hx-get="/goals/new-modal"
+         hx-target="#modal-new-goal-content"
+         hx-swap="innerHTML"
+         title="New Goal"
+         class="w-full flex items-center justify-center gap-1.5 px-3 py-2 rounded-md text-xs font-medium bg-brand/10 hover:bg-brand/20 text-brand-light border border-brand/20 transition-colors cursor-pointer">
+        <svg class="w-3.5 h-3.5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"/>
+        </svg>
+        <span class="sidebar-label">New Goal</span>
+      </button>
+    </div>
+    {% endif %}
+
+    <!-- Goals tree: main content area -->
+    <div class="flex-1 overflow-y-auto px-3 py-2">
+
+      <div id="sidebar-goals"
+        hx-get="/goals/sidebar-data?active_goal={{ pid if pid is defined else '' }}&current_path={{ request.url.path }}&current_thread={{ request.query_params.get('thread_id', '') }}"
+        hx-trigger="load"
+        hx-swap="innerHTML">
+        <div class="px-2 py-2 text-2xs text-gray-600">Loading...</div>
+      </div>
+    </div>
+
+    <!-- Bottom nav: Platform Improvement (admin) + Dashboard + Settings -->
+    <div class="px-3 pt-2 pb-1 border-t border-border flex-shrink-0">
+      {% if user.system_role == 'admin' %}
+      <!-- Platform Improvement: admin-only goal, rendered goal-style with a
+           collapsible sub-tree. The search icon itself is the expand/collapse
+           toggle; only the text label navigates. Sits above Dashboard.
+           Sub-tree is expanded when on a /goals/__platform__ path. -->
+      {% set p_active = '/goals/__platform__' in request.url.path %}
+      <div class="mb-1">
+        <div class="flex items-center gap-0.5">
+          <button onclick="toggleGoalTree('__platform__')"
+                  title="{% if p_active %}Collapse{% else %}Expand{% endif %} Platform Improvement"
+                  class="row-toggle-btn flex-shrink-0 w-6 h-6 flex items-center justify-center rounded hover:bg-surface-hover transition-colors {% if p_active %}bg-surface-hover{% endif %}">
+            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M21 21l-5.197-5.197m0 0A7.5 7.5 0 105.196 5.196a7.5 7.5 0 0010.607 10.607z"/>
+            </svg>
+          </button>
+          <a href="/goals/__platform__/thread" data-tooltip-title="Platform Improvement"
+             class="sidebar-item flex-1 min-w-0 {% if request.url.path == '/goals/__platform__' or request.url.path == '/goals/__platform__/thread' %}sidebar-item-active{% endif %}">
+            <svg class="rail-nav-icon w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M21 21l-5.197-5.197m0 0A7.5 7.5 0 105.196 5.196a7.5 7.5 0 0010.607 10.607z"/>
+            </svg>
+            <span class="sidebar-label truncate">Platform Improvement</span>
+          </a>
+        </div>
+        <div id="goal-tree-__platform__" data-loaded="true"
+             class="ml-5 mt-0.5 space-y-0.5 border-l border-border pl-2 {% if not p_active %}hidden{% endif %}">
+          <a href="/goals/__platform__/thread"
+             class="sidebar-item text-2xs py-1 {% if request.url.path == '/goals/__platform__/thread' %}text-emerald-400 bg-emerald-500/10 font-medium{% else %}text-gray-500 hover:text-gray-300{% endif %}">
+            <svg class="w-3 h-3 flex-shrink-0 text-emerald-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M17 8h2a2 2 0 012 2v6a2 2 0 01-2 2h-2v4l-4-4H9a2 2 0 01-2-2V6a2 2 0 012-2h6"/>
+            </svg>
+            <span class="sidebar-label"># goal-thread</span>
+          </a>
+          <a href="/goals/__platform__/chat/platform-shca"
+             class="sidebar-item text-2xs py-1 {% if '/goals/__platform__/chat/platform-shca' in request.url.path %}text-violet-400 bg-violet-500/10 font-medium{% else %}text-gray-500 hover:text-gray-300{% endif %}">
+            <svg class="w-3 h-3 flex-shrink-0 text-violet-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M8 10h.01M12 10h.01M16 10h.01M9 16H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-5l-5 5v-5z"/>
+            </svg>
+            <span class="sidebar-label"># assistant</span>
+          </a>
+          <a href="/goals/__platform__/stories"
+             class="sidebar-item text-2xs py-1 {% if request.url.path == '/goals/__platform__/stories' %}text-brand-light bg-brand/10 font-medium{% else %}text-gray-500 hover:text-gray-300{% endif %}">
+            <svg class="w-3 h-3 flex-shrink-0 text-gray-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2"/>
+            </svg>
+            <span class="sidebar-label"># story-board</span>
+          </a>
+        </div>
+      </div>
+      {% endif %}
+      {% if user.system_role == 'admin' %}
+      <a href="/dashboard" data-tooltip-title="Dashboard"
+         class="sidebar-item {% if request.url.path == '/dashboard' %}sidebar-item-active{% endif %}">
+        <svg class="w-4 h-4 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M3.75 6A2.25 2.25 0 016 3.75h2.25A2.25 2.25 0 0110.5 6v2.25a2.25 2.25 0 01-2.25 2.25H6a2.25 2.25 0 01-2.25-2.25V6zM3.75 15.75A2.25 2.25 0 016 13.5h2.25a2.25 2.25 0 012.25 2.25V18a2.25 2.25 0 01-2.25 2.25H6A2.25 2.25 0 013.75 18v-2.25zM13.5 6a2.25 2.25 0 012.25-2.25H18A2.25 2.25 0 0120.25 6v2.25A2.25 2.25 0 0118 10.5h-2.25a2.25 2.25 0 01-2.25-2.25V6zM13.5 15.75a2.25 2.25 0 012.25-2.25H18a2.25 2.25 0 012.25 2.25V18A2.25 2.25 0 0118 20.25h-2.25A2.25 2.25 0 0113.5 18v-2.25z"/>
+        </svg>
+        <span class="sidebar-label">Dashboard</span>
+      </a>
+      {% endif %}
+      <a href="/settings" id="sidebar-settings-link" data-tooltip-title="Settings"
+         class="sidebar-item {% if request.url.path == '/settings' or request.url.path.startswith('/settings/') %}sidebar-item-active{% endif %}">
+        <svg class="w-4 h-4 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M10.343 3.94c.09-.542.56-.94 1.11-.94h1.093c.55 0 1.02.398 1.11.94l.149.894c.07.424.384.764.78.93.398.164.855.142 1.205-.108l.737-.527a1.125 1.125 0 011.45.12l.773.774c.39.389.44 1.002.12 1.45l-.527.737c-.25.35-.272.806-.107 1.204.165.397.505.71.93.78l.893.15c.543.09.94.56.94 1.109v1.094c0 .55-.397 1.02-.94 1.11l-.893.149c-.425.07-.765.383-.93.78-.165.398-.143.854.107 1.204l.527.738c.32.447.269 1.06-.12 1.45l-.774.773a1.125 1.125 0 01-1.449.12l-.738-.527c-.35-.25-.806-.272-1.203-.107-.397.165-.71.505-.781.929l-.149.894c-.09.542-.56.94-1.11.94h-1.094c-.55 0-1.019-.398-1.11-.94l-.148-.894c-.071-.424-.384-.764-.781-.93-.398-.164-.854-.142-1.204.108l-.738.527c-.447.32-1.06.269-1.45-.12l-.773-.774a1.125 1.125 0 01-.12-1.45l.527-.737c.25-.35.273-.806.108-1.204-.165-.397-.505-.71-.93-.78l-.894-.15c-.542-.09-.94-.56-.94-1.109v-1.094c0-.55.398-1.02.94-1.11l.894-.149c.424-.07.765-.383.93-.78.165-.398.143-.854-.108-1.204l-.526-.738a1.125 1.125 0 01.12-1.45l.773-.773a1.125 1.125 0 011.45-.12l.737.527c.35.25.807.272 1.204.107.397-.165.71-.505.78-.929l.15-.894z"/>
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/>
+        </svg>
+        <span class="sidebar-label">Settings</span>
+      </a>
+    </div>
+
+    <!-- User info + controls -->
+    <div class="px-3 py-3 flex-shrink-0">
+      <div class="sidebar-user-row flex items-center gap-2 mb-2">
+        {% if user.photo_url %}
+        <img src="{{ user.photo_url }}" class="w-8 h-8 rounded-full flex-shrink-0" />
+        {% else %}
+        <div class="w-8 h-8 rounded-full bg-brand/20 text-brand flex items-center justify-center text-xs font-bold flex-shrink-0">
+          {{ (user.display_name or user.email or "?")[0].upper() }}
+        </div>
+        {% endif %}
+        <div class="flex-1 min-w-0 sidebar-label">
+          <div class="text-xs font-medium truncate">{{ user.display_name or user.email }}</div>
+          {% if user.system_role == "admin" %}
+          <div class="text-2xs text-brand">platform.admin</div>
+          {% elif user.system_role == "editor" %}
+          <div class="text-2xs text-brand">platform.editor</div>
+          {% endif %}
+        </div>
+
+        <!-- Sign out -->
+        <form action="/auth/logout" method="post" class="sidebar-signout-wrap flex-shrink-0">
+          <button class="relative flex-shrink-0 w-7 h-7 flex items-center justify-center rounded-md text-gray-500 hover:bg-surface-hover hover:text-red-400 transition-colors"
+            data-tooltip-title="Sign out">
+            <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1"/>
+            </svg>
+          </button>
+        </form>
+      </div>
+
+      <!-- Theme + font scale toggles -->
+      <div class="sidebar-theme-size-row items-center">
+        <button onclick="toggleTheme()" id="theme-toggle-btn"
+          class="flex-1 flex flex-col items-center justify-center gap-0.5 px-2 py-2 rounded-md text-gray-500 hover:bg-surface-hover hover:text-gray-300 transition-colors"
+          data-tooltip-title="Toggle light/dark theme">
+          <svg id="theme-icon-sun" class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 3v1m0 16v1m9-9h-1M4 12H3m15.364-6.364l-.707.707M6.343 17.657l-.707.707M18.364 17.657l-.707-.707M6.343 6.343l-.707-.707M12 7a5 5 0 100 10A5 5 0 0012 7z"/>
+          </svg>
+          <svg id="theme-icon-moon" class="w-4 h-4 hidden" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20.354 15.354A9 9 0 018.646 3.646 9.003 9.003 0 0012 21a9.003 9.003 0 008.354-5.646z"/>
+          </svg>
+          <span class="sidebar-label" style="font-size:0.6rem; line-height:1">Theme</span>
+        </button>
+
+        <button onclick="toggleFontScale()" id="scale-toggle-btn"
+          class="flex-1 flex flex-col items-center justify-center gap-0.5 px-2 py-2 rounded-md text-gray-500 hover:bg-surface-hover hover:text-gray-300 transition-colors"
+          data-tooltip-title="Toggle font size">
+          <span class="font-semibold" style="font-size:0.9rem; line-height:1">Aa</span>
+          <span class="sidebar-label" style="font-size:0.6rem; line-height:1">Size</span>
+        </button>
+      </div>
+    </div>
+  </nav>
+
+  <!-- Mobile overlay -->
+  <div id="sidebar-overlay" class="hidden fixed inset-0 bg-black/50 z-20 lg:hidden" onclick="toggleSidebar()"></div>
+
+  <!-- ── Main content ─────────────────────────────────────────────────── -->
+  <main class="flex-1 overflow-y-auto">
+    {% block content %}{% endblock %}
+  </main>
+</div>
+
+<!-- Global New Goal modal: shell always present; form loaded via HTMX on demand -->
+<!-- Scrollable-modal pattern: outer div scrolls; inner centering div uses min-h-full so
+     items-center works correctly even when the card is shorter than the viewport, while
+     still allowing the outer div to scroll when the card is taller (e.g. large browser font). -->
+{% if user and user.system_role in ["admin", "editor"] %}
+<div id="modal-new-goal" class="hidden fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center p-4"
+     onclick="if(event.target===this) this.classList.add('hidden')">
+  <div class="card w-full max-w-lg max-h-[90vh] overflow-y-auto p-6">
+    <div id="modal-new-goal-content">
+      <!-- populated by hx-get="/goals/new-modal" -->
+    </div>
+  </div>
+</div>
+{% endif %}
+
+<!-- Shared hover-card: shown by initHoverCards() in the script block below.
+     Renders two things that both use this same styled card instead of the
+     browser's native title="" tooltip: (1) sidebar items carrying
+     data-tooltip-title/data-tooltip-preview (name + optional message
+     preview), and (2) every other element in the app that carries a plain
+     title="" attribute, converted once to data-hover-title so the browser's
+     own tooltip never fires alongside this one. Positions itself next to
+     whichever element is hovered.
+
+     Hidden via visibility (not the shared .hidden utility / display:none) -
+     see the #hover-card rule in app.css - so it stays part of layout while
+     hidden and its real offsetWidth/offsetHeight can be measured for
+     positioning BEFORE it's shown. pointer-events-none below already keeps
+     it inert while hidden regardless, so this can't reintroduce the
+     click-blocking class of bug .hidden's display:none was fixed for
+     elsewhere. -->
+<div id="hover-card"
+     class="fixed z-[200] pointer-events-none
+            bg-surface border border-border rounded-lg shadow-xl
+            px-3 py-2 w-max max-w-56"
+     style="top:0;left:0">
+  <p id="hover-card-title"
+     class="text-xs font-semibold text-gray-100 break-words mb-0.5"></p>
+  <p id="hover-card-preview"
+     class="text-2xs text-gray-500 leading-snug break-words line-clamp-2"></p>
+</div>
+
+<!-- Explainability preferences: bootstrapped once from the server-rendered
+     user row so app.js/tour.js can gate tooltip/hover/wizard behavior without
+     a round-trip. Settings > Help & Explainability writes through
+     /settings/preferences/{key} and updates this object in place (see
+     agentosTogglePreference in app.js) so toggling takes effect immediately. -->
+<script>
+  window.userPrefs = {
+    tooltips_enabled: {{ (user.preferences.tooltips_enabled if user.preferences else True) | tojson }},
+    hover_help_enabled: {{ (user.preferences.hover_help_enabled if user.preferences else True) | tojson }},
+    startup_wizard_enabled: {{ (user.preferences.startup_wizard_enabled if user.preferences else True) | tojson }}
+  };
+</script>
+
+<!-- ── Guided tour overlay ───────────────────────────────────────────────────
+     Shared shell for window.startTour() (static/js/tour.js). #tour-spotlight
+     is positioned over the current step's target element on every step;
+     its oversized box-shadow dims the rest of the page, so no separate
+     backdrop element is needed. #tour-card carries the step copy and
+     Prev/Next, positioned relative to the spotlight by tour.js. The ✕ in
+     the header is the only way to dismiss the tour early - no separate
+     Cancel button, since both did exactly the same thing. It calls
+     abandonTour(), not endTour() directly: closing a journey milestone
+     early also cascades the rest of the journey as done server-side (see
+     abandonTour() in tour.js). ────── -->
+<div id="tour-overlay" class="hidden fixed inset-0 z-[9998]">
+  <div id="tour-spotlight" class="fixed rounded-lg pointer-events-none transition-all duration-200 ease-in-out"
+       style="box-shadow: 0 0 0 9999px rgba(0,0,0,0.65); top:0; left:0; width:0; height:0;"></div>
+  <div id="tour-card"
+       class="fixed z-[9999] bg-gray-900 border border-gray-700 rounded-xl shadow-2xl w-80 p-4 space-y-3 transition-all duration-200 ease-in-out"
+       style="top:0; left:0;">
+    <div class="flex items-center justify-between">
+      <span id="tour-step-counter" class="text-2xs text-gray-500"></span>
+      <button type="button" onclick="abandonTour()" class="text-gray-500 hover:text-gray-300 transition-colors" aria-label="Close tour">
+        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
+        </svg>
+      </button>
+    </div>
+    <h3 id="tour-step-title" class="text-sm font-semibold text-gray-100"></h3>
+    <p id="tour-step-body" class="text-xs text-gray-400 leading-relaxed"></p>
+    <div class="flex justify-between items-center pt-1">
+      <button id="tour-btn-prev" type="button" onclick="tourPrev()" class="btn btn-secondary btn-sm hidden">Prev</button>
+      <div class="flex-1"></div>
+      <button id="tour-btn-next" type="button" onclick="tourNext()" class="btn btn-primary btn-sm">Next</button>
+    </div>
+  </div>
+</div>
+
+{% else %}
+<!-- Unauthenticated layout -->
+<div class="min-h-full flex items-center justify-center">
+  {% block unauth_content %}{% endblock %}
+</div>
+{% endif %}
+
+<script src="/static/js/app.js?v={{ request.state.static_js_version }}"></script>
+{% if user %}<script src="/static/js/tour.js?v={{ request.state.static_tour_js_version }}"></script>{% endif %}
+{% block extra_js %}{% endblock %}
+
+{% if user %}
+<!-- ── Shared confirmation modal ────────────────────────────────────────────
+     Two tiers, both driven by window.confirmAction() (see script below):
+       - type-to-confirm: caller passes a `phrase`: the user must type it
+         exactly before the button enables. Paste is blocked. Used for
+         destructive/irreversible actions (delete goal/task/agent/resource).
+       - click-only: caller omits `phrase`: the phrase row is hidden and the
+         button is enabled immediately. Used for lower-stakes confirmations
+         (archive, deprecate, disable, mark done, trigger a report).
+     goalPause()/goalResume()/goalDelete() are thin wrappers over this.
+─────────────────────────────────────────────────────────────────────── -->
+<div id="goal-confirm-modal" class="hidden fixed inset-0 z-[9999] flex items-center justify-center" role="dialog" aria-modal="true">
+  <div id="gcm-backdrop" class="absolute inset-0 bg-black/70 backdrop-blur-sm"></div>
+  <div class="relative bg-gray-900 border border-gray-700 rounded-xl shadow-2xl w-full max-w-md mx-4 p-6 space-y-4">
+    <div>
+      <h2 id="gcm-title" class="text-base font-semibold text-gray-100"></h2>
+      <p id="gcm-body" class="text-sm text-gray-400 mt-1"></p>
+    </div>
+    <div id="gcm-phrase-section">
+      <p class="text-sm text-gray-300 mb-2">
+        Type <span id="gcm-phrase" class="font-mono font-semibold select-none px-1.5 py-0.5 rounded bg-gray-800 text-amber-300"></span> to confirm:
+      </p>
+      <input id="gcm-input" type="text"
+             autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"
+             placeholder="Type the phrase…"
+             class="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm text-gray-100 focus:outline-none focus:border-indigo-500" />
+      <p id="gcm-mismatch" class="hidden text-xs text-red-400 mt-1">Text does not match: type it exactly.</p>
+    </div>
+    <div id="gcm-reason-row" class="hidden">
+      <label class="text-xs text-gray-400 block mb-1">Reason <span class="text-gray-600">(optional)</span></label>
+      <input id="gcm-reason" type="text" autocomplete="off"
+             placeholder="Why are you pausing this goal?"
+             class="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm text-gray-100 focus:outline-none focus:border-indigo-500" />
+    </div>
+    <div class="flex gap-3 justify-end pt-1">
+      <button id="gcm-cancel" class="btn btn-secondary btn-sm">Cancel</button>
+      <button id="gcm-confirm" disabled
+              class="px-4 py-1.5 rounded text-sm font-semibold transition-colors disabled:opacity-40 disabled:cursor-not-allowed">
+        Confirm
+      </button>
+    </div>
+  </div>
+</div>
+
+<!-- ── Toast/snackbar notifications ─────────────────────────────────────────
+     Non-blocking outcome messages (success/error/info), replaces bare
+     alert(). Stacks bottom-right, auto-dismisses. See window.showToast(). ──
+─────────────────────────────────────────────────────────────────────── -->
+<div id="toast-container" class="fixed bottom-4 right-4 z-[9999] flex flex-col gap-2 items-end pointer-events-none"></div>
+
+<script>
+// ── UTC timestamp local-time tooltips ────────────────────────────────────
+// All displayed timestamps are UTC. Any element carrying data-utc="<ISO
+// datetime>" gets its title filled with just the local time on hover.
+// A MutationObserver covers timestamps appended later by live/streaming UI
+// (chat, council/security/orchestrator/goal threads) with no per-page JS.
+function _applyUtcTooltip(el) {
+  const iso = el.getAttribute('data-utc');
+  if (!iso) return;
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return;
+  el.title = d.toLocaleString();
+}
+function applyUtcTooltips(root) {
+  (root || document).querySelectorAll('[data-utc]').forEach(_applyUtcTooltip);
+}
+document.addEventListener('DOMContentLoaded', () => applyUtcTooltips());
+new MutationObserver((mutations) => {
+  for (const m of mutations) {
+    m.addedNodes.forEach((node) => {
+      if (node.nodeType !== 1) return;
+      if (node.matches && node.matches('[data-utc]')) _applyUtcTooltip(node);
+      if (node.querySelectorAll) node.querySelectorAll('[data-utc]').forEach(_applyUtcTooltip);
+    });
+  }
+}).observe(document.body, { childList: true, subtree: true });
+
+// ── Theme toggle ──
+function toggleTheme() {
+  const html = document.documentElement;
+  const isLight = html.classList.contains('light');
+  html.classList.toggle('light', !isLight);
+  html.classList.toggle('dark', isLight);
+  const newTheme = isLight ? 'dark' : 'light';
+  localStorage.setItem('theme', newTheme);
+  _updateThemeIcons(!isLight);
+  const hljsLink = document.getElementById('hljs-theme');
+  if (hljsLink) {
+    hljsLink.href = newTheme === 'light'
+      ? 'https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11/build/styles/github.min.css'
+      : 'https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11/build/styles/github-dark.min.css';
+  }
+}
+
+function _updateThemeIcons(isLight) {
+  const sun = document.getElementById('theme-icon-sun');
+  const moon = document.getElementById('theme-icon-moon');
+  if (sun) sun.classList.toggle('hidden', isLight);
+  if (moon) moon.classList.toggle('hidden', !isLight);
+}
+
+// ── Font scale toggle ──
+function toggleFontScale() {
+  const html = document.documentElement;
+  const isLarge = html.classList.contains('text-large');
+  html.classList.toggle('text-large', !isLarge);
+  localStorage.setItem('font-scale', isLarge ? 'normal' : 'large');
+}
+
+// ── Sidebar collapse/expand ──
+const SIDEBAR_KEY = 'sidebar-collapsed';
+
+function initSidebar() {
+  const sidebar = document.getElementById('sidebar');
+  const collapsed = localStorage.getItem(SIDEBAR_KEY) === 'true';
+  if (collapsed) {
+    sidebar.classList.remove('sidebar-expanded');
+    sidebar.classList.add('sidebar-collapsed');
+  }
+}
+
+function toggleSidebar() {
+  const sidebar = document.getElementById('sidebar');
+  const isCollapsed = sidebar.classList.contains('sidebar-collapsed');
+  if (isCollapsed) {
+    sidebar.classList.remove('sidebar-collapsed');
+    sidebar.classList.add('sidebar-expanded');
+    localStorage.setItem(SIDEBAR_KEY, 'false');
+  } else {
+    sidebar.classList.add('sidebar-collapsed');
+    sidebar.classList.remove('sidebar-expanded');
+    localStorage.setItem(SIDEBAR_KEY, 'true');
+  }
+  // Hide overlay on desktop
+  document.getElementById('sidebar-overlay')?.classList.add('hidden');
+}
+
+// ── Goal tree expand/collapse ──
+// For the active goal, toggles sub-items in-place.
+// For non-active goals (no loaded data), navigates to the goal page.
+function toggleGoalTree(gid) {
+  const tree = document.getElementById('goal-tree-' + gid);
+  const chevron = document.getElementById('chevron-' + gid);
+  if (!tree) return;
+  if (tree.dataset.loaded !== 'true') {
+    window.location.href = '/goals/' + gid;
+    return;
+  }
+  const isHidden = tree.classList.contains('hidden');
+  tree.classList.toggle('hidden', !isHidden);
+  if (chevron) chevron.classList.toggle('rotate-90', isHidden);
+}
+
+// ── GO thread sub-channels expand/collapse ──
+// Reveals the goal-thread's collapsible sub-rows: Agent Mesh, Goal Review
+// Council, Security Council.
+function toggleGoChildren(gid) {
+  const children = document.getElementById('go-children-' + gid);
+  const arrow = document.getElementById('arrow-go-' + gid);
+  if (!children) return;
+  children.classList.toggle('hidden');
+  if (arrow) arrow.classList.toggle('rotate-90');
+}
+
+// ── Kill switch: system + goal pause/resume (app-wide, used by banner +
+//    goal detail button). Defined globally so any page can call them. ──
+async function _controlPost(url, body) {
+  const resp = await fetch(url, {
+    method: 'POST',
+    headers: body ? {'Content-Type': 'application/json'} : {},
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  if (resp.ok) { location.reload(); return; }
+  let msg = 'Action failed (' + resp.status + ')';
+  try { const d = await resp.json(); if (d.error) msg = d.error; } catch (e) { /* non-JSON */ }
+  showToast(msg, 'error');
+}
+async function systemPause() {
+  const result = await window.confirmAction({
+    title: 'Freeze the system',
+    body: 'ALL goals stop dispatching new work immediately: not just one. In-flight turns finish, but nothing new starts until resumed.',
+    phrase: 'Freeze the system',
+    reason: true,
+    danger: true,
+  });
+  if (!result) return;
+  await _controlPost('/settings/controls/pause', {reason: result.reason});
+}
+async function systemResume() {
+  const result = await window.confirmAction({
+    title: 'Resume the system',
+    body: 'Execution resumes immediately across every goal. Queued messages drain and dispatch begins picking up new work.',
+    phrase: 'Resume the system',
+  });
+  if (!result) return;
+  await _controlPost('/settings/controls/resume');
+}
+
+// ── Toast/snackbar notifications ──
+// showToast(message, type): type is 'success' | 'warning' | 'error' | 'info' (default).
+// Non-blocking, auto-dismisses (warning/error stay longer so they can be read).
+function showToast(message, type) {
+  type = type || 'info';
+  const styles = {
+    success: 'bg-emerald-900/90 border-emerald-600 text-emerald-100',
+    warning: 'bg-amber-900/90 border-amber-600 text-amber-100',
+    error:   'bg-red-900/90 border-red-600 text-red-100',
+    info:    'bg-gray-800/90 border-gray-600 text-gray-100',
+  };
+  if (!styles[type]) {
+    console.warn(`[showToast] unknown type "${type}", falling back to 'info' styling`);
+  }
+  const el = document.createElement('div');
+  el.className = `pointer-events-auto max-w-sm w-full border rounded-lg shadow-lg px-4 py-3 text-sm flex items-start gap-3 ${styles[type] || styles.info}`;
+  el.innerHTML = `<span class="flex-1 whitespace-pre-wrap">${String(message).replace(/</g, '&lt;')}</span>
+    <button class="shrink-0 opacity-60 hover:opacity-100" aria-label="Dismiss">&times;</button>`;
+  el.querySelector('button').addEventListener('click', () => el.remove());
+  document.getElementById('toast-container').appendChild(el);
+  setTimeout(() => el.remove(), (type === 'error' || type === 'warning') ? 8000 : 4500);
+}
+
+// ── Shared busy-state helper for refresh/regenerate-style buttons ──
+// window.withLoadingState(button, asyncFn, {loadingLabel}) wraps any
+// ad-hoc async button handler so every such button gets the same
+// guarantees, instead of each page reimplementing disable/spinner logic:
+//   - ignores the click if the button is already mid-flight (no spam)
+//   - disables the button and swaps in a spinner + label synchronously,
+//     before the async work starts, so there's an immediate "it's running" cue
+//   - ALWAYS restores the button in a finally, even if asyncFn throws or
+//     rejects, so it can never get stuck spinning
+//   - if the button was removed from the DOM by the action itself (e.g. an
+//     htmx swap replaced its container), skips restoration instead of
+//     touching a detached node
+// Usage: <button onclick="withLoadingState(this, () => refreshFiles())">
+function withLoadingState(button, asyncFn, opts) {
+  if (!button || button.disabled) return;
+  const loadingLabel = (opts && opts.loadingLabel) || 'Working…';
+  const originalHTML = button.innerHTML;
+  const originalWidth = button.getBoundingClientRect().width;
+  button.disabled = true;
+  button.style.minWidth = originalWidth + 'px';
+  button.innerHTML = `<span class="btn-loading-spinner"></span><span>${loadingLabel}</span>`;
+  const restore = () => {
+    if (!document.body.contains(button)) return;
+    button.disabled = false;
+    button.innerHTML = originalHTML;
+    button.style.minWidth = '';
+  };
+  return Promise.resolve()
+    .then(() => asyncFn())
+    .catch(err => {
+      showToast(err && err.message ? err.message : 'Action failed', 'error');
+      throw err;
+    })
+    .finally(restore);
+}
+
+// ── Shared confirmation modal ──
+// window.confirmAction({title, body, phrase, reason, danger}) returns a
+// Promise resolving to {confirmed:true, reason:string} on confirm, or null
+// on cancel / ESC / backdrop click.
+//   - Pass `phrase` for the type-to-confirm tier (destructive/irreversible
+//     actions) - paste is blocked so the text must be entered intentionally.
+//   - Omit `phrase` for the click-only tier (lower-stakes confirmations) -
+//     the button enables immediately, no typing required.
+//   - `danger: true` styles the confirm button red; otherwise it's styled
+//     per the tier (amber for type-to-confirm, indigo for click-only).
+(function _initConfirmModal() {
+  const $ = id => document.getElementById(id);
+
+  function _open({title, body, phrase, reason, reasonPlaceholder, danger}) {
+    $('gcm-title').textContent   = title;
+    $('gcm-body').textContent    = body;
+    $('gcm-input').value         = '';
+    $('gcm-reason').value        = '';
+    $('gcm-reason').placeholder  = reasonPlaceholder || 'Why are you pausing this goal?';
+    $('gcm-mismatch').classList.add('hidden');
+    $('gcm-reason-row').classList.toggle('hidden', !reason);
+    $('gcm-phrase-section').classList.toggle('hidden', !phrase);
+    $('gcm-phrase').textContent  = phrase || '';
+
+    const confirmCls = danger
+      ? 'bg-red-700 hover:bg-red-600 text-white'
+      : phrase
+        ? 'bg-amber-700 hover:bg-amber-600 text-white'
+        : 'bg-indigo-600 hover:bg-indigo-500 text-white';
+    const btn = $('gcm-confirm');
+    btn.className = `px-4 py-1.5 rounded text-sm font-semibold transition-colors disabled:opacity-40 disabled:cursor-not-allowed ${confirmCls}`;
+    btn.disabled  = !!phrase;
+    $('goal-confirm-modal').classList.remove('hidden');
+    setTimeout(() => (phrase ? $('gcm-input') : btn).focus(), 50);
+    return new Promise(res => { window._gcmResolve = res; });
+  }
+
+  function _close(result) {
+    $('goal-confirm-modal').classList.add('hidden');
+    if (window._gcmResolve) { window._gcmResolve(result); window._gcmResolve = null; }
+  }
+
+  $('gcm-input').addEventListener('paste',  e => e.preventDefault());
+  $('gcm-input').addEventListener('input',  () => {
+    const match = $('gcm-input').value === $('gcm-phrase').textContent;
+    $('gcm-confirm').disabled = !match;
+    $('gcm-mismatch').classList.toggle('hidden', match || $('gcm-input').value === '');
+  });
+  $('gcm-confirm').addEventListener('click', () => {
+    const phraseActive = !$('gcm-phrase-section').classList.contains('hidden');
+    if (phraseActive && $('gcm-input').value !== $('gcm-phrase').textContent) return;
+    _close({confirmed: true, reason: $('gcm-reason').value.trim()});
+  });
+  $('gcm-cancel').addEventListener('click',   () => _close(null));
+  $('gcm-backdrop').addEventListener('click', () => _close(null));
+  // Close on ESC; Enter triggers confirm when enabled (phrase input or the button itself).
+  document.addEventListener('keydown', e => {
+    if ($('goal-confirm-modal').classList.contains('hidden')) return;
+    if (e.key === 'Escape') { _close(null); }
+    if (e.key === 'Enter' && !$('gcm-confirm').disabled &&
+        (document.activeElement === $('gcm-input') || document.activeElement === $('gcm-confirm'))) {
+      $('gcm-confirm').click();
+    }
+  });
+
+  window.confirmAction = _open;
+})();
+
+// ── Route htmx's hx-confirm through the shared modal ──
+// Without this, hx-confirm falls back to the native browser confirm().
+// Intercept the request, show our modal with the same question text, and
+// only let the request through if the user confirms.
+document.body.addEventListener('htmx:confirm', function (evt) {
+  if (!evt.detail.question) return;
+  evt.preventDefault();
+  window.confirmAction({title: 'Confirm', body: evt.detail.question}).then(result => {
+    if (result?.confirmed) evt.detail.issueRequest(true);
+  });
+});
+
+// ── Never swap a 304 Not Modified response ──
+// htmx 1.9's default response handling treats any 2xx/3xx status as
+// swappable. A 304 has no body by HTTP spec, so without this guard a
+// polling target using ETag/If-None-Match (e.g. hx-trigger="every 5s")
+// gets its content silently replaced with nothing every time the server
+// reports "unchanged" -- the visible symptom is a panel that flashes its
+// real content once on load and then goes blank on the next poll.
+document.body.addEventListener('htmx:beforeSwap', function (evt) {
+  if (evt.detail.xhr && evt.detail.xhr.status === 304) {
+    evt.detail.shouldSwap = false;
+  }
+});
+
+async function goalPause(pid) {
+  const result = await window.confirmAction({
+    title: 'Pause this goal',
+    body: 'All execution for this goal will be frozen. In-flight turns will finish but no new work will dispatch until resumed.',
+    phrase: 'Pause this goal',
+    reason: true,
+  });
+  if (!result) return;
+  await _controlPost('/settings/controls/goals/' + encodeURIComponent(pid) + '/pause', {reason: result.reason});
+}
+async function goalResume(pid) {
+  const result = await window.confirmAction({
+    title: 'Resume this goal',
+    body: 'Execution will resume immediately. Queued messages will drain and the dispatcher will begin picking up new work.',
+    phrase: 'Resume this goal',
+  });
+  if (!result) return;
+  await _controlPost('/settings/controls/goals/' + encodeURIComponent(pid) + '/resume');
+}
+async function goalDelete(pid) {
+  const result = await window.confirmAction({
+    title: 'Delete this goal',
+    body: 'This soft-deletes the goal. Tasks, threads, messages, and ledger events are kept, but the goal is removed from active lists. This cannot be undone.',
+    phrase: 'Delete this goal',
+    danger: true,
+  });
+  if (!result) return;
+  await _controlPost('/goals/' + encodeURIComponent(pid) + '/delete');
+}
+
+// ── Toast-driven form submission (data-toast-submit / data-confirm) ──
+// Single source of truth for "a plain form's 4xx/5xx must not navigate to
+// error.html or dump raw JSON" — every form gets this by adding one
+// attribute, present and future, instead of each page hand-rolling its own
+// fetch+toast interceptor (that repetition is exactly how the .action-name
+// shadowing bug and the missing-try/catch bugs slipped in before this was
+// consolidated — see research/ROLE_SYSTEM.md and git history for context).
+// Implementation lives in static/js/app.js (submitFormWithToast + the
+// delegated submit listener) so it's cacheable instead of re-parsed inline
+// on every page; it forward-references showToast/confirmAction, which are
+// defined below in this file — safe because app.js only registers the
+// listener at load time, and the listener body only calls them later, at
+// actual submit time, by which point this script has already run.
+//
+// Opt in with:
+//   data-toast-submit          plain forms: submit via fetch, toast on error
+//   data-confirm="..."         same, but show a confirm modal first
+//     data-confirm-danger="true"   type-to-confirm tier (vs. click-only)
+//     data-confirm-phrase="..."    exact phrase to type (default: button text)
+//   data-fail="..."             fallback error message (default: "Action failed.")
+//   data-success="..."          show a success toast on the page fetch lands on
+//   data-success-hash="tab-x"   append #tab-x to the redirect target (fetch's
+//                                resp.url drops any fragment the server sent)
+
+// Shared flash-message reader for the `data-success` case above: a 303
+// redirect can't carry a response body, so the success message rides in
+// ?_flash= instead. Runs on every page load; no-ops when the param is absent.
+// Defaults to a success toast — most callers are confirming a plain-form
+// action worked — but a handler can override the color with ?_flash_type=
+// (e.g. goal creation's GO-provisioning-failure path, which redirects to
+// the newly-created goal so the user isn't blocked, but still needs to know
+// its orchestrator agent didn't come up).
+(function() {
+  const params = new URLSearchParams(window.location.search);
+  const flash = params.get('_flash');
+  const flashType = params.get('_flash_type');
+  if (!flash && !flashType) return;
+  if (flash) showToast(flash, flashType || 'success');
+  params.delete('_flash');
+  params.delete('_flash_type');
+  const qs = params.toString();
+  window.history.replaceState({}, '', window.location.pathname + (qs ? `?${qs}` : '') + window.location.hash);
+})();
+
+// ── Silent Firebase token refresh ──
+// Firebase ID tokens expire after 60 minutes. This loop refreshes
+// the token every 50 minutes and updates the HttpOnly cookie via
+// POST /auth/refresh. The user never sees a login screen mid-session.
+(function initTokenRefresh() {
+  const fbConfig = {
+    apiKey: "{{ request.state.firebase_api_key }}",
+    projectId: "{{ request.state.firebase_project_id }}",
+    authDomain: "{{ request.state.firebase_project_id }}.firebaseapp.com",
+  };
+  if (!firebase.apps.length) firebase.initializeApp(fbConfig);
+  const auth = firebase.auth();
+
+  async function refreshToken() {
+    try {
+      const user = auth.currentUser;
+      if (!user) {
+        // Firebase SDK doesn't know the user (page loaded with cookie only).
+        // Wait for onAuthStateChanged to fire.
+        return;
+      }
+      const freshToken = await user.getIdToken(/* forceRefresh */ true);
+      const resp = await fetch('/auth/refresh', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({id_token: freshToken}),
+      });
+      if (resp.ok) {
+        console.debug('[auth] Token refreshed silently');
+      } else if (resp.status === 401) {
+        // Token invalid: redirect to login
+        window.location.href = '/login';
+      }
+    } catch (err) {
+      console.warn('[auth] Token refresh failed:', err);
+    }
+  }
+
+  // Refresh every 50 minutes
+  setInterval(refreshToken, 50 * 60 * 1000);
+
+  // Also refresh once on page load (catches tabs that were open overnight)
+  auth.onAuthStateChanged((user) => {
+    if (user) {
+      // Small delay to let the page finish loading
+      setTimeout(refreshToken, 3000);
+    }
+  });
+})();
+
+// ── Shared hover-card: sidebar previews + every title="" hint ─────────────
+// One floating card renders both (1) sidebar items carrying
+// data-tooltip-title/data-tooltip-preview — always the name, plus "Sender:
+// first few words…" when a message exists (always showing the name, not
+// just when a preview exists, matters most in the collapsed sidebar, where
+// the icon has no visible label to fall back on) — and (2) every other
+// element in the app that used to carry a native title="" attribute,
+// converted here to data-hover-title so the browser's own tooltip never
+// fires alongside this one. Both are gated by the same "Hover cards"
+// preference (Settings > Help & Explainability, hover_help_enabled) — once
+// title="" renders through this same mechanism there's no meaningful
+// difference left between "a tooltip" and "a hover card" to gate separately.
+(function initHoverCards() {
+  const card = document.getElementById('hover-card');
+  const titleEl = document.getElementById('hover-card-title');
+  const previewEl = document.getElementById('hover-card-preview');
+  if (!card) return;
+
+  let _active = null;  // currently hovered element
+
+  function _show(target) {
+    if (window.userPrefs && window.userPrefs.hover_help_enabled === false) return;
+    const title = target.dataset.tooltipTitle || target.dataset.hoverTitle || '';
+    if (!title) return;
+    const preview = target.dataset.tooltipPreview || '';
+
+    titleEl.textContent   = title;
+    previewEl.textContent = preview;
+    previewEl.classList.toggle('hidden', !preview);
+
+    // Position to the right of the element (or left, if the element opts in
+    // via data-hover-side="left" - e.g. a trigger that's reliably near the
+    // page's right edge and would otherwise flip on every hover), vertically
+    // centred. card is hidden via visibility, not display:none (see the
+    // #hover-card rule in app.css), so it's still part of layout here and
+    // offsetWidth/offsetHeight reflect this hover's actual title/preview
+    // content, already set above - not a guess.
+    const rect = target.getBoundingClientRect();
+    const cardH = card.offsetHeight || 40;  // defensive fallback only
+    const cardW = card.offsetWidth || 100;  // defensive fallback only
+    const preferLeft = target.dataset.hoverSide === 'left';
+    let top  = rect.top + (rect.height / 2) - (cardH / 2);
+    let left = preferLeft ? (rect.left - cardW - 8) : (rect.right + 8);
+
+    // Clamp so it doesn't overflow the viewport bottom.
+    const maxTop = window.innerHeight - (cardH + 8);
+    if (top > maxTop) top = maxTop;
+    if (top < 4) top = 4;
+
+    // Flip if the preferred side would overflow its edge. The original
+    // sidebar-only version could assume there was always room to the right;
+    // title="" hints appear on elements all over every page (including ones
+    // flush against either edge), so that assumption no longer holds.
+    if (!preferLeft && left + cardW > window.innerWidth - 4) left = rect.left - cardW - 8;
+    if (preferLeft && left < 4) left = rect.right + 8;
+    if (left < 4) left = 4;
+
+    card.style.top  = `${top}px`;
+    card.style.left = `${left}px`;
+    card.classList.add('is-visible');
+    _active = target;
+  }
+
+  function _hide() {
+    card.classList.remove('is-visible');
+    _active = null;
+  }
+
+  function _convertTitleEl(el) {
+    if (el.hasAttribute && el.hasAttribute('title')) {
+      el.dataset.hoverTitle = el.getAttribute('title');
+      el.removeAttribute('title');
+    }
+  }
+
+  function _convertTitlesIn(root) {
+    _convertTitleEl(root);
+    if (root.querySelectorAll) root.querySelectorAll('[title]').forEach(_convertTitleEl);
+  }
+
+  // title="" attributes get added to the DOM in more ways than HTMX swaps
+  // alone — several pages build rows via raw innerHTML template literals
+  // (e.g. chat/index.html's participant list, agents/detail.html's error
+  // rows) which HTMX never sees. A MutationObserver catches all of them
+  // uniformly: the initial pass below, any HTMX swap, and any ad-hoc JS
+  // render, without needing to enumerate every trigger.
+  _convertTitlesIn(document.body);
+  new MutationObserver((mutations) => {
+    for (const m of mutations) {
+      if (m.type === 'attributes') {
+        _convertTitleEl(m.target);
+      } else {
+        m.addedNodes.forEach((node) => { if (node.nodeType === 1) _convertTitlesIn(node); });
+      }
+    }
+  }).observe(document.body, { attributes: true, attributeFilter: ['title'], subtree: true, childList: true });
+
+  // Use event delegation on the document so it works after HTMX swaps.
+  document.addEventListener('mouseover', (e) => {
+    const target = e.target.closest('[data-tooltip-title], [data-hover-title]');
+    if (target && target !== _active) _show(target);
+    else if (!target && _active) _hide();
+  });
+
+  document.addEventListener('mouseleave', (e) => {
+    // mouseleave doesn't bubble, so catch it on the element itself via delegation.
+    if (_active && !_active.contains(e.relatedTarget)) _hide();
+  }, true);
+
+  // Hide when the user starts clicking (navigating away).
+  document.addEventListener('mousedown', _hide);
+})();
+
+// ── User-scoped WebSocket for real-time sidebar badge updates ─────────────
+// Opens once per browser session from base.html: survives page navigations
+// that HTMX swaps without a full reload. Receives unreadCountUpdated events
+// and shows/hides [data-thread-badge] spans in the sidebar without polling.
+//
+// Why open here (not in a page-specific script):
+//   The sidebar is always visible across all goal pages, so badge state must
+//   be maintained at the layout level, not per-page. A single persistent WS
+//   here covers GO threads AND SHCA threads across all goals simultaneously.
+(function connectUserStream() {
+  let _ws = null;
+  let _reconnectDelay = 1500;  // ms; doubles on each failure, capped at 30 s
+
+  async function _connect() {
+    const user = firebase.auth().currentUser;
+    if (!user) return;  // onAuthStateChanged will re-trigger
+
+    let token;
+    try {
+      token = await user.getIdToken();
+    } catch (e) {
+      console.warn('[user-stream] getIdToken failed - skipping:', e);
+      return;
+    }
+
+    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+    _ws = new WebSocket(
+      `${proto}://${location.host}/stream/user-events?token=${encodeURIComponent(token)}`
+    );
+
+    _ws.addEventListener('open', () => {
+      _reconnectDelay = 1500;  // reset backoff on successful connect
+      console.debug('[user-stream] connected');
+    });
+
+    _ws.addEventListener('message', (ev) => {
+      let msg;
+      try { msg = JSON.parse(ev.data); } catch { return; }
+
+      if (msg.type !== 'unreadCountUpdated') return;  // ignore pings etc.
+
+      const { thread_id, count } = msg;
+      if (!thread_id) return;
+
+      // Suppress the badge while the user is actively watching this thread.
+      // goal_thread and chat templates set window.CURRENT_THREAD_ID on WS open
+      // and clear it on WS close so we don't count up while they're reading live.
+      if (thread_id === window.CURRENT_THREAD_ID) return;
+
+      // Find ALL spans watching this thread (there may be one per HTMX swap).
+      document.querySelectorAll(`[data-thread-badge="${thread_id}"]`).forEach(badge => {
+        if (count > 0) {
+          badge.textContent = count;
+          badge.classList.remove('hidden');
+        } else {
+          badge.classList.add('hidden');
+        }
+      });
+    });
+
+    _ws.addEventListener('close', () => {
+      _ws = null;
+      const delay = Math.min(_reconnectDelay, 30000);
+      _reconnectDelay = delay * 2;
+      console.debug(`[user-stream] closed: reconnecting in ${delay}ms`);
+      setTimeout(_connect, delay);
+    });
+
+    _ws.addEventListener('error', (e) => {
+      // onclose fires after onerror; reconnect is handled there.
+      console.warn('[user-stream] WS error:', e);
+    });
+  }
+
+  // Start as soon as Firebase confirms the user's identity.
+  firebase.auth().onAuthStateChanged((user) => {
+    if (user && !_ws) _connect();
+  });
+})();
+
+// Init on load
+initSidebar();
+_updateThemeIcons(document.documentElement.classList.contains('light'));
+</script>
+{% endif %}
+</body>
+</html>

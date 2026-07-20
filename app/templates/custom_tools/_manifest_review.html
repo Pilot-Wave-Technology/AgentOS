@@ -1,0 +1,80 @@
+{# Shared partial: renders the tool's declared manifest in human-readable form.
+
+   Include with: {% include "custom_tools/_manifest_review.html" %}
+   Expects `tool` in scope (with optional tool.manifest dict).
+
+   The manifest is what the OpenClaw capability runtime enforces. Showing it
+   here is the admin-side "permission prompt": they can see exactly what
+   network destinations, secrets, storage, and MCP servers a tool was granted
+   before deciding to enable / assign it to a profile. #}
+{% if tool.manifest %}
+{% set caps = tool.manifest.get('capabilities') or {} %}
+<div class="bg-gray-900 border border-gray-800 rounded-xl p-5 mb-4">
+  <div class="flex items-center justify-between mb-4">
+    <h2 class="text-xs font-semibold uppercase tracking-wider text-gray-500">Declared capabilities</h2>
+    <span class="text-xs text-gray-600">enforced by the runtime</span>
+  </div>
+
+  {% if not caps %}
+  <p class="text-sm text-gray-500">No capabilities declared: tool runs sandboxed with no I/O access.</p>
+  {% endif %}
+
+  <dl class="space-y-3 text-sm">
+    {% if caps.net %}
+    <div>
+      <dt class="text-gray-400 mb-1">net.fetch: <span class="text-xs text-gray-600">outbound HTTP hosts</span></dt>
+      <dd class="flex flex-wrap gap-1.5">
+        {% for host in caps.net.get('hosts') or [] %}
+        <span class="pill bg-indigo-900/40 text-indigo-300 font-mono text-xs">{{ host }}</span>
+        {% endfor %}
+      </dd>
+    </div>
+    {% endif %}
+
+    {% if caps.secrets %}
+    <div>
+      <dt class="text-gray-400 mb-1">secrets.get: <span class="text-xs text-gray-600">credentials by name</span></dt>
+      <dd class="flex flex-wrap gap-1.5">
+        {% for name in caps.secrets.get('names') or [] %}
+        <span class="pill bg-amber-900/40 text-amber-300 font-mono text-xs">{{ name }}</span>
+        {% endfor %}
+      </dd>
+    </div>
+    {% endif %}
+
+    {% if caps.storage %}
+    <div>
+      <dt class="text-gray-400 mb-1">storage: <span class="text-xs text-gray-600">workspace filesystem</span></dt>
+      <dd>
+        <span class="pill bg-teal-900/40 text-teal-300 text-xs">
+          {{ caps.storage.get('mode', 'read') }} access
+        </span>
+        <span class="text-xs text-gray-600 ml-2">scoped to the calling agent's workspace</span>
+      </dd>
+    </div>
+    {% endif %}
+
+    {% if caps.mcp %}
+    <div>
+      <dt class="text-gray-400 mb-1">mcp.call: <span class="text-xs text-gray-600">allowed MCP servers</span></dt>
+      <dd class="flex flex-wrap gap-1.5">
+        {% for server in caps.mcp.get('servers') or [] %}
+        <span class="pill bg-purple-900/40 text-purple-300 font-mono text-xs break-all">{{ server }}</span>
+        {% endfor %}
+      </dd>
+    </div>
+    {% endif %}
+
+    {% if tool.manifest.get('limits') %}
+    <div>
+      <dt class="text-gray-400 mb-1">limits</dt>
+      <dd class="text-xs text-gray-500">
+        {% if tool.manifest.limits.get('timeout_ms') %}
+        timeout: {{ tool.manifest.limits.timeout_ms }} ms
+        {% endif %}
+      </dd>
+    </div>
+    {% endif %}
+  </dl>
+</div>
+{% endif %}

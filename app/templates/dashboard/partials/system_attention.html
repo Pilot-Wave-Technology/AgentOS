@@ -1,0 +1,36 @@
+{% set at = system.attention %}
+<div class="bg-gray-900 border border-gray-800 rounded-xl p-5">
+  <div class="flex items-center justify-between mb-3">
+    <h3 class="font-semibold">Needs Attention</h3>
+    {% if at.total > 0 %}
+    <span class="text-xs px-2 py-0.5 rounded-full bg-amber-900/40 text-amber-300">{{ at.total }}</span>
+    {% endif %}
+  </div>
+
+  {% if at.rows %}
+  <ul class="space-y-1">
+    {% for it in at.rows %}
+    {% if it.href %}
+    <a href="{{ it.href }}"
+       class="flex items-center gap-3 text-sm hover:bg-gray-800 rounded-lg px-2 py-2 -mx-2 transition-colors">
+      <span class="w-2 h-2 rounded-full bg-amber-400 flex-shrink-0"></span>
+      <span class="flex-1">{{ it.label }}</span>
+      <span class="text-gray-600">→</span>
+    </a>
+    {% else %}
+    <div class="flex items-center gap-3 text-sm px-2 py-2 -mx-2">
+      <span class="w-2 h-2 rounded-full bg-amber-400 flex-shrink-0"></span>
+      <span class="flex-1">{{ it.label }}</span>
+    </div>
+    {% endif %}
+    {% endfor %}
+  </ul>
+  {% else %}
+  <div class="flex items-center gap-2 text-sm text-green-400">
+    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4.5 12.75l6 6 9-13.5"/>
+    </svg>
+    Nothing needs attention.
+  </div>
+  {% endif %}
+</div>

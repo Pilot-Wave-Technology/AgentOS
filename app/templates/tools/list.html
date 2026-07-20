@@ -1,0 +1,539 @@
+{% extends "base.html" %}
+{% block title %}Tool Registry{% endblock %}
+
+{# Helpers: preserve the other two tabs' search/page state on every tab link #}
+{% set tools_base = "tools_q=" ~ tools_q ~ "&profiles_page=" ~ profiles_page ~ "&profiles_q=" ~ profiles_q ~ "&custom_tools_page=" ~ custom_tools_page ~ "&custom_tools_q=" ~ custom_tools_q ~ "&custom_tools_tier=" ~ custom_tools_tier %}
+{% set profiles_base = "profiles_q=" ~ profiles_q ~ "&tools_page=" ~ tools_page ~ "&tools_q=" ~ tools_q ~ "&custom_tools_page=" ~ custom_tools_page ~ "&custom_tools_q=" ~ custom_tools_q ~ "&custom_tools_tier=" ~ custom_tools_tier %}
+{% set custom_tools_base = "custom_tools_q=" ~ custom_tools_q ~ "&custom_tools_tier=" ~ custom_tools_tier ~ "&tools_page=" ~ tools_page ~ "&tools_q=" ~ tools_q ~ "&profiles_page=" ~ profiles_page ~ "&profiles_q=" ~ profiles_q %}
+
+{% block content %}
+<div class="p-8 max-w-6xl mx-auto">
+  <a href="/settings" class="inline-flex items-center gap-1 text-xs text-gray-500 hover:text-gray-300 transition-colors mb-5">
+    <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"/></svg>
+    Settings
+  </a>
+
+  {# Page header #}
+  <div class="flex items-center justify-between mb-6">
+    <div>
+      <h1 class="text-2xl font-bold">Tool Registry</h1>
+      <p class="text-gray-400 text-sm mt-1">{{ tools_total }} tool{{ 's' if tools_total != 1 else '' }} · {{ profiles_total }} profile{{ 's' if profiles_total != 1 else '' }}</p>
+    </div>
+    {% if can_edit %}
+    <div class="flex gap-2">
+      <button id="btn-sync-catalog" onclick="syncCatalog()" class="btn btn-secondary btn-sm">↻ Sync from OpenClaw</button>
+    </div>
+    {% endif %}
+  </div>
+
+  {# ── Tab bar ── #}
+  <div class="flex gap-1 border-b border-gray-800 mb-6">
+    <a href="/settings/tools?tab=system-tools&{{ tools_base }}"
+       class="px-4 py-2 text-sm rounded-t-lg transition-colors {% if tab == 'system-tools' %}text-indigo-400 border-b-2 border-indigo-500{% else %}text-gray-500 hover:text-gray-300{% endif %}">
+      System Tools
+    </a>
+    <a href="/settings/tools?tab=custom-tools&{{ custom_tools_base }}"
+       class="px-4 py-2 text-sm rounded-t-lg transition-colors flex items-center gap-1.5 {% if tab == 'custom-tools' %}text-indigo-400 border-b-2 border-indigo-500{% else %}text-gray-500 hover:text-gray-300{% endif %}">
+      Custom Tools
+      {% if custom_tools_total %}
+      <span class="text-2xs px-1.5 py-0.5 rounded-full {% if tab == 'custom-tools' %}bg-indigo-900/60 text-indigo-300{% else %}bg-gray-800 text-gray-500{% endif %}">
+        {{ custom_tools_total }}
+      </span>
+      {% endif %}
+    </a>
+    <a href="/settings/tools?tab=profiles&{{ profiles_base }}"
+       class="px-4 py-2 text-sm rounded-t-lg transition-colors {% if tab == 'profiles' %}text-indigo-400 border-b-2 border-indigo-500{% else %}text-gray-500 hover:text-gray-300{% endif %}">
+      Profiles
+    </a>
+  </div>
+
+  {# ══════════════════════════════════════════════════════════════════════ #}
+  {# Tools tab                                                              #}
+  {# ══════════════════════════════════════════════════════════════════════ #}
+  {% if tab == 'system-tools' %}
+
+  {# Search + count #}
+  <div class="flex items-center justify-between mb-6">
+    <form method="get" action="/settings/tools" id="tools-search-form">
+      <input type="hidden" name="tab" value="system-tools" />
+      <input type="hidden" name="profiles_page" value="{{ profiles_page }}" />
+      <input type="hidden" name="profiles_q" value="{{ profiles_q }}" />
+      <input type="hidden" name="custom_tools_page" value="{{ custom_tools_page }}" />
+      <input type="hidden" name="custom_tools_q" value="{{ custom_tools_q }}" />
+      <div class="relative">
+        <input name="tools_q" type="text" value="{{ tools_q }}"
+          placeholder="Filter tools by name, group, source… (Enter)"
+          onkeydown="if(event.key==='Enter'){document.getElementById('tools-search-form').submit()}"
+          class="px-3 py-1.5 bg-gray-800 border border-gray-700 rounded-lg text-sm focus:outline-none focus:border-indigo-500 w-80 pr-8" />
+        {% if tools_q %}
+        <a href="/settings/tools?tab=system-tools&{{ tools_base | replace('tools_q=' ~ tools_q, 'tools_q=') }}"
+           class="absolute right-2 top-1/2 -translate-y-1/2 text-gray-500 hover:text-gray-300 text-xs">✕</a>
+        {% endif %}
+      </div>
+    </form>
+    <span class="text-xs text-gray-500">
+      {% if tools_q %}{{ tools_total }} match{{ 'es' if tools_total != 1 else '' }} for "{{ tools_q }}"
+      {% else %}{{ tools_total }} active tool{{ 's' if tools_total != 1 else '' }}{% endif %}
+      {% if tools_pages > 1 %} · page {{ tools_page }}/{{ tools_pages }}{% endif %}
+    </span>
+  </div>
+
+  {# Tools pagination #}
+  {% if tools_pages > 1 %}
+  <div class="flex items-center justify-between mb-4 text-xs text-gray-500">
+    <span>Page {{ tools_page }} of {{ tools_pages }}</span>
+    <div class="flex gap-2">
+      {% if tools_page > 1 %}
+      <a href="/settings/tools?tab=system-tools&tools_page={{ tools_page - 1 }}&{{ tools_base }}" class="btn btn-secondary btn-sm">← Prev</a>
+      {% endif %}
+      {% if tools_page < tools_pages %}
+      <a href="/settings/tools?tab=system-tools&tools_page={{ tools_page + 1 }}&{{ tools_base }}" class="btn btn-secondary btn-sm">Next →</a>
+      {% endif %}
+    </div>
+  </div>
+  {% endif %}
+
+  {# Grouped card sections #}
+  {% if tools_by_group %}
+  <div class="space-y-6">
+    {% for group_name in tools_by_group.keys() | sort %}
+    {% set group_tools = tools_by_group[group_name] %}
+    <div>
+      <div class="flex items-center gap-3 mb-3">
+        <h2 class="text-xs font-semibold uppercase tracking-wider text-gray-500">{{ group_name }}</h2>
+        <span class="text-xs text-gray-600">{{ group_tools | length }}</span>
+        <div class="flex-1 border-t border-gray-800"></div>
+      </div>
+      <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+        {% for t in group_tools %}
+        <a href="{% if t.tier %}/custom-tools/{{ t.name }}{% else %}/settings/tools/{{ t.name }}{% endif %}"
+           class="flex flex-col gap-1 px-4 py-3 bg-gray-800/60 border border-gray-700 rounded-lg
+                  hover:border-indigo-500/60 hover:bg-gray-800 transition-colors">
+          <div class="flex items-center justify-between gap-2">
+            <span class="font-mono text-sm text-indigo-300 truncate">{{ t.name }}</span>
+            {% if t.is_core %}
+            <span class="pill pill-neutral flex-shrink-0">core</span>
+            {% else %}
+            <span class="pill bg-amber-900/40 text-amber-300 flex-shrink-0">{{ t.source }}</span>
+            {% endif %}
+          </div>
+          {% if t.label %}
+          <span class="text-xs text-gray-400 truncate">{{ t.label }}</span>
+          {% endif %}
+          {% if t.description %}
+          <span class="text-xs text-gray-600 line-clamp-1 mt-0.5">{{ t.description }}</span>
+          {% endif %}
+        </a>
+        {% endfor %}
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+  {% else %}
+  <div class="text-center py-16 border border-gray-800 rounded-xl">
+    {% if tools_q %}
+    <p class="text-gray-400">No tools match "{{ tools_q }}".</p>
+    {% else %}
+    <p class="text-gray-400 mb-4">No tools registered yet.</p>
+    {% if can_edit %}
+    <a href="/settings/tools/new" class="btn btn-primary btn-sm">+ Register first tool</a>
+    {% endif %}
+    {% endif %}
+  </div>
+  {% endif %}
+
+
+  {# Inactive tools (disabled / deprecated / unavailable): collapsed, only on tools tab #}
+  {% if inactive_tools %}
+  {% set status_pill = {
+    'disabled':    'pill-neutral',
+    'deprecated':  'bg-amber-900/40 text-amber-300',
+    'unavailable': 'bg-red-900/40 text-red-300',
+  } %}
+  <details class="border border-gray-800 rounded-lg mt-8">
+    <summary class="px-4 py-3 text-sm text-gray-500 cursor-pointer hover:text-gray-300 select-none">
+      {{ inactive_tools | length }} inactive tool{{ 's' if inactive_tools | length != 1 else '' }}
+    </summary>
+    <div class="overflow-x-auto border-t border-gray-800">
+      <table class="w-full text-sm">
+        <tbody class="divide-y divide-gray-800/60">
+          {% for t in inactive_tools %}
+          <tr class="hover:bg-gray-900/40 transition-colors">
+            <td class="py-3 px-4"><span class="font-mono text-gray-600 text-xs">{{ t.name }}</span></td>
+            <td class="py-3 pr-4 text-gray-600">{{ t.label or 'Not Set' }}</td>
+            <td class="py-3 pr-4"><span class="pill pill-neutral">{{ t.group_name or 'Not Set' }}</span></td>
+            <td class="py-3 pr-4"><span class="pill {{ status_pill.get(t.status, 'pill-neutral') }}">{{ t.status }}</span></td>
+            <td class="py-3 pr-4"><a href="/settings/tools/{{ t.name }}" class="btn btn-secondary btn-sm">View</a></td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </details>
+  {% endif %}
+
+  {# ══════════════════════════════════════════════════════════════════════ #}
+  {# Profiles tab                                                           #}
+  {# ══════════════════════════════════════════════════════════════════════ #}
+  {% elif tab == 'profiles' %}
+
+  {% set profile_status_pill = {
+    'active':     'pill-success',
+    'deprecated': 'bg-amber-900/40 text-amber-300',
+  } %}
+
+  <div class="flex items-center justify-between mb-4">
+    <p class="text-sm text-gray-500">Named collections of tools assigned to agent templates.</p>
+    {% if can_edit %}
+    <a href="/settings/tool-profiles/new" class="btn btn-primary btn-sm">+ New Profile</a>
+    {% endif %}
+  </div>
+
+  {# Search + count #}
+  <div class="flex items-center justify-between mb-6">
+    <form method="get" action="/settings/tools" id="profiles-search-form">
+      <input type="hidden" name="tab" value="profiles" />
+      <input type="hidden" name="tools_page" value="{{ tools_page }}" />
+      <input type="hidden" name="tools_q" value="{{ tools_q }}" />
+      <input type="hidden" name="custom_tools_page" value="{{ custom_tools_page }}" />
+      <input type="hidden" name="custom_tools_q" value="{{ custom_tools_q }}" />
+      <div class="relative">
+        <input name="profiles_q" type="text" value="{{ profiles_q }}"
+          placeholder="Filter by ID, name, description… (Enter)"
+          onkeydown="if(event.key==='Enter'){document.getElementById('profiles-search-form').submit()}"
+          class="px-3 py-1.5 bg-gray-800 border border-gray-700 rounded-lg text-sm focus:outline-none focus:border-indigo-500 w-80 pr-8" />
+        {% if profiles_q %}
+        <a href="/settings/tools?tab=profiles&{{ profiles_base | replace('profiles_q=' ~ profiles_q, 'profiles_q=') }}"
+           class="absolute right-2 top-1/2 -translate-y-1/2 text-gray-500 hover:text-gray-300 text-xs">✕</a>
+        {% endif %}
+      </div>
+    </form>
+    <span class="text-xs text-gray-500">
+      {% if profiles_q %}{{ profiles_total }} match{{ 'es' if profiles_total != 1 else '' }} for "{{ profiles_q }}"
+      {% else %}{{ profiles_total }} active profile{{ 's' if profiles_total != 1 else '' }}{% endif %}
+      {% if profiles_pages > 1 %} · page {{ profiles_page }}/{{ profiles_pages }}{% endif %}
+    </span>
+  </div>
+
+  {# Profiles pagination #}
+  {% if profiles_pages > 1 %}
+  <div class="flex items-center justify-between mb-4 text-xs text-gray-500">
+    <span>Page {{ profiles_page }} of {{ profiles_pages }}</span>
+    <div class="flex gap-2">
+      {% if profiles_page > 1 %}
+      <a href="/settings/tools?tab=profiles&profiles_page={{ profiles_page - 1 }}&{{ profiles_base }}" class="btn btn-secondary btn-sm">← Prev</a>
+      {% endif %}
+      {% if profiles_page < profiles_pages %}
+      <a href="/settings/tools?tab=profiles&profiles_page={{ profiles_page + 1 }}&{{ profiles_base }}" class="btn btn-secondary btn-sm">Next →</a>
+      {% endif %}
+    </div>
+  </div>
+  {% endif %}
+
+  {% if profiles %}
+  <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+    {% for p in profiles %}
+    <a href="/settings/tool-profiles/{{ p.id }}"
+       class="flex flex-col gap-1 px-4 py-3 bg-gray-800/60 border border-gray-700 rounded-lg
+              hover:border-indigo-500/60 hover:bg-gray-800 transition-colors">
+      <div class="flex items-center justify-between gap-2">
+        <span class="text-sm text-gray-200 font-medium truncate">{{ p.name | replace('SHCA Coordinator', 'Assistant Coordinator') }}</span>
+        <span class="pill {{ profile_status_pill.get(p.status, 'pill-neutral') }} flex-shrink-0">{{ p.status }}</span>
+      </div>
+      <div class="flex items-center gap-2 text-xs text-gray-500">
+        <span class="font-mono text-gray-600 truncate">{{ p.id | replace('shca-coordinator', 'assistant-coordinator') }}</span>
+        <span>·</span>
+        <span class="pill pill-info flex-shrink-0">{{ (p.tool_names or []) | length }} tool{{ 's' if (p.tool_names or []) | length != 1 else '' }}</span>
+      </div>
+      {% if p.description %}
+      <span class="text-xs text-gray-600 line-clamp-1 mt-0.5">{{ p.description }}</span>
+      {% endif %}
+      <span class="text-2xs text-gray-700 mt-1" {% if p.created_at %}data-utc="{{ p.created_at.isoformat() }}"{% endif %}>Created {{ p.created_at.strftime('%Y-%m-%d') if p.created_at else 'Not Set' }}{% if p.created_at %} UTC{% endif %}</span>
+    </a>
+    {% endfor %}
+  </div>
+
+  {% else %}
+  <div class="text-center py-16 border border-gray-800 rounded-xl">
+    {% if profiles_q %}
+    <p class="text-gray-400">No profiles match "{{ profiles_q }}".</p>
+    {% else %}
+    <p class="text-gray-400 mb-4">No profiles defined yet.</p>
+    {% if can_edit %}
+    <a href="/settings/tool-profiles/new" class="btn btn-primary btn-sm">+ Create first profile</a>
+    {% endif %}
+    {% endif %}
+  </div>
+  {% endif %}
+
+  {# ══════════════════════════════════════════════════════════════════════ #}
+  {# Custom Tools tab                                                       #}
+  {# ══════════════════════════════════════════════════════════════════════ #}
+  {% elif tab == 'custom-tools' %}
+
+  {% set status_pill = {
+    'enabled':    'pill-success',
+    'disabled':   'pill-neutral',
+    'deprecated': 'bg-amber-900/40 text-amber-300',
+  } %}
+
+  <div class="flex items-center justify-between mb-6">
+    <p class="text-sm text-gray-500">
+      Admin-defined tools loaded dynamically into all agents. No gateway restart required.
+    </p>
+    <div class="flex gap-2 items-center">
+      <a href="/custom-tools/credentials" class="btn btn-secondary btn-sm">Credentials</a>
+      {% if can_edit %}
+      <div class="relative" id="new-custom-tool-menu">
+        <button onclick="toggleCustomMenu()"
+          class="btn btn-primary btn-sm flex items-center gap-1">
+          + New Tool
+          <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/>
+          </svg>
+        </button>
+        <div id="custom-tool-dropdown"
+          class="hidden absolute right-0 mt-1 bg-surface border border-border rounded-lg shadow-xl z-20 min-w-[180px] py-1">
+          <a href="/custom-tools/new/http_action"
+            class="flex items-center gap-2 px-4 py-2.5 text-sm hover:bg-surface-hover transition-colors">
+            <span class="text-blue-400 text-xs font-medium w-8 shrink-0">HTTP</span>HTTP Action</a>
+          <a href="/custom-tools/new/typescript"
+            class="flex items-center gap-2 px-4 py-2.5 text-sm hover:bg-surface-hover transition-colors">
+            <span class="text-green-400 text-xs font-medium w-8 shrink-0">TS</span>TypeScript</a>
+          <a href="/custom-tools/openapi/import"
+            class="flex items-center gap-2 px-4 py-2.5 text-sm hover:bg-surface-hover transition-colors">
+            <span class="text-purple-400 text-xs font-medium w-8 shrink-0">API</span>OpenAPI Import</a>
+          <a href="/custom-tools/mcp/import"
+            class="flex items-center gap-2 px-4 py-2.5 text-sm hover:bg-surface-hover transition-colors">
+            <span class="text-teal-400 text-xs font-medium w-8 shrink-0">MCP</span>MCP Server</a>
+        </div>
+      </div>
+      {% endif %}
+    </div>
+  </div>
+
+  {# Search + count #}
+  <div class="flex items-center justify-between mb-6">
+    <form method="get" action="/settings/tools" id="custom-tools-search-form" class="flex items-center gap-2">
+      <input type="hidden" name="tab" value="custom-tools" />
+      <input type="hidden" name="tools_page" value="{{ tools_page }}" />
+      <input type="hidden" name="tools_q" value="{{ tools_q }}" />
+      <input type="hidden" name="profiles_page" value="{{ profiles_page }}" />
+      <input type="hidden" name="profiles_q" value="{{ profiles_q }}" />
+      <select name="custom_tools_tier" onchange="this.form.submit()"
+        class="px-2 py-1.5 bg-gray-800 border border-gray-700 rounded-lg text-sm focus:outline-none focus:border-indigo-500">
+        <option value="" {% if not custom_tools_tier %}selected{% endif %}>All types</option>
+        {% for tier_value, tier_label in [("http_action", "HTTP Action"), ("typescript", "TypeScript"), ("openapi", "OpenAPI"), ("mcp_server", "MCP Server")] %}
+        <option value="{{ tier_value }}" {% if custom_tools_tier == tier_value %}selected{% endif %}>{{ tier_label }}</option>
+        {% endfor %}
+      </select>
+      <div class="relative">
+        <input name="custom_tools_q" type="text" value="{{ custom_tools_q }}"
+          placeholder="Filter by name, label, tier, status… (Enter)"
+          onkeydown="if(event.key==='Enter'){document.getElementById('custom-tools-search-form').submit()}"
+          class="px-3 py-1.5 bg-gray-800 border border-gray-700 rounded-lg text-sm focus:outline-none focus:border-indigo-500 w-80 pr-8" />
+        {% if custom_tools_q %}
+        <a href="/settings/tools?tab=custom-tools&{{ custom_tools_base | replace('custom_tools_q=' ~ custom_tools_q, 'custom_tools_q=') }}"
+           class="absolute right-2 top-1/2 -translate-y-1/2 text-gray-500 hover:text-gray-300 text-xs">✕</a>
+        {% endif %}
+      </div>
+    </form>
+    <span class="text-xs text-gray-500">
+      {% if custom_tools_q or custom_tools_tier %}{{ custom_tools_matches }} match{{ 'es' if custom_tools_matches != 1 else '' }}
+      {% else %}{{ custom_tools_total }} tool{{ 's' if custom_tools_total != 1 else '' }}{% endif %}
+      {% if custom_tools_pages > 1 %} · page {{ custom_tools_page }}/{{ custom_tools_pages }}{% endif %}
+    </span>
+  </div>
+
+  {# Custom tools pagination #}
+  {% if custom_tools_pages > 1 %}
+  <div class="flex items-center justify-between mb-4 text-xs text-gray-500">
+    <span>Page {{ custom_tools_page }} of {{ custom_tools_pages }}</span>
+    <div class="flex gap-2">
+      {% if custom_tools_page > 1 %}
+      <a href="/settings/tools?tab=custom-tools&custom_tools_page={{ custom_tools_page - 1 }}&{{ custom_tools_base }}" class="btn btn-secondary btn-sm">← Prev</a>
+      {% endif %}
+      {% if custom_tools_page < custom_tools_pages %}
+      <a href="/settings/tools?tab=custom-tools&custom_tools_page={{ custom_tools_page + 1 }}&{{ custom_tools_base }}" class="btn btn-secondary btn-sm">Next →</a>
+      {% endif %}
+    </div>
+  </div>
+  {% endif %}
+
+  {% if custom_tools %}
+  {% if can_edit %}
+  <div class="flex items-center gap-2 mb-4 text-xs text-gray-500">
+    <input type="checkbox" id="select-all-tools" onchange="toggleSelectAll(this)"
+      class="w-4 h-4 accent-indigo-500" />
+    <label for="select-all-tools" class="cursor-pointer select-none">Select all on this page</label>
+  </div>
+  {% endif %}
+
+  <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+    {% for t in custom_tools %}
+    <div class="relative flex flex-col gap-1 px-4 py-3 {% if can_edit %}pl-9{% endif %} bg-gray-800/60 border border-gray-700 rounded-lg
+                hover:border-indigo-500/60 hover:bg-gray-800 transition-colors tool-tile">
+      {% if can_edit %}
+      <input type="checkbox" value="{{ t.name }}" onchange="onToolCheckChange()"
+        class="tool-checkbox absolute left-3 top-3.5 w-4 h-4 accent-indigo-500" />
+      {% endif %}
+      <div class="flex items-center justify-between gap-2">
+        <a href="/custom-tools/{{ t.name }}" class="font-mono text-sm text-indigo-300 truncate hover:underline">{{ t.name }}</a>
+        <span class="pill {{ status_pill.get(t.status, 'pill-neutral') }} flex-shrink-0">{{ t.status }}</span>
+      </div>
+      <div class="flex items-center gap-2">
+        <span class="text-xs text-gray-400 truncate">{{ t.label }}</span>
+        <span class="text-2xs text-gray-600 uppercase tracking-wider flex-shrink-0">{{ t.tier }}</span>
+      </div>
+      {% if t.description %}
+      <p class="text-2xs text-gray-500 line-clamp-2">{{ t.description }}</p>
+      {% endif %}
+      <div class="flex items-center justify-between gap-2 text-2xs text-gray-600 mt-1">
+        <span class="truncate">
+          {% if t.credential_id %}
+            {% for c in credentials %}{% if c.id|string == t.credential_id|string %}{{ c.name }}{% endif %}{% endfor %}
+          {% else %}no credential{% endif %}
+        </span>
+        <span class="flex-shrink-0" {% if t.created_at %}data-utc="{{ t.created_at.isoformat() }}"{% endif %}>{{ t.created_at.strftime('%Y-%m-%d') if t.created_at else 'Not Set' }}{% if t.created_at %} UTC{% endif %}</span>
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+
+  {% if can_edit %}
+  <!-- Bulk action bar: appears when ≥1 tool selected -->
+  <div id="bulk-bar"
+    class="hidden fixed bottom-6 left-1/2 -translate-x-1/2 z-30
+           flex items-center gap-4 px-5 py-3
+           bg-gray-900 border border-gray-700 rounded-xl shadow-2xl text-sm">
+    <span id="bulk-count" class="text-gray-300 font-medium tabular-nums min-w-[6rem]"></span>
+    <div class="flex items-center gap-2">
+      <label class="text-gray-500 text-xs">Assign credential</label>
+      <select id="bulk-credential"
+        class="px-3 py-1.5 bg-gray-800 border border-gray-700 rounded-lg text-sm focus:outline-none focus:border-indigo-500">
+        <option value="">- None (clear) -</option>
+        {% for c in credentials %}
+        <option value="{{ c.id }}">{{ c.name }} ({{ c.credential_type }})</option>
+        {% endfor %}
+      </select>
+      <button onclick="applyBulkCredential()"
+        class="btn btn-primary btn-sm">Apply</button>
+    </div>
+    <button onclick="clearSelection()" class="text-gray-600 hover:text-gray-300 text-xs ml-1">✕ Clear</button>
+  </div>
+  {% endif %}
+
+  {% else %}
+  <div class="text-center py-16 border border-gray-800 rounded-xl">
+    {% if custom_tools_q and custom_tools_tier %}
+    <p class="text-gray-400">No tools match "{{ custom_tools_q }}" in {{ custom_tools_tier }}.</p>
+    {% elif custom_tools_q %}
+    <p class="text-gray-400">No tools match "{{ custom_tools_q }}".</p>
+    {% elif custom_tools_tier %}
+    <p class="text-gray-400">No tools of type "{{ custom_tools_tier }}".</p>
+    {% else %}
+    <p class="text-gray-400 mb-2">No custom tools yet.</p>
+    {% if can_edit %}
+    <p class="text-gray-600 text-sm mb-6">Add an HTTP Action, TypeScript function, import an OpenAPI spec, or connect an MCP server.</p>
+    <div class="flex justify-center gap-3">
+      <a href="/custom-tools/new/http_action" class="btn btn-primary btn-sm">HTTP Action</a>
+      <a href="/custom-tools/new/typescript" class="btn btn-secondary btn-sm">TypeScript</a>
+      <a href="/custom-tools/openapi/import" class="btn btn-secondary btn-sm">OpenAPI Import</a>
+      <a href="/custom-tools/mcp/import" class="btn btn-secondary btn-sm">MCP Server</a>
+    </div>
+    {% endif %}
+    {% endif %}
+  </div>
+  {% endif %}
+
+  <script>
+  function toggleCustomMenu() {
+    document.getElementById('custom-tool-dropdown').classList.toggle('hidden');
+  }
+  document.addEventListener('click', function(e) {
+    const menu = document.getElementById('new-custom-tool-menu');
+    if (menu && !menu.contains(e.target)) {
+      document.getElementById('custom-tool-dropdown').classList.add('hidden');
+    }
+  });
+
+  function getChecked() {
+    return [...document.querySelectorAll('.tool-checkbox:checked')].map(cb => cb.value);
+  }
+
+  function onToolCheckChange() {
+    const checked = getChecked();
+    const total = document.querySelectorAll('.tool-checkbox').length;
+    document.getElementById('select-all-tools').indeterminate = checked.length > 0 && checked.length < total;
+    document.getElementById('select-all-tools').checked = checked.length === total;
+    updateBulkBar(checked);
+  }
+
+  function toggleSelectAll(cb) {
+    document.querySelectorAll('.tool-checkbox').forEach(c => { c.checked = cb.checked; });
+    updateBulkBar(cb.checked ? getChecked() : []);
+  }
+
+  function updateBulkBar(checked) {
+    const bar = document.getElementById('bulk-bar');
+    if (checked.length === 0) {
+      bar.classList.add('hidden');
+    } else {
+      document.getElementById('bulk-count').textContent = checked.length + ' tool' + (checked.length > 1 ? 's' : '') + ' selected';
+      bar.classList.remove('hidden');
+    }
+  }
+
+  function clearSelection() {
+    document.querySelectorAll('.tool-checkbox').forEach(c => { c.checked = false; });
+    document.getElementById('select-all-tools').checked = false;
+    document.getElementById('select-all-tools').indeterminate = false;
+    updateBulkBar([]);
+  }
+
+  async function applyBulkCredential() {
+    const toolNames = getChecked();
+    if (!toolNames.length) return;
+    const credentialId = document.getElementById('bulk-credential').value || null;
+    const label = credentialId
+      ? document.getElementById('bulk-credential').options[document.getElementById('bulk-credential').selectedIndex].text
+      : 'none';
+
+    try {
+      const r = await fetch('/api/custom-tools/bulk/credential', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ tool_names: toolNames, credential_id: credentialId }),
+      });
+      if (!r.ok) { const d = await r.json(); throw new Error(d.detail || 'Failed'); }
+      const data = await r.json();
+      clearSelection();
+      window.location.reload();
+    } catch(e) {
+      showToast('Error: ' + e.message, 'error');
+    }
+  }
+  </script>
+
+  {% endif %}{# end tab #}
+
+</div>
+
+<script>
+async function syncCatalog() {
+  const btn = document.getElementById('btn-sync-catalog');
+  btn.disabled = true; btn.textContent = '↻ Syncing…';
+  try {
+    const r = await fetch('/api/tools/registry/sync', { method: 'POST' });
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.detail || 'Sync failed');
+    showToast(`Sync complete: added: ${data.added}, updated: ${data.updated}, deprecated: ${data.deprecated}, total: ${data.total}`, 'success');
+    window.location.reload();
+  } catch(e) {
+    showToast('Sync error: ' + e.message, 'error');
+  } finally {
+    btn.disabled = false; btn.textContent = '↻ Sync from OpenClaw';
+  }
+}
+</script>
+{% endblock %}

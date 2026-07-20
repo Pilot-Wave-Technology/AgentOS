@@ -1,0 +1,359 @@
+{% extends "base.html" %}
+{% from "partials/_info_popover.html" import info_popover %}
+{% block title %}{{ agent.name }}: Instance{% endblock %}
+{% block content %}
+<div class="p-6 max-w-4xl mx-auto">
+
+  <!-- ── Back + header ────────────────────────────────────────────────── -->
+  <div class="mb-6">
+    <a href="/settings/agent-registry?view=instances" class="inline-flex items-center gap-1.5 text-xs text-gray-500 hover:text-gray-300 transition-colors mb-4">
+      <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"/>
+      </svg>
+      Agent Registry
+    </a>
+    <div class="flex items-start justify-between">
+      <div class="flex items-center gap-3">
+        {% if agent.emoji %}<span class="text-3xl leading-none">{{ agent.emoji }}</span>{% endif %}
+        <div>
+          <div class="flex items-center gap-2 flex-wrap">
+            <h1 class="text-xl font-bold text-gray-100">{{ agent.name }}</h1>
+            <span class="pill {% if agent.type == 'SHCA' %}pill-info{% elif agent.type == 'GO' %}pill-success{% elif agent.type == 'RA' %}bg-amber-900/40 text-amber-300{% else %}bg-purple-900/40 text-purple-300{% endif %}">{{ 'Assistant' if agent.type == 'SHCA' else agent.type }}</span>
+            <span class="pill {% if agent.scope == 'goal' %}pill-warning{% else %}pill-neutral{% endif %}">{{ agent.scope or "task" }}</span>
+            {{ info_popover(
+              "GO orchestrates a goal and generates stories/tasks. Assistant is the long-lived per-user assistant. IA is a task-scoped worker spun up per task. RA automatically reviews finished task output.",
+              label="What do GO / Assistant / IA / RA mean?"
+            ) }}
+          </div>
+          <div class="font-mono text-xs text-indigo-400 mt-0.5">{{ agent.id }}</div>
+        </div>
+      </div>
+      <!-- Sync badge -->
+      <div class="flex-shrink-0">
+        {% set is_drifted = agent.config_version and agent.gateway_synced_version and agent.gateway_synced_version < agent.config_version %}
+        {% if agent.last_sync_error %}
+        <span class="flex items-center gap-1.5 text-xs text-red-400 px-2.5 py-1 rounded-full bg-red-900/30 border border-red-800/40"
+              title="{{ agent.last_sync_error }}">
+          <span class="w-1.5 h-1.5 rounded-full bg-red-500"></span>Sync error
+        </span>
+        {% elif is_drifted %}
+        <span class="flex items-center gap-1.5 text-xs text-amber-400 px-2.5 py-1 rounded-full bg-amber-900/30 border border-amber-800/40"
+              title="Config v{{ agent.config_version }}: gateway on v{{ agent.gateway_synced_version }}">
+          <span class="w-1.5 h-1.5 rounded-full bg-amber-400"></span>Drift v{{ agent.gateway_synced_version }}→{{ agent.config_version }}
+        </span>
+        {% else %}
+        <span class="flex items-center gap-1.5 text-xs text-emerald-400 px-2.5 py-1 rounded-full bg-emerald-900/30 border border-emerald-800/40">
+          <span class="w-1.5 h-1.5 rounded-full bg-emerald-500"></span>Synced
+        </span>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+
+  {% if is_runtime_instance %}
+  <div class="mb-5 flex items-center gap-2.5 px-4 py-3 rounded-lg bg-amber-900/20 border border-amber-800/40 text-amber-300 text-sm">
+    <svg class="w-4 h-4 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/>
+    </svg>
+    <span>Runtime instance: configuration is inherited from the template and cannot be edited here.
+      {% if agent.task_id %}<a href="#" class="underline ml-1 text-amber-200">Task {{ agent.task_id }}</a>{% endif %}
+    </span>
+    {{ info_popover(
+      "Every " ~ agent.type ~ " instance is created from a template in the Agent Registry's Templates tab. Editing settings like model or tools happens on the template: every instance made from it inherits the change on its next sync.",
+      label="What's a template vs. an instance?"
+    ) }}
+  </div>
+  {% endif %}
+
+  {% if not can_edit %}
+  <!-- Read-only view: no form, no inputs -->
+  <div class="space-y-5">
+    <div class="card p-5 space-y-3">
+      <h2 class="text-xs font-semibold uppercase tracking-wider text-gray-500">Basics</h2>
+      <div class="grid grid-cols-3 gap-4 text-sm">
+        <div><p class="text-xs text-gray-500 mb-0.5">Model</p><p class="font-mono text-gray-200">{{ agent.model.split("/")[-1] if agent.model and "/" in agent.model else (agent.model or 'Not Set') }}</p></div>
+        <div><p class="text-xs text-gray-500 mb-0.5">Max tokens</p><p class="text-gray-200">{{ agent.max_tokens or 'Not Set' }}</p></div>
+        <div><p class="text-xs text-gray-500 mb-0.5">Memory</p><p class="text-gray-200">{{ 'enabled' if agent.memory_enabled else 'disabled' }}</p></div>
+      </div>
+      {% if agent.notes %}
+      <div><p class="text-xs text-gray-500 mb-0.5">Notes</p><p class="text-gray-300 text-sm">{{ agent.notes }}</p></div>
+      {% endif %}
+    </div>
+    <div class="card p-5 space-y-4">
+      <h2 class="text-xs font-semibold uppercase tracking-wider text-gray-500">Instructions</h2>
+      <div>
+        <p class="text-xs text-gray-500 mb-1">Operating Instructions (AGENTS.md)</p>
+        <pre class="text-xs text-gray-300 bg-gray-800 rounded p-3 overflow-x-auto whitespace-pre-wrap">{{ agent.base_system_prompt or 'Not Set' }}</pre>
+      </div>
+      <div>
+        <p class="text-xs text-gray-500 mb-1">Persona & Boundaries (SOUL.md)</p>
+        <pre class="text-xs text-gray-300 bg-gray-800 rounded p-3 overflow-x-auto whitespace-pre-wrap">{{ agent.soul or 'Not Set' }}</pre>
+      </div>
+    </div>
+    <div class="card p-5">
+      <h2 class="text-xs font-semibold uppercase tracking-wider text-gray-500 mb-3">Tool Allow-list</h2>
+      {% if agent.tools_allow %}
+      <div class="flex flex-wrap gap-1.5">
+        {% for t in agent.tools_allow %}<span class="pill pill-neutral font-mono text-xs">{{ t }}</span>{% endfor %}
+      </div>
+      {% else %}
+      <p class="text-xs text-gray-600">All tools allowed.</p>
+      {% endif %}
+    </div>
+    <div class="flex justify-end">
+      <a href="/settings/agent-registry?view=instances" class="btn btn-secondary btn-sm">Back</a>
+    </div>
+  </div>
+  {% else %}
+  <!-- ── Edit form ─────────────────────────────────────────────────────── -->
+  <form id="instance-form" class="space-y-5">
+
+    <!-- Basics -->
+    <div class="card p-5 space-y-4">
+      <h2 class="text-xs font-semibold uppercase tracking-wider text-gray-500">Basics</h2>
+
+      <div class="grid grid-cols-3 gap-3">
+        <div class="col-span-2">
+          <label class="block text-xs text-gray-400 mb-1.5">Display Name</label>
+          <input name="name" required value="{{ agent.name or '' }}"
+            class="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm focus:outline-none focus:border-indigo-500" />
+        </div>
+        <div>
+          <label class="block text-xs text-gray-400 mb-1.5">Emoji</label>
+          <input name="emoji" maxlength="4" value="{{ agent.emoji or '' }}"
+            class="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-lg text-center focus:outline-none focus:border-indigo-500" />
+        </div>
+      </div>
+
+      <div class="grid grid-cols-3 gap-3">
+        <div>
+          <label class="block text-xs text-gray-400 mb-1.5">Type</label>
+          <select name="type" onchange="updateTypeUI()" class="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm focus:outline-none focus:border-indigo-500">
+            {% for opt in [('SHCA','Assistant: Coordinator'), ('IA','IA: Worker'), ('GO','GO: Orchestrator'), ('RA','RA: Reviewer')] %}
+            <option value="{{ opt[0] }}" {% if agent.type == opt[0] %}selected{% endif %}>{{ opt[1] }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div>
+          <label class="block text-xs text-gray-400 mb-1.5">Scope</label>
+          <select name="scope" class="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm focus:outline-none focus:border-indigo-500">
+            <option value="task" {% if (agent.scope or 'task') == 'task' %}selected{% endif %}>Task</option>
+            <option value="goal" {% if agent.scope == 'goal' %}selected{% endif %}>Goal</option>
+          </select>
+        </div>
+        <div>
+          <label class="block text-xs text-gray-400 mb-1.5">Model</label>
+          <select name="model" id="model-select" class="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm focus:outline-none focus:border-indigo-500">
+            {% for m in models %}
+            <option value="{{ m }}" {% if agent.model == m %}selected{% endif %}>{{ m.split("/")[-1] if "/" in m else m }}</option>
+            {% endfor %}
+          </select>
+        </div>
+      </div>
+
+      <div class="grid grid-cols-2 gap-3">
+        <div>
+          <label class="block text-xs text-gray-400 mb-1.5">Max tokens <span class="text-gray-600">(optional)</span></label>
+          <input name="max_tokens" type="number" min="1" value="{{ agent.max_tokens or '' }}"
+            class="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm focus:outline-none focus:border-indigo-500" />
+        </div>
+        <div id="memory-section" class="flex items-end pb-1">
+          <label class="flex items-center gap-2 text-sm cursor-pointer select-none">
+            <input type="checkbox" name="memory_enabled" class="accent-indigo-500 w-4 h-4" {% if agent.memory_enabled %}checked{% endif %} />
+            <span class="text-gray-300">Enable memory</span>
+          </label>
+        </div>
+      </div>
+
+      <div>
+        <label class="block text-xs text-gray-400 mb-1.5">Notes <span class="text-gray-600">(internal)</span></label>
+        <textarea name="notes" rows="2"
+          class="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm focus:outline-none focus:border-indigo-500 resize-none">{{ agent.notes or '' }}</textarea>
+      </div>
+    </div>
+
+    <!-- Instructions -->
+    <div class="card p-5 space-y-4">
+      <h2 class="text-xs font-semibold uppercase tracking-wider text-gray-500">Instructions</h2>
+
+      <div>
+        <label class="block text-xs text-gray-400 mb-1.5">Operating Instructions <span class="text-gray-600">(AGENTS.md)</span></label>
+        <textarea name="base_system_prompt" rows="12"
+          class="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-xs focus:outline-none focus:border-indigo-500 font-mono resize-y">{{ agent.base_system_prompt or '' }}</textarea>
+      </div>
+
+      <div>
+        <label class="block text-xs text-gray-400 mb-1.5">Persona & Boundaries <span class="text-gray-600">(SOUL.md)</span></label>
+        <textarea name="soul" rows="7"
+          class="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-xs focus:outline-none focus:border-indigo-500 font-mono resize-y">{{ agent.soul or '' }}</textarea>
+      </div>
+    </div>
+
+    <!-- Tools -->
+    <div class="card p-5">
+      <h2 class="text-xs font-semibold uppercase tracking-wider text-gray-500 mb-3">Tool Allow-list <span class="font-normal normal-case text-gray-600">(leave empty for all tools)</span></h2>
+      <div class="grid grid-cols-4 gap-1 p-3 bg-gray-800/60 rounded-lg border border-gray-700/60 max-h-44 overflow-y-auto">
+        {% for t in tool_options %}
+        <label class="flex items-center gap-1.5 text-xs cursor-pointer hover:text-gray-200 transition-colors">
+          <input type="checkbox" name="tools_allow" value="{{ t }}" class="inst-tools-allow accent-indigo-500"
+            {% if t in (agent.tools_allow or []) %}checked{% endif %} />
+          {{ t }}
+        </label>
+        {% endfor %}
+      </div>
+    </div>
+
+    <!-- Actions row -->
+    <div class="flex items-center justify-between pt-1">
+      {% if not is_runtime_instance %}
+      <button type="button" onclick="confirmDelete()"
+        class="btn btn-danger btn-sm">
+        Delete instance
+      </button>
+      {% else %}
+      <div></div>
+      {% endif %}
+      <div class="flex items-center gap-3">
+        <span id="save-error" class="hidden text-xs text-red-400"></span>
+        <a href="/settings/agent-registry?view=instances" class="text-sm text-gray-500 hover:text-gray-300 transition-colors">Back</a>
+        {% if not is_runtime_instance %}
+        <button type="button" onclick="saveInstance()" id="btn-save" class="btn btn-primary btn-sm">
+          Save changes
+        </button>
+        {% endif %}
+      </div>
+    </div>
+  </form>
+  {% endif %}{# end can_edit #}
+
+</div>
+{% endblock %}
+
+{% block extra_js %}
+{% if can_edit %}
+<script>
+const AGENT_ID = {{ agent.id | tojson }};
+
+function updateTypeUI() {
+  const type = document.querySelector('[name="type"]')?.value;
+  const memSection = document.getElementById('memory-section');
+  if (!memSection) return;
+  const isIA = type === 'IA';
+  memSection.style.display = isIA ? 'none' : '';
+  if (isIA) memSection.querySelector('input[name="memory_enabled"]').checked = false;
+}
+updateTypeUI();
+
+// Populate model select with live gateway models
+(async function fetchModels() {
+  try {
+    const resp = await fetch('/api/gateway/models');
+    if (!resp.ok) return;
+    const data = await resp.json();
+    if (!data.models?.length) return;
+    const sel = document.getElementById('model-select');
+    const current = sel.value;
+    const CLI = [
+      { id: 'claude-cli/opus',   name: 'Claude Code (Opus)'   },
+      { id: 'claude-cli/sonnet', name: 'Claude Code (Sonnet)' },
+      { id: 'claude-cli/haiku',  name: 'Claude Code (Haiku)'  },
+    ];
+    sel.innerHTML = '';
+    function norm(id) {
+      if (!id || id.includes('/')) return id;
+      const lc = id.toLowerCase();
+      if (lc.startsWith('gemini-')) return 'google/' + id;
+      if (lc.startsWith('claude-')) return 'anthropic/' + id;
+      if (lc.startsWith('gpt-') || lc.startsWith('o1-') || lc.startsWith('o3-')) return 'openai/' + id;
+      return id;
+    }
+    data.models.forEach(m => {
+      const o = document.createElement('option');
+      o.value = norm(m.id); o.textContent = m.name || o.value;
+      if (o.value === current) o.selected = true;
+      sel.appendChild(o);
+    });
+    const div = document.createElement('option');
+    div.disabled = true; div.textContent = '── Claude Code (CLI) ──';
+    sel.appendChild(div);
+    CLI.forEach(m => {
+      const o = document.createElement('option');
+      o.value = m.id; o.textContent = m.name;
+      if (o.value === current) o.selected = true;
+      sel.appendChild(o);
+    });
+  } catch (e) { console.warn('Model fetch failed:', e); }
+})();
+
+async function saveInstance() {
+  const form = document.getElementById('instance-form');
+  const errEl = document.getElementById('save-error');
+  const btn = document.getElementById('btn-save');
+  errEl.classList.add('hidden');
+
+  const get = name => form.querySelector(`[name="${name}"]`)?.value?.trim() ?? null;
+  const maxTok = get('max_tokens');
+  const toolsAllow = Array.from(form.querySelectorAll('.inst-tools-allow:checked')).map(el => el.value);
+
+  const patch = {
+    name:               get('name') || null,
+    emoji:              get('emoji'),
+    type:               get('type') || null,
+    scope:              get('scope') || null,
+    model:              get('model') || null,
+    max_tokens:         maxTok ? parseInt(maxTok, 10) : null,
+    memory_enabled:     form.querySelector('[name="memory_enabled"]')?.checked ?? null,
+    notes:              get('notes'),
+    base_system_prompt: get('base_system_prompt'),
+    soul:               get('soul'),
+    tools_allow:        toolsAllow,
+  };
+
+  btn.disabled = true;
+  btn.textContent = 'Saving…';
+
+  try {
+    const resp = await fetch(`/api/v1/agents/${AGENT_ID}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(patch),
+    });
+    const data = await resp.json();
+    if (data.ok) {
+      window.location.href = '/settings/agent-registry?view=instances';
+    } else {
+      errEl.textContent = data.detail || data.error || 'Save failed';
+      errEl.classList.remove('hidden');
+    }
+  } catch (e) {
+    errEl.textContent = 'Error: ' + e.message;
+    errEl.classList.remove('hidden');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Save changes';
+  }
+}
+
+async function confirmDelete() {
+  const result = await window.confirmAction({
+    title: 'Delete this instance',
+    body: `This removes "${AGENT_ID}" from the gateway and registry.`,
+    phrase: `Delete ${AGENT_ID}`,
+    danger: true,
+  });
+  if (!result) return;
+  try {
+    const resp = await fetch(`/api/v1/agents/${AGENT_ID}`, { method: 'DELETE' });
+    if (resp.ok) {
+      window.location.href = '/settings/agent-registry?view=instances';
+    } else {
+      const data = await resp.json();
+      showToast(data.detail || 'Delete failed', 'error');
+    }
+  } catch (e) {
+    showToast('Delete failed: ' + e.message, 'error');
+  }
+}
+</script>
+{% endif %}
+{% endblock %}

@@ -1,0 +1,348 @@
+{% extends "base.html" %}
+{% from "partials/_info_popover.html" import info_popover %}
+{% block title %}Agent Registry{% endblock %}
+{% block content %}
+<div class="p-6 max-w-7xl mx-auto">
+  <a href="/settings" class="inline-flex items-center gap-1 text-xs text-gray-500 hover:text-gray-300 transition-colors mb-5">
+    <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"/></svg>
+    Settings
+  </a>
+
+  <!-- ── Page header ──────────────────────────────────────────────────── -->
+  <div class="flex items-center justify-between mb-5">
+    <div>
+      <h1 class="text-2xl font-bold">Agent Registry</h1>
+      <p class="text-gray-400 text-sm mt-1">Templates, live instances, and gateway sync state.</p>
+    </div>
+    <!-- Toggle + New Template button grouped on the right -->
+    <div class="flex items-center gap-2">
+      <div class="flex items-center bg-surface border border-border rounded-lg p-0.5">
+        <a href="/settings/agent-registry?view=templates{% if type_filter %}&type={{ type_filter }}{% endif %}{% if q %}&q={{ q }}{% endif %}{% if per != 10 %}&per={{ per }}{% endif %}"
+           class="px-3 py-1.5 rounded-md text-sm font-medium transition-colors {% if view == 'templates' %}bg-brand text-white{% else %}text-gray-400 hover:text-gray-200{% endif %}">
+          Templates{% if tmpl_total %} <span class="{% if view == 'templates' %}text-indigo-200{% else %}text-gray-600{% endif %} text-xs">{{ tmpl_total }}</span>{% endif %}
+        </a>
+        <a href="/settings/agent-registry?view=instances{% if type_filter %}&type={{ type_filter }}{% endif %}{% if q %}&q={{ q }}{% endif %}{% if per != 10 %}&per={{ per }}{% endif %}"
+           class="px-3 py-1.5 rounded-md text-sm font-medium transition-colors {% if view == 'instances' %}bg-brand text-white{% else %}text-gray-400 hover:text-gray-200{% endif %}">
+          Instances{% if view == 'instances' and total %} <span class="text-indigo-200 text-xs">{{ total }}</span>{% endif %}
+        </a>
+      </div>
+      {% if can_edit %}
+      <a href="/settings/agent-registry/new" title="Create a new agent template (IA or RA)"
+        class="btn btn-primary btn-sm">
+        + New Template
+      </a>
+      {% endif %}
+    </div>
+  </div>
+
+  <!-- ── Gateway status strip ─────────────────────────────────────────── -->
+  {% if gateway %}
+  <div class="flex items-center gap-2 mb-5 px-3 py-2 bg-surface rounded-lg border border-border text-xs text-gray-400">
+    {% if gateway.status == 'active' %}
+    <span class="w-1.5 h-1.5 rounded-full bg-emerald-400 flex-shrink-0"></span>
+    <span class="text-gray-300 font-medium">{{ gateway.name or gateway.id }}</span>
+    <span class="text-gray-600">·</span>
+    <span>{{ gateway.current_agents or 0 }} agents</span>
+    <span class="text-gray-600">·</span>
+    <span>heartbeat <span class="text-gray-300 rel-time" id="gw-heartbeat" data-ts="{{ gateway.last_heartbeat_at.isoformat() if gateway.last_heartbeat_at else '' }}">None</span></span>
+    {% elif gateway.status == 'draining' %}
+    <span class="w-1.5 h-1.5 rounded-full bg-amber-400 flex-shrink-0"></span>
+    <span class="text-amber-300 font-medium">{{ gateway.name or gateway.id }}</span>
+    <span class="text-gray-600">·</span><span>draining</span>
+    {% else %}
+    <span class="w-1.5 h-1.5 rounded-full bg-red-500 flex-shrink-0"></span>
+    <span class="text-red-300 font-medium">{{ gateway.name or gateway.id }}</span>
+    <span class="text-gray-600">·</span><span class="text-red-400">down</span>
+    {% endif %}
+  </div>
+  {% endif %}
+
+  <!-- ── Filters row ───────────────────────────────────────────────────── -->
+  <div class="flex flex-wrap items-center gap-2 mb-4">
+
+    <!-- Type filter -->
+    <div class="relative flex-shrink-0">
+      <select onchange="applyFilter('type', this.value)"
+        class="px-3 py-1.5 pr-7 bg-gray-800 border border-gray-700 rounded-lg text-sm text-gray-300 focus:outline-none focus:border-indigo-500 appearance-none cursor-pointer">
+        <option value="" {% if not type_filter %}selected{% endif %}>All types</option>
+        <option value="GO"   {% if type_filter == 'GO'   %}selected{% endif %}>GO</option>
+        <option value="SHCA" {% if type_filter == 'SHCA' %}selected{% endif %}>Assistant</option>
+        <option value="IA"   {% if type_filter == 'IA'   %}selected{% endif %}>IA</option>
+        <option value="RA"   {% if type_filter == 'RA'   %}selected{% endif %}>RA</option>
+      </select>
+      <svg class="absolute right-2 top-1/2 -translate-y-1/2 w-3 h-3 text-gray-500 pointer-events-none" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/>
+      </svg>
+    </div>
+
+    <!-- Per-page selector -->
+    <div class="relative flex-shrink-0">
+      <select onchange="applyFilter('per', this.value)"
+        class="px-3 py-1.5 pr-7 bg-gray-800 border border-gray-700 rounded-lg text-sm text-gray-300 focus:outline-none focus:border-indigo-500 appearance-none cursor-pointer">
+        <option value="5"  {% if per == 5  %}selected{% endif %}>5 / page</option>
+        <option value="10" {% if per == 10 %}selected{% endif %}>10 / page</option>
+        <option value="15" {% if per == 15 %}selected{% endif %}>15 / page</option>
+      </select>
+      <svg class="absolute right-2 top-1/2 -translate-y-1/2 w-3 h-3 text-gray-500 pointer-events-none" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/>
+      </svg>
+    </div>
+
+    <!-- Search -->
+    <div class="relative flex-1 min-w-0 max-w-xs">
+      <input id="reg-search" type="text"
+        placeholder="Search (Enter)…"
+        value="{{ q }}"
+        onkeydown="if(event.key==='Enter'){applySearch(this.value)}"
+        class="w-full px-3 py-1.5 bg-gray-800 border border-gray-700 rounded-lg text-sm focus:outline-none focus:border-indigo-500 pr-6" />
+      {% if q %}
+      <a href="/settings/agent-registry?view={{ view }}{% if type_filter %}&type={{ type_filter }}{% endif %}{% if per != 10 %}&per={{ per }}{% endif %}"
+         class="absolute right-2 top-1/2 -translate-y-1/2 text-gray-500 hover:text-gray-300 text-xs">✕</a>
+      {% endif %}
+    </div>
+
+    <!-- Result count + pagination -->
+    {% if view == 'instances' %}
+    <span class="text-xs text-gray-500 flex-shrink-0">
+      {% if q %}{{ total }} result{{ 's' if total != 1 else '' }} for "{{ q }}"
+      {% elif total > 0 %}{{ page_start }}–{{ page_end }} of {{ total }}
+      {% endif %}
+    </span>
+    <div class="flex items-center gap-1 ml-auto flex-shrink-0">
+      {% if prev_url %}<a href="{{ prev_url }}" class="btn btn-secondary btn-sm">← Prev</a>{% endif %}
+      {% if not q and (prev_url or next_url) %}<span class="text-xs text-gray-600 px-1">{{ page_num }}</span>{% endif %}
+      {% if next_url %}<a href="{{ next_url }}" class="btn btn-secondary btn-sm">Next →</a>{% endif %}
+    </div>
+    {% elif view == 'templates' %}
+    <span class="text-xs text-gray-500 flex-shrink-0">
+      {% if q %}{{ tmpl_total }} result{{ 's' if tmpl_total != 1 else '' }} for "{{ q }}"
+      {% elif tmpl_page_start > 0 %}{{ tmpl_page_start }}–{{ tmpl_page_end }} of {{ tmpl_total }}
+      {% endif %}
+    </span>
+    <div class="flex items-center gap-1 ml-auto flex-shrink-0">
+      {% if tmpl_prev_url %}<a href="{{ tmpl_prev_url }}" class="btn btn-secondary btn-sm">← Prev</a>{% endif %}
+      {% if tmpl_prev_url or tmpl_next_url %}<span class="text-xs text-gray-600 px-1">{{ tpage }}</span>{% endif %}
+      {% if tmpl_next_url %}<a href="{{ tmpl_next_url }}" class="btn btn-secondary btn-sm">Next →</a>{% endif %}
+    </div>
+    {% endif %}
+  </div>
+
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <!-- TEMPLATES VIEW                                                    -->
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  {% if view == 'templates' %}
+  {% if templates_data %}
+  <div class="overflow-x-auto">
+    <table class="w-full text-sm">
+      <thead class="text-xs text-gray-500 uppercase border-b border-gray-800">
+        <tr>
+          <th class="text-left pb-3 pr-4 pl-4">Template</th>
+          <th class="text-left pb-3 pr-4">Type
+            {{ info_popover(
+              "GO orchestrates a goal and generates stories/tasks. Assistant is the long-lived per-user assistant. IA is a task-scoped worker spun up per task. RA automatically reviews finished task output.",
+              label="What do GO / Assistant / IA / RA mean?"
+            ) }}
+          </th>
+          <th class="text-left pb-3 pr-4">Model</th>
+          <th class="text-left pb-3 pr-4">Files</th>
+          <th class="text-left pb-3 pr-4">Live</th>
+          <th class="text-left pb-3 pr-4">Drift
+            {{ info_popover(
+              "A running instance's config has been edited since it was last pushed to the gateway. The instance keeps running its older config until the next sync: this number is how many instances are behind."
+            ) }}
+          </th>
+          <th class="text-left pb-3 pr-4">Ver.</th>
+          <th class="text-left pb-3 pr-4">Status</th>
+          <th class="text-left pb-3"></th>
+        </tr>
+      </thead>
+      <tbody class="divide-y divide-gray-800/60">
+        {% for t in templates_data %}
+        <tr class="hover:bg-gray-900/40 transition-colors cursor-pointer"
+            onclick="window.location='/templates/{{ t.id }}'">
+          <td class="py-2.5 pr-4 pl-4">
+            <div class="flex items-center gap-2.5">
+              {% if t.emoji %}<span class="text-xl leading-none">{{ t.emoji }}</span>{% endif %}
+              <div>
+                <div class="font-mono text-xs text-indigo-400 leading-tight">{{ t.id }}</div>
+                <div class="font-medium text-gray-100 mt-0.5">{{ t.name }}</div>
+              </div>
+            </div>
+          </td>
+          <td class="py-2.5 pr-4">
+            <span class="pill {% if t.type == 'GO' %}pill-success{% elif t.type == 'SHCA' %}pill-info{% elif t.type == 'RA' %}bg-amber-900/40 text-amber-300{% else %}bg-purple-900/40 text-purple-300{% endif %}">{{ 'Assistant' if t.type == 'SHCA' else t.type }}</span>
+          </td>
+          <td class="py-2.5 pr-4 font-mono text-xs text-gray-300">{{ t.model.split("/")[-1] if "/" in t.model else t.model }}</td>
+          <td class="py-2.5 pr-4 text-xs text-gray-400">{{ t.file_count }}</td>
+          <td class="py-2.5 pr-4 text-xs text-gray-400">{{ t.instance_count }}</td>
+          <td class="py-2.5 pr-4 text-xs">
+            {% if t.drift_count > 0 %}
+            <a href="/settings/agent-registry?view=instances&type={{ t.type }}" onclick="event.stopPropagation()"
+               class="flex items-center gap-1 text-amber-400 hover:text-amber-300"
+               title="{{ t.drift_count }} instance{{ 's' if t.drift_count != 1 else '' }} behind">
+              <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01M12 3l9 18H3L12 3z"/>
+              </svg>{{ t.drift_count }}
+            </a>
+            {% elif t.instance_count > 0 %}<span class="text-emerald-500">✓</span>
+            {% else %}<span class="text-gray-700">None</span>{% endif %}
+          </td>
+          <td class="py-2.5 pr-4 font-mono text-xs text-gray-500">v{{ t.version }}</td>
+          <td class="py-2.5 pr-4">
+            {% if t.status == 'active' %}<span class="pill pill-success">active</span>
+            {% else %}<span class="pill pill-neutral">{{ t.status }}</span>{% endif %}
+          </td>
+          <td class="py-2.5 pr-4 text-right">
+            <a href="/templates/{{ t.id }}" onclick="event.stopPropagation()" class="text-xs text-indigo-400 hover:text-indigo-300">{{ 'Edit →' if can_edit else 'View →' }}</a>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <div class="text-center py-16 text-gray-500">
+    <div class="text-5xl mb-4 opacity-20">⬡</div>
+    <p class="text-sm">No templates{% if type_filter %} of type <strong>{{ type_filter }}</strong>{% endif %}{% if q %} matching <strong>"{{ q }}"</strong>{% endif %}.</p>
+  </div>
+  {% endif %}
+  {% endif %}
+
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <!-- INSTANCES VIEW                                                    -->
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  {% if view == 'instances' %}
+  {% if agents or q %}
+  <div class="overflow-x-auto">
+    <table class="w-full text-sm">
+      <thead class="text-xs text-gray-500 uppercase border-b border-gray-800">
+        <tr>
+          <th class="text-left pb-3 pr-4 pl-4">ID / Name</th>
+          <th class="text-left pb-3 pr-4">Type / Scope
+            {{ info_popover(
+              "GO orchestrates a goal and generates stories/tasks. Assistant is the long-lived per-user assistant. IA is a task-scoped worker spun up per task. RA automatically reviews finished task output.",
+              label="What do GO / Assistant / IA / RA mean?"
+            ) }}
+          </th>
+          <th class="text-left pb-3 pr-4">Model</th>
+          <th class="text-left pb-3 pr-4">Tools</th>
+          <th class="text-left pb-3 pr-4">Sync
+            {{ info_popover(
+              "This instance's config has been edited since it was last pushed to the gateway: it keeps running the older config until the next sync. \"Synced\" means the running instance matches its current config."
+            ) }}
+          </th>
+          <th class="text-left pb-3 pr-4">Last synced</th>
+          <th class="text-left pb-3"></th>
+        </tr>
+      </thead>
+      <tbody class="divide-y divide-gray-800/60">
+        {% for a in agents %}
+        {% set is_drifted = a.config_version and a.gateway_synced_version and a.gateway_synced_version < a.config_version %}
+        {% set has_error = a.last_sync_error %}
+        <tr class="hover:bg-gray-900/40 transition-colors cursor-pointer"
+            onclick="window.location='/settings/agent-registry/instances/{{ a.id }}'">
+          <td class="py-2.5 pr-4 pl-4">
+            <div class="flex items-center gap-2.5">
+              {% if a.emoji %}<span class="text-xl leading-none">{{ a.emoji }}</span>{% endif %}
+              <div>
+                <div class="font-mono text-xs text-indigo-400 leading-tight">{{ a.id }}</div>
+                <div class="font-medium text-gray-100 mt-0.5">{{ a.name }}</div>
+              </div>
+            </div>
+          </td>
+          <td class="py-2.5 pr-4">
+            <div class="flex flex-col gap-1">
+              <span class="pill {% if a.type == 'SHCA' %}pill-info{% elif a.type == 'GO' %}pill-success{% elif a.type == 'RA' %}bg-amber-900/40 text-amber-300{% else %}bg-purple-900/40 text-purple-300{% endif %} self-start">{{ 'Assistant' if a.type == 'SHCA' else a.type }}</span>
+              <span class="pill {% if a.scope == 'goal' %}pill-warning{% else %}pill-neutral{% endif %} self-start">{{ a.scope or "task" }}</span>
+            </div>
+          </td>
+          <td class="py-2.5 pr-4">
+            <div class="font-mono text-xs text-gray-300">{{ a.model.split("/")[-1] if "/" in a.model else a.model }}</div>
+            {% if a.memory_enabled %}<div class="flex items-center gap-1 mt-0.5"><span class="w-1.5 h-1.5 rounded-full bg-indigo-500"></span><span class="text-2xs text-indigo-400">memory</span></div>{% endif %}
+          </td>
+          <td class="py-2.5 pr-4">
+            {% set tc = (a.tools_allow or []) | length %}
+            {% if tc > 0 %}<span class="pill pill-neutral" title="{{ (a.tools_allow) | join(', ') }}">{{ tc }} tools</span>
+            {% else %}<span class="text-gray-600 text-xs">default</span>{% endif %}
+          </td>
+          <td class="py-2.5 pr-4">
+            {% if has_error %}
+            <span class="flex items-center gap-1.5 text-xs text-red-400" title="{{ a.last_sync_error }}">
+              <span class="w-1.5 h-1.5 rounded-full bg-red-500"></span>Error
+            </span>
+            {% elif is_drifted %}
+            <span class="flex items-center gap-1.5 text-xs text-amber-400"
+                  title="Config v{{ a.config_version }}: gateway on v{{ a.gateway_synced_version }}">
+              <span class="w-1.5 h-1.5 rounded-full bg-amber-400"></span>Drift v{{ a.gateway_synced_version }}→{{ a.config_version }}
+            </span>
+            {% else %}
+            <span class="flex items-center gap-1.5 text-xs text-emerald-400">
+              <span class="w-1.5 h-1.5 rounded-full bg-emerald-500"></span>Synced
+            </span>
+            {% endif %}
+          </td>
+          <td class="py-2.5 pr-4">
+            {% if a.binding_last_synced_at %}
+            <span class="text-xs text-gray-500 rel-time" data-ts="{{ a.binding_last_synced_at.isoformat() }}">None</span>
+            {% elif a.gateway_synced_at %}
+            <span class="text-xs text-gray-500 rel-time" data-ts="{{ a.gateway_synced_at.isoformat() }}">None</span>
+            {% else %}<span class="text-gray-700 text-xs">None</span>{% endif %}
+          </td>
+          <td class="py-2.5 pr-4 text-right">
+            <a href="/settings/agent-registry/instances/{{ a.id }}" onclick="event.stopPropagation()"
+               class="text-xs text-indigo-400 hover:text-indigo-300">View →</a>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <div class="text-center py-16 text-gray-500">
+    <div class="text-5xl mb-4 opacity-20">⬡</div>
+    <p class="text-sm">No instances{% if type_filter %} of type <strong>{{ type_filter }}</strong>{% endif %}.</p>
+  </div>
+  {% endif %}
+  {% endif %}
+
+</div>
+
+{% block extra_js %}
+<script>
+function relTime(ts) {
+  if (!ts) return 'None';
+  const diff = Math.floor((Date.now() - new Date(ts).getTime()) / 1000);
+  if (diff < 5)    return 'just now';
+  if (diff < 60)   return diff + 's ago';
+  if (diff < 3600) return Math.floor(diff / 60) + 'm ago';
+  if (diff < 86400) return Math.floor(diff / 3600) + 'h ago';
+  return Math.floor(diff / 86400) + 'd ago';
+}
+function renderRelTimes() {
+  document.querySelectorAll('.rel-time[data-ts]').forEach(el => { el.textContent = relTime(el.dataset.ts); });
+}
+renderRelTimes();
+setInterval(renderRelTimes, 10000);
+
+function applyFilter(key, value) {
+  const url = new URL(window.location.href);
+  if (value) url.searchParams.set(key, value);
+  else url.searchParams.delete(key);
+  url.searchParams.delete('after');
+  url.searchParams.delete('stack');
+  url.searchParams.delete('tpage');
+  window.location.href = url.toString();
+}
+
+function applySearch(q) {
+  const url = new URL(window.location.href);
+  if (q) url.searchParams.set('q', q);
+  else url.searchParams.delete('q');
+  url.searchParams.delete('after');
+  url.searchParams.delete('stack');
+  url.searchParams.delete('tpage');
+  window.location.href = url.toString();
+}
+</script>
+{% endblock %}
+{% endblock %}

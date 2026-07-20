@@ -1,0 +1,78 @@
+{% extends "base.html" %}
+{% block title %}New Conversation: {{ goal.name }}{% endblock %}
+{% block content %}
+<div class="p-6 lg:p-8 max-w-2xl mx-auto">
+  <div class="mb-6">
+    <h1 class="text-xl font-semibold text-gray-100">Start a Conversation</h1>
+    <p class="text-sm text-gray-500 mt-0.5">{{ goal.name }}: pick an assistant to chat with</p>
+  </div>
+
+  <!-- My Assistants -->
+  {% if my_assistants %}
+  <div class="mb-6">
+    <div class="text-2xs font-semibold uppercase tracking-wider text-gray-600 mb-2">Your Assistants</div>
+    <div class="space-y-2">
+      {% for assistant in my_assistants %}
+      <form action="/goals/{{ pid }}/chat/{{ assistant.agent_id }}/new" method="post" data-toast-submit data-fail="Failed to start conversation.">
+        <button type="submit" class="card card-interactive w-full p-4 text-left group">
+          <div class="flex items-center gap-3">
+            <div class="w-9 h-9 rounded-full bg-brand/20 text-brand flex items-center justify-center text-sm font-bold flex-shrink-0">
+              {{ assistant.display_name[0].upper() if assistant.display_name else "A" }}
+            </div>
+            <div class="flex-1 min-w-0">
+              <div class="font-medium text-gray-200 group-hover:text-brand-light transition-colors">{{ assistant.display_name }}</div>
+              <div class="text-2xs text-gray-600 font-mono">{{ assistant.agent_id }}</div>
+            </div>
+            <svg class="w-5 h-5 text-gray-600 group-hover:text-brand transition-colors flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z"/>
+            </svg>
+          </div>
+        </button>
+      </form>
+      {% endfor %}
+    </div>
+  </div>
+  {% endif %}
+
+  <!-- Other members' Assistants -->
+  {% if other_assistants %}
+  <div class="mb-6">
+    <div class="text-2xs font-semibold uppercase tracking-wider text-gray-600 mb-2">Team Assistants</div>
+    <div class="space-y-2">
+      {% for assistant in other_assistants %}
+      <form action="/goals/{{ pid }}/chat/{{ assistant.agent_id }}/new" method="post" data-toast-submit data-fail="Failed to start conversation.">
+        <button type="submit" class="card card-interactive w-full p-4 text-left group">
+          <div class="flex items-center gap-3">
+            <div class="w-9 h-9 rounded-full bg-emerald-500/20 text-emerald-400 flex items-center justify-center text-sm font-bold flex-shrink-0">
+              {{ assistant.display_name[0].upper() if assistant.display_name else "?" }}
+            </div>
+            <div class="flex-1 min-w-0">
+              <div class="font-medium text-gray-200 group-hover:text-brand-light transition-colors">{{ assistant.display_name }}</div>
+              <div class="text-2xs text-gray-500">{{ assistant.owner_name }}'s assistant</div>
+              <div class="text-2xs text-gray-600 font-mono">{{ assistant.agent_id }}</div>
+            </div>
+            <svg class="w-5 h-5 text-gray-600 group-hover:text-emerald-400 transition-colors flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z"/>
+            </svg>
+          </div>
+        </button>
+      </form>
+      {% endfor %}
+    </div>
+  </div>
+  {% endif %}
+
+  <!-- No Assistants at all -->
+  {% if not my_assistants and not other_assistants %}
+  <div class="card p-12 text-center">
+    <svg class="w-12 h-12 mx-auto text-gray-700 mb-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1" d="M9.75 3.104v5.714a2.25 2.25 0 01-.659 1.591L5 14.5"/>
+    </svg>
+    <p class="text-gray-500 text-sm">No assistants available in this goal.</p>
+    <p class="text-gray-600 text-xs mt-2">
+      <a href="/settings/my-agents" class="text-brand hover:text-brand-light">Configure an Assistant</a> first, then add it to this goal.
+    </p>
+  </div>
+  {% endif %}
+</div>
+{% endblock %}

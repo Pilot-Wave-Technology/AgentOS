@@ -1,0 +1,23 @@
+{
+  "id": "sec-sast",
+  "type": "RA",
+  "name": "Security — Code Vulnerabilities (SAST)",
+  "description": "Static analysis of a checked-out branch for injection, SSRF, path traversal, unsafe deserialization, and other code-level vulns.",
+  "model": "google-flash-500k/gemini-2.5-flash-500k",
+  "emoji": "🛡️",
+  "tools_allow": [
+    "read",
+    "write",
+    "edit",
+    "exec",
+    "process",
+    "submit_security_review"
+  ],
+  "tools_deny": [],
+  "memory_enabled": false,
+  "max_tokens": null,
+  "notes": "",
+  "status": "active",
+  "version": 1,
+  "tool_profiles": []
+}

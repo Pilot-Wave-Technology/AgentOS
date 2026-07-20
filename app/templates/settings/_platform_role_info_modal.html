@@ -1,0 +1,81 @@
+<!-- Platform role capability matrix: single source of truth for what platform.member /
+     platform.editor / platform.admin can do. Included wherever a "What can roles do?"
+     affordance is needed (Users page, Signup Requests page, ...) so the matrix never
+     has to be kept in sync across multiple templates. -->
+<div id="modal-role-info" class="hidden fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50 p-4"
+     onclick="if(event.target===this) this.classList.add('hidden')">
+  <div class="card w-full max-w-2xl p-6 max-h-[85vh] overflow-y-auto">
+    <div class="flex items-start justify-between mb-1">
+      <h2 class="text-lg font-semibold text-gray-100">What can each role do?</h2>
+      <button onclick="document.getElementById('modal-role-info').classList.add('hidden')"
+        class="text-gray-500 hover:text-gray-300 -mt-1 -mr-1 p-1" aria-label="Close">
+        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/></svg>
+      </button>
+    </div>
+    <p class="text-xs text-gray-500 mb-4">
+      <span class="text-gray-300">platform.editor</span> has the same Settings page access as
+      <span class="text-gray-300">platform.member</span>: only My Agents, Help &amp; Explainability,
+      and Model Pricing (read-only). Users, Signup Requests, the Agent/Skill/Tool Registry, Memory
+      Prompts, Claude Phases, Integrations, Kill Switch, Dashboard, and Council Runs are all
+      <span class="text-gray-300">platform.admin</span>-only. Editor's one distinguishing capability
+      is goal creation (a general goal-lifecycle action, not a Settings page).
+    </p>
+
+    <div class="overflow-x-auto">
+      <table class="w-full text-xs">
+        <thead class="text-2xs text-gray-600 border-b border-border">
+          <tr>
+            <th class="text-left pb-2 pr-3 font-medium uppercase">Area</th>
+            <th class="text-center pb-2 px-2 font-medium">platform.member</th>
+            <th class="text-center pb-2 px-2 font-medium">platform.editor</th>
+            <th class="text-center pb-2 pl-2 font-medium">platform.admin</th>
+          </tr>
+        </thead>
+        <tbody class="divide-y divide-border text-gray-300">
+          {% set rows = [
+            ("View My Agents, Help & Explainability", true, true, true),
+            ("View Model Pricing", true, true, true),
+            ("Create goals", false, true, true),
+            ("View Users, Signup Requests, Skill/Tool/Agent Registry, Templates, Claude Phases, Integrations, Memory Prompts", false, false, true),
+            ("View Kill Switch (goal pause/resume state, system state)", false, false, true),
+            ("Edit Skill Registry, Tool Registry, Agent Registry, Templates, Claude Phases", false, false, true),
+            ("Delete, pause, or resume any goal (Kill Switch)", false, false, true),
+            ("View Dashboard", false, false, true),
+            ("View/manage Council Runs (Goal Review, Security, Platform Research queues)", false, false, true),
+            ("Freeze the entire system", false, false, true),
+            ("Manage users: change roles", false, false, true),
+            ("Review and approve signup requests", false, false, true),
+            ("Edit Memory Prompts, Integrations, Model Pricing", false, false, true),
+            ("Run/watch Security Council, Goal Review Council, Platform Research Council (env-gated - dormant unless enabled on this deployment)", false, false, true),
+          ] %}
+          {% for label, member_ok, editor_ok, admin_ok in rows %}
+          <tr>
+            <td class="py-2 pr-3">{{ label }}</td>
+            <td class="py-2 px-2 text-center">
+              {% if member_ok %}<span class="text-emerald-400">✓</span>{% else %}<span class="text-red-400">✗</span>{% endif %}
+            </td>
+            <td class="py-2 px-2 text-center">
+              {% if editor_ok %}<span class="text-emerald-400">✓</span>{% else %}<span class="text-red-400">✗</span>{% endif %}
+            </td>
+            <td class="py-2 pl-2 text-center">
+              {% if admin_ok %}<span class="text-emerald-400">✓</span>{% else %}<span class="text-red-400">✗</span>{% endif %}
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+
+    <p class="text-2xs text-gray-600 mt-4">
+      This is platform-wide access - it's independent of any specific goal's membership. Inside a goal,
+      day-to-day work (stories, tasks, chat, resources) is governed by that goal's own
+      <span class="text-gray-400">goal.member</span> / <span class="text-gray-400">goal.manager</span> roles;
+      a platform.editor or platform.admin gets no bypass there unless they're also an actual member -
+      see the "What can roles do?" button on any goal's Members page. The platform-wide exceptions are
+      goal delete/pause/resume (Kill Switch — platform.admin-only, works regardless of goal membership,
+      same as system freeze) and the Security/Goal Review/Platform Research Councils, which are
+      platform.admin-only even for a goal's own
+      members or managers.
+    </p>
+  </div>
+</div>

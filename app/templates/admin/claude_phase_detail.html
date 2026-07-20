@@ -1,0 +1,129 @@
+{% extends "base.html" %}
+{% block title %}{{ phase.name }}: Phase{% endblock %}
+{% block content %}
+<div class="p-6 lg:p-8 max-w-5xl mx-auto">
+  <div class="flex items-center justify-between mb-6">
+    <div class="flex items-center gap-3">
+      <a href="/settings/claude-phases" class="inline-flex items-center gap-1 text-2xs text-gray-500 hover:text-gray-300">
+        <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"/></svg>
+        All phases
+      </a>
+      <div>
+        <h1 class="text-xl font-semibold text-gray-100 font-mono">{{ phase.name }}</h1>
+        <p class="text-sm text-gray-500 mt-0.5">{{ phase.description or 'No description' }}</p>
+      </div>
+    </div>
+    <div class="flex items-center gap-2">
+      {% if phase.status == 'active' %}
+        <span class="pill pill-success">active</span>
+      {% else %}
+        <span class="pill pill-warn">disabled</span>
+      {% endif %}
+      {% if phase.status == 'active' and can_edit %}
+        <form action="/settings/claude-phases/{{ phase.name }}/disable" method="post" class="inline"
+              data-confirm="Disable {{ phase.name }}? Existing task rows that reference it remain valid; new workspaces will not get this phase.">
+          <button type="submit" class="btn btn-secondary btn-sm">
+            Disable
+          </button>
+        </form>
+      {% endif %}
+    </div>
+  </div>
+
+  {% if not can_edit %}
+  <div class="card p-5">
+    <div class="text-2xs uppercase tracking-wider text-gray-500 mb-3">Identity</div>
+    <div class="grid grid-cols-2 gap-3 text-sm">
+      <div>
+        <p class="text-2xs text-gray-500 mb-1">Model</p>
+        <p class="text-gray-200 font-mono">{{ phase.model or 'inherit' }}</p>
+      </div>
+      <div>
+        <p class="text-2xs text-gray-500 mb-1">Tools</p>
+        <p class="text-gray-400 text-xs">✅ {{ phase.allowed_tools|length }} allow · ❌ {{ phase.denied_tools|length }} deny</p>
+      </div>
+    </div>
+  </div>
+  <p class="text-2xs text-gray-600 mt-2 mb-4">Full system prompt and tool lists are rendered in "As-rendered file" below.</p>
+  {% else %}
+  <form action="/settings/claude-phases/{{ phase.name }}" method="post" class="space-y-4" data-toast-submit data-fail="Failed to save phase.">
+    <div class="card p-5">
+      <div class="text-2xs uppercase tracking-wider text-gray-500 mb-3">Identity</div>
+      <div class="grid grid-cols-2 gap-3">
+        <div>
+          <label class="block text-2xs text-gray-500 mb-1">Name</label>
+          <input type="text" value="{{ phase.name }}" readonly disabled
+                 class="input w-full font-mono text-sm opacity-60 cursor-not-allowed" />
+          <div class="text-2xs text-gray-600 mt-1">Immutable. Create a new phase if you need a different name.</div>
+        </div>
+        <div>
+          <label class="block text-2xs text-gray-500 mb-1">Model (empty = inherit)</label>
+          <input type="text" name="model" value="{{ phase.model or '' }}" placeholder="inherit"
+                 class="input w-full font-mono text-sm" />
+        </div>
+      </div>
+      <div class="mt-3">
+        <label class="block text-2xs text-gray-500 mb-1">Description</label>
+        <input type="text" name="description" value="{{ phase.description or '' }}"
+               class="input w-full text-sm" />
+      </div>
+      <div class="mt-3">
+        <label class="block text-2xs text-gray-500 mb-1">Status</label>
+        <select name="status" class="input w-48 text-sm">
+          <option value="active" {% if phase.status == 'active' %}selected{% endif %}>active</option>
+          <option value="disabled" {% if phase.status == 'disabled' %}selected{% endif %}>disabled</option>
+        </select>
+      </div>
+    </div>
+
+    <div class="card p-5">
+      <div class="text-2xs uppercase tracking-wider text-gray-500 mb-3">System prompt</div>
+      <textarea name="system_prompt" rows="16"
+                class="input w-full text-xs font-mono">{{ phase.system_prompt }}</textarea>
+      <div class="text-2xs text-gray-600 mt-1">
+        This becomes the body of <code>{{ phase.name }}.md</code> after the YAML frontmatter.
+      </div>
+    </div>
+
+    <div class="card p-5">
+      <div class="text-2xs uppercase tracking-wider text-gray-500 mb-3">Tool allowlist / denylist</div>
+      <div class="grid grid-cols-2 gap-3">
+        <div>
+          <label class="block text-2xs text-gray-500 mb-1">Allowed tools (✅)</label>
+          <textarea name="allowed_tools" rows="8"
+                    class="input w-full text-2xs font-mono">{% for t in phase.allowed_tools %}{{ t }}
+{% endfor %}</textarea>
+          <div class="text-2xs text-gray-600 mt-1">One per line. e.g. <code>Bash(pytest:*)</code></div>
+        </div>
+        <div>
+          <label class="block text-2xs text-gray-500 mb-1">Denied tools (❌)</label>
+          <textarea name="denied_tools" rows="8"
+                    class="input w-full text-2xs font-mono">{% for t in phase.denied_tools %}{{ t }}
+{% endfor %}</textarea>
+          <div class="text-2xs text-gray-600 mt-1">Phase-level deny. The workspace-wide deny list in <code>.claude/settings.json</code> still applies.</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="flex justify-end gap-2">
+      <a href="/settings/claude-phases" class="btn btn-secondary btn-sm">Cancel</a>
+      <button type="submit" class="btn btn-primary btn-sm">Save changes</button>
+    </div>
+  </form>
+  {% endif %}
+
+  <div class="card p-5 mt-6">
+    <div class="text-2xs uppercase tracking-wider text-gray-500 mb-3 flex items-center justify-between">
+      <span>As-rendered file</span>
+      <span class="text-gray-700 font-normal">written to <code>&lt;workspace&gt;/.claude/agents/{{ phase.name }}.md</code></span>
+    </div>
+    <pre class="text-2xs font-mono text-gray-300 whitespace-pre-wrap overflow-x-auto bg-surface/60 p-3 rounded-md">{{ rendered_md }}</pre>
+  </div>
+
+  <div class="text-2xs text-gray-700 mt-6">
+    Created by {{ phase.created_by }} ·
+    Created <span data-utc="{{ phase.created_at.isoformat() }}">{{ phase.created_at.strftime('%Y-%m-%d %H:%M') }} UTC</span> ·
+    Updated <span data-utc="{{ phase.updated_at.isoformat() }}">{{ phase.updated_at.strftime('%Y-%m-%d %H:%M') }} UTC</span>
+  </div>
+</div>
+{% endblock %}

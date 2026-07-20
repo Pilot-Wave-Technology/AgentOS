@@ -1,0 +1,23 @@
+{% if activity_rows %}
+<ul class="divide-y divide-gray-800/50">
+  {% for a in activity_rows %}
+  <li class="flex items-center gap-3 py-2.5 first:pt-0 last:pb-0">
+    {# Category dot: color set by the service via dot_class #}
+    <span class="w-2 h-2 rounded-full flex-shrink-0 {{ a.dot_class }}"></span>
+    {# Event description #}
+    <span class="flex-1 text-sm text-gray-300 truncate">{{ a.text }}</span>
+    {# Goal badge: only when the event is scoped to a specific goal #}
+    {% if a.goal_name %}
+    <span class="hidden sm:inline-block text-xs text-gray-500 bg-gray-800 px-1.5 py-0.5
+                 rounded whitespace-nowrap max-w-[9rem] truncate">
+      {{ a.goal_name }}
+    </span>
+    {% endif %}
+    {# Relative time #}
+    <span class="text-xs text-gray-600 whitespace-nowrap flex-shrink-0">{{ a.ago }}</span>
+  </li>
+  {% endfor %}
+</ul>
+{% else %}
+<p class="text-sm text-gray-500 py-2">No recent activity.</p>
+{% endif %}

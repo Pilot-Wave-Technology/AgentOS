@@ -1,0 +1,168 @@
+{% extends "base.html" %}
+{% block title %}{{ tool.label }}: MCP Tool{% endblock %}
+
+{% block content %}
+{% set _back_tab = 'system-tools' if (tool and tool.is_core) else 'custom-tools' %}
+{% set _back_label = 'System Tools' if (tool and tool.is_core) else 'Custom Tools' %}
+<div class="p-8 max-w-3xl mx-auto">
+
+  <div class="mb-6">
+    <a href="/settings/tools?tab={{ _back_tab }}" class="inline-flex items-center gap-1 text-sm text-indigo-400 hover:text-indigo-300">
+      <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"/></svg>
+      Tool Registry / {{ _back_label }}
+    </a>
+  </div>
+
+  <div class="flex items-start justify-between mb-6">
+    <div>
+      <h1 class="text-2xl font-bold mb-1">{{ tool.label }}</h1>
+      <p class="text-gray-500 text-sm font-mono">{{ tool.name }}</p>
+    </div>
+    <span class="pill bg-teal-900/40 text-teal-300 mt-1">{{ tool.tier }}</span>
+  </div>
+
+  {% if tool.description %}
+  <p class="text-gray-400 text-sm mb-6">{{ tool.description }}</p>
+  {% endif %}
+
+  <div class="mb-6 px-4 py-3 bg-blue-900/20 border border-blue-800/40 rounded-lg text-sm text-blue-300">
+    <span class="font-medium">Read-only by design.</span>
+    {% if tool.tier == 'mcp_server' %}
+    <span class="text-blue-300/80">Connection details, transport, and the tool list below come from introspecting the live MCP server: there's no manual edit form for them. Change the server config at the source, then click <span class="font-medium">Regenerate</span> to re-sync, or use Disable/Enable to change availability.</span>
+    {% else %}
+    <span class="text-blue-300/80">This tool is discovered from its parent MCP server's config, not stored independently: there's no manual edit form for it. Update and regenerate the parent MCP server to change it, or use Disable/Enable here to change availability.</span>
+    {% endif %}
+  </div>
+
+  <!-- Connection info -->
+  <div class="bg-gray-900 border border-gray-800 rounded-xl p-5 mb-4">
+    <h2 class="text-xs font-semibold uppercase tracking-wider text-gray-500 mb-4">MCP Connection</h2>
+    <dl class="space-y-3 text-sm">
+      <div class="flex gap-4">
+        <dt class="text-gray-500 w-28 shrink-0">Transport</dt>
+        <dd class="font-mono text-gray-300">{{ tool.config.get('transport', 'Not Set') }}</dd>
+      </div>
+      {% if tool.config.get('server_url') %}
+      <div class="flex gap-4">
+        <dt class="text-gray-500 w-28 shrink-0">Server URL</dt>
+        <dd class="font-mono text-gray-300 break-all">{{ tool.config.get('server_url') }}</dd>
+      </div>
+      {% endif %}
+      {% if tool.config.get('command') %}
+      <div class="flex gap-4">
+        <dt class="text-gray-500 w-28 shrink-0">Command</dt>
+        <dd class="font-mono text-gray-300">{{ tool.config.get('command') }}</dd>
+      </div>
+      {% endif %}
+      {% if tool.config.get('mcp_tool_name') %}
+      <div class="flex gap-4">
+        <dt class="text-gray-500 w-28 shrink-0">MCP tool name</dt>
+        <dd class="font-mono text-gray-300">{{ tool.config.get('mcp_tool_name') }}</dd>
+      </div>
+      {% endif %}
+    </dl>
+  </div>
+
+  <!-- Credential -->
+  <div class="bg-gray-900 border border-gray-800 rounded-xl p-5 mb-4">
+    <h2 class="text-xs font-semibold uppercase tracking-wider text-gray-500 mb-4">Authentication</h2>
+    {% if tool.credential_id %}
+      {% for c in credentials %}{% if c.id|string == tool.credential_id|string %}
+      <p class="text-sm text-gray-300">{{ c.name }} <span class="text-gray-500">({{ c.credential_type }})</span></p>
+      {% endif %}{% endfor %}
+    {% else %}
+      <p class="text-sm text-gray-600">No credential assigned.</p>
+    {% endif %}
+  </div>
+
+  <!-- Parameters -->
+  {% if tool.parameters_schema and tool.parameters_schema.get('properties') %}
+  <div class="bg-gray-900 border border-gray-800 rounded-xl p-5 mb-4">
+    <h2 class="text-xs font-semibold uppercase tracking-wider text-gray-500 mb-4">Parameters</h2>
+    <table class="w-full text-sm">
+      <thead class="text-xs text-gray-600 border-b border-gray-800">
+        <tr>
+          <th class="text-left pb-2 pr-4">Name</th>
+          <th class="text-left pb-2 pr-4">Type</th>
+          <th class="text-left pb-2">Description</th>
+        </tr>
+      </thead>
+      <tbody class="divide-y divide-gray-800/40">
+        {% for name, prop in tool.parameters_schema.properties.items() %}
+        <tr>
+          <td class="py-2 pr-4 font-mono text-xs text-indigo-300">
+            {{ name }}
+            {% if name in (tool.parameters_schema.get('required') or []) %}
+            <span class="text-red-400">*</span>{% endif %}
+          </td>
+          <td class="py-2 pr-4 text-xs text-gray-500">{{ prop.get('type', 'Not Set') }}</td>
+          <td class="py-2 text-xs text-gray-400">{{ prop.get('description', '') }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endif %}
+
+  {% include "custom_tools/_manifest_review.html" %}
+
+  {% if can_edit %}
+  <!-- Status / actions -->
+  <div class="flex gap-3 mt-6">
+    {% if tool.status == 'enabled' %}
+    <button onclick="withLoadingState(this, () => setStatus('disabled'))" class="btn btn-secondary btn-sm">Disable</button>
+    {% else %}
+    <button onclick="withLoadingState(this, () => setStatus('enabled'))" class="btn btn-primary btn-sm">Enable</button>
+    {% endif %}
+    {% if tool.tier in ('mcp_server', 'openapi') %}
+    <button onclick="withLoadingState(this, regenerate, {loadingLabel: 'Regenerating…'})" class="btn btn-secondary btn-sm" title="Re-run the generator against current config: picks up generator improvements without changing operations">
+      Regenerate
+    </button>
+    {% endif %}
+  </div>
+
+  <div id="status-err" class="hidden mt-4 px-4 py-3 bg-red-900/30 border border-red-800 rounded-lg text-sm text-red-300"></div>
+  <div id="status-ok" class="hidden mt-4 px-4 py-3 bg-green-900/30 border border-green-800 rounded-lg text-sm text-green-300"></div>
+  {% else %}
+  <div class="mt-6">
+    <span class="pill {% if tool.status == 'enabled' %}pill-success{% else %}pill-neutral{% endif %}">{{ tool.status }}</span>
+  </div>
+  {% endif %}
+</div>
+
+{% if can_edit %}
+<script>
+async function setStatus(status) {
+  const errEl = document.getElementById('status-err');
+  errEl.classList.add('hidden');
+  try {
+    const r = await fetch(`/api/custom-tools/{{ tool.name }}/${status}`, { method: 'POST' });
+    if (!r.ok) { throw new Error(await extractErrorDetail(r, 'Failed')); }
+    window.location.reload();
+  } catch(e) {
+    errEl.textContent = e.message; errEl.classList.remove('hidden');
+  }
+}
+
+async function regenerate() {
+  const errEl = document.getElementById('status-err');
+  const okEl = document.getElementById('status-ok');
+  errEl.classList.add('hidden');
+  okEl.classList.add('hidden');
+  try {
+    const r = await fetch(`/api/custom-tools/{{ tool.name }}/regenerate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),  // no config changes: pure regenerate
+    });
+    if (!r.ok) { throw new Error(await extractErrorDetail(r, 'Regenerate failed')); }
+    okEl.textContent = 'Regenerated and tools.reload signalled. Reloading…';
+    okEl.classList.remove('hidden');
+    setTimeout(() => window.location.reload(), 800);
+  } catch(e) {
+    errEl.textContent = e.message; errEl.classList.remove('hidden');
+  }
+}
+</script>
+{% endif %}{# end can_edit script #}
+{% endblock %}

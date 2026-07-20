@@ -1,0 +1,228 @@
+{# Live git-graph state partial: reused by the page + the HTMX actions. #}
+
+<!-- ── Derived plan (preview: read-only, zero side effects) ───────────────── -->
+<div class="mb-6">
+  <h2 class="text-xs font-semibold uppercase tracking-wider text-gray-500 mb-2">Derived plan (preview)</h2>
+  {% if plan.errors %}
+  <div class="text-2xs text-red-400 mb-2">errors: {{ plan.errors | join('; ') }}</div>
+  {% endif %}
+  {% if plan.workstreams %}
+  <table class="w-full text-xs border border-border rounded overflow-hidden">
+    <thead class="text-2xs uppercase tracking-wider text-gray-500 bg-surface">
+      <tr>
+        <th class="text-left px-2 py-1.5">Branch (workstream)</th>
+        <th class="text-left px-2 py-1.5">Stories</th>
+        <th class="text-left px-2 py-1.5">Owners</th>
+        <th class="text-left px-2 py-1.5">Merge</th>
+        <th class="text-left px-2 py-1.5">Depends on</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for w in plan.workstreams %}
+      <tr class="border-t border-border">
+        <td class="px-2 py-1.5 font-mono text-gray-300">{{ w.branch_name }}</td>
+        <td class="px-2 py-1.5 text-gray-400">{{ w.story_ids | join(', ') }}</td>
+        <td class="px-2 py-1.5 text-gray-400">{{ w.owners | join(', ') or 'None' }}</td>
+        <td class="px-2 py-1.5 text-gray-400">{{ w.merge_reason or 'N/A' }}</td>
+        <td class="px-2 py-1.5 text-gray-500 font-mono text-2xs">{{ w.depends_on_workstreams | join(', ') or 'None' }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <div class="text-2xs text-gray-600">
+    No workstreams derived (need stories with a repo association + dependencies).
+    {% if plan.unplaced %}<br>Unplaced (no repo): {{ plan.unplaced | join(', ') }}{% endif %}
+  </div>
+  {% endif %}
+</div>
+
+<!-- ── Git nodes (branches) ────────────────────────────────────────────────── -->
+<div class="mb-6">
+  <h2 class="text-xs font-semibold uppercase tracking-wider text-gray-500 mb-2">Git nodes (branches)</h2>
+  {% if nodes %}
+  <table class="w-full text-xs border border-border rounded overflow-hidden">
+    <thead class="text-2xs uppercase tracking-wider text-gray-500 bg-surface">
+      <tr>
+        <th class="text-left px-2 py-1.5">Branch</th>
+        <th class="text-left px-2 py-1.5">State</th>
+        <th class="text-left px-2 py-1.5">base</th>
+        <th class="text-left px-2 py-1.5">synced</th>
+        <th class="text-left px-2 py-1.5">merge commit</th>
+        <th class="text-left px-2 py-1.5">error</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for n in nodes %}
+      <tr class="border-t border-border">
+        <td class="px-2 py-1.5 font-mono text-gray-300">{{ n.branch_name }}</td>
+        <td class="px-2 py-1.5">
+          {% set st = n.state %}
+          {% set cls = 'bg-gray-500/15 text-gray-400' %}
+          {% if st == 'MERGED' %}{% set cls = 'bg-green-500/15 text-green-400' %}
+          {% elif st in ('CONFLICTED', 'PROTECTION_BLOCKED', 'ESCALATED', 'ABANDONED') %}{% set cls = 'bg-red-500/15 text-red-400' %}
+          {% elif st in ('QUEUED', 'SYNCING', 'MERGING', 'MERGEABLE') %}{% set cls = 'bg-amber-500/15 text-amber-400' %}
+          {% elif st in ('IN_PROGRESS', 'READY', 'BRANCH_CREATED', 'BRANCHING') %}{% set cls = 'bg-brand/15 text-brand-light' %}
+          {% endif %}
+          <span class="text-2xs px-1.5 py-0.5 rounded {{ cls }}">{{ st }}</span>
+        </td>
+        <td class="px-2 py-1.5 font-mono text-2xs text-gray-500">{{ (n.base_sha or '')[:8] or 'N/A' }}</td>
+        <td class="px-2 py-1.5 font-mono text-2xs text-gray-500">{{ (n.last_synced_trunk_sha or '')[:8] or 'N/A' }}</td>
+        <td class="px-2 py-1.5 font-mono text-2xs text-gray-500">{{ (n.merge_commit_sha or '')[:8] or 'N/A' }}</td>
+        <td class="px-2 py-1.5 text-2xs text-red-400/80">
+          {{ (n.last_error or '')[:80] }}
+          {% if n.state in ('ESCALATED', 'CONFLICTED', 'PROTECTION_BLOCKED') %}
+          <button hx-post="/goals/{{ pid }}/git/ui/retry/{{ n.id }}"
+                  hx-target="#git-state" hx-swap="innerHTML"
+                  hx-confirm="Re-queue this node? Do this only AFTER fixing the cause (grant the missing permission, repair CI, reconfigure the trunk). The engine retries the workstream from scratch (idempotently)."
+                  class="ml-1 text-2xs px-2 py-0.5 rounded bg-brand/15 text-brand-light hover:bg-brand/25 transition-colors"
+                  title="Re-queue this stuck node after fixing the underlying cause">
+            Retry
+          </button>
+          {% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <div class="text-2xs text-gray-600">No nodes yet: click <b>Reconcile</b> to derive + persist the topology.</div>
+  {% endif %}
+</div>
+
+<!-- ── Shared repos (cross-goal auto-visibility: §11) ─────────────────────────── -->
+{% if shared_repos %}
+<div class="mb-6">
+  <h2 class="text-xs font-semibold uppercase tracking-wider text-gray-500 mb-2">Shared with other goals</h2>
+  {% for sr in shared_repos %}
+  <div class="mb-3 border border-border rounded overflow-hidden">
+    <div class="px-2 py-1.5 bg-surface text-2xs text-gray-400 font-mono">
+      {{ sr.repo }} · also used by: <span class="text-amber-400">{{ sr.goals | join(', ') }}</span>
+    </div>
+    {% for n in sr.nodes %}
+    <div class="px-2 py-1.5 border-t border-border flex items-center gap-2">
+      <span class="font-mono text-xs text-gray-400">{{ n.branch_name }}</span>
+      <span class="text-2xs text-gray-500">→ {{ n.trunk_branch }}</span>
+      <span class="text-2xs px-1.5 py-0.5 rounded bg-gray-500/15 text-gray-400">{{ n.state }}</span>
+      {% if n.pr_number %}<span class="text-2xs text-brand-light">PR #{{ n.pr_number }}</span>{% endif %}
+      <span class="text-2xs text-amber-400 ml-auto">{{ n.goal_name or n.goal_id }}</span>
+    </div>
+    {% endfor %}
+  </div>
+  {% endfor %}
+</div>
+{% endif %}
+
+<!-- ── Merge lanes (who holds the lane, who's waiting: §10 blocked-visibility) ── -->
+{% if lanes %}
+<div class="mb-6">
+  <h2 class="text-xs font-semibold uppercase tracking-wider text-gray-500 mb-2">Merge lanes</h2>
+  {% for lane in lanes %}
+  <div class="mb-3 border border-border rounded overflow-hidden">
+    <div class="px-2 py-1.5 bg-surface text-2xs text-gray-400 font-mono">
+      {{ lane.repo }} · trunk <b>{{ lane.trunk_branch }}</b>
+    </div>
+    {% if lane.holder %}
+    <div class="px-2 py-1.5 border-t border-border flex items-center gap-2">
+      <span class="text-2xs px-1.5 py-0.5 rounded bg-green-500/15 text-green-400">HOLDING</span>
+      <span class="font-mono text-xs text-gray-300">{{ lane.holder.branch_name }}</span>
+      <span class="text-2xs text-gray-500">{{ lane.holder.sub_state }}</span>
+      {% if not lane.holder.is_this_goal %}<span class="text-2xs text-amber-400">· goal: {{ lane.holder.goal_name or lane.holder.goal_id }}</span>{% endif %}
+      {% if lane.holder.owner %}<span class="text-2xs text-gray-600">@{{ lane.holder.owner }}</span>{% endif %}
+      {# §12 cancel: shown when this goal holds the lane OR is waiting behind it; the
+         endpoint re-checks authority. Frees a stuck lane (no auto-release exists). #}
+      {% if lane.holder.is_this_goal or lane.waiting | selectattr('is_this_goal') | list %}
+      <button hx-post="/goals/{{ pid }}/git/lanes/{{ lane.holder.node_id }}/cancel"
+              hx-target="#git-state" hx-swap="innerHTML"
+              hx-confirm="Cancel this merge? It closes the PR, frees the lane for the next workstream, and leaves dependents blocked pending re-plan."
+              class="text-2xs px-2 py-0.5 rounded bg-red-600/80 hover:bg-red-500 text-white transition-colors ml-auto">
+        Cancel lane
+      </button>
+      {% endif %}
+    </div>
+    {% endif %}
+    {% for w in lane.waiting %}
+    <div class="px-2 py-1.5 border-t border-border flex items-center gap-2 {% if w.is_this_goal %}bg-amber-500/5{% endif %}">
+      <span class="text-2xs px-1.5 py-0.5 rounded bg-gray-500/15 text-gray-400">#{{ w.position }} waiting</span>
+      <span class="font-mono text-xs text-gray-400">{{ w.branch_name }}</span>
+      {% if not w.is_this_goal %}<span class="text-2xs text-amber-400">· goal: {{ w.goal_name or w.goal_id }}</span>{% endif %}
+      {% if w.owner %}<span class="text-2xs text-gray-600">@{{ w.owner }}</span>{% endif %}
+      {% if w.is_this_goal %}<span class="text-2xs text-amber-400 ml-auto">blocked: lane held{% if lane.holder %} by {{ lane.holder.branch_name }}{% endif %} (you're #{{ w.position }})</span>{% endif %}
+    </div>
+    {% endfor %}
+  </div>
+  {% endfor %}
+</div>
+{% endif %}
+
+<!-- ── Merge stories (human-approved) ──────────────────────────────────────── -->
+<div class="mb-6">
+  <h2 class="text-xs font-semibold uppercase tracking-wider text-gray-500 mb-2">Merge stories</h2>
+  {% if merges %}
+  <table class="w-full text-xs border border-border rounded overflow-hidden">
+    <thead class="text-2xs uppercase tracking-wider text-gray-500 bg-surface">
+      <tr>
+        <th class="text-left px-2 py-1.5">Title</th>
+        <th class="text-left px-2 py-1.5">State</th>
+        <th class="text-left px-2 py-1.5">Approval</th>
+        <th class="text-right px-2 py-1.5"></th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for m in merges %}
+      <tr class="border-t border-border">
+        <td class="px-2 py-1.5 text-gray-300">{{ m.title }}</td>
+        <td class="px-2 py-1.5 text-gray-400">{{ m.state }}</td>
+        <td class="px-2 py-1.5 text-2xs">
+          {% if m.merge_approved_at %}
+          <span class="text-green-400">approved</span>
+          <span class="text-gray-600">({{ m.merge_approved_by or '?' }})</span>
+          {% else %}
+          <span class="text-gray-500">not approved</span>
+          {% endif %}
+        </td>
+        <td class="px-2 py-1.5 text-right">
+          {% if not m.merge_approved_at %}
+          <button hx-post="/goals/{{ pid }}/git/ui/approve/{{ m.id }}"
+                  hx-target="#git-state" hx-swap="innerHTML"
+                  hx-confirm="Approve this merge? Once the engine is enabled it will land the branch to trunk."
+                  class="text-2xs px-2 py-0.5 rounded bg-green-600 hover:bg-green-500 text-white transition-colors">
+            Approve
+          </button>
+          {% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <div class="text-2xs text-gray-600">No merge stories yet.</div>
+  {% endif %}
+</div>
+
+<!-- ── Merge queue (per repo, FIFO) ────────────────────────────────────────── -->
+<div>
+  <h2 class="text-xs font-semibold uppercase tracking-wider text-gray-500 mb-2">Merge queue</h2>
+  {% if queue %}
+  <table class="w-full text-xs border border-border rounded overflow-hidden">
+    <thead class="text-2xs uppercase tracking-wider text-gray-500 bg-surface">
+      <tr>
+        <th class="text-left px-2 py-1.5">Branch</th>
+        <th class="text-left px-2 py-1.5">Status</th>
+        <th class="text-left px-2 py-1.5">Seq</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for q in queue %}
+      <tr class="border-t border-border">
+        <td class="px-2 py-1.5 font-mono text-gray-300">{{ q.branch_name }}</td>
+        <td class="px-2 py-1.5 text-gray-400">{{ q.status }}</td>
+        <td class="px-2 py-1.5 text-gray-500">{{ q.enqueue_seq }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <div class="text-2xs text-gray-600">Queue empty (nodes enqueue once their merge story is approved).</div>
+  {% endif %}
+</div>

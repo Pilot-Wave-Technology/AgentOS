@@ -1,0 +1,206 @@
+{% extends "base.html" %}
+{% from "partials/_info_popover.html" import info_popover %}
+{% block title %}Kill Switch{% endblock %}
+
+{% block content %}
+<div class="max-w-6xl mx-auto px-6 py-6">
+  <a href="/settings" class="inline-flex items-center gap-1 text-xs text-gray-500 hover:text-gray-300 transition-colors mb-5">
+    <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"/></svg>
+    Settings
+  </a>
+
+  <!-- ── System freeze toggle ──────────────────────────────────────────── -->
+  <div class="card p-4 mb-6 flex items-center gap-4">
+    <div>
+      <h1 class="text-lg font-semibold text-gray-100 flex items-center gap-1.5">Kill Switch
+        {{ info_popover(
+          "Every pause/resume/freeze action on this page - system-wide or for a single goal - is platform.admin-only, regardless of a user's role on the goal itself. This is a platform-wide safety control, not a goal-management permission."
+        ) }}
+      </h1>
+      <p class="text-2xs text-gray-500 mt-0.5">
+        Pause or resume individual goals, or freeze the entire system.
+        Pausing is graceful: in-flight turns finish; no new work dispatches.
+      </p>
+    </div>
+    <div class="ml-auto flex items-center gap-2">
+      {% if system_paused %}
+        <span class="text-red-400 font-semibold text-sm mr-2">⏸ System frozen{% if system_reason %}: {{ system_reason }}{% endif %}</span>
+        {% if user.system_role == 'admin' %}
+        <button onclick="systemResume()" class="px-4 py-2 rounded bg-emerald-600 hover:bg-emerald-500 font-bold text-sm">▶ RECOVER / Resume System</button>
+        {% else %}
+        <span class="text-2xs text-gray-500">Contact an admin to resume.</span>
+        {% endif %}
+      {% else %}
+        {% if user.system_role == 'admin' %}
+        <button onclick="systemPause()" class="px-4 py-2 rounded bg-red-700 hover:bg-red-600 font-bold text-sm">⏻ Freeze System</button>
+        {% else %}
+        <span class="flex items-center gap-1.5 text-sm text-emerald-400">
+          <span class="w-1.5 h-1.5 rounded-full bg-emerald-500 flex-shrink-0"></span>
+          System running <span class="text-2xs text-gray-500 ml-1">(admin-only to freeze)</span>
+        </span>
+        {% endif %}
+      {% endif %}
+    </div>
+  </div>
+
+  <!-- ── Goals list ────────────────────────────────────────────────────── -->
+  <div class="mb-5">
+    <h2 class="text-base font-semibold text-gray-100 mb-3">All Goals</h2>
+
+    <!-- Filters row -->
+    <div class="flex flex-wrap items-center gap-2 mb-4">
+
+      <!-- Per-page selector -->
+      <div class="relative flex-shrink-0">
+        <select onchange="applyFilter('per', this.value)"
+          class="px-3 py-1.5 pr-7 bg-gray-800 border border-gray-700 rounded-lg text-sm text-gray-300 focus:outline-none focus:border-indigo-500 appearance-none cursor-pointer">
+          <option value="5"  {% if per == 5  %}selected{% endif %}>5 / page</option>
+          <option value="10" {% if per == 10 %}selected{% endif %}>10 / page</option>
+          <option value="15" {% if per == 15 %}selected{% endif %}>15 / page</option>
+          <option value="25" {% if per == 25 %}selected{% endif %}>25 / page</option>
+        </select>
+        <svg class="absolute right-2 top-1/2 -translate-y-1/2 w-3 h-3 text-gray-500 pointer-events-none" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/>
+        </svg>
+      </div>
+
+      <!-- Search -->
+      <div class="relative flex-1 min-w-0 max-w-xs">
+        <input id="goal-search" type="text"
+          placeholder="Search (Enter)…"
+          value="{{ q }}"
+          onkeydown="if(event.key==='Enter'){applySearch(this.value)}"
+          class="w-full px-3 py-1.5 bg-gray-800 border border-gray-700 rounded-lg text-sm focus:outline-none focus:border-indigo-500 pr-6" />
+        {% if q %}
+        <a href="/settings/controls{% if per != 10 %}?per={{ per }}{% endif %}"
+           class="absolute right-2 top-1/2 -translate-y-1/2 text-gray-500 hover:text-gray-300 text-xs">✕</a>
+        {% endif %}
+      </div>
+
+      <!-- Result count + pagination -->
+      <span class="text-xs text-gray-500 flex-shrink-0">
+        {% if q %}{{ total }} result{{ 's' if total != 1 else '' }} for "{{ q }}"
+        {% elif total > 0 %}{{ page_start }}–{{ page_end }} of {{ total }}
+        {% endif %}
+      </span>
+      <div class="flex items-center gap-1 ml-auto flex-shrink-0">
+        {% if prev_url %}<a href="{{ prev_url }}" class="btn btn-secondary btn-sm">← Prev</a>{% endif %}
+        {% if prev_url or next_url %}<span class="text-xs text-gray-600 px-1">{{ page_num }}</span>{% endif %}
+        {% if next_url %}<a href="{{ next_url }}" class="btn btn-secondary btn-sm">Next →</a>{% endif %}
+      </div>
+    </div>
+
+    <!-- Goals table -->
+    {% if goals %}
+    <div class="overflow-x-auto">
+      <table class="w-full text-sm">
+        <thead class="text-xs text-gray-500 uppercase border-b border-gray-800">
+          <tr>
+            <th class="text-left pb-3 pr-4 pl-2">Goal ID</th>
+            <th class="text-left pb-3 pr-4">Name</th>
+            <th class="text-left pb-3 pr-4">Status</th>
+            <th class="text-left pb-3 pr-4">Pause state</th>
+            <th class="text-left pb-3 pr-4">Paused by</th>
+            <th class="text-right pb-3">Actions</th>
+          </tr>
+        </thead>
+        <tbody class="divide-y divide-gray-800/60">
+          {% for g in goals %}
+          <tr class="hover:bg-gray-900/40 transition-colors {% if g.is_paused %}bg-amber-950/20{% endif %}">
+            <td class="py-2.5 pr-4 pl-2 font-mono text-xs text-indigo-400 whitespace-nowrap">{{ g.id }}</td>
+            <td class="py-2.5 pr-4 text-gray-100 max-w-xs truncate">{{ g.name or "None" }}</td>
+            <td class="py-2.5 pr-4">
+              <span class="pill {% if g.status == 'active' %}pill-success{% else %}pill-neutral{% endif %}">{{ g.status }}</span>
+            </td>
+            <td class="py-2.5 pr-4">
+              {% if g.is_paused %}
+                <span class="flex items-center gap-1.5 text-xs text-amber-400">
+                  <span class="w-1.5 h-1.5 rounded-full bg-amber-400 flex-shrink-0"></span>
+                  <span class="truncate max-w-[16rem]" title="{{ g.pause_reason }}">
+                    ⏸ Paused{% if g.pause_reason %}: {{ g.pause_reason }}{% endif %}
+                  </span>
+                </span>
+              {% else %}
+                <span class="flex items-center gap-1.5 text-xs text-emerald-400">
+                  <span class="w-1.5 h-1.5 rounded-full bg-emerald-500 flex-shrink-0"></span>
+                  Running
+                </span>
+              {% endif %}
+            </td>
+            <td class="py-2.5 pr-4 text-xs text-gray-500">
+              {% if g.paused_by %}{{ g.paused_by }}{% else %}None{% endif %}
+            </td>
+            <td class="py-2.5 text-right whitespace-nowrap">
+              {% if can_edit %}
+                {% if g.is_paused %}
+                  <button onclick="goalResume('{{ g.id }}')"
+                          class="px-3 py-1 rounded text-xs bg-emerald-700 hover:bg-emerald-600 font-medium">
+                    ▶ Resume
+                  </button>
+                {% else %}
+                  <button onclick="goalPause('{{ g.id }}')"
+                          class="px-3 py-1 rounded text-xs bg-amber-700 hover:bg-amber-600 font-medium">
+                    ⏸ Pause
+                  </button>
+                {% endif %}
+                <button onclick="goalDelete('{{ g.id }}')"
+                        class="px-3 py-1 rounded text-xs bg-red-800 hover:bg-red-700 font-medium ml-1">
+                  Delete
+                </button>
+              {% else %}
+                <span class="text-2xs text-gray-500">admin-only</span>
+              {% endif %}
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% elif q %}
+    <div class="text-center py-12 text-gray-500">
+      <div class="text-4xl mb-3 opacity-20">🔍</div>
+      <p class="text-sm">No goals matching <strong>"{{ q }}"</strong>.</p>
+    </div>
+    {% else %}
+    <div class="text-center py-12 text-gray-500">
+      <div class="text-4xl mb-3 opacity-20">⬡</div>
+      <p class="text-sm">No active goals.</p>
+    </div>
+    {% endif %}
+  </div>
+
+  <!-- ── Active agents + halted tasks (read-only operational view) ─────── -->
+  {# Agent-level action buttons (Stop / Force-kill / Resume) are preserved in
+     the backend router (admin_controls.py) but are not shown in the UI for now.
+     They will be re-surfaced in a future iteration. The polling fragment below
+     keeps the infrastructure alive so we can bring them back without code changes. #}
+  <div id="controls-fragment-mount"
+       hx-get="/settings/controls/agents"
+       hx-trigger="load, every 10s"
+       hx-swap="innerHTML">
+  </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+// systemPause()/systemResume() are defined globally in base.html (shared
+// confirmAction() modal: same type-to-confirm tier as goal pause/resume).
+
+function applyFilter(key, value) {
+  const url = new URL(window.location.href);
+  if (value && value !== '10') url.searchParams.set(key, value);
+  else url.searchParams.delete(key);
+  url.searchParams.delete('page');
+  window.location.href = url.toString();
+}
+
+function applySearch(q) {
+  const url = new URL(window.location.href);
+  if (q) url.searchParams.set('q', q);
+  else url.searchParams.delete('q');
+  url.searchParams.delete('page');
+  window.location.href = url.toString();
+}
+</script>
+{% endblock %}

@@ -1,0 +1,193 @@
+{% extends "base.html" %}
+{% block title %}{{ task.title }}: Tasks{% endblock %}
+{% block content %}
+<div class="p-6 lg:p-8 max-w-4xl mx-auto">
+  <!-- Header -->
+  <div class="flex items-center gap-2 mb-1">
+    <a href="/goals/{{ pid }}/tasks/board" class="text-slate-400 hover:text-white text-sm">&larr; Task Board</a>
+  </div>
+  <div class="flex items-start justify-between mb-6">
+    <div class="flex-1">
+      <h1 class="text-xl font-semibold text-gray-100">{{ task.title }}</h1>
+      <div class="flex items-center gap-2 mt-1.5">
+        <span class="pill
+          {% if task.state == 'done' %}pill-success
+          {% elif task.state == 'failed' %}pill-error
+          {% elif task.state == 'in_progress' %}pill-info
+          {% elif task.state == 'blocked' %}pill-error
+          {% elif task.state == 'awaiting_approval' %}pill-warning
+          {% else %}pill-neutral{% endif %}">
+          {{ task.state|replace('_', ' ') }}
+        </span>
+        <span class="text-2xs px-1.5 py-0.5 rounded
+          {% if task.priority == 'critical' %}bg-red-900/50 text-red-400
+          {% elif task.priority == 'high' %}bg-orange-900/50 text-orange-400
+          {% elif task.priority == 'medium' %}bg-indigo-900/50 text-indigo-400
+          {% else %}bg-gray-800 text-gray-500{% endif %}">
+          {{ task.priority or 'medium' }}
+        </span>
+        <span class="text-2xs text-gray-600">{{ task.id }}</span>
+      </div>
+    </div>
+    <!-- State transition buttons -->
+    <div class="flex gap-2">
+      {% if task.state == 'pending' %}
+      <form action="/goals/{{ pid }}/tasks/{{ task.id }}/transition" method="post" data-toast-submit data-fail="Failed to update state.">
+        <input type="hidden" name="state" value="in_progress">
+        <button class="btn btn-primary btn-sm">Start Working</button>
+      </form>
+      {% elif task.state == 'in_progress' %}
+      <form action="/goals/{{ pid }}/tasks/{{ task.id }}/transition" method="post" data-toast-submit data-fail="Failed to update state.">
+        <input type="hidden" name="state" value="done">
+        <button class="btn btn-primary btn-sm">Mark Done</button>
+      </form>
+      <form action="/goals/{{ pid }}/tasks/{{ task.id }}/transition" method="post" data-toast-submit data-fail="Failed to update state.">
+        <input type="hidden" name="state" value="blocked">
+        <button class="btn btn-secondary btn-sm">Block</button>
+      </form>
+      {% elif task.state == 'blocked' %}
+      <form action="/goals/{{ pid }}/tasks/{{ task.id }}/transition" method="post" data-toast-submit data-fail="Failed to update state.">
+        <input type="hidden" name="state" value="done">
+        <button class="btn btn-primary btn-sm">Mark Done</button>
+      </form>
+      <form action="/goals/{{ pid }}/tasks/{{ task.id }}/transition" method="post" data-toast-submit data-fail="Failed to update state.">
+        <input type="hidden" name="state" value="in_progress">
+        <button class="btn btn-secondary btn-sm">Unblock</button>
+      </form>
+      {% endif %}
+    </div>
+  </div>
+
+  <!-- Assignee -->
+  <div class="card p-4 mb-4">
+    <div class="flex items-center justify-between">
+      <div>
+        <h3 class="text-xs font-semibold text-gray-500 uppercase mb-1">Assigned To</h3>
+        {% if assignee_name %}
+        <span class="text-sm text-gray-200">{{ assignee_name }}</span>
+        {% else %}
+        <span class="text-sm text-gray-500 italic">Unassigned</span>
+        {% endif %}
+      </div>
+      <form class="flex items-center gap-2" action="/goals/{{ pid }}/tasks/{{ task.id }}/assign" method="post" data-toast-submit data-fail="Failed to reassign task.">
+        <select name="assigned_to" class="input text-xs py-1 w-40">
+          <option value="">Unassign</option>
+          {% for m in members %}
+          <option value="{{ m.uid }}" {% if m.uid == task.assigned_to %}selected{% endif %}>
+            {{ m.display_name or m.email }}
+          </option>
+          {% endfor %}
+        </select>
+        <button type="submit" class="btn btn-secondary btn-sm">Reassign</button>
+      </form>
+    </div>
+  </div>
+
+  <!-- Description -->
+  {% if task.description %}
+  <div class="card p-4 mb-4">
+    <h3 class="text-xs font-semibold text-gray-500 uppercase mb-2">Description</h3>
+    <div class="text-sm text-gray-300 whitespace-pre-wrap">{{ task.description }}</div>
+  </div>
+  {% endif %}
+
+  {% if task.acceptance_criteria %}
+  <div class="card p-4 mb-4">
+    <h3 class="text-xs font-semibold text-gray-500 uppercase mb-2">Acceptance Criteria</h3>
+    <div class="text-sm text-gray-300 whitespace-pre-wrap">{{ task.acceptance_criteria }}</div>
+  </div>
+  {% endif %}
+
+  <!-- Blocked reason -->
+  {% if task.state == 'blocked' and task.blocked_reason %}
+  <div class="card p-4 mb-4 border-orange-600/30 bg-orange-900/10">
+    <h3 class="text-xs font-semibold text-orange-400 uppercase mb-1">Blocked</h3>
+    <p class="text-sm text-orange-300">{{ task.blocked_reason }}</p>
+  </div>
+  {% endif %}
+
+  <!-- Result summary -->
+  {% if task.result_summary %}
+  <div class="card p-4 mb-4 border-emerald-600/30 bg-emerald-900/10">
+    <h3 class="text-xs font-semibold text-emerald-400 uppercase mb-1">Result</h3>
+    <p class="text-sm text-emerald-300">{{ task.result_summary }}</p>
+  </div>
+  {% endif %}
+
+  <!-- Dependencies -->
+  <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
+    <!-- Upstream (this task depends on) -->
+    {% if upstream %}
+    <div class="card p-4">
+      <h3 class="text-xs font-semibold text-gray-500 uppercase mb-2">Depends On</h3>
+      {% for dep in upstream %}
+      <div class="flex items-center gap-2 py-1">
+        <span class="w-2 h-2 rounded-full
+          {% if dep.state == 'done' %}bg-emerald-400{% elif dep.state == 'failed' %}bg-red-400{% else %}bg-gray-500{% endif %}"></span>
+        <a href="/goals/{{ pid }}/tasks/{{ dep.id }}/human" class="text-xs text-gray-300 hover:text-white">
+          {{ dep.title }}
+        </a>
+        <span class="text-2xs text-gray-600">{{ dep.state }}</span>
+      </div>
+      {% if dep.result_summary %}
+      <p class="text-2xs text-gray-500 ml-4 mb-1">{{ dep.result_summary[:100] }}</p>
+      {% endif %}
+      {% endfor %}
+    </div>
+    {% endif %}
+
+    <!-- Downstream (tasks that depend on this) -->
+    {% if dependents %}
+    <div class="card p-4">
+      <h3 class="text-xs font-semibold text-gray-500 uppercase mb-2">Blocks</h3>
+      {% for dep in dependents %}
+      <div class="flex items-center gap-2 py-1">
+        <span class="w-2 h-2 rounded-full
+          {% if dep.state == 'done' %}bg-emerald-400{% else %}bg-gray-500{% endif %}"></span>
+        <a href="/goals/{{ pid }}/tasks/{{ dep.id }}/human" class="text-xs text-gray-300 hover:text-white">
+          {{ dep.title }}
+        </a>
+      </div>
+      {% endfor %}
+    </div>
+    {% endif %}
+  </div>
+
+  <!-- Resource dependencies -->
+  {% if resource_deps %}
+  <div class="card p-4 mb-4">
+    <h3 class="text-xs font-semibold text-gray-500 uppercase mb-2">Resources</h3>
+    {% for rd in resource_deps %}
+    <div class="flex items-center gap-2 py-1">
+      <span class="text-2xs px-1.5 py-0.5 rounded
+        {% if rd.dep_type == 'requires' %}bg-blue-900/50 text-blue-400
+        {% elif rd.dep_type == 'produces' %}bg-emerald-900/50 text-emerald-400
+        {% else %}bg-orange-900/50 text-orange-400{% endif %}">
+        {{ rd.dep_type }}
+      </span>
+      <a href="/goals/{{ pid }}/resources/{{ rd.resource_id }}" class="text-xs text-gray-300 hover:text-white">
+        {{ rd.resource_name }} ({{ rd.resource_kind }})
+      </a>
+    </div>
+    {% endfor %}
+  </div>
+  {% endif %}
+
+  <!-- Event history -->
+  {% if events %}
+  <div class="card p-4">
+    <h3 class="text-xs font-semibold text-gray-500 uppercase mb-2">History</h3>
+    <div class="space-y-1.5">
+      {% for e in events %}
+      <div class="text-xs text-gray-500">
+        <span class="text-gray-400" {% if e.created_at %}data-utc="{{ e.created_at.isoformat() }}"{% endif %}>{{ e.created_at.strftime('%Y-%m-%d %H:%M') if e.created_at else '' }}{% if e.created_at %} UTC{% endif %}</span>
+        &middot; {{ e.from_state }} → {{ e.to_state }}
+        {% if e.actor %} by {{ e.actor }}{% endif %}
+        {% if e.note %}: {{ e.note[:100] }}{% endif %}
+      </div>
+      {% endfor %}
+    </div>
+  </div>
+  {% endif %}
+</div>
+{% endblock %}

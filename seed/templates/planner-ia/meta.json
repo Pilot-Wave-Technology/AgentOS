@@ -1,0 +1,53 @@
+{
+  "id": "planner-ia",
+  "type": "IA",
+  "name": "Code Planner",
+  "description": "",
+  "model": "claude-cli/sonnet",
+  "emoji": "",
+  "tools_allow": [
+    "read",
+    "write",
+    "edit",
+    "apply_patch",
+    "exec",
+    "process",
+    "web_search",
+    "web_fetch",
+    "browser",
+    "canvas",
+    "cron",
+    "message",
+    "gateway",
+    "agents_list",
+    "sessions_spawn",
+    "sessions_send",
+    "sessions_list",
+    "sessions_history",
+    "subagents",
+    "session_status",
+    "memory_search",
+    "memory_get",
+    "task_report",
+    "create_task",
+    "task_status",
+    "task_activity",
+    "message_assistant",
+    "image",
+    "pdf",
+    "tts",
+    "nodes"
+  ],
+  "tools_deny": [],
+  "memory_enabled": false,
+  "max_tokens": null,
+  "notes": "",
+  "status": "active",
+  "version": 1,
+  "tool_profiles": [
+    {
+      "profile_id": "task-worker",
+      "position": 0
+    }
+  ]
+}

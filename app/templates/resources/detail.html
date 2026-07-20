@@ -1,0 +1,937 @@
+{% extends "base.html" %}
+{% from "partials/_info_popover.html" import info_popover %}
+{% block title %}{{ resource.name }}: Resources{% endblock %}
+{% block content %}
+{% set ft = (resource.file_type or '') | lower | trim('.') %}
+<div class="p-6 lg:p-8 max-w-5xl mx-auto">
+
+  <!-- Back link -->
+  <div class="flex items-center gap-2 mb-1">
+    <a href="/goals/{{ pid }}/resources" class="text-slate-400 hover:text-white text-sm">&larr; Resources</a>
+  </div>
+
+  <!-- Header row -->
+  <div class="flex items-start justify-between mb-6">
+    <div>
+      <h1 class="text-xl font-semibold text-gray-100">
+        {% if resource.kind == 'repo' %}📦
+        {% elif resource.kind == 'branch' %}🌿
+        {% elif resource.kind in ('document', 'file') %}📄
+        {% elif resource.kind == 'service' %}⚙️
+        {% elif resource.kind == 'dataset' %}🗄️
+        {% elif resource.kind == 'config' %}🔧
+        {% elif resource.kind in ('gcp_environment',) %}☁️
+        {% elif resource.kind in ('gcp_test_sa', 'gcp_deploy_sa') %}🔑
+        {% else %}📁{% endif %}
+        {{ resource.name }}
+        {% if resource.kind == 'environment' %}
+        <span class="ml-2 text-xs text-gray-600 font-normal">(legacy)</span>
+        {% endif %}
+      </h1>
+      <p class="text-sm text-gray-500 mt-0.5">
+        {{ resource.kind }}
+        {% if resource.uri %} &middot; <span class="font-mono">{{ resource.uri }}</span>{% endif %}
+        {% if resource.file_type %} &middot; .{{ resource.file_type }}
+          {% if resource.file_size_bytes %}({{ (resource.file_size_bytes / 1024)|round(1) }} KB){% endif %}
+        {% endif %}
+        {% if resource.status and resource.status != 'active' %}
+        &middot; <span class="text-yellow-500">{{ resource.status }}</span>
+        {% endif %}
+      </p>
+    </div>
+    <div class="flex gap-2 flex-shrink-0">
+      {% if resource.kind == 'repo' or resource.gcs_uri %}
+      <form action="/goals/{{ pid }}/resources/{{ resource.id }}/scan" method="post">
+        <button type="submit" class="btn btn-secondary btn-sm"
+          title="Re-run the AI summarisation scan.">Rescan</button>
+      </form>
+      {% endif %}
+      {% if not resource.locked_by %}
+      <form action="/goals/{{ pid }}/resources/{{ resource.id }}/lock" method="post">
+        <input type="hidden" name="for_task" value="">
+        <button type="submit" class="btn btn-secondary btn-sm">Lock</button>
+      </form>
+      {% else %}
+      <form action="/goals/{{ pid }}/resources/{{ resource.id }}/unlock" method="post">
+        <button type="submit" class="btn btn-secondary btn-sm">Unlock</button>
+      </form>
+      {% endif %}
+      {% set can_manage = (role == 'admin') %}
+      {% if can_manage %}
+      {% if resource.status == 'archived' %}
+      <form action="/goals/{{ pid }}/resources/{{ resource.id }}/unarchive" method="post">
+        <button type="submit" class="btn btn-primary btn-sm">Unarchive</button>
+      </form>
+      {% else %}
+      <form action="/goals/{{ pid }}/resources/{{ resource.id }}/archive" method="post"
+            data-confirm="Archive this resource?">
+        <button type="submit" class="btn btn-secondary btn-sm">Archive</button>
+      </form>
+      {% endif %}
+      <form action="/goals/{{ pid }}/resources/{{ resource.id }}/delete" method="post"
+            data-confirm="This cannot be undone." data-confirm-danger="true" data-confirm-phrase="Delete this resource">
+        <button type="submit" class="btn btn-danger btn-sm">Delete</button>
+      </form>
+      {% endif %}
+    </div>
+  </div>
+
+  <!-- Lock status banner -->
+  {% if resource.locked_by %}
+  <div class="card p-3 mb-4 border-yellow-600/30 bg-yellow-900/10">
+    <span class="text-sm text-yellow-400">
+      Locked by {{ resource.locked_by }}{% if resource.locked_for %} for task {{ resource.locked_for }}{% endif %}
+    </span>
+  </div>
+  {% endif %}
+
+  <!-- ════════════════════════════════════════════════════════════════════════
+       KIND-SPECIFIC PANELS
+       ════════════════════════════════════════════════════════════════════════ -->
+
+  {# ── REPO ─────────────────────────────────────────────────────────────── #}
+  {% if resource.kind == 'repo' %}
+  <div class="card p-4 mb-4">
+    <h3 class="text-xs font-semibold text-gray-500 uppercase mb-3">Repository</h3>
+    <div class="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-4">
+      <div>
+        <p class="text-2xs text-gray-500 mb-0.5">Owner / Name</p>
+        <p class="text-sm text-gray-200 font-mono">
+          {% if resource.repo_owner and resource.repo_name %}
+            {{ resource.repo_owner }}/{{ resource.repo_name }}
+          {% else %}{{ resource.name }}{% endif %}
+        </p>
+      </div>
+      <div>
+        <p class="text-2xs text-gray-500 mb-0.5">Default Branch</p>
+        <p class="text-sm text-gray-200 font-mono">{{ resource.default_branch or github_live.default_branch if github_live else resource.default_branch or 'Not Set' }}</p>
+      </div>
+      {% if resource.clone_url %}
+      <div class="col-span-2">
+        <p class="text-2xs text-gray-500 mb-0.5">Clone URL</p>
+        <p class="text-xs text-gray-400 font-mono break-all">{{ resource.clone_url }}</p>
+      </div>
+      {% endif %}
+    </div>
+
+    {% if github_live %}
+    <!-- Live GitHub stats bar -->
+    <div class="flex flex-wrap gap-4 text-sm border-t border-gray-800 pt-3 mt-1">
+      {% if github_live.language %}
+      <span class="text-gray-400"><span class="text-gray-600 text-xs mr-1">language</span>{{ github_live.language }}</span>
+      {% endif %}
+      {% if github_live.open_prs is not none %}
+      <span class="text-gray-400"><span class="text-gray-600 text-xs mr-1">open PRs</span>
+        <span class="{% if github_live.open_prs > 0 %}text-indigo-400{% endif %}">{{ github_live.open_prs }}</span>
+      </span>
+      {% endif %}
+      {% if github_live.open_issues is not none %}
+      <span class="text-gray-400"><span class="text-gray-600 text-xs mr-1">open issues</span>{{ github_live.open_issues }}</span>
+      {% endif %}
+      {% if github_live.stars %}
+      <span class="text-gray-400"><span class="text-gray-600 text-xs mr-1">stars</span>{{ github_live.stars }}</span>
+      {% endif %}
+      {% if github_live.pushed_at %}
+      <span class="text-gray-400"><span class="text-gray-600 text-xs mr-1">last push</span>{{ github_live.pushed_at[:10] }}</span>
+      {% endif %}
+      {% if github_live.private %}
+      <span class="pill text-2xs bg-gray-800 text-gray-400">private</span>
+      {% endif %}
+      {% if github_live.html_url %}
+      <a href="{{ github_live.html_url }}" target="_blank" rel="noopener"
+         class="text-indigo-400 hover:text-indigo-300 text-xs ml-auto">Open on GitHub →</a>
+      {% endif %}
+    </div>
+    {% if github_live.description %}
+    <p class="text-xs text-gray-500 mt-2 italic">{{ github_live.description }}</p>
+    {% endif %}
+    {% if github_live.topics %}
+    <div class="flex flex-wrap gap-1 mt-2">
+      {% for topic in github_live.topics %}
+      <span class="text-2xs bg-indigo-900/30 text-indigo-400 px-1.5 py-0.5 rounded">{{ topic }}</span>
+      {% endfor %}
+    </div>
+    {% endif %}
+    {% else %}
+    <p class="text-xs text-gray-600 mt-1">Live GitHub data unavailable - check GitHub App connectivity.</p>
+    {% endif %}
+  </div>
+  {% endif %}{# end repo #}
+
+  {# ── BRANCH ───────────────────────────────────────────────────────────── #}
+  {% if resource.kind == 'branch' %}
+  <div class="card p-4 mb-4">
+    <h3 class="text-xs font-semibold text-gray-500 uppercase mb-3">Branch</h3>
+    <div class="grid grid-cols-2 sm:grid-cols-3 gap-3 mb-3 text-sm">
+      <div>
+        <p class="text-2xs text-gray-500 mb-0.5">Branch</p>
+        <p class="text-gray-200 font-mono">{{ resource.branch_name or resource.name }}</p>
+      </div>
+      <div>
+        <p class="text-2xs text-gray-500 mb-0.5">Base</p>
+        <p class="text-gray-400 font-mono">{{ resource.base_branch or github_live.base_branch if github_live else resource.base_branch or 'Not Set' }}</p>
+      </div>
+      {% if resource.head_sha %}
+      <div>
+        <p class="text-2xs text-gray-500 mb-0.5">HEAD</p>
+        <p class="text-gray-400 font-mono text-xs">{{ resource.head_sha[:12] }}…</p>
+      </div>
+      {% endif %}
+    </div>
+
+    {% if github_live %}
+    <!-- Ahead / behind indicator -->
+    <div class="flex items-center gap-4 py-2 border-t border-gray-800">
+      {% if github_live.ahead_by is not none %}
+      <div class="flex items-center gap-1.5">
+        <span class="w-2 h-2 rounded-full {% if github_live.ahead_by > 0 %}bg-emerald-500{% else %}bg-gray-700{% endif %}"></span>
+        <span class="text-sm {% if github_live.ahead_by > 0 %}text-emerald-400{% else %}text-gray-500{% endif %}">
+          {{ github_live.ahead_by }} ahead
+        </span>
+      </div>
+      {% endif %}
+      {% if github_live.behind_by is not none %}
+      <div class="flex items-center gap-1.5">
+        <span class="w-2 h-2 rounded-full {% if github_live.behind_by > 0 %}bg-yellow-500{% else %}bg-gray-700{% endif %}"></span>
+        <span class="text-sm {% if github_live.behind_by > 0 %}text-yellow-400{% else %}text-gray-500{% endif %}">
+          {{ github_live.behind_by }} behind
+        </span>
+      </div>
+      {% endif %}
+      <span class="text-gray-700 text-xs">vs {{ github_live.base_branch }}</span>
+
+      <!-- PR link -->
+      {% if github_live.pr %}
+      <a href="{{ github_live.pr.html_url }}" target="_blank" rel="noopener"
+         class="ml-auto flex items-center gap-1.5 text-xs text-indigo-400 hover:text-indigo-300">
+        {% if github_live.pr.draft %}
+        <span class="pill text-2xs bg-gray-800 text-gray-400">draft</span>
+        {% endif %}
+        PR #{{ github_live.pr.number }}: {{ github_live.pr.title | truncate(50) }} →
+      </a>
+      {% else %}
+      <span class="ml-auto text-xs text-gray-600">No open PR</span>
+      {% endif %}
+    </div>
+
+    {% if github_live.repo_owner and github_live.repo_name %}
+    <p class="text-2xs text-gray-600 mt-2">
+      Repo:
+      <a href="/goals/{{ pid }}/resources/{{ resource.parent_id }}" class="text-indigo-500 hover:text-indigo-400">
+        {{ github_live.repo_owner }}/{{ github_live.repo_name }}
+      </a>
+    </p>
+    {% endif %}
+    {% else %}
+    <p class="text-xs text-gray-600">Live branch status unavailable - check GitHub App connectivity.</p>
+    {% endif %}
+  </div>
+  {% endif %}{# end branch #}
+
+  {# ── DOCUMENT / FILE ──────────────────────────────────────────────────── #}
+  {% if resource.kind in ('document', 'file') %}
+  <div class="card p-4 mb-4">
+    <h3 class="text-xs font-semibold text-gray-500 uppercase mb-3">File</h3>
+    <!-- File metadata row -->
+    <div class="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-3 text-sm">
+      {% if resource.file_type %}
+      <div>
+        <p class="text-2xs text-gray-500 mb-0.5">Type</p>
+        <p class="text-gray-200 font-mono">.{{ resource.file_type }}</p>
+      </div>
+      {% endif %}
+      {% if resource.file_size_bytes %}
+      <div>
+        <p class="text-2xs text-gray-500 mb-0.5">Size</p>
+        <p class="text-gray-200">
+          {% if resource.file_size_bytes < 1024 %}{{ resource.file_size_bytes }} B
+          {% elif resource.file_size_bytes < 1048576 %}{{ (resource.file_size_bytes / 1024)|round(1) }} KB
+          {% else %}{{ (resource.file_size_bytes / 1048576)|round(2) }} MB{% endif %}
+        </p>
+      </div>
+      {% endif %}
+      {% if resource.file_path %}
+      <div class="col-span-2">
+        <p class="text-2xs text-gray-500 mb-0.5">Path</p>
+        <p class="text-xs text-gray-400 font-mono break-all">{{ resource.file_path }}</p>
+      </div>
+      {% endif %}
+    </div>
+
+    <!-- Scan stats (from resource_summaries.metadata) -->
+    {% if scan_stats %}
+    <div class="flex flex-wrap gap-x-5 gap-y-1 text-xs text-gray-400 border-t border-gray-800 pt-3 mb-3">
+      {% if scan_stats.pages %}
+      <span><span class="text-gray-600 mr-1">pages</span>{{ scan_stats.pages }}</span>
+      {% endif %}
+      {% if scan_stats.paragraph_count %}
+      <span><span class="text-gray-600 mr-1">paragraphs</span>{{ scan_stats.paragraph_count }}</span>
+      {% endif %}
+      {% if scan_stats.tables %}
+      <span><span class="text-gray-600 mr-1">tables</span>{{ scan_stats.tables }}</span>
+      {% endif %}
+      {% if scan_stats.rows %}
+      <span><span class="text-gray-600 mr-1">rows</span>{{ scan_stats.rows }}</span>
+      {% endif %}
+      {% if scan_stats.sheets %}
+      <span><span class="text-gray-600 mr-1">sheets</span>{{ scan_stats.sheets | join(', ') }}</span>
+      {% endif %}
+      {% if scan_stats.token_count %}
+      <span><span class="text-gray-600 mr-1">tokens</span>{{ scan_stats.token_count }}</span>
+      {% endif %}
+    </div>
+    <!-- Excel column headers -->
+    {% if scan_stats.headers %}
+    <div class="mb-3">
+      <p class="text-2xs text-gray-500 mb-1">Columns ({{ scan_stats.headers | length }})</p>
+      <div class="flex flex-wrap gap-1">
+        {% for h in scan_stats.headers[:30] %}
+        <span class="text-2xs bg-gray-800 text-gray-300 px-1.5 py-0.5 rounded font-mono">{{ h }}</span>
+        {% endfor %}
+        {% if scan_stats.headers | length > 30 %}
+        <span class="text-2xs text-gray-600">+{{ scan_stats.headers | length - 30 }} more</span>
+        {% endif %}
+      </div>
+    </div>
+    {% endif %}
+    {% endif %}
+
+    <!-- Download / open link -->
+    {% if viewer_url %}
+    <div class="flex items-center gap-3 border-t border-gray-800 pt-3">
+      <a href="{{ viewer_url }}" target="_blank" rel="noopener"
+         class="btn btn-secondary btn-sm">{% if viewer_url_is_external %}Open file{% else %}Download file{% endif %}</a>
+    </div>
+    {% endif %}
+  </div>
+
+  <!-- ── Inline viewer ─────────────────────────────────────────────────── -->
+  {% set ft = (resource.file_type or '')|lower|trim('.') %}
+  {% set is_image = ft in ('png', 'jpg', 'jpeg', 'gif', 'webp', 'svg') %}
+
+  {# Rendering limits shown in every viewer card so users know the constraints upfront #}
+  {% if ft == 'pdf' %}{% set _render_limit = 'first 30 pages · max 5 MB' %}
+  {% elif ft in ('docx', 'doc') %}{% set _render_limit = 'max 5 MB' %}
+  {% elif ft in ('xlsx', 'xls') %}{% set _render_limit = 'first 500 rows/sheet · max 5 MB' %}
+  {% elif ft == 'csv' %}{% set _render_limit = 'first 500 rows · max 5 MB' %}
+  {% else %}{% set _render_limit = '' %}{% endif %}
+
+  {% if render_failed %}
+  {# Render job wrote a permanent failure - code-level error, no auto-retries #}
+  <div class="card p-4 mb-4 border border-red-800/60 bg-red-950/20">
+    <div class="flex items-start justify-between gap-4">
+      <div class="min-w-0">
+        <h3 class="text-xs font-semibold text-red-400 uppercase mb-1">Rendering failed</h3>
+        <p class="text-sm text-gray-400 mb-1">
+          Content extraction failed with a code error - the file may be in an unsupported
+          format or is corrupted. Retrying may not resolve this.
+        </p>
+        <p class="text-2xs text-gray-600">
+          If you re-uploaded a corrected file, use "Try again" to re-trigger extraction.
+        </p>
+      </div>
+      <div class="flex flex-col gap-2 flex-shrink-0">
+        <form action="/goals/{{ pid }}/resources/{{ resource.id }}/retry-render" method="post">
+          <button type="submit" class="btn btn-secondary btn-sm w-full">Try again</button>
+        </form>
+        {% if viewer_url %}
+        <a href="{{ viewer_url }}" download class="btn btn-secondary btn-sm text-center">Download</a>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+
+  {% elif render_pending and ft != 'pdf' %}
+  {# Render job triggered but not yet finished (or in backoff).
+     PDFs skip this card - the native viewer below already shows the file. #}
+  <div class="card p-4 mb-4">
+    <div class="flex items-start justify-between gap-4">
+      <div>
+        <h3 class="text-xs font-semibold text-gray-500 uppercase mb-1">Rendering in progress</h3>
+        <p class="text-sm text-gray-400">Document content is being extracted and will be available in a few minutes.</p>
+        {% if _render_limit %}<p class="text-2xs text-gray-700 mt-1">Limits: {{ _render_limit }}</p>{% endif %}
+      </div>
+      <a href="" onclick="window.location.reload(); return false;"
+         class="btn btn-secondary btn-sm flex-shrink-0">Refresh</a>
+    </div>
+  </div>
+
+  {% elif doc_rendered_content %}
+  {# PDF / DOCX / XLSX / CSV: pre-rendered by the Cloud Run render job #}
+  <div class="card p-4 mb-4">
+    <div class="flex items-center justify-between mb-3">
+      <div>
+        <h3 class="text-xs font-semibold text-gray-500 uppercase">
+          {% if ft in ('xlsx', 'xls', 'csv') %}Spreadsheet data{% elif ft in ('pdf', 'docx', 'doc') %}Document content{% else %}Content{% endif %}
+        </h3>
+        {% if _render_limit %}<p class="text-2xs text-gray-700 mt-0.5">{{ _render_limit }}</p>{% endif %}
+      </div>
+      {% if viewer_url %}
+      <a href="{{ viewer_url }}" download
+         class="text-xs text-indigo-400 hover:text-indigo-300">Download →</a>
+      {% endif %}
+    </div>
+    <div class="rendered-doc" style="max-height:700px; overflow-y:auto;">
+      {{ doc_rendered_content | safe }}
+    </div>
+  </div>
+
+  {% elif viewer_url and ft == 'pdf' %}
+  {# Fallback for external PDFs where server-side extraction isn't available #}
+  <div class="card p-0 mb-4 overflow-hidden">
+    <div class="flex items-center justify-between px-4 py-2 border-b border-gray-800">
+      <div>
+        <h3 class="text-xs font-semibold text-gray-500 uppercase">Preview</h3>
+        {% if _render_limit %}<p class="text-2xs text-gray-700 mt-0.5">{{ _render_limit }}</p>{% endif %}
+      </div>
+      <a href="{{ viewer_url }}" target="_blank" rel="noopener"
+         class="text-xs text-indigo-400 hover:text-indigo-300">Open in new tab →</a>
+    </div>
+    <object data="{{ viewer_url }}" type="application/pdf"
+            class="w-full block" style="height:680px;">
+      <div class="p-6 text-center text-sm text-gray-500">
+        PDF preview is not supported in your browser.
+        <a href="{{ viewer_url }}" class="text-indigo-400 hover:text-indigo-300 ml-1">Download to view.</a>
+      </div>
+    </object>
+  </div>
+
+  {% elif viewer_url and is_image %}
+  <div class="card p-4 mb-4">
+    <div class="flex items-center justify-between mb-3">
+      <h3 class="text-xs font-semibold text-gray-500 uppercase">Preview</h3>
+      <a href="{{ viewer_url }}" target="_blank" rel="noopener"
+         class="text-xs text-indigo-400 hover:text-indigo-300">Open full size →</a>
+    </div>
+    <img src="{{ viewer_url }}" alt="{{ resource.name }}"
+         class="max-w-full rounded border border-gray-800"
+         style="max-height:600px; object-fit:contain;">
+  </div>
+
+  {% elif doc_text_content and ft == 'md' %}
+  <div class="card p-4 mb-4">
+    <div class="flex items-center justify-between mb-3">
+      <h3 class="text-xs font-semibold text-gray-500 uppercase">Preview</h3>
+      {% if viewer_url %}
+      <a href="{{ viewer_url }}" target="_blank" rel="noopener"
+         class="text-xs text-indigo-400 hover:text-indigo-300">Download →</a>
+      {% endif %}
+    </div>
+    <div class="md-content text-sm max-h-[600px] overflow-y-auto">
+      {{ doc_text_content | md | safe }}
+    </div>
+  </div>
+
+  {% elif doc_text_content %}
+  <div class="card p-4 mb-4">
+    <div class="flex items-center justify-between mb-3">
+      <h3 class="text-xs font-semibold text-gray-500 uppercase">Preview</h3>
+      {% if viewer_url %}
+      <a href="{{ viewer_url }}" target="_blank" rel="noopener"
+         class="text-xs text-indigo-400 hover:text-indigo-300">Download →</a>
+      {% endif %}
+    </div>
+    <pre class="text-xs text-gray-300 bg-gray-900/50 rounded p-3 overflow-x-auto max-h-[600px] overflow-y-auto leading-relaxed"
+       {% if ft in ('json', 'yaml', 'yml') %}id="syntax-pre" data-ft="{{ ft }}"{% endif %}>{{ doc_text_content | e }}</pre>
+  </div>
+
+  {% elif viewer_url and ft in ('xlsx', 'xls') %}
+  <div class="card p-4 mb-4">
+    <h3 class="text-xs font-semibold text-gray-500 uppercase mb-1">Spreadsheet data</h3>
+    {% if _render_limit %}<p class="text-2xs text-gray-700 mb-2">{{ _render_limit }}</p>{% endif %}
+    <p class="text-sm text-gray-500">Content extraction unavailable for this file (file may be too large or externally hosted).
+      <a href="{{ viewer_url }}" class="text-indigo-400 hover:text-indigo-300 ml-1">Download to open in Excel.</a>
+    </p>
+  </div>
+  {% endif %}
+  {% endif %}{# end document/file #}
+
+  {# ── SERVICE ──────────────────────────────────────────────────────────── #}
+  {% if resource.kind == 'service' %}
+  <div class="card p-4 mb-4">
+    <h3 class="text-xs font-semibold text-gray-500 uppercase mb-3">Service / API</h3>
+    {% if resource.uri %}
+    <div class="mb-3">
+      <p class="text-2xs text-gray-500 mb-0.5">Endpoint</p>
+      <p class="text-sm text-gray-200 font-mono break-all">{{ resource.uri }}</p>
+    </div>
+    {% endif %}
+    {% if resource.metadata %}
+    <div class="grid grid-cols-1 sm:grid-cols-2 gap-2 mt-2">
+      {% for k, v in resource.metadata.items() %}
+      <div>
+        <p class="text-2xs text-gray-600 mb-0.5">{{ k }}</p>
+        <p class="text-xs text-gray-300 font-mono">{{ v }}</p>
+      </div>
+      {% endfor %}
+    </div>
+    {% endif %}
+  </div>
+  {% endif %}
+
+  {# ── DATASET ──────────────────────────────────────────────────────────── #}
+  {% if resource.kind == 'dataset' %}
+  <div class="card p-4 mb-4">
+    <h3 class="text-xs font-semibold text-gray-500 uppercase mb-3">Dataset</h3>
+    {% if resource.uri %}
+    <div class="mb-3">
+      <p class="text-2xs text-gray-500 mb-0.5">URI / Location</p>
+      <p class="text-sm text-gray-200 font-mono break-all">{{ resource.uri }}</p>
+    </div>
+    {% endif %}
+    {% if resource.metadata %}
+    <div class="grid grid-cols-1 sm:grid-cols-2 gap-2">
+      {% for k, v in resource.metadata.items() %}
+      <div>
+        <p class="text-2xs text-gray-600 mb-0.5">{{ k }}</p>
+        <p class="text-xs text-gray-300 font-mono">{{ v }}</p>
+      </div>
+      {% endfor %}
+    </div>
+    {% endif %}
+  </div>
+  {% endif %}
+
+  {# ── CONFIG ───────────────────────────────────────────────────────────── #}
+  {% if resource.kind == 'config' %}
+  <div class="card p-4 mb-4">
+    <h3 class="text-xs font-semibold text-gray-500 uppercase mb-3">Configuration</h3>
+    {% if resource.uri %}
+    <div class="mb-3">
+      <p class="text-2xs text-gray-500 mb-0.5">Identifier / Key</p>
+      <p class="text-sm text-gray-200 font-mono">{{ resource.uri }}</p>
+    </div>
+    {% endif %}
+    {% if resource.human_context %}
+    <pre class="text-xs text-gray-300 bg-gray-900/50 rounded p-3 overflow-x-auto">{{ resource.human_context }}</pre>
+    {% endif %}
+    {% if resource.metadata %}
+    <details class="mt-3 {% if not resource.human_context %}mt-0{% endif %}">
+      <summary class="text-2xs text-gray-500 cursor-pointer">Raw metadata</summary>
+      <pre class="text-2xs text-gray-500 mt-1 overflow-x-auto whitespace-pre-wrap">{{ resource.metadata | tojson_pretty | safe }}</pre>
+    </details>
+    {% endif %}
+  </div>
+  {% endif %}
+
+  {# ── GCP SA detail panel (existing logic, kept) ───────────────────────── #}
+  {% if is_gcp_sa %}
+  {% set sa_email = (resource.metadata or {}).get('sa_email', '') %}
+  {% set proj = sa_email.split('@')[1].split('.iam.')[0] if sa_email and '@' in sa_email else '' %}
+  {% set cr_sa = gcp_vm_sa_email or 'CLOUD_RUN_SA@YOUR_PROJECT.iam.gserviceaccount.com' %}
+  <div class="card p-4 mb-4">
+    <h3 class="text-xs font-semibold text-gray-500 uppercase mb-3">Service Account</h3>
+    <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-4 text-sm">
+      <div>
+        <p class="text-2xs text-gray-500 mb-0.5">SA Email</p>
+        {% if sa_email %}
+        <p class="text-gray-200 font-mono text-xs break-all">{{ sa_email }}</p>
+        {% else %}
+        <p class="text-gray-500 text-xs">Not set</p>
+        {% endif %}
+      </div>
+      <div>
+        <p class="text-2xs text-gray-500 mb-0.5">Project</p>
+        <p class="text-gray-200 text-xs font-mono">{{ proj or 'Not Set' }}</p>
+      </div>
+      <div>
+        <p class="text-2xs text-gray-500 mb-0.5">Role</p>
+        <p class="text-gray-200 text-xs">{{ 'Integration testing (test SA)' if resource.kind == 'gcp_test_sa' else 'Deployment (deploy SA)' }}</p>
+      </div>
+      <div>
+        <p class="text-2xs text-gray-500 mb-0.5">Cloud Run SA
+          {{ info_popover("The SA this control panel runs as. It must hold roles/iam.serviceAccountTokenCreator on the target SA.") }}
+        </p>
+        <p class="text-gray-200 text-xs font-mono break-all">{{ cr_sa }}</p>
+      </div>
+    </div>
+    {% if sa_email %}
+    <div class="flex items-start gap-2.5 mb-4 p-3 rounded-lg
+      {% if impersonation_check and impersonation_check.status == 'ok' %}bg-emerald-900/20 border border-emerald-800/40
+      {% elif impersonation_check and impersonation_check.status == 'no_permission' %}bg-red-900/20 border border-red-800/40
+      {% else %}bg-gray-900/40 border border-gray-800{% endif %}">
+      <span class="text-lg leading-none mt-0.5">
+        {% if impersonation_check and impersonation_check.status == 'ok' %}✅
+        {% elif impersonation_check and impersonation_check.status == 'no_permission' %}⚠️
+        {% else %}❓{% endif %}
+      </span>
+      <div>
+        {% if impersonation_check and impersonation_check.status == 'ok' %}
+        <p class="text-xs font-medium text-emerald-400">Impersonation ready</p>
+        <p class="text-2xs text-gray-500 mt-0.5">Cloud Run SA has <code>roles/iam.serviceAccountTokenCreator</code> on this SA.</p>
+        {% elif impersonation_check and impersonation_check.status == 'no_permission' %}
+        <p class="text-xs font-medium text-red-400">Missing permission</p>
+        <p class="text-2xs text-gray-500 mt-0.5">Cloud Run SA cannot yet impersonate this SA. Run the grant command below.</p>
+        {% elif impersonation_check and impersonation_check.status == 'error' %}
+        <p class="text-xs font-medium text-yellow-400">Check failed</p>
+        <p class="text-2xs text-gray-500 mt-0.5">{{ impersonation_check.message }}</p>
+        {% else %}
+        <p class="text-xs font-medium text-gray-400">Status unknown</p>
+        <p class="text-2xs text-gray-500 mt-0.5">{{ (impersonation_check or {}).get('message', 'Could not determine impersonation status.') }}</p>
+        {% endif %}
+      </div>
+    </div>
+    <div class="space-y-3">
+      <p class="text-xs font-semibold text-gray-400">Setup commands</p>
+      <div>
+        <p class="text-2xs text-gray-500 mb-1">Grant impersonation (run once per SA)</p>
+        <div class="relative group">
+          <pre class="text-2xs bg-gray-900 border border-gray-700 rounded p-2.5 overflow-x-auto text-gray-300 leading-relaxed" id="cmd-grant">gcloud iam service-accounts add-iam-policy-binding \
+  {{ sa_email }} \
+  --member="serviceAccount:{{ cr_sa }}" \
+  --role="roles/iam.serviceAccountTokenCreator" \
+  --project={{ proj or 'YOUR_PROJECT_ID' }}</pre>
+          <button type="button" class="absolute top-1.5 right-1.5 text-2xs text-gray-600 hover:text-gray-300 opacity-0 group-hover:opacity-100 transition-opacity"
+            onclick="navigator.clipboard.writeText(document.getElementById('cmd-grant').textContent)">copy</button>
+        </div>
+      </div>
+      <div>
+        <p class="text-2xs text-gray-500 mb-1">Verify the binding is in place</p>
+        <div class="relative group">
+          <pre class="text-2xs bg-gray-900 border border-gray-700 rounded p-2.5 overflow-x-auto text-gray-300 leading-relaxed" id="cmd-verify">gcloud iam service-accounts get-iam-policy {{ sa_email }} \
+  --format=json \
+  | python3 -c "import sys,json; p=json.load(sys.stdin); \
+    [print(b) for b in p.get('bindings',[]) \
+    if b['role']=='roles/iam.serviceAccountTokenCreator']"</pre>
+          <button type="button" class="absolute top-1.5 right-1.5 text-2xs text-gray-600 hover:text-gray-300 opacity-0 group-hover:opacity-100 transition-opacity"
+            onclick="navigator.clipboard.writeText(document.getElementById('cmd-verify').textContent)">copy</button>
+        </div>
+      </div>
+      <div>
+        <p class="text-2xs text-gray-500 mb-1">Remove the binding (revoke access)</p>
+        <div class="relative group">
+          <pre class="text-2xs bg-gray-900 border border-gray-700 rounded p-2.5 overflow-x-auto text-gray-300 leading-relaxed" id="cmd-revoke">gcloud iam service-accounts remove-iam-policy-binding \
+  {{ sa_email }} \
+  --member="serviceAccount:{{ cr_sa }}" \
+  --role="roles/iam.serviceAccountTokenCreator" \
+  --project={{ proj or 'YOUR_PROJECT_ID' }}</pre>
+          <button type="button" class="absolute top-1.5 right-1.5 text-2xs text-gray-600 hover:text-gray-300 opacity-0 group-hover:opacity-100 transition-opacity"
+            onclick="navigator.clipboard.writeText(document.getElementById('cmd-revoke').textContent)">copy</button>
+        </div>
+      </div>
+      {% if not gcp_vm_sa_email %}
+      <p class="text-2xs text-yellow-600">⚠️ GCP_VM_SA_EMAIL env var not set - configure in Cloud Run so commands show the real SA email.</p>
+      {% endif %}
+    </div>
+    {% else %}
+    <p class="text-xs text-gray-500">No SA email recorded. Re-attach via the parent environment page.</p>
+    {% endif %}
+  </div>
+  {% endif %}{# end is_gcp_sa #}
+
+  {# ── OTHER / ENVIRONMENT / CATCH-ALL ──────────────────────────────────── #}
+  {% if resource.kind in ('other', 'environment') or (resource.uri and resource.kind not in ('repo', 'branch', 'document', 'file', 'service', 'dataset', 'config', 'gcp_environment', 'gcp_test_sa', 'gcp_deploy_sa')) %}
+  <div class="card p-4 mb-4">
+    <h3 class="text-xs font-semibold text-gray-500 uppercase mb-3">Details</h3>
+    {% if resource.uri %}
+    <div class="mb-3">
+      <p class="text-2xs text-gray-500 mb-0.5">URI</p>
+      <p class="text-sm text-gray-200 font-mono break-all">{{ resource.uri }}</p>
+    </div>
+    {% endif %}
+    {% if resource.metadata %}
+    <details {% if not resource.uri %}open{% endif %}>
+      <summary class="text-2xs text-gray-500 cursor-pointer mb-1">Metadata</summary>
+      <pre class="text-2xs text-gray-500 overflow-x-auto whitespace-pre-wrap">{{ resource.metadata | tojson_pretty | safe }}</pre>
+    </details>
+    {% endif %}
+  </div>
+  {% endif %}
+
+  <!-- ════════════════════════════════════════════════════════════════════════
+       HUMAN CONTEXT
+       ════════════════════════════════════════════════════════════════════════ -->
+  {% if resource.human_context and resource.kind != 'config' %}
+  <div class="card p-4 mb-4">
+    <h3 class="text-xs font-semibold text-gray-500 uppercase mb-2">Context</h3>
+    <p class="text-sm text-gray-300">{{ resource.human_context }}</p>
+  </div>
+  {% endif %}
+
+  <!-- ════════════════════════════════════════════════════════════════════════
+       AI SUMMARY
+       ════════════════════════════════════════════════════════════════════════ -->
+  {% if summary %}
+  <div class="card p-4 mb-4">
+    <div class="flex items-center justify-between mb-2">
+      <h3 class="text-xs font-semibold text-gray-500 uppercase">Summary</h3>
+      <span class="text-2xs text-gray-600">
+        {{ summary.summary_type }} scan &middot;
+        <span {% if summary.scanned_at %}data-utc="{{ summary.scanned_at.isoformat() }}"{% endif %}>{{ summary.scanned_at.strftime('%Y-%m-%d %H:%M') if summary.scanned_at else 'unknown' }}{% if summary.scanned_at %} UTC{% endif %}</span>
+      </span>
+    </div>
+    <div class="text-sm md-content">{{ summary.content | md | safe }}</div>
+    {% if summary.metadata and resource.kind not in ('document', 'file') %}
+    <details class="mt-3">
+      <summary class="text-2xs text-gray-500 cursor-pointer">Scan metadata</summary>
+      <pre class="text-2xs text-gray-600 mt-1 overflow-x-auto whitespace-pre-wrap">{{ summary.metadata | tojson_pretty | safe }}</pre>
+    </details>
+    {% elif summary.metadata and resource.kind in ('document', 'file') and not scan_stats %}
+    <details class="mt-3">
+      <summary class="text-2xs text-gray-500 cursor-pointer">Scan metadata</summary>
+      <pre class="text-2xs text-gray-600 mt-1 overflow-x-auto whitespace-pre-wrap">{{ summary.metadata | tojson_pretty | safe }}</pre>
+    </details>
+    {% endif %}
+  </div>
+  {% else %}
+  <div class="card p-4 mb-4 text-center">
+    <p class="text-sm text-gray-500">No summary yet.
+      {% if resource.kind == 'repo' or resource.gcs_uri %}
+      <form action="/goals/{{ pid }}/resources/{{ resource.id }}/scan" method="post" class="inline">
+        <button type="submit" class="text-indigo-400 hover:text-indigo-300 underline">Scan now</button>
+      </form>
+      {% endif %}
+    </p>
+  </div>
+  {% endif %}
+
+  <!-- ════════════════════════════════════════════════════════════════════════
+       CHILDREN  (branches under repo; SAs under gcp_environment)
+       ════════════════════════════════════════════════════════════════════════ -->
+  {% set is_gcp_env = resource.kind == 'gcp_environment' %}
+  {% set has_test_sa = children | selectattr('kind', 'equalto', 'gcp_test_sa') | list | length > 0 %}
+  {% set has_deploy_sa = children | selectattr('kind', 'equalto', 'gcp_deploy_sa') | list | length > 0 %}
+  {% if children or resource.kind == 'repo' or is_gcp_env %}
+  <div class="card p-4 mb-4">
+    <div class="flex items-center justify-between mb-2">
+      <h3 class="text-xs font-semibold text-gray-500 uppercase">
+        {% if resource.kind == 'repo' %}Branches{% else %}Contents{% endif %}
+      </h3>
+      <div class="flex items-center gap-3">
+        {% if resource.kind == 'repo' %}
+        <button onclick="document.getElementById('modal-add-branch').classList.remove('hidden')"
+          class="text-xs text-indigo-400 hover:text-indigo-300">+ Add Branch</button>
+        {% endif %}
+        {% if is_gcp_env and not has_test_sa %}
+        <button onclick="document.getElementById('modal-attach-test-sa').classList.remove('hidden')"
+          class="text-xs text-indigo-400 hover:text-indigo-300"
+          title="Attach a GCP service account for integration testing.">+ Add Test SA</button>
+        {% endif %}
+        {% if is_gcp_env and not has_deploy_sa %}
+        <button onclick="document.getElementById('modal-attach-deploy-sa').classList.remove('hidden')"
+          class="text-xs text-indigo-400 hover:text-indigo-300"
+          title="Attach a GCP service account for deployment.">+ Add Deploy SA</button>
+        {% endif %}
+      </div>
+    </div>
+    {% if children %}
+    <div class="space-y-1.5">
+      {% for child in children %}
+      <a href="/goals/{{ pid }}/resources/{{ child.id }}"
+         class="flex items-center gap-2 text-sm text-gray-400 hover:text-gray-200 py-1">
+        <span>{% if child.kind == 'branch' %}🌿{% elif child.kind == 'file' %}📎{% elif child.kind in ('gcp_test_sa', 'gcp_deploy_sa') %}🔑{% else %}📁{% endif %}</span>
+        {{ child.name }}
+        {% if child.kind == 'gcp_test_sa' %}<span class="text-2xs text-gray-600">(test SA)</span>
+        {% elif child.kind == 'gcp_deploy_sa' %}<span class="text-2xs text-gray-600">(deploy SA)</span>{% endif %}
+        {% if child.locked_by %}<span class="pill pill-warning text-2xs">locked</span>{% endif %}
+      </a>
+      {% endfor %}
+    </div>
+    {% elif is_gcp_env %}
+    <p class="text-xs text-gray-600">No service accounts attached yet.</p>
+    {% else %}
+    <p class="text-xs text-gray-600">No branches tracked yet.</p>
+    {% endif %}
+  </div>
+  {% endif %}
+
+  <!-- ════════════════════════════════════════════════════════════════════════
+       GCP ENVIRONMENT metadata panel
+       ════════════════════════════════════════════════════════════════════════ -->
+  {% if resource.kind == 'gcp_environment' and resource.metadata %}
+  {% set m = resource.metadata %}
+  <div class="card p-4 mb-4">
+    <h3 class="text-xs font-semibold text-gray-500 uppercase mb-3">GCP Environment</h3>
+    <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 text-sm">
+      {% if m.target_project_id %}
+      <div>
+        <p class="text-2xs text-gray-500 mb-0.5">Project</p>
+        <p class="text-gray-200 font-mono">{{ m.target_project_id }}</p>
+      </div>
+      {% endif %}
+      {% if m.target_region %}
+      <div>
+        <p class="text-2xs text-gray-500 mb-0.5">Region</p>
+        <p class="text-gray-200 font-mono">{{ m.target_region }}</p>
+      </div>
+      {% endif %}
+      {% if m.test_service_account %}
+      <div>
+        <p class="text-2xs text-gray-500 mb-0.5">Test SA</p>
+        <p class="text-xs text-gray-400 font-mono break-all">{{ m.test_service_account }}</p>
+      </div>
+      {% endif %}
+      {% if m.deploy_service_account %}
+      <div>
+        <p class="text-2xs text-gray-500 mb-0.5">Deploy SA</p>
+        <p class="text-xs text-gray-400 font-mono break-all">{{ m.deploy_service_account }}</p>
+      </div>
+      {% endif %}
+    </div>
+  </div>
+  {% endif %}
+
+  <!-- ════════════════════════════════════════════════════════════════════════
+       MODALS
+       ════════════════════════════════════════════════════════════════════════ -->
+
+  <!-- Attach SA modals (gcp_environment only) -->
+  {% if is_gcp_env %}
+  {% set proj = resource.metadata.target_project_id if resource.metadata and resource.metadata.target_project_id else 'YOUR_PROJECT_ID' %}
+  {% set cloud_run_sa = gcp_vm_sa_email if gcp_vm_sa_email else 'CLOUD_RUN_SA@YOUR_CONTROL_PANEL_PROJECT.iam.gserviceaccount.com' %}
+  {% for sa_role, sa_label, sa_default_name in [('test', 'Test', 'test-runner'), ('deploy', 'Deploy', 'deployer')] %}
+  <div id="modal-attach-{{ sa_role }}-sa" class="hidden fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50 p-4"
+       onclick="if(event.target===this) this.classList.add('hidden')">
+    <div class="card w-full max-w-lg p-6 max-h-[90vh] overflow-y-auto">
+      <h2 class="text-lg font-semibold mb-1 text-gray-100">Attach {{ sa_label }} Service Account</h2>
+      <p class="text-xs text-gray-500 mb-4">Environment: <code>{{ resource.name }}</code>{% if proj != 'YOUR_PROJECT_ID' %} &middot; project <code>{{ proj }}</code>{% endif %}</p>
+      <div class="mb-4">
+        <p class="text-xs font-semibold text-gray-400 mb-2">Step 1: Run these commands in your terminal</p>
+        <p class="text-2xs text-gray-500 mb-1">Create the service account:</p>
+        <div class="relative group mb-3">
+          <pre class="text-2xs bg-gray-900 border border-gray-700 rounded p-2.5 overflow-x-auto text-gray-300 leading-relaxed" id="cmd-create-{{ sa_role }}">gcloud iam service-accounts create {{ sa_default_name }} \
+  --display-name="AgentOS {{ sa_label }} SA" \
+  --project={{ proj }}</pre>
+          <button type="button" class="absolute top-1.5 right-1.5 text-2xs text-gray-600 hover:text-gray-400 opacity-0 group-hover:opacity-100 transition-opacity"
+            onclick="navigator.clipboard.writeText(document.getElementById('cmd-create-{{ sa_role }}').textContent)">copy</button>
+        </div>
+        <p class="text-2xs text-gray-500 mb-1">Grant AgentOS permission to impersonate it:</p>
+        <div class="relative group">
+          <pre class="text-2xs bg-gray-900 border border-gray-700 rounded p-2.5 overflow-x-auto text-gray-300 leading-relaxed" id="cmd-bind-{{ sa_role }}">gcloud iam service-accounts add-iam-policy-binding \
+  {{ sa_default_name }}@{{ proj }}.iam.gserviceaccount.com \
+  --member="serviceAccount:{{ cloud_run_sa }}" \
+  --role="roles/iam.serviceAccountTokenCreator" \
+  --project={{ proj }}</pre>
+          <button type="button" class="absolute top-1.5 right-1.5 text-2xs text-gray-600 hover:text-gray-400 opacity-0 group-hover:opacity-100 transition-opacity"
+            onclick="navigator.clipboard.writeText(document.getElementById('cmd-bind-{{ sa_role }}').textContent)">copy</button>
+        </div>
+      </div>
+      <form action="/goals/{{ pid }}/resources/{{ resource.id }}/attach-sa" method="post" class="space-y-3" data-toast-submit data-fail="Failed to attach SA.">
+        <input type="hidden" name="role" value="{{ sa_role }}">
+        <div>
+          <p class="text-xs font-semibold text-gray-400 mb-2">Step 2: Paste the SA email</p>
+          <input name="sa_email" class="input" placeholder="{{ sa_default_name }}@{{ proj }}.iam.gserviceaccount.com" required />
+        </div>
+        <div class="flex justify-end gap-2 pt-1">
+          <button type="button" onclick="document.getElementById('modal-attach-{{ sa_role }}-sa').classList.add('hidden')"
+            class="btn btn-secondary">Cancel</button>
+          <button type="submit" class="btn btn-primary">Attach SA</button>
+        </div>
+      </form>
+      {% if gcp_vm_sa_email %}
+      <div class="mt-4 pt-4 border-t border-gray-800">
+        <p class="text-2xs text-gray-600 mb-2">Or let AgentOS create it for you</p>
+        <button type="button"
+          onclick="document.getElementById('modal-attach-{{ sa_role }}-sa').classList.add('hidden');window.open('/goals/{{ pid }}/gcp/oauth/start?role={{ sa_role }}&rid={{ resource.id }}','gcp-oauth','width=540,height=640')"
+          class="btn btn-secondary btn-sm w-full">Connect Google Cloud (OAuth)</button>
+      </div>
+      {% endif %}
+    </div>
+  </div>
+  {% endfor %}
+  {% endif %}
+
+  <!-- Add Branch modal (repo only) -->
+  {% if resource.kind == 'repo' %}
+  <div id="modal-add-branch" class="hidden fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50 p-4"
+       onclick="if(event.target===this) this.classList.add('hidden')">
+    <div class="card w-full max-w-md p-6">
+      <h2 class="text-lg font-semibold mb-4 text-gray-100">Add Branch</h2>
+      <form action="/goals/{{ pid }}/resources/add" method="post" class="space-y-4" data-toast-submit data-fail="Failed to add branch.">
+        <input type="hidden" name="kind" value="branch">
+        <input type="hidden" name="parent_repo_id" value="{{ resource.id }}">
+        <div>
+          <label class="block text-sm text-gray-400 mb-1.5">Branch Name</label>
+          <input name="branch_name" required class="input" placeholder="e.g., feat/auth, fix/login-bug" />
+        </div>
+        <div>
+          <label class="block text-sm text-gray-400 mb-1.5">Base Branch</label>
+          <input name="base_branch" class="input" value="{{ resource.default_branch or github_live.default_branch if github_live else resource.default_branch or 'main' }}" />
+        </div>
+        <div>
+          <label class="block text-sm text-gray-400 mb-1.5">Context for GO</label>
+          <textarea name="human_context" rows="2" class="input" placeholder="What is this branch for?"></textarea>
+        </div>
+        <div class="flex justify-end gap-2 pt-2">
+          <button type="button" onclick="document.getElementById('modal-add-branch').classList.add('hidden')"
+            class="btn btn-secondary">Cancel</button>
+          <button type="submit" class="btn btn-primary">Add Branch</button>
+        </div>
+      </form>
+    </div>
+  </div>
+  {% endif %}
+
+  <!-- ════════════════════════════════════════════════════════════════════════
+       EVENT HISTORY
+       ════════════════════════════════════════════════════════════════════════ -->
+  {% if events %}
+  <div class="card p-4">
+    <h3 class="text-xs font-semibold text-gray-500 uppercase mb-2">History</h3>
+    <div class="space-y-2">
+      {% for e in events %}
+      <div class="text-xs text-gray-500">
+        <span class="text-gray-400" data-utc="{{ e.created_at.isoformat() }}">{{ e.created_at.strftime('%Y-%m-%d %H:%M') }} UTC</span>
+        &middot; {{ e.event_type }} by {{ e.actor }}
+      </div>
+      {% endfor %}
+    </div>
+  </div>
+  {% endif %}
+
+</div>
+
+{% if is_gcp_env %}
+<script>
+window.addEventListener('message', function(e) {
+  if (e.origin !== window.location.origin) return;
+  if (e.data && e.data.type === 'gcp_sa_provisioned') { window.location.reload(); }
+});
+</script>
+{% endif %}
+
+{% if doc_text_content and ft in ('json', 'yaml', 'yml') %}
+<script>
+(function() {
+  var pre = document.getElementById('syntax-pre');
+  if (!pre) return;
+  var ft = pre.dataset.ft;
+  var raw = pre.textContent;
+  function esc(s) { return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+  function span(color, text) { return '<span style="color:' + color + '">' + text + '</span>'; }
+  if (ft === 'json') {
+    /* Colorize JSON: keys=blue, string values=green, numbers=indigo, booleans=amber, null=red */
+    pre.innerHTML = esc(raw).replace(
+      /("(?:\\u[0-9a-fA-F]{4}|\\[^u]|[^\\"])*"(\s*:)?|\btrue\b|\bfalse\b|\bnull\b|-?\d+(?:\.\d+)?(?:[eE][+\-]?\d+)?)/g,
+      function(m) {
+        if (/^"/.test(m)) return /:$/.test(m) ? span('#93c5fd', m) : span('#6ee7b7', m);
+        if (m === 'true' || m === 'false') return span('#fcd34d', m);
+        if (m === 'null') return span('#f87171', m);
+        return span('#a5b4fc', m);
+      }
+    );
+  } else {
+    /* Colorize YAML: comments=gray, keys=blue, values=green, booleans=amber, numbers=indigo */
+    pre.innerHTML = esc(raw).split('\n').map(function(line) {
+      if (/^\s*#/.test(line)) return span('#6b7280', line);
+      var m = line.match(/^(\s*)([-\w.:]+)(\s*:)(.*)/);
+      if (m) {
+        var v = m[4];
+        if (/^\s*(true|false|yes|no|on|off)\s*$/.test(v))
+          v = v.replace(/(true|false|yes|no|on|off)/, span('#fcd34d', '$1'));
+        else if (/^\s*\d/.test(v))
+          v = v.replace(/(\d[\d.]*)/, span('#a5b4fc', '$1'));
+        else if (v.trim())
+          v = v.replace(/^(\s*)(\S.*)$/, '$1' + span('#6ee7b7', '$2'));
+        return m[1] + span('#93c5fd', m[2]) + span('#64748b', m[3]) + v;
+      }
+      if (/^\s*-\s/.test(line))
+        return line.replace(/^(\s*-\s)(.+)/, '$1' + span('#6ee7b7', '$2'));
+      return line;
+    }).join('\n');
+  }
+})();
+</script>
+{% endif %}
+
+{% endblock %}

@@ -1,0 +1,301 @@
+{% extends "base.html" %}
+{% from "partials/_tour_trigger.html" import tour_trigger %}
+{% block title %}Members: {{ goal.name }}{% endblock %}
+{% block content %}
+<div class="p-6 lg:p-8 max-w-4xl mx-auto">
+  <a href="/goals/{{ pid }}" class="inline-flex items-center gap-1 text-xs text-gray-500 hover:text-gray-300 transition-colors mb-5">
+    <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"/></svg>
+    {{ goal.name }}
+  </a>
+  <div class="mb-6">
+    <h1 class="text-xl font-semibold text-gray-100">Members</h1>
+    <p class="text-sm text-gray-500 mt-0.5">{{ goal.name }}</p>
+  </div>
+
+  {# No platform.admin bypass: membership management is goal.manager-only. #}
+  {% set can_manage = (viewer_role == 'admin') %}
+
+  <!-- Members -->
+  <section class="card p-6 mb-5">
+    <div class="flex items-center justify-between mb-4">
+      <h2 class="text-sm font-semibold text-gray-200">Members</h2>
+      <div class="flex items-center gap-2">
+        <button onclick="document.getElementById('modal-role-info').classList.remove('hidden')"
+          type="button" title="What can each role do?"
+          class="btn btn-secondary btn-sm">
+          <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8.228 9c.549-1.165 2.03-2 3.772-2 2.21 0 4 1.343 4 3 0 1.4-1.278 2.575-3.006 2.907-.542.104-.994.54-.994 1.093m0 3h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/>
+          </svg>
+          What can roles do?
+        </button>
+        {% if can_manage %}
+        {% if user.preferences.get("startup_wizard_enabled", True) %}
+        {{ tour_trigger("manage-members", "How to manage members") }}
+        {% endif %}
+        <button id="btn-add-member" onclick="document.getElementById('modal-add-member').classList.remove('hidden')"
+          class="btn btn-primary btn-sm">
+          <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"/>
+          </svg>
+          Add member
+        </button>
+        {% endif %}
+      </div>
+    </div>
+    <table class="w-full text-sm">
+      <thead class="text-2xs text-gray-600 uppercase border-b border-border">
+        <tr>
+          <th class="text-left pb-2 font-medium">Name / Email</th>
+          <th class="text-left pb-2 font-medium">Role</th>
+          {% if can_manage %}
+          <th class="text-right pb-2 font-medium"></th>
+          {% endif %}
+        </tr>
+      </thead>
+      <tbody class="divide-y divide-border">
+        {% for m in members %}
+        <tr>
+          <td class="py-2.5">
+            <div class="font-medium text-gray-200" title="{{ m.email or '' }}">{{ m.display_name or m.uid }}</div>
+          </td>
+          <td class="py-2.5">
+            {% if can_manage %}
+            <form method="post" action="/goals/{{ pid }}/members/{{ m.uid }}/role" class="inline">
+              <select name="role" data-current-role="{{ m.role }}" onchange="submitMemberRole(this)"
+                class="text-xs px-2 py-1 rounded border border-border bg-surface text-gray-300 focus:outline-none focus:border-brand cursor-pointer">
+                <option value="member"  {% if m.role == 'member' %}selected{% endif %}>goal.member</option>
+                <option value="admin"   {% if m.role == 'admin' %}selected{% endif %}>goal.manager</option>
+              </select>
+            </form>
+            {% else %}
+            <span class="pill {% if m.role == 'admin' %}pill-info{% else %}pill-neutral{% endif %}">
+              {{ GOAL_ROLE_LABELS.get(m.role, m.role) }}
+            </span>
+            {% endif %}
+          </td>
+          {% if can_manage %}
+          <td class="py-2.5 text-right">
+            <button type="button"
+              onclick='removeMember("{{ m.uid }}", {{ (m.display_name or m.uid) | tojson }})'
+              class="btn btn-secondary btn-sm text-red-400 hover:text-red-300">
+              Remove
+            </button>
+          </td>
+          {% endif %}
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </section>
+
+  {# Join Requests section removed from UI: no goal-level entry point exists
+     anywhere in the app to create a join_requests row, so this section could
+     only ever render "No pending requests." Backend endpoints, model, and
+     table are left intact — see research/ (or ask) if reviving this later. #}
+</div>
+
+<!-- Role info modal -->
+<div id="modal-role-info" class="hidden fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50 p-4"
+     onclick="if(event.target===this) this.classList.add('hidden')">
+  <div class="card w-full max-w-2xl p-6 max-h-[85vh] overflow-y-auto">
+    <div class="flex items-start justify-between mb-1">
+      <h2 class="text-lg font-semibold text-gray-100">What can each role do?</h2>
+      <button onclick="document.getElementById('modal-role-info').classList.add('hidden')"
+        class="text-gray-500 hover:text-gray-300 -mt-1 -mr-1 p-1" aria-label="Close">
+        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/></svg>
+      </button>
+    </div>
+    <p class="text-xs text-gray-500 mb-4">
+      Every member can see everything in the goal. <span class="text-gray-300">goal.manager</span> is what unlocks
+      editing, membership, and settings.
+    </p>
+
+    <div class="overflow-x-auto">
+      <table class="w-full text-xs">
+        <thead class="text-2xs text-gray-600 border-b border-border">
+          <tr>
+            <th class="text-left pb-2 pr-3 font-medium uppercase">Area</th>
+            <th class="text-center pb-2 px-2 font-medium">goal.member</th>
+            <th class="text-center pb-2 pl-2 font-medium">goal.manager</th>
+          </tr>
+        </thead>
+        <tbody class="divide-y divide-border text-gray-300">
+          {% set rows = [
+            ("View dashboard, tasks, stories, chat, threads, monitor, audit log, Git Engine", true, true),
+            ("Create tasks and stories; reply in threads; chat and upload files", true, true),
+            ("Work your own assigned story or task through to done", true, true),
+            ("Delete, approve, or post a human-review decision: on tasks assigned to you", true, true),
+            ("Add / browse / upload goal resources", true, true),
+            ("Invite a member, change a member's role", false, true),
+            ("Edit goal settings, integrations, GO model", false, true),
+            ("Delete, approve, or post a human-review decision: on any task in the goal", false, true),
+            ("Archive, unarchive, or delete a resource", false, true),
+          ] %}
+          {% for label, member_ok, manager_ok in rows %}
+          <tr>
+            <td class="py-2 pr-3">{{ label }}</td>
+            <td class="py-2 px-2 text-center">
+              {% if member_ok %}<span class="text-emerald-400">✓</span>{% else %}<span class="text-red-400">✗</span>{% endif %}
+            </td>
+            <td class="py-2 pl-2 text-center">
+              {% if manager_ok %}<span class="text-emerald-400">✓</span>{% else %}<span class="text-red-400">✗</span>{% endif %}
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+
+    <p class="text-2xs text-gray-600 mt-4">
+      One exception: a story or task's own assignee can act on it (start/block/done, delete, approve, human-review)
+      even without goal.manager: that's ownership, not a role grant. Membership management (invite, role changes)
+      requires being an actual goal.manager: platform.admin/editor get no bypass there. A platform.admin can
+      still manage this goal's settings and integrations without being a member (platform.editor cannot).
+      Separately, platform.admin can delete, pause, or resume this goal from Settings → Kill Switch regardless
+      of membership: platform.editor has no bypass there, and freezing the entire system also stays admin-only.
+    </p>
+  </div>
+</div>
+
+<!-- Add member modal -->
+<div id="modal-add-member" class="hidden fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50 p-4"
+     onclick="if(event.target===this) this.classList.add('hidden')">
+  <div class="card w-full max-w-sm p-6">
+    <h2 class="text-lg font-semibold mb-4 text-gray-100">Add Member</h2>
+    <form action="/goals/{{ pid }}/members" method="post" class="space-y-3" data-toast-submit data-fail="Failed to add member.">
+      <div>
+        <label class="block text-sm text-gray-400 mb-1.5">Email address</label>
+        <input name="email" type="email" required class="input" placeholder="user@example.com" />
+      </div>
+      <div>
+        <label class="block text-sm text-gray-400 mb-1.5">Role</label>
+        <select name="role" class="input">
+          <option value="member">goal.member</option>
+          <option value="admin">goal.manager</option>
+        </select>
+      </div>
+      <div class="flex justify-end gap-2 pt-2">
+        <button type="button" onclick="document.getElementById('modal-add-member').classList.add('hidden')"
+          class="btn btn-secondary btn-sm">Cancel</button>
+        <button type="submit" class="btn btn-primary btn-sm">Add Member</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+{% if can_manage %}
+<!-- Reassign-stories modal: shown when removal needs not-yet-started stories -->
+<!-- handed to someone else first (409 needs_reassignment from the DELETE call). -->
+<div id="modal-reassign" class="hidden fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50 p-4"
+     onclick="if(event.target===this) this.classList.add('hidden')">
+  <div class="card w-full max-w-md p-6">
+    <h2 class="text-lg font-semibold mb-1 text-gray-100">Reassign stories before removing</h2>
+    <p id="reassign-count" class="text-xs text-gray-500 mb-4"></p>
+
+    <div class="mb-3">
+      <label class="block text-sm text-gray-400 mb-1.5">Assign all to</label>
+      <select id="reassign-target-select" class="input"></select>
+    </div>
+
+    <div id="reassign-story-list" class="mb-4 max-h-56 overflow-y-auto border border-border rounded-lg divide-y divide-border"></div>
+    <div class="flex justify-end gap-2 pt-2">
+      <button type="button" onclick="document.getElementById('modal-reassign').classList.add('hidden')"
+        class="btn btn-secondary btn-sm">Cancel</button>
+      <button type="button" onclick="submitReassignment()" class="btn btn-primary btn-sm">Reassign & Remove</button>
+    </div>
+  </div>
+</div>
+
+<script>
+let _reassignTargetUid = null;
+
+function escapeHtml(str) {
+  const d = document.createElement('div');
+  d.textContent = str;
+  return d.innerHTML;
+}
+
+async function submitMemberRole(selectEl) {
+  const form = selectEl.form;
+  const previousRole = selectEl.dataset.currentRole;
+  try {
+    const resp = await fetch(form.getAttribute('action'), { method: 'POST', body: new FormData(form) });
+    if (resp.ok) {
+      // Reload rather than patch in place: demoting yourself changes can_manage
+      // for the whole page (Add Member / Remove / other role selects vanish).
+      window.location.reload();
+      return;
+    }
+    selectEl.value = previousRole;
+    let msg = 'Failed to update role.';
+    try { const d = await resp.json(); if (d.detail) msg = d.detail; } catch {}
+    showToast(msg, 'error');
+  } catch {
+    selectEl.value = previousRole;
+    showToast('Network error. Please try again.', 'error');
+  }
+}
+
+async function removeMember(uid, name) {
+  const result = await window.confirmAction({
+    title: 'Remove member',
+    body: `Remove ${name} from this goal?`,
+    danger: true,
+  });
+  if (!result) return;
+  await attemptRemove(uid, {});
+}
+
+async function attemptRemove(uid, reassignments) {
+  const resp = await fetch(`/goals/{{ pid }}/members/${uid}`, {
+    method: 'DELETE',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({reassignments}),
+  });
+  if (resp.ok) {
+    window.location.reload();
+    return;
+  }
+  let data = {};
+  try { data = await resp.json(); } catch (e) { /* non-JSON error body */ }
+  if (resp.status === 409 && data.status === 'needs_reassignment') {
+    openReassignModal(uid, data.stories || [], data.candidates || []);
+  } else {
+    showToast(data.detail || data.message || 'Remove failed', 'error');
+  }
+}
+
+function openReassignModal(uid, stories, candidates) {
+  _reassignTargetUid = uid;
+
+  document.getElementById('reassign-count').textContent = stories.length === 1
+    ? "1 story hasn't been started yet — pick someone else to take it over."
+    : `${stories.length} stories haven't been started yet — pick someone else to take them all over.`;
+
+  const targetSelect = document.getElementById('reassign-target-select');
+  targetSelect.innerHTML = candidates.map(c => `<option value="${escapeHtml(c.uid)}">${escapeHtml(c.name)}</option>`).join('');
+  targetSelect.dataset.storyIds = JSON.stringify(stories.map(s => s.id));
+
+  const list = document.getElementById('reassign-story-list');
+  list.innerHTML = stories.map(s => `
+    <div class="text-sm text-gray-300 px-3 py-2 truncate" title="${escapeHtml(s.title)}">${escapeHtml(s.title)}</div>
+  `).join('');
+
+  document.getElementById('modal-reassign').classList.remove('hidden');
+}
+
+async function submitReassignment() {
+  const targetSelect = document.getElementById('reassign-target-select');
+  const storyIds = JSON.parse(targetSelect.dataset.storyIds || '[]');
+  const reassignments = {};
+  storyIds.forEach(id => { reassignments[id] = targetSelect.value; });
+  document.getElementById('modal-reassign').classList.add('hidden');
+  await attemptRemove(_reassignTargetUid, reassignments);
+}
+
+// add_member's success redirect carries its result message (new member vs.
+// already-a-member/role-updated) via base.html's shared ?_flash= reader —
+// see app/templates/base.html.
+</script>
+{% endif %}
+{% endblock %}

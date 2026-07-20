@@ -1,0 +1,70 @@
+{# Shared personal section included by both "overview" and "my_work" tabs. #}
+
+{% if personal.at_risk %}
+{% include "dashboard/partials/personal_at_risk.html" %}
+{% endif %}
+
+{% include "dashboard/partials/personal_standups.html" %}
+
+<div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+
+  {# My Goals with completion_pct bars #}
+  <div class="bg-gray-900 border border-gray-800 rounded-xl p-5">
+    <div class="flex items-baseline justify-between mb-3">
+      <span class="text-xs font-semibold uppercase tracking-wider text-gray-500">My Goals</span>
+      <span class="text-2xl font-bold text-indigo-400">{{ personal.goals_count }}</span>
+    </div>
+    {% if personal.goals %}
+    <div class="space-y-1.5">
+      {% for g in personal.goals[:5] %}
+      <a href="/goals/{{ g.id }}"
+         class="block hover:bg-gray-800 rounded-md px-2 py-1.5 transition-colors -mx-2">
+        <div class="flex items-center gap-2 text-xs mb-1">
+          <span class="flex-1 truncate" style="color: {{ g.color_tag }}">{{ g.name }}</span>
+        </div>
+        <div class="h-1 bg-gray-800 rounded-full">
+          <div class="h-full rounded-full bg-indigo-500/60"
+               style="width: {{ g.completion_pct }}%"></div>
+        </div>
+      </a>
+      {% endfor %}
+      {% if personal.goals_count > 5 %}
+      <a href="/goals" class="text-xs text-gray-500 hover:text-gray-300 pl-2">
+        +{{ personal.goals_count - 5 }} more
+      </a>
+      {% endif %}
+    </div>
+    {% else %}
+    <p class="text-sm text-gray-500">
+      Not part of any goals yet.
+      <a href="/goals" class="text-indigo-400 hover:text-indigo-300">Browse →</a>
+    </p>
+    {% endif %}
+  </div>
+
+  {# My Tasks: tasks created through the user's SHCA conversations #}
+  <div class="bg-gray-900 border border-gray-800 rounded-xl p-5">
+    <div class="flex items-baseline justify-between mb-3">
+      <span class="text-xs font-semibold uppercase tracking-wider text-gray-500">My Tasks</span>
+      <span class="text-2xl font-bold text-blue-400">{{ personal.open_tasks_total }}</span>
+    </div>
+    {% if personal.open_tasks_needs_approval > 0 %}
+    <div class="flex items-center gap-2 text-sm text-indigo-400 mb-1">
+      <span class="w-1.5 h-1.5 rounded-full bg-indigo-400 flex-shrink-0"></span>
+      {{ personal.open_tasks_needs_approval }} awaiting your approval
+    </div>
+    {% endif %}
+    {% if personal.open_tasks_blocked > 0 %}
+    <div class="flex items-center gap-2 text-sm text-amber-400 mb-1">
+      <span class="w-1.5 h-1.5 rounded-full bg-amber-400 flex-shrink-0"></span>
+      {{ personal.open_tasks_blocked }} blocked: agent waiting on you
+    </div>
+    {% endif %}
+    {% if personal.open_tasks_needs_approval == 0 and personal.open_tasks_blocked == 0 and personal.open_tasks_total > 0 %}
+    <p class="text-sm text-green-400">All moving along.</p>
+    {% elif personal.open_tasks_total == 0 %}
+    <p class="text-sm text-gray-500">No active tasks from your assistant.</p>
+    {% endif %}
+  </div>
+
+</div>

@@ -1,0 +1,46 @@
+{% if notifs %}
+<ul class="divide-y divide-gray-800">
+  {% for n in notifs %}
+  <li id="notif-{{ n.id }}"
+    class="px-4 py-3 hover:bg-gray-800/60 transition-colors
+           {% if not n.read %}border-l-2 border-indigo-500{% else %}border-l-2 border-transparent{% endif %}">
+    {% if n.link %}
+    <a href="{{ n.link }}" onclick="readNotif('{{ n.id }}')" class="block">
+    {% else %}
+    <div onclick="readNotif('{{ n.id }}')" class="cursor-default">
+    {% endif %}
+      <div class="flex items-start justify-between gap-2">
+        <span class="text-sm font-medium {% if not n.read %}text-white{% else %}text-gray-400{% endif %}">
+          {{ n.title }}
+        </span>
+        {% if not n.read %}
+        <span class="w-1.5 h-1.5 rounded-full bg-indigo-400 mt-1.5 flex-shrink-0"></span>
+        {% endif %}
+      </div>
+      {% if n.body %}
+      <p class="text-xs text-gray-500 mt-0.5 line-clamp-2">{{ n.body }}</p>
+      {% endif %}
+      <p class="text-[0.67rem] text-gray-600 mt-1">{{ n.agent_id or n.type }}</p>
+    {% if n.link %}</a>{% else %}</div>{% endif %}
+  </li>
+  {% endfor %}
+</ul>
+{% else %}
+<div class="flex flex-col items-center justify-center h-full py-16 text-gray-600">
+  <span class="text-3xl mb-2">🔔</span>
+  <p class="text-sm">No notifications</p>
+</div>
+{% endif %}
+
+<script>
+async function readNotif(id) {
+  const el = document.getElementById('notif-' + id);
+  if (!el) return;
+  // Optimistically remove unread styling
+  el.classList.remove('border-indigo-500');
+  el.classList.add('border-transparent');
+  el.querySelector('.bg-indigo-400')?.remove();
+  el.querySelector('.text-white')?.classList.replace('text-white', 'text-gray-400');
+  await fetch(`/notifications/${id}/read`, { method: 'POST' });
+}
+</script>
