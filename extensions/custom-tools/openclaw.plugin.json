@@ -1,0 +1,10 @@
+{
+  "id": "custom-tools",
+  "name": "Custom Tools",
+  "description": "Dynamically loads admin-defined tools from the AgentOS control panel. Tools are fetched at startup and refreshed via tools.reload RPC — no gateway restart required.",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "name": "@openclaw/custom-tools",
+  "version": "1.0.0",
+  "description": "OpenClaw plugin — admin-defined custom tools from AgentOS control panel",
+  "type": "module",
+  "openclaw": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0"
+  }
+}

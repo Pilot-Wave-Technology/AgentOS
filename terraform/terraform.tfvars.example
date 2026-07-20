@@ -1,0 +1,46 @@
+###############################################################################
+# AgentOS gateway (OpenClaw) — STAGE 1 of 2. Deploy this FIRST.
+#   cp terraform.tfvars.example terraform.tfvars   # then edit
+#
+# This stack creates the shared VPC + subnet + archive bucket + firewalls + VM.
+# It does NOT create secrets or the SA — it references the ones the platform
+# branch's prerequisites.sh created (run that FIRST). After apply, copy this
+# stack's outputs into the PLATFORM tfvars.
+###############################################################################
+
+project_id   = "my-agentos-project"        # <-- your GCP project (you own it)
+region       = "us-central1"
+zone         = "us-central1-a"
+name_prefix  = "agentos"                    # MUST match what prerequisites.sh used (default "agentos") —
+                                            # the gateway SA + secret names derive from it
+name         = "agentos-gateway"
+
+# Shared network (created here; platform reuses it)
+network_name = "agentos-vpc"
+subnet_cidr  = "10.20.0.0/20"
+
+# CIDRs allowed to reach the gateway port. This MUST include the platform
+# Stage-② Serverless VPC connector CIDR. The default below assumes the platform's
+# default connector range (10.8.0.0/28) — keep the two in sync if you change either.
+# allowed_source_ranges_gateway = ["10.20.0.0/20", "10.8.0.0/28"]
+
+# Your AgentOS FORK — the VM clones this on boot. Use the SAME url in the
+# platform stack's repo_url. Public fork = no creds; private fork = set
+# GATEWAY_REPO_TOKEN in secrets.env (prerequisites.sh). See FORKING.md.
+repo_url     = "https://github.com/YOUR_ORG/AgentOS.git"
+repo_branch  = "agent_os_openclaw"
+
+# (LLM/gateway secrets are created by prerequisites.sh — not here. To clone a
+#  PRIVATE repo, put a token in the gateway-repo-token secret via secrets.env.)
+
+# VM sizing / access
+machine_type      = "e2-standard-4"
+boot_disk_size_gb = 100
+processes_per_vm  = 1
+ssh_iap_only      = false
+
+# Optional: install a Chrome Remote Desktop session on the VM (default off).
+# enable_chrome_remote_desktop = false
+
+# Repeatable testing: allow `terraform destroy` to remove a non-empty bucket.
+force_destroy_buckets = true    # set false for a real/persistent deployment

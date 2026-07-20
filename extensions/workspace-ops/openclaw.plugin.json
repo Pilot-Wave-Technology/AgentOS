@@ -1,0 +1,10 @@
+{
+  "id": "workspace-ops",
+  "name": "Workspace Operations",
+  "description": "Admin RPC methods for the AgentOS integration flow: workspace.mergePreview and workspace.gitDiff.",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  }
+}

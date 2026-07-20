@@ -1,0 +1,9 @@
+{
+  "name": "@openclaw/workspace-ops",
+  "version": "1.0.0",
+  "description": "OpenClaw plugin — workspace merge preview and git diff for the AgentOS integration flow",
+  "type": "module",
+  "openclaw": {
+    "extensions": ["./index.ts"]
+  }
+}

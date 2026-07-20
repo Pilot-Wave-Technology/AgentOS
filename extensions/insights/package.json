@@ -1,0 +1,11 @@
+{
+  "name": "@openclaw/insights",
+  "version": "1.0.0",
+  "description": "Dashboard observability methods — exposes sandbox health, platform metrics, and runtime status as gateway RPCs without modifying OpenClaw core.",
+  "type": "module",
+  "openclaw": {
+    "extensions": [
+      "./index.ts"
+    ]
+  }
+}

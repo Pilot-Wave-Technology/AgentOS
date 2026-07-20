@@ -1,0 +1,32 @@
+#!/bin/bash
+TASK_ID="$1"
+PAYLOAD="$2"
+if [ -z "$TASK_ID" ] || [ -z "$PAYLOAD" ]; then
+  echo "Usage: task-report <task_id> '<json_payload>'"
+  exit 1
+fi
+STATUS=$(echo "$PAYLOAD" | jq -r '.status // "completed"')
+SUMMARY=$(echo "$PAYLOAD" | jq -r '.summary // ""')
+RESULT="$SUMMARY"
+DETAILS=$(echo "$PAYLOAD" | jq -r '.details // ""')
+if [ -n "$DETAILS" ]; then
+  RESULT="$RESULT
+
+$DETAILS"
+fi
+GW_AGENT_ID=""
+if [ -n "$OPENCLAW_AGENT_ID" ]; then
+  GW_AGENT_ID="$OPENCLAW_AGENT_ID"
+elif [[ "$PWD" =~ workspace-([^/]+)- ]]; then
+  GW_AGENT_ID="${BASH_REMATCH[1]}"
+fi
+BODY=$(jq -n \
+  --arg status "$STATUS" \
+  --arg result "$RESULT" \
+  --argjson report "$PAYLOAD" \
+  --arg gw_id "$GW_AGENT_ID" \
+  '{status: $status, result: $result, report: $report, gateway_agent_id: $gw_id}')
+curl -s -X POST "${CONTROL_PANEL_URL}/internal/tasks/${TASK_ID}/complete" \
+  -H "Authorization: Bearer ${OPENCLAW_GATEWAY_TOKEN}" \
+  -H "Content-Type: application/json" \
+  -d "$BODY"

@@ -1,0 +1,13 @@
+# CODEOWNERS — GitHub auto-requests these reviewers on pull requests to this
+# (gateway) branch. The LAST matching pattern wins.
+#
+# To add people: append their GitHub @handle(s), space-separated, to a line —
+# or uncomment/add a path line to route a specific area.
+#
+# Default owner for everything on this branch:
+*   @abhi-chaudhary-pwh @harshwardhanagarwal
+
+# --- Area owners (examples — uncomment/edit as the team grows) ---
+# /src/        @abhi-chaudhary-pwh
+# /infra/      @abhi-chaudhary-pwh
+# /deploy/     @abhi-chaudhary-pwh

@@ -1,0 +1,96 @@
+# .gcloudignore
+#
+# Controls what `gcloud builds submit` uploads as the build context.
+# By default gcloud falls back to .gitignore, but .gitignore excludes
+# vendor/ entirely, which strips out vendor/a2ui/ — required for the
+# `pnpm canvas:a2ui:bundle` build step.
+#
+# This file mirrors .dockerignore so the Cloud Build context matches
+# what the Docker image build expects.
+
+# VCS / metadata
+.git
+.gitattributes
+.gitmodules
+.github
+.worktrees
+
+# Editor / OS
+.DS_Store
+**/.DS_Store
+.vscode
+.idea
+
+# Caches / build outputs (will be regenerated)
+node_modules
+**/node_modules
+.pnpm-store
+**/.pnpm-store
+.turbo
+**/.turbo
+.cache
+**/.cache
+.next
+**/.next
+coverage
+**/coverage
+*.log
+tmp
+**/tmp
+dist
+**/dist
+.tsbuildinfo
+**/.tsbuildinfo
+
+# Terraform local state (state lives in GCS)
+infra/**/.terraform/
+infra/**/*.tfstate
+infra/**/*.tfstate.*
+
+# Secrets — never upload
+.env
+.env.*
+!.env.example
+memory/
+.agent/*.json
+.agents/
+.claude/
+local/
+.local/
+IDENTITY.md
+USER.md
+
+# Large native app build artifacts (not needed for the gateway build)
+apps/macos/.build
+apps/macos/.build-local
+apps/macos/.swiftpm
+apps/ios/build
+apps/ios/.derivedData
+apps/ios/.swiftpm
+apps/android/.gradle
+apps/android/app/build
+apps/android/.cxx
+apps/android/.kotlin
+apps/shared/MoltbotKit/.build
+apps/shared/MoltbotKit/.swiftpm
+apps/shared/OpenClawKit/.build
+apps/shared/OpenClawKit/.swiftpm
+**/*.bun-build
+**/ModuleCache/
+Core/
+bin/
+
+# Heavy media
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.gif
+*.mp4
+*.mov
+*.wav
+*.mp3
+appcast.xml
+
+# Keep critical assets needed by the build
+!assets/icons/**

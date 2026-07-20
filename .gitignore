@@ -1,0 +1,176 @@
+node_modules
+**/node_modules/
+.env
+docker-compose.extra.yml
+dist
+pnpm-lock.yaml
+bun.lock
+bun.lockb
+coverage
+__pycache__/
+*.pyc
+.tsbuildinfo
+.pnpm-store
+.worktrees/
+.DS_Store
+**/.DS_Store
+ui/src/ui/__screenshots__/
+ui/playwright-report/
+ui/test-results/
+packages/dashboard-next/.next/
+packages/dashboard-next/out/
+
+# Mise configuration files
+mise.toml
+
+# Android build artifacts
+apps/android/.gradle/
+apps/android/app/build/
+apps/android/.cxx/
+apps/android/.kotlin/
+
+# Bun build artifacts
+*.bun-build
+apps/macos/.build/
+apps/shared/MoltbotKit/.build/
+apps/shared/OpenClawKit/.build/
+apps/shared/OpenClawKit/Package.resolved
+**/ModuleCache/
+bin/
+bin/clawdbot-mac
+bin/docs-list
+apps/macos/.build-local/
+apps/macos/.swiftpm/
+apps/shared/MoltbotKit/.swiftpm/
+apps/shared/OpenClawKit/.swiftpm/
+Core/
+apps/ios/*.xcodeproj/
+apps/ios/*.xcworkspace/
+apps/ios/.swiftpm/
+apps/ios/.derivedData/
+apps/ios/.local-signing.xcconfig
+vendor/
+apps/ios/Clawdbot.xcodeproj/
+apps/ios/Clawdbot.xcodeproj/**
+apps/macos/.build/**
+**/*.bun-build
+apps/ios/*.xcfilelist
+
+# Vendor build artifacts
+vendor/a2ui/renderers/lit/dist/
+src/canvas-host/a2ui/*.bundle.js
+src/canvas-host/a2ui/*.map
+.bundle.hash
+
+# fastlane (iOS)
+apps/ios/fastlane/README.md
+apps/ios/fastlane/report.xml
+apps/ios/fastlane/Preview.html
+apps/ios/fastlane/screenshots/
+apps/ios/fastlane/test_output/
+apps/ios/fastlane/logs/
+apps/ios/fastlane/.env
+
+# fastlane build artifacts (local)
+apps/ios/*.ipa
+apps/ios/*.dSYM.zip
+
+# provisioning profiles (local)
+apps/ios/*.mobileprovision
+
+# Local untracked files
+.local/
+documentation/.local/
+tmp/
+IDENTITY.md
+USER.md
+.tgz
+.idea
+
+# local tooling
+.serena/
+
+# Agent credentials and memory (NEVER COMMIT)
+/memory/
+.agent/*.json
+!.agent/workflows/
+/local/
+package-lock.json
+.claude/
+.agents/
+.agents
+.agent/
+skills-lock.json
+
+# Local iOS signing overrides
+apps/ios/LocalSigning.xcconfig
+
+# Xcode build directories (xcodebuild output)
+apps/ios/build/
+apps/shared/OpenClawKit/build/
+Swabble/build/
+
+# Generated protocol schema (produced via pnpm protocol:gen)
+dist/protocol.schema.json
+.ant-colony/
+
+# Eclipse
+**/.project
+**/.classpath
+**/.settings/
+**/.gradle/
+
+# Synthing
+**/.stfolder/
+.dev-state
+
+# ────────────────────────────────────────────────────────────────────────
+# Added by agent_os_openclaw (Terraform deployment artifacts only).
+# Files like pnpm-lock.yaml / vendor/* / documentation/reference/templates/*.md are
+# matched by patterns above but force-tracked in git so VM builds work.
+# ────────────────────────────────────────────────────────────────────────
+
+**/.terraform/
+*.tfstate
+*.tfstate.*
+crash.log
+crash.*.log
+*.tfplan
+*.tfvars.local
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# ── AgentOS deploy artifacts (never commit) ──
+secrets.env
+*.pem
+*-sa.json
+firebase-sa.json
+**/terraform.tfvars
+**/*.tfstate
+**/*.tfstate.*
+**/.terraform/
+
+# ── A2UI lit renderer: required by the gateway build ──
+# The source .gitignore blanket-ignores vendor/, but the OSS gateway CLONES the
+# repo (git ships only tracked files) and its build compiles the lit renderer
+# (scripts/bundle-a2ui.sh -> tsc -> rolldown). Re-include just that renderer so
+# the clone has the sources; its dist/ stays ignored and is built on the VM.
+!vendor/
+vendor/*
+!vendor/a2ui
+vendor/a2ui/*
+!vendor/a2ui/renderers
+vendor/a2ui/renderers/*
+!vendor/a2ui/renderers/lit
+vendor/a2ui/renderers/lit/dist/
+
+# ── Agent-workspace base templates: required by the gateway at runtime ──
+# The gateway seeds every new agent workspace from documentation/reference/
+# templates/*.md (loadTemplate() throws if any is missing). The source .gitignore
+# has bare IDENTITY.md / USER.md rules (for agents' runtime workspace files) that
+# also hid those two TEMPLATE files. Re-include the templates; the per-agent
+# IDENTITY/USER the platform generates still override them in each workspace.
+# (main renamed docs/ -> documentation/; the old !docs/... rule missed them.)
+!documentation/reference/templates/*.md

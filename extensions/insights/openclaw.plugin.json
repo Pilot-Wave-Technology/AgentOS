@@ -1,0 +1,10 @@
+{
+  "id": "insights",
+  "name": "Platform Insights",
+  "description": "Read-only gateway RPCs for the AgentOS dashboard — sandbox health, container runtime status, and platform metrics.",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  }
+}

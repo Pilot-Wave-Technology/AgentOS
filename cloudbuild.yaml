@@ -1,0 +1,35 @@
+# AgentOS gateway (OpenClaw) — redeploy on push.
+#
+# The gateway VM self-clones + provisions itself on first boot (see the terraform
+# startup script -> scripts/gateway-provision.sh). This pipeline runs the SAME
+# provisioning script on the existing VM so a push to your fork reconfigures and
+# rebuilds it: pull -> gateway-provision.sh (install + build + full openclaw
+# config + synthetic models + wrappers/hooks + restart). No image registry — the
+# gateway runs from source on the VM.
+#
+# Requires: the Cloud Build service account can SSH via IAP. prerequisites.sh
+# grants it roles/iap.tunnelResourceAccessor + roles/compute.osAdminLogin.
+# Substitutions default to the terraform names.
+
+substitutions:
+  _VM_NAME: agentos-gateway
+  _ZONE: us-central1-a
+
+steps:
+  - id: redeploy-gateway
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        set -euo pipefail
+        gcloud compute ssh "${_VM_NAME}" --zone "${_ZONE}" --tunnel-through-iap --command '
+          set -euo pipefail
+          cd /opt/agentos-gateway
+          sudo git pull --ff-only
+          sudo bash scripts/gateway-provision.sh
+          echo "gateway redeployed: $(git rev-parse --short HEAD)"
+        '
+
+options:
+  logging: CLOUD_LOGGING_ONLY
