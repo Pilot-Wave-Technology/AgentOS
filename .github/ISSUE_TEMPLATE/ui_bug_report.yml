@@ -1,0 +1,106 @@
+name: UI bug report
+description: Report visual, layout, or interaction defects in the web control UI — not behavior or logic bugs.
+title: "[UI Bug]: "
+labels:
+  - bug
+  - ui
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for filing this report. Include a screenshot or recording whenever possible — visual bugs are hard to triage from text alone.
+  - type: dropdown
+    id: page
+    attributes:
+      label: Affected page or component
+      description: Where does this visual issue occur?
+      options:
+        - Goal / story / task dashboard
+        - Chat / assistant conversation
+        - Settings / member management
+        - Guided tour / onboarding
+        - Sidebar / navigation
+        - Other (describe in summary)
+    validations:
+      required: true
+  - type: dropdown
+    id: bug_type
+    attributes:
+      label: Bug type
+      description: Choose the category that best matches this report.
+      options:
+        - Visual/rendering glitch (wrong colors, broken styles, garbled output)
+        - Layout/responsive issue (overlapping, clipped, or misaligned elements)
+        - Interaction/animation bug (hover, transition, focus, or click-target issue)
+        - Accessibility issue (contrast, keyboard nav, screen reader)
+    validations:
+      required: true
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: One-sentence statement of what looks wrong.
+      placeholder: The hover-card for the sidebar tour trigger is clipped by its scroll ancestor on the goal dashboard.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: Provide the shortest deterministic repro path.
+      placeholder: |
+        1. Open a goal dashboard at a narrow viewport width.
+        2. Hover the agent-type icon in the sidebar.
+        3. Observe the tooltip position.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected appearance
+      description: What it should look like if the bug does not exist.
+      placeholder: The tooltip stays fully visible within the viewport.
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual appearance
+      description: What it looks like instead.
+      placeholder: The tooltip is clipped on the right edge and half off-screen.
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Screenshots or recordings
+      description: Attach screenshots or screen recordings showing the issue. Redact anything sensitive.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: AgentOS version / commit SHA
+      description: Exact version or commit tested.
+      placeholder: <commit SHA or tag>
+    validations:
+      required: true
+  - type: input
+    id: browser
+    attributes:
+      label: Browser and OS
+      description: Where this was observed.
+      placeholder: Chrome 132 on macOS 15.4
+    validations:
+      required: true
+  - type: input
+    id: viewport
+    attributes:
+      label: Viewport / window size
+      description: Optional. Relevant for layout and responsive issues.
+      placeholder: 1280x720
+  - type: textarea
+    id: additional_information
+    attributes:
+      label: Additional information
+      description: Add any context that helps triage but does not fit above — theme (light/dark), zoom level, custom browser extensions, etc.

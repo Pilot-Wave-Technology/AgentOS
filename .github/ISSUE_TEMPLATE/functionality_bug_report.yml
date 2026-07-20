@@ -1,0 +1,128 @@
+name: Functionality bug report
+description: Report defects in behavior or logic, including regressions, crashes, and incorrect output — not visual/UI issues.
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for filing this report. Keep it concise, reproducible, and evidence-based.
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      description: Which part of AgentOS is affected? (Maps to the branch the fix lands on.)
+      options:
+        - Control plane (agent_os_platform — API, web UI, services, DB)
+        - Agent gateway (agent_os_openclaw — runtime, workspaces, LLM calls)
+        - Docs / deployment (main)
+        - Not sure
+    validations:
+      required: true
+  - type: dropdown
+    id: bug_type
+    attributes:
+      label: Bug type
+      description: Choose the category that best matches this report.
+      options:
+        - Regression (worked before, now fails)
+        - Crash (process/app exits or hangs)
+        - Behavior bug (incorrect output/state without crash)
+    validations:
+      required: true
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: One-sentence statement of what is broken.
+      placeholder: After upgrading to <version>, <feature> behavior regressed from <prior version>.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: Provide the shortest deterministic repro path.
+      placeholder: |
+        1. Create a goal with X.
+        2. Accept the generated story.
+        3. Observe the task dispatch behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What should happen if the bug does not exist.
+      placeholder: The task transitions to awaiting_approval after the Reviewer Agent verdict.
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: What happened instead, including user-visible errors.
+      placeholder: The task stays in automated_review indefinitely; no reviewer verdict is posted.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: AgentOS version / commit SHA
+      description: Exact version or commit tested.
+      placeholder: <commit SHA or tag>
+    validations:
+      required: true
+  - type: dropdown
+    id: agent_type
+    attributes:
+      label: Agent type involved (if any)
+      description: Which agent type, if the bug involves agent behavior.
+      options:
+        - Not applicable
+        - GO (Goal Orchestrator)
+        - Assistant
+        - IA (Independent Agent)
+        - RA (Reviewer Agent)
+        - Council (Goal Review / Security / Platform Research)
+  - type: input
+    id: deployment
+    attributes:
+      label: Deployment
+      description: Local dev, self-hosted Cloud Run, or other.
+      placeholder: Local (uvicorn --reload) / Cloud Run / other
+  - type: input
+    id: config_location
+    attributes:
+      label: Relevant config / feature flags
+      description: Optional. Relevant env vars or feature flags if this bug depends on non-default config. Redact secrets.
+      placeholder: MEMORY_V2_ENABLED=true, GITGRAPH_ENABLED=true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs, screenshots, and evidence
+      description: Include redacted logs/screenshots/recordings that prove the behavior.
+      render: shell
+  - type: textarea
+    id: impact
+    attributes:
+      label: Impact and severity
+      description: |
+        Explain who is affected, how severe it is, how often it happens, and the practical consequence.
+        Include:
+        - Affected users/goals/agent types
+        - Severity (annoying, blocks workflow, data risk, etc.)
+        - Frequency (always/intermittent/edge case)
+        - Consequence (stalled tasks, lost work, incorrect approvals, etc.)
+      placeholder: |
+        Affected: All goals using Council review
+        Severity: High (blocks task completion)
+        Frequency: 100% repro
+        Consequence: Tasks never reach the human approval gate
+  - type: textarea
+    id: additional_information
+    attributes:
+      label: Additional information
+      description: Add any context that helps triage but does not fit above. If this is a regression, include the last known good and first known bad versions.
+      placeholder: Last known good commit <...>, first known bad commit <...>, temporary workaround is ...

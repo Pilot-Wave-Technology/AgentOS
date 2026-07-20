@@ -1,0 +1,12 @@
+# CODEOWNERS — GitHub auto-requests these reviewers on pull requests.
+#
+# How it works: for a PR, GitHub reads the CODEOWNERS of the PR's *base branch*,
+# and the LAST matching pattern wins.
+#
+# To add people: append their GitHub @handle(s), space-separated, to a line —
+# or add a more specific path line above the catch-all. Examples:
+#   *                 @you @teammate        # everyone reviews everything
+#   /deploy/          @deploy-owner         # route one area to a specific owner
+#
+# Default owner for everything on this branch:
+*   @abhi-chaudhary-pwh @harshwardhanagarwal
