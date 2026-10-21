@@ -18,8 +18,9 @@ Describe the problem and fix in 2–5 bullets:
 
 ## Scope (select all touched areas)
 
-- [ ] Goal / Story / Task orchestration
-- [ ] Agent types (GO, Assistant, IA, RA)
+- [ ] Goal / Story / Execution
+- [ ] Agents (GO, Assistant, executor profiles, council reviewers)
+- [ ] Kernel / execution plane (conductor, executor pods, GKE)
 - [ ] Ledger / event sourcing
 - [ ] Memory (V2, compaction, search)
 - [ ] Platform channels (Slack)

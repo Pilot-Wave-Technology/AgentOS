@@ -47,7 +47,7 @@ body:
       placeholder: |
         1. Create a goal with X.
         2. Accept the generated story.
-        3. Observe the task dispatch behavior.
+        3. Observe the execution's behavior.
     validations:
       required: true
   - type: textarea
@@ -55,7 +55,7 @@ body:
     attributes:
       label: Expected behavior
       description: What should happen if the bug does not exist.
-      placeholder: The task transitions to awaiting_approval after the Reviewer Agent verdict.
+      placeholder: The execution finishes and opens a pull request for review.
     validations:
       required: true
   - type: textarea
@@ -63,7 +63,7 @@ body:
     attributes:
       label: Actual behavior
       description: What happened instead, including user-visible errors.
-      placeholder: The task stays in automated_review indefinitely; no reviewer verdict is posted.
+      placeholder: The execution stays running indefinitely; no pull request is opened.
     validations:
       required: true
   - type: input
@@ -83,9 +83,9 @@ body:
         - Not applicable
         - GO (Goal Orchestrator)
         - Assistant
-        - IA (Independent Agent)
-        - RA (Reviewer Agent)
-        - Council (Goal Review / Security / Platform Research)
+        - Executor (story execution / pod)
+        - Council reviewer (Goal Review / Security / Platform Research)
+        - Kernel / conductor
   - type: input
     id: deployment
     attributes:
@@ -114,12 +114,12 @@ body:
         - Affected users/goals/agent types
         - Severity (annoying, blocks workflow, data risk, etc.)
         - Frequency (always/intermittent/edge case)
-        - Consequence (stalled tasks, lost work, incorrect approvals, etc.)
+        - Consequence (stalled stories, lost work, incorrect approvals, etc.)
       placeholder: |
         Affected: All goals using Council review
-        Severity: High (blocks task completion)
+        Severity: High (blocks story completion)
         Frequency: 100% repro
-        Consequence: Tasks never reach the human approval gate
+        Consequence: Stories never reach a pull request
   - type: textarea
     id: additional_information
     attributes:

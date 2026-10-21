@@ -1,93 +1,19 @@
 # Deploying AgentOS — the map
 
-This is the **high-level map** of an AgentOS deployment. It shows the order and how
-the two branches fit together, then hands you off to the detailed, step-by-step
-guide inside each branch. Do the real work from those guides — this page is just so
-you always know where you are.
+This page is only the order. Do the real work from the step-by-step files it links;
+the `agent_os_platform` guide ([`deploy/README.md`](https://github.com/Pilot-Wave-Technology/AgentOS/blob/agent_os_platform/deploy/README.md)) is the spine and drives the whole sequence.
+Everything runs on **Google Cloud, in one region**. Expect ~2 hours the first time.
 
-> **AgentOS deploys in TWO stages, gateway first:**
-> **① the gateway (`agent_os_openclaw`)**, then **② the control plane (`agent_os_platform`)**.
-> The gateway creates the shared VPC and archive bucket; the control plane reuses them
-> and connects to it. Deploy the platform first and it has nothing to talk to.
+**Run [`./preflight.sh`](https://github.com/Pilot-Wave-Technology/AgentOS/blob/agent_os_platform/preflight.sh) (platform branch) between every pair of steps** — it checks that what the last step should have created actually exists, and treats "could not determine" as a failure.
 
-Everything runs on **Google Cloud** (Cloud Run, Cloud Build, Cloud SQL, one gateway VM),
-all in **one region**. Almost everything is created for you by Terraform — your job is
-mostly to gather a few accounts/keys and run a handful of commands in order.
+1. **Accounts and one-time setup** — platform [`deploy/00`](https://github.com/Pilot-Wave-Technology/AgentOS/blob/agent_os_platform/deploy/00-prerequisites.md)–[`04`](https://github.com/Pilot-Wave-Technology/AgentOS/blob/agent_os_platform/deploy/04-collect-your-values.md): GCP project, Firebase, GitHub App, optional Slack (configured after first login), collect your values into `secrets.env`, then run `./prerequisites.sh <PROJECT> <REGION>`. It creates the service accounts, IAM and every non-database secret, and stops with a list of exact fix commands if a required secret (the Gemini and Anthropic keys, the Firebase service account, the GitHub App key) is empty.
+2. **Stage ① — gateway** — [`agent_os_openclaw` `deploy/README.md`](https://github.com/Pilot-Wave-Technology/AgentOS/blob/agent_os_openclaw/deploy/README.md): `terraform apply` creates the VM (it self-provisions on boot), VPC, reserved address, archive bucket and firewalls. Note the outputs `network_name` and `archive_bucket`. The gateway URL is derived automatically from the reserved `<prefix>-gateway-ip` address — nothing to copy.
+3. **Stage ② — platform infrastructure** — platform [`deploy/05`](https://github.com/Pilot-Wave-Technology/AgentOS/blob/agent_os_platform/deploy/05-provision-infrastructure.md): `terraform apply` creates Cloud SQL, the image registry, the VPC connector, the five Cloud Run services and the GKE execution-plane cluster.
+4. **Secrets, readiness, build** — platform [`deploy/06`](https://github.com/Pilot-Wave-Technology/AgentOS/blob/agent_os_platform/deploy/06-fill-in-secrets.md)–[`07`](https://github.com/Pilot-Wave-Technology/AgentOS/blob/agent_os_platform/deploy/07-build-and-deploy.md): check every secret is real, pass the gateway readiness gate, run Cloud Build (build → migrate → deploy), publish the VS Code extension with `./publish-extension.sh`, and point the GitHub App webhook at your URL.
+5. **Verify and log in** — platform [`deploy/08`](https://github.com/Pilot-Wave-Technology/AgentOS/blob/agent_os_platform/deploy/08-deploy-gateway-vm.md)–[`09`](https://github.com/Pilot-Wave-Technology/AgentOS/blob/agent_os_platform/deploy/09-first-login-and-verify.md): confirm the gateway link, then log in as the bootstrap admin. Optional channels (Slack, [`deploy/03`](https://github.com/Pilot-Wave-Technology/AgentOS/blob/agent_os_platform/deploy/03-slack-app.md)) are set up now, in the admin UI.
+6. **Your first story** — platform [`deploy/11-your-first-story.md`](https://github.com/Pilot-Wave-Technology/AgentOS/blob/agent_os_platform/deploy/11-your-first-story.md): a goal, a repo, a story, and a pull request you accept.
 
-**Expect ~2 hours** for a first-time setup. Running cost is a few dollars/day when idle
-and more while agents are working — you're paying for one always-on gateway VM plus
-Cloud SQL and Cloud Run.
-
-The two detailed guides:
-- **Stage ① gateway** → [`agent_os_openclaw/deploy/README.md`](https://github.com/Pilot-Wave-Technology/AgentOS/blob/agent_os_openclaw/deploy/README.md)
-- **Stage ② control plane** → [`agent_os_platform/deploy/README.md`](https://github.com/Pilot-Wave-Technology/AgentOS/blob/agent_os_platform/deploy/README.md)
-
-The Stage ② guide is the **spine of the process** — it owns the shared prerequisites
-and the one-time setup that both stages depend on, and it hands off to Stage ① at the
-right moment (you still deploy the gateway first; the platform guide just drives the
-whole sequence). Start there.
-
----
-
-## The order at a glance
-
-### 0 · Before you start — accounts, keys, and one-time setup
-*(Stage ② guide, files `00`–`04` + `prerequisites.sh`)*
-
-- A **Google Cloud** project (billing enabled, you're owner) and the `gcloud` + `terraform` CLIs.
-- **Firebase** for login, a **GitHub org + App** for agent repo work, LLM API keys (**Anthropic + Gemini**; OpenAI optional). **Slack** is optional and needs *nothing* pre-deploy — you wire it up in the admin UI (Settings → Integrations → Slack) after first login.
-- Collect all of it into `secrets.env`, then run the one-time, repeatable
-  **`prerequisites.sh <PROJECT> <REGION>`** — it creates the service accounts, IAM,
-  **all Secret Manager secrets**, and the **Cloud SQL** instance + database + users.
-
-### 1 · Stage ① — deploy the gateway
-*(`agent_os_openclaw/deploy/`)*
-
-- `terraform apply` in the gateway branch creates the **VM** (plus the shared **VPC**,
-  **archive bucket**, firewall). The VM **self-provisions on boot**: it clones the
-  branch, builds the gateway, installs the security scanners, writes its config, and
-  starts the service on port **18789**.
-- Confirm it's up (`systemctl is-active openclaw-gateway@18789` → `active`) and note the
-  VM's internal IP — you'll need `ws://<ip>:18789` next.
-
-### 2 · Stage ② — deploy the control plane
-*(`agent_os_platform/deploy/`, files `05`–`09`)*
-
-1. **Provision infra** — set `openclaw_ws_url = ws://<gateway-ip>:18789`, then
-   `terraform apply` creates the VPC connector, buckets, and the Cloud Run **placeholder**
-   services (four in the default split profile, or one in `single`).
-2. **Gateway-ready gate (do this before building)** — set the `control-panel-url` secret
-   to the web service URL, then confirm the gateway is **ready**: service `active`, it has
-   `CONTROL_PANEL_URL` in its env, and the **Anthropic key is present**. This gate matters:
-   the build is when the platform agents are (re)created against the gateway, and if the
-   gateway can't resolve their model yet they fall back to a default. *Only build once it's green.*
-3. **Build & deploy** — `gcloud builds submit … cloudbuild.yaml` runs the pipeline:
-   **build** the image → **migrate** (create the schema + seed the built-in
-   agents/templates/tools) → **deploy** the real image to every service.
-
-### 3 · First login
-*(Stage ② guide, file `09`)*
-
-- Open the web URL, log in as the bootstrap admin, add the hostname to Firebase
-  **Authorized domains**, and **create a goal**. That first goal is the end-to-end test:
-  the Goal Orchestrator provisions, responds, and you're live.
-
----
-
-## Tearing it down (repeatable testing)
-
-Each branch ships a `reset.sh`. Run them in this order — **platform first**, because its
-VPC connector lives on the gateway's VPC:
-
-```bash
-cd agentos-platform  && ./reset.sh      # Cloud Run, buckets, connector, Cloud SQL, DSN secrets
-cd ../agentos-openclaw && ./reset.sh    # gateway VM, VPC, archive bucket
-```
-
-Your accounts, LLM keys, and other Secret Manager entries survive teardown, so a
-re-deploy on the same project reuses them. Then redeploy in the same order: Stage ① → Stage ②.
-
----
+**Teardown:** `./teardown.sh` in the platform checkout removes the platform (Cloud Run, Cloud SQL, GKE), then the gateway (VM, VPC, archive bucket). Secrets and service accounts persist, so a redeploy on the same project reuses them; `./teardown.sh --everything` removes those too. What is left on purpose, and recovery: platform [`deploy/12-teardown.md`](https://github.com/Pilot-Wave-Technology/AgentOS/blob/agent_os_platform/deploy/12-teardown.md).
 
 ## Where the detail lives
 

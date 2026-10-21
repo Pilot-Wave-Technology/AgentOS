@@ -19,6 +19,7 @@ timeline with you.
 AgentOS spans three branches; the security-relevant surface lives in two of them:
 
 - **`agent_os_platform` (control plane)** — a Firebase-authenticated web app. Relevant areas: per-goal authorization, the kill switch, the custom-tools broker and its SSRF guards, and secret handling — all secrets live in Secret Manager, never in the repository.
+- **`agent_os_platform` (execution plane and kernel)** — story work runs in executor pods on GKE: two containers running as different users, a default-deny network policy, egress only through a proxy, and no cloud credential inside the pod. The kernel's verifier re-runs a completion claim's checks in a clean container before the work is accepted. Escapes from the pod, ways to reach the cloud or the database beyond the pod's own login, and ways to get an unverified claim accepted are all in scope.
 - **`agent_os_openclaw` (gateway)** — a VPC-internal runtime that hosts agents. It uses per-agent scoped tokens for calls back to the control plane and is never public-facing. It is a fork of [OpenClaw](https://github.com/openclaw/openclaw) (MIT): report issues in the AgentOS additions here; issues in unmodified upstream code should also be reported to OpenClaw.
 - **`main`** — documentation and governance only; no runtime.
 

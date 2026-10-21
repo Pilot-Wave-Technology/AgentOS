@@ -1,34 +1,18 @@
-
+# `main` holds docs and governance only — no application code.
 
 # ── AgentOS deploy artifacts (never commit) ──
 secrets.env
 *.pem
 *-sa.json
-firebase-sa.json
 **/terraform.tfvars
 **/*.tfstate
 **/*.tfstate.*
 **/.terraform/
 
-# ── A2UI lit renderer: required by the gateway build ──
-# The source .gitignore blanket-ignores vendor/, but the OSS gateway CLONES the
-# repo (git ships only tracked files) and its build compiles the lit renderer
-# (scripts/bundle-a2ui.sh -> tsc -> rolldown). Re-include just that renderer so
-# the clone has the sources; its dist/ stays ignored and is built on the VM.
-!vendor/
-vendor/*
-!vendor/a2ui
-vendor/a2ui/*
-!vendor/a2ui/renderers
-vendor/a2ui/renderers/*
-!vendor/a2ui/renderers/lit
-vendor/a2ui/renderers/lit/dist/
-
-# ── Agent-workspace base templates: required by the gateway at runtime ──
-# The gateway seeds every new agent workspace from documentation/reference/
-# templates/*.md (loadTemplate() throws if any is missing). The source .gitignore
-# has bare IDENTITY.md / USER.md rules (for agents' runtime workspace files) that
-# also hid those two TEMPLATE files. Re-include the templates; the per-agent
-# IDENTITY/USER the platform generates still override them in each workspace.
-# (main renamed docs/ -> documentation/; the old !docs/... rule missed them.)
-!documentation/reference/templates/*.md
+# Editor / OS noise
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*~
