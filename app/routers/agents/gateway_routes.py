@@ -19,6 +19,7 @@ import time
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
 
+from app import local_dev
 from app.auth import require_admin, require_editor
 from app.database import get_pool
 from app.openclaw import gateway_admin, GatewayError
@@ -90,8 +91,8 @@ async def sync_agent_to_gateway(agent_id: str, request: Request, user: dict = De
     agent = dict(agent)
 
     gateway_agent_id = agent.get("gateway_agent_id") or agent_id
-    model = agent.get("model", "google/gemini-2.5-flash")
-    workspace = f"~/.openclaw/workspace-{gateway_agent_id}"
+    model = agent.get("model", "google/gemini-3.8-flash")
+    workspace = local_dev.agent_workspace_path(gateway_agent_id)
     tools_allow = agent.get("tools_allow", [])
     tools_param = {"allow": tools_allow} if tools_allow else None
 

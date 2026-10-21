@@ -21,11 +21,19 @@ from app.internal_auth import verify_internal_bearer
 from app.database import get_pool, resolve_goal_id
 from app.openclaw import session_manager, gateway_admin
 from app.services.go_agent import build_go_context
+from app.routers.thread_paging import fetch_channel_page, register_channel_earlier_route
 
 _log = logging.getLogger(__name__)
 
+# NOTE: the router-level ownership_guard applies to every route registered
+# below, including the paging route added by register_channel_earlier_route().
 router = APIRouter(dependencies=[_sec_Depends(_ownership_guard)])
 templates = Jinja2Templates(directory="app/templates")
+
+# Visual identity for this channel's card chrome, passed to the shared
+# channels/_message.html partial. Plain rows override it per-role via
+# data-accent (emerald for GO, indigo for assistants, gray for system).
+_ACCENT = "amber"
 
 # ── Orchestrator channel subscriber registry ──────────────────────────────────
 _orch_subscribers: dict[str, set] = {}
@@ -75,26 +83,13 @@ async def orchestrator_page(
     if not orch_thread_id:
         raise HTTPException(status_code=404, detail="Orchestrator channel not found")
 
-    msg_rows = await pool.fetch(
-        """SELECT m.id, m.sender, m.role, m.content, m.created_at, m.card_data
-           FROM messages m
-           WHERE m.thread_id = $1
-             AND m.kind <> 'system_inject'
-             AND NOT (m.kind = 'system_wake' AND m.sender = 'system' AND m.card_data IS NULL)
-           ORDER BY m.created_at""",
-        orch_thread_id,
+    # Only the newest window is rendered; older history is paged in on demand.
+    # See app/routers/thread_paging.py for why this is keyset-based.
+    messages, has_older = await fetch_channel_page(pool, orch_thread_id)
+    _log.info(
+        "orchestrator-channel: rendering goal=%s messages=%d has_older=%s",
+        pid, len(messages), has_older,
     )
-    messages = []
-    for r in msg_rows:
-        m = dict(r)
-        # card_data is JSONB — asyncpg returns it as a JSON string; parse so the
-        # template can read card fields directly (review cards).
-        if isinstance(m.get("card_data"), str) and m["card_data"]:
-            try:
-                m["card_data"] = json.loads(m["card_data"])
-            except Exception:
-                m["card_data"] = None
-        messages.append(m)
 
     firebase_token = request.cookies.get("firebase_token", "")
 
@@ -108,8 +103,24 @@ async def orchestrator_page(
             "thread_id": orch_thread_id, "messages": messages,
             "firebase_token": firebase_token,
             "auto_fire_tour": auto_fire_tour,
+            "has_older": has_older,
+            "oldest_message_id": messages[0]["id"] if messages else "",
+            "accent": _ACCENT,
+            # This channel carries both sides of an internal exchange, so rows
+            # are labelled by role (GO / System / Assistant), not by sender id.
+            "label_mode": "role",
+            "load_earlier_url": f"/goals/{pid}/orchestrator/messages/earlier",
         },
     )
+
+
+register_channel_earlier_route(
+    router,
+    channel_slug="orchestrator",
+    thread_id_column="orchestrator_thread_id",
+    accent=_ACCENT,
+    label_mode="role",
+)
 
 
 # ── WebSocket (read-only broadcast to human observers) ────────────────────────
@@ -279,7 +290,7 @@ async def internal_orchestrator_message(pid: str, request: Request):
 
         if session:
             # Slim context (goal identity + team roster only)
-            context = await build_go_context(pid)
+            context = await build_go_context(pid, go_thread_id)
             go_msg_content = (
                 f"{context}\n\n---\n\n"
                 f"[Orchestrator Channel Message]\n{formatted}\n\n"

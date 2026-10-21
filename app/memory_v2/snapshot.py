@@ -37,10 +37,44 @@ def _is_memory_filename(filename: str) -> bool:
     return any(filename == p or filename.startswith(p) for p in _MEMORY_FILE_PREFIXES)
 
 
+def memory_key(agent_id: str, goal_id: str) -> str:
+    """Canonical `agent_workspace_files.agent_id` for per-(goal, user) assistant memory.
+    Shared by the LOCAL path and the gateway snapshot/restore so both read/write ONE
+    store, regardless of thread or local-vs-gateway instance. Stable — no thread, no
+    synthetic suffix. NB: gateway RPCs still address the LIVE agent by its per-instance
+    `gateway_agent_id`; this is the DB key only (translate instance→(agent,goal) at the
+    DB boundary). `agent_id` is the abstract assistant `agents.id`."""
+    return f"{agent_id}-{goal_id}"
+
+
+async def _db_key_for(gateway_agent_id: str, db_key: Optional[str] = None) -> str:
+    """The canonical `agent_workspace_files.agent_id` for a gateway INSTANCE id. Prefer
+    an explicit `db_key` (callers that already know the abstract agent + goal pass it —
+    avoids the raw-vs-normalized gateway-id mismatch); else translate the instance id to
+    `{agent}-{goal}` via `agent_instances`; else fall back to the raw id so legacy /
+    abstract-agent callers still work."""
+    if db_key:
+        return db_key
+    try:
+        row = await get_pool().fetchrow(
+            "SELECT template_id, goal_id FROM agent_instances "
+            "WHERE gateway_agent_id = $1 AND template_id IS NOT NULL AND goal_id IS NOT NULL "
+            "ORDER BY created_at DESC LIMIT 1",
+            gateway_agent_id,
+        )
+    except Exception:  # noqa: BLE001
+        row = None
+    if row and row["template_id"] and row["goal_id"]:
+        return memory_key(row["template_id"], row["goal_id"])
+    return gateway_agent_id
+
+
 # ── Snapshot ─────────────────────────────────────────────────────────────────
 
-async def snapshot_agent_workspace(agent_id: str, reason: str) -> int:
-    """Snapshot all memory files in an agent's workspace into PG.
+async def snapshot_agent_workspace(agent_id: str, reason: str, db_key: Optional[str] = None) -> int:
+    """Snapshot all memory files in an agent's workspace into PG under the canonical
+    `{agent}-{goal}` key (so local + gateway share ONE store). `agent_id` is the gateway
+    INSTANCE id used for the RPCs; `db_key` overrides the DB key (else translated).
 
     Returns count of files snapshotted. Failures are logged and the
     function returns whatever it managed to snapshot — never raises into
@@ -49,6 +83,7 @@ async def snapshot_agent_workspace(agent_id: str, reason: str) -> int:
     if reason not in ("pre_reap", "periodic", "manual", "pre_gateway_restart"):
         _log.warning("snapshot_agent_workspace: invalid reason=%r — skipping", reason)
         return 0
+    store_key = await _db_key_for(agent_id, db_key)
 
     try:
         list_result = await gateway_admin.call(
@@ -72,10 +107,15 @@ async def snapshot_agent_workspace(agent_id: str, reason: str) -> int:
         filename = entry.get("filename") or ""
         if not _is_memory_filename(filename):
             continue
+        # agents.files.get serves only top-level allow-listed files (MEMORY.md); it
+        # rejects `memory/` subpaths. The daily memory/*.md logs consolidate into
+        # MEMORY.md, so capturing MEMORY.md is sufficient — skip the rest quietly.
+        if "/" in filename:
+            continue
         try:
             file_result = await gateway_admin.call(
                 "agents.files.get",
-                {"agentId": agent_id, "filename": filename},
+                {"agentId": agent_id, "name": filename},  # gateway param is `name`, not `filename`
                 timeout=30,
             )
         except Exception:
@@ -92,7 +132,7 @@ async def snapshot_agent_workspace(agent_id: str, reason: str) -> int:
                 """INSERT INTO agent_workspace_files
                      (agent_id, filename, content, bytes, snapshot_reason)
                    VALUES ($1, $2, $3, $4, $5)""",
-                agent_id, filename, content, bytes_count, reason,
+                store_key, filename, content, bytes_count, reason,
             )
             snapshotted += 1
         except Exception:
@@ -110,42 +150,56 @@ async def snapshot_agent_workspace(agent_id: str, reason: str) -> int:
 
 # ── Restore ──────────────────────────────────────────────────────────────────
 
-async def has_prior_snapshot(agent_id: str) -> bool:
+async def has_prior_snapshot(agent_id: str, db_key: Optional[str] = None) -> bool:
     pool = get_pool()
+    store_key = await _db_key_for(agent_id, db_key)
     return bool(await pool.fetchval(
-        "SELECT 1 FROM agent_workspace_files WHERE agent_id = $1 LIMIT 1",
-        agent_id,
+        "SELECT 1 FROM agent_workspace_files WHERE agent_id = ANY($1) LIMIT 1",
+        list({store_key, agent_id}),  # canonical key, or legacy raw-id rows
     ))
 
 
-async def restore_agent_workspace(agent_id: str) -> int:
-    """Restore the latest snapshot of each memory file to the agent's
-    workspace via `agents.files.set`.
+async def restore_agent_workspace(agent_id: str, db_key: Optional[str] = None) -> int:
+    """Restore the latest snapshot of each memory file to the agent's workspace via
+    `agents.files.set`. Reads under the canonical `{agent}-{goal}` key (so it picks up
+    LOCAL writes too), with a fallback to legacy raw-id rows. `agent_id` is the gateway
+    INSTANCE id for the RPC.
 
-    Called from `app/shca_provisioning.py` after the per-user template
-    files are seeded but before the first session message.
-
-    Returns count of files restored. Failures are logged but non-fatal.
+    Called at agent provisioning time after the per-user template files are seeded but
+    before the first session message. Returns count of files restored. Non-fatal.
     """
     pool = get_pool()
+    store_key = await _db_key_for(agent_id, db_key)
     rows = await pool.fetch(
         """SELECT DISTINCT ON (filename) filename, content, snapshot_at
              FROM agent_workspace_files
             WHERE agent_id = $1
             ORDER BY filename, snapshot_at DESC""",
-        agent_id,
+        store_key,
     )
+    if not rows and store_key != agent_id:
+        rows = await pool.fetch(
+            """SELECT DISTINCT ON (filename) filename, content, snapshot_at
+                 FROM agent_workspace_files
+                WHERE agent_id = $1
+                ORDER BY filename, snapshot_at DESC""",
+            agent_id,
+        )
     if not rows:
         return 0
 
     restored = 0
     for r in rows:
+        # agents.files.set (like .get) only accepts top-level allow-listed files and
+        # rejects `memory/` subpaths — restore MEMORY.md (the durable, consolidated file).
+        if "/" in r["filename"]:
+            continue
         try:
             await gateway_admin.call(
                 "agents.files.set",
                 {
                     "agentId": agent_id,
-                    "filename": r["filename"],
+                    "name": r["filename"],  # gateway param is `name`, not `filename`
                     "content": r["content"],
                 },
                 timeout=30,

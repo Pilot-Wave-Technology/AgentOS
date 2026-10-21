@@ -3,7 +3,7 @@
   "type": "PlatformResearch",
   "name": "Research: Tools & MCP",
   "description": "Finds best-in-class tools and MCP servers that fill gaps in our agents' capabilities.",
-  "model": "google-flash-1m/gemini-2.5-flash-1m",
+  "model": "google-flash38-1m/gemini-3.8-flash-1m",
   "emoji": "🧰",
   "tools_allow": [
     "read",

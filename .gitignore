@@ -5,12 +5,28 @@ __pycache__/
 venv/
 dist/
 *.egg-info/
+# `pip wheel .` / `python -m build` leave this next to the
+# package. It is a COPY of src/, so git reads it as a rename
+# of the real files and will happily stage the build output
+# in place of the source.
+build/
 .pytest_cache/
 .mypy_cache/
 serviceAccountKey.json
 *.pem
 *-firebase-adminsdk-*.json
 agentic-team-*.json
+/.coverage
+.scratch_commit_test
+
+# graphify output artifacts — generated, never committed
+graphify-out/
+
+# E0 artifact content store (local blobs, content-addressed)
+infra/e0/artifacts/
+
+# JUnit report written by scripts/ci/run_suite.sh
+pytest-report.xml
 
 # ── AgentOS deploy artifacts (never commit) ──
 secrets.env

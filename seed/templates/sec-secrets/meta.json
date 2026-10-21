@@ -3,7 +3,7 @@
   "type": "RA",
   "name": "Security — Secrets & Exposure",
   "description": "Scans a checked-out branch (working tree + git history) for hardcoded secrets, keys, and credentials.",
-  "model": "google-flash-500k/gemini-2.5-flash-500k",
+  "model": "google-flash38-500k/gemini-3.8-flash-500k",
   "emoji": "🔑",
   "tools_allow": [
     "read",

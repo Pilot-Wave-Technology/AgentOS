@@ -9,18 +9,19 @@ from file 07 (from the `agent_os_platform` checkout root):
 gcloud builds submit \
   --project "$PROJECT_ID" \
   --config=cloudbuild.yaml \
+  --service-account="projects/$PROJECT_ID/serviceAccounts/agentos-build@$PROJECT_ID.iam.gserviceaccount.com" \
   --substitutions=COMMIT_SHA=$(git rev-parse --short HEAD),_REGION=$REGION \
   .
 ```
 `--substitutions=COMMIT_SHA=…` is **required**: a manual `gcloud builds submit`
 does not populate `$COMMIT_SHA` (only trigger builds do), and omitting it fails
-immediately with `invalid image name "…/agentos:"` (empty tag). Use
-`cloudbuild-single.yaml` if you deployed the single profile.
+immediately with `invalid image name "…/agentos:"` (empty tag).
 
-> **Auto-deploy on push?** Not set up by this guide — there is no Cloud Build
-> trigger by default, so a `git push` alone does **not** redeploy. If you want
-> that, create a trigger on the `agent_os_platform` branch pointing at
-> `cloudbuild.yaml` in the Cloud Build console.
+> **Auto-deploy on push?** Only if you did **file 07, step 7.4**, which sets up
+> a Cloud Build trigger and is recommended. Without that trigger a `git push`
+> does **not** redeploy, and the command above is how you deploy. If you are not
+> sure which applies to you, look for a trigger on the `agent_os_platform`
+> branch in the Cloud Build console.
 
 ## Changing behaviour (flags) or config
 1. Edit `terraform/terraform.tfvars` (the `flags { ... }` block or any input).
@@ -28,11 +29,22 @@ immediately with `invalid image name "…/agentos:"` (empty tag). Use
 Flags take effect on the next revision. See `../CONFIG.md` for what each does.
 
 ## Updating the gateway
-Push to `agent_os_openclaw`, then either `terraform apply` in the gateway folder,
-or SSH in and refresh:
+Push to `agent_os_openclaw`, then run the gateway's own build — it pulls the
+branch on the VM and re-runs the full provisioning script (install, build,
+config, restart), which a bare `git pull && pnpm build` would skip. From the
+`agentos-openclaw` checkout root:
 ```bash
-gcloud compute ssh agentos-gateway --tunnel-through-iap --zone <zone> --command \
-  "cd /opt/agentos-gateway && sudo git pull && sudo pnpm install && sudo pnpm build && sudo systemctl restart 'openclaw-gateway@*'"
+gcloud builds submit --config=cloudbuild.yaml \
+  --project "$PROJECT_ID" \
+  --service-account="projects/$PROJECT_ID/serviceAccounts/agentos-build@$PROJECT_ID.iam.gserviceaccount.com" \
+  --substitutions=_ZONE=<zone>,_VM_NAME=agentos-gateway \
+  .
+```
+(Or a Cloud Build trigger on `agent_os_openclaw` running the same file.) The
+other supported path is a VM restart: every boot re-fetches the branch, re-reads
+the secrets and re-runs provisioning.
+```bash
+gcloud compute instances reset agentos-gateway --zone <zone>
 ```
 
 ## Rotating a secret
@@ -45,32 +57,33 @@ printf %s 'NEW_VALUE' | ./set-secret.sh <secret-name>
 ```
 Then redeploy the affected service(s) so they pick up `:latest` — a `git push`
 re-runs Cloud Build, or restart directly with `gcloud run services update
-<service> --region <region>` (split: `agentos-web`/`-council`/`-git`/`-management`
-as relevant; single: `agentos`). If you rotate `openclaw-gateway-token`, redeploy
-**both** the platform and the gateway.
+<service> --region <region>` (`agentos-web`/`-council`/`-git`/`-management`/`-scheduler`
+as relevant). If you rotate `openclaw-gateway-token` or an LLM key, also restart
+the gateway VM (`gcloud compute instances reset agentos-gateway --zone <zone>`) —
+it reads its secrets at boot.
 
 ## Where to look when something's wrong
 
 | Symptom | Look here |
 |---|---|
-| App won't load / 500s | Cloud Run logs: Console → Cloud Run → `agentos-web` (split default; `agentos` on single) → **Logs** |
+| App won't load / 500s | Cloud Run logs: Console → Cloud Run → `agentos-web` → **Logs** |
 | Login fails | Firebase **Authorized domains** includes your URL? (file 01.5) `FIREBASE_*` correct? |
-| Migration failed | Re-run file 07.2; read the job log for the failing statement |
-| GO agent never replies | `openclaw_ws_url` correct? `openclaw-gateway-token` **same** on both sides? Gateway service running? |
+| Migration failed | Re-run the pipeline (file 07, step 7.1); read the job log for the failing statement |
+| GO agent never replies | Gateway address right? Compare the control panel's `OPENCLAW_WS_URL` with the reserved `<name_prefix>-gateway-ip` (`gcloud compute addresses list`) -- a re-apply of the platform stack re-derives it. `openclaw-gateway-token` **same** on both sides? Gateway service running? |
 | Gateway not starting | SSH in: `sudo tail -100 /var/log/openclaw-startup.log` |
 | Git actions fail | GitHub App permissions (file 02.2), App installed on the repo, `github-app-key` secret set |
 | Slack commands do nothing | Request URLs point at your live URL? signing secret correct? command names match the suffix? |
-| Templates/skills missing | The seed migration didn't run — file 07.2 |
+| Templates/skills missing | The seed migration didn't run — re-run file 07, step 7.1 |
 
 ## Useful commands
 ```bash
 # tail the web app logs
-gcloud run services logs read agentos-web --region <region> --limit 100   # split default; `agentos` on single
+gcloud run services logs read agentos-web --region <region> --limit 100
 
 # list your secrets
 gcloud secrets list
 
-# see current service env/flags (what Terraform set)  — `agentos` on single profile
+# see current service env/flags (what Terraform set)
 gcloud run services describe agentos-web --region <region> --format='value(spec.template.spec.containers[0].env)'
 
 # re-run migrations by hand
@@ -78,13 +91,12 @@ gcloud run jobs execute agentos-migrate --region <region> --wait
 ```
 
 ## Costs
-The main cost drivers are Cloud SQL (always on), the gateway VM (always on), and
-LLM API usage (when agents work). To pause spend on a test deployment: stop the
-gateway VM and scale the Cloud Run service `min-instances` to 0 (note: some
-background loops won't run at 0). To tear everything down, use `./reset.sh` in
-each folder (platform first) — see below. Note the Cloud SQL instance is created
-by `prerequisites.sh`, not terraform, so `reset.sh` deletes it explicitly (a bare
-`terraform destroy` would leave it running as orphaned cost).
+Expect roughly **$25+/day idle** (GKE ~3 nodes + cluster fee, Cloud SQL, gateway
+VM, 5 warm Cloud Run services) before LLM usage, which comes on top when agents
+work. To pause spend on a test deployment: stop the gateway VM and scale the
+Cloud Run services' `min-instances` to 0 (note: some background loops won't run
+at 0). To tear everything down: `./teardown.sh` — see
+[file 12](12-teardown.md).
 
 ## Repeatable testing on the same project
 
@@ -95,24 +107,24 @@ Use this between test runs. It checks the instance exists, wipes the schema, and
 re-runs migrations (schema + seed) — no ~10-min instance recreate:
 ```bash
 cd agentos-platform && ./db-reset.sh
-# restart so the app reconnects — split (default): all four; single: just `agentos`
-for s in agentos-web agentos-council agentos-git agentos-management; do
+# restart all five services so the app reconnects
+for s in agentos-web agentos-council agentos-git agentos-management agentos-scheduler; do
   gcloud run services update "$s" --region <region> 2>/dev/null
 done
 ```
 The gateway keeps running; only the platform DB is reset.
 
 ### Full: destroy everything and redeploy from scratch
-Set `force_destroy_buckets = true` in both tfvars first (so non-empty buckets can
-be deleted). The Cloud SQL instance was created by `prerequisites.sh`, not
-Terraform — `reset.sh` deletes it directly (it has no deletion protection).
-**Order matters — platform before gateway** (the connector lives on the gateway's
-VPC):
 ```bash
-cd agentos-platform && ./reset.sh      # stage ② down (Cloud Run, Cloud SQL, secrets, connector)
-cd ../agentos-openclaw && ./reset.sh   # stage ① down (VM, VPC, archive bucket, gateway secrets)
+cd agentos-platform && ./teardown.sh   # platform, then gateway; asks you to type the project id
 ```
-Then redeploy in the normal order: **gateway (stage ①) → platform (stage ②)**.
+Nothing to edit first — it lifts Cloud SQL deletion protection and allows
+non-empty buckets to go by itself. Secrets and service accounts are **kept**, so
+the redeploy starts at **gateway (stage ①) → platform (stage ②)**.
+`./teardown.sh --everything` also removes the secrets, service accounts and
+images. Details, what is left on purpose, and recovery: [file 12](12-teardown.md).
+A database made by an older `prerequisites.sh` is not in Terraform's state: run
+`terraform/adopt-existing.sh` first, or the destroy leaves it running.
 
 ### Idempotency
 `terraform apply` is a no-op on infra that already exists, so re-running it after

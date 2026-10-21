@@ -27,6 +27,7 @@ IS-DISTINCT-FROM; cancel guards out of terminal states).
 """
 from __future__ import annotations
 
+import json
 import logging
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -34,8 +35,15 @@ from typing import Optional
 from app.database import get_pool
 
 from . import github_ops as gh
-from .merge_lane import _finalize_merged, cancel_engine_stories_for_group
-from .node_errors import clear_node_error, record_node_github_failure
+from .merge_lane import (
+    _finalize_merged,
+    cancel_engine_stories_for_node,
+    fan_out_cancel_notices,
+    notify_merge_group_node_cancelled,
+    reject_merge_story_if_last_live_node,
+)
+from .node_errors import (PR_CLOSED_UNMERGED, clear_node_error,
+                          record_node_github_failure)
 from .repo_identity import set_observed_trunk
 
 _log = logging.getLogger(__name__)
@@ -131,7 +139,8 @@ async def _node_for_pr(repo_id: str, pr_number: int) -> Optional[dict]:
     return dict(r) if r else None
 
 
-async def _advance_trunk(repo: dict, trunk_branch: str, new_trunk: str) -> bool:
+async def _advance_trunk(repo: dict, trunk_branch: str, new_trunk: str,
+                         *, legacy: bool = True) -> bool:
     """Advance the observed trunk_sha for (repo, trunk_branch) — detection cache only,
     never a mutation base. Writes the per-(repo,trunk) git_repo_trunks cache (§0) and
     the legacy git_repos.trunk_sha. Idempotent — no-op when unchanged. (Only ever
@@ -141,6 +150,13 @@ async def _advance_trunk(repo: dict, trunk_branch: str, new_trunk: str) -> bool:
         return False
     pool = get_pool()
     await set_observed_trunk(pool, repo["id"], trunk_branch, new_trunk)
+    if not legacy:
+        # A NON-DEFAULT LANE MUST NOT TOUCH THE LEGACY FIELD.
+        # `git_repos.trunk_sha` is one coarse value for a repo that may
+        # carry several lanes; writing a sibling lane's head into it is
+        # the last-write-wins confusion this per-lane cache exists to
+        # replace.
+        return True
     res = await pool.execute(
         "UPDATE git_repos SET trunk_sha = $2, trunk_sha_seen_at = now() "
         "WHERE id = $1 AND trunk_sha IS DISTINCT FROM $2",
@@ -156,6 +172,7 @@ async def _cancel_node(node_id: str, reason: str) -> None:
     unmet — story_transitions._DEP_SATISFIED_SQL / branches._is_cut_ready), so the
     consumer chain stays blocked for re-plan (§0 exit-2)."""
     pool = get_pool()
+    pending_notices: list[tuple[str, str]] = []
     # One transaction so a crash can't leave a torn ESCALATED/parked/rejected state
     # (mirrors grind._escalate_node).
     async with pool.acquire() as conn, conn.transaction():
@@ -167,20 +184,31 @@ async def _cancel_node(node_id: str, reason: str) -> None:
         await conn.execute(
             "UPDATE git_merge_queue SET status = 'parked' WHERE node_id = $1", node_id
         )
-        # Mark the node's merge story rejected (dependents stay blocked via the merge-dep rule).
-        await conn.execute(
-            "UPDATE stories SET state = 'rejected', updated_at = now() "
-            "WHERE story_kind = 'merge' AND state NOT IN ('done', 'rejected', 'cancelled') "
-            "  AND merge_group_id IN (SELECT merge_group_id FROM git_merge_group_nodes "
-            "                         WHERE git_node_id = $1)",
-            node_id,
-        )
-        # Cascade-cancel the group's engine diff/fix stories — the branch is being torn
+        # Reject the merge story ONLY if this was the group's last live node. On a
+        # multi-repo story the group holds one node per repo, and rejecting the shared
+        # merge story because ONE repo was cancelled makes every healthy sibling
+        # un-enqueueable forever (enqueue_ready_merges skips rejected merge stories).
+        # When siblings survive, the merge story stays open and we tell the operator
+        # instead — the story genuinely cannot complete until this node is retried, and
+        # nothing else would surface that.
+        rejected = await reject_merge_story_if_last_live_node(conn, node_id, reason)
+        if not rejected:
+            pending_notices = await notify_merge_group_node_cancelled(
+                conn, node_id, reason,
+            )
+        # Cascade-cancel THIS NODE's engine diff/fix stories — the branch is being torn
         # down, so its integrate/fix assistant stories must not keep running (orphans).
+        # Node-scoped (M2.4): a sibling repo in the same merge group may still be live,
+        # and its diff/fix story must survive.
         for g in await conn.fetch(
             "SELECT merge_group_id FROM git_merge_group_nodes WHERE git_node_id = $1", node_id
         ):
-            await cancel_engine_stories_for_group(conn, g["merge_group_id"])
+            await cancel_engine_stories_for_node(conn, node_id, g["merge_group_id"])
+
+    # Fan out AFTER the transaction commits — notify_new_message takes its own pool
+    # connection, so firing it inside would announce a message to every browser even if
+    # the teardown rolled back.
+    await fan_out_cancel_notices(pending_notices)
 
 
 # Write-to-PRs perms so reaping can CLOSE a dead goal's open PR.
@@ -241,19 +269,24 @@ async def reap_deleted_goal_nodes() -> int:
                 "UPDATE git_merge_queue SET status = 'parked' WHERE node_id = $1",
                 row["node_id"],
             )
-            await conn.execute(
-                "UPDATE stories SET state = 'cancelled', updated_at = now() "
-                "WHERE story_kind = 'merge' "
-                "  AND state NOT IN ('done', 'cancelled', 'rejected') "
-                "  AND merge_group_id IN (SELECT merge_group_id FROM git_merge_group_nodes "
-                "                         WHERE git_node_id = $1)",
-                row["node_id"],
-            )
+            from app.services.story_state_ledger import record_states_where
+            await record_states_where(
+                conn, "cancelled",
+                where=("story_kind = 'merge' AND state NOT IN "
+                       "('done', 'cancelled', 'rejected') AND merge_group_id "
+                       "IN (SELECT merge_group_id FROM git_merge_group_nodes "
+                       "WHERE git_node_id = $1)"),
+                params=(row["node_id"],), action="pr_closed_by_human")
+            # Node-scoped (M2.4). The goal is deleted so its siblings are being reaped
+            # too, but reaping is per-node and may be partial within one pass — scoping
+            # by node keeps each reap independent instead of order-dependent.
             for g in await conn.fetch(
                 "SELECT merge_group_id FROM git_merge_group_nodes WHERE git_node_id = $1",
                 row["node_id"],
             ):
-                await cancel_engine_stories_for_group(conn, g["merge_group_id"])
+                await cancel_engine_stories_for_node(
+                    conn, row["node_id"], g["merge_group_id"],
+                )
         reaped += 1
     if reaped:
         _log.info("git-engine: reaped %d node(s) of deleted/cancelled goal(s)", reaped)
@@ -290,8 +323,38 @@ async def _finalize_or_cancel(repo: dict, node: Optional[dict], pr: dict,
             out["trunk_advanced"] += 1
     elif allow_cancel and pr.get("state") == "closed":   # closed && !merged → human-cancel
         if node:
-            await _cancel_node(node["id"], "PR closed unmerged (human-cancel) — replan")
+            await _cancel_node(node["id"], f"{PR_CLOSED_UNMERGED} (human-cancel)")
             out["cancelled"] += 1
+
+
+async def _pushed_lane(ev, repo: dict, default: str) -> str:
+    """The branch this push was for, when it is a lane this repo tracks.
+
+    Falls back to the repo's default trunk when the ref is missing or is
+    not a lane anybody lands on -- a feature branch push, which the live
+    read then no-ops on.
+    """
+    payload = ev["payload"] if "payload" in ev.keys() else None
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except ValueError:
+            payload = None
+    ref = (payload or {}).get("ref") or ""
+    if not ref.startswith("refs/heads/"):
+        return default
+    branch = ref[len("refs/heads/"):]
+    if branch == default:
+        return default
+    # A LANE IS ONE SOMETHING LANDS ON. Checked against the nodes rather
+    # than against `git_repo_trunks`, so a lane that has never been
+    # observed still counts -- which is exactly the one most in need of
+    # a first observation.
+    known = await get_pool().fetchval(
+        "SELECT EXISTS (SELECT 1 FROM git_nodes "
+        " WHERE git_repo_id = $1 AND trunk_branch = $2)",
+        repo["id"], branch)
+    return branch if known else default
 
 
 async def _handle_event(ev, out: dict, tokens: dict) -> None:
@@ -322,14 +385,28 @@ async def _handle_event(ev, out: dict, tokens: dict) -> None:
         await _finalize_or_cancel(repo, node, pr, token, out,
                                   allow_cancel=(action == "closed"))
     elif event == "push":
-        # Any push to trunk advances the observed sha. A live read is idempotent
-        # (a push to a non-trunk branch leaves trunk HEAD unchanged → no-op update).
+        # THE LANE THAT WAS PUSHED, not the repo's default one.
+        #
+        # This read `repo["trunk_branch"]` — a single last-write-wins
+        # value on a repo that may carry SEVERAL lanes. So a push to
+        # `bmi_backend` went and re-read `bmi_frontend`'s head and
+        # advanced that, and `bmi_backend`'s observed sha was never
+        # refreshed by any push, ever. Found on BMIA1, where it had been
+        # three days stale and nothing could notice trunk moving under a
+        # story on that lane.
+        #
+        # `reconcile` states the rule this missed: "trunk_branch is
+        # carried on the NODE (per-goal trunk, §0) so cut/compare/merge
+        # use THIS goal's trunk, not a repo-canonical last-write-wins
+        # value."
+        pushed = await _pushed_lane(ev, repo, trunk_branch)
         token = await _token(name, repo["id"], tokens)
         try:
-            new_trunk = await gh.get_trunk_sha(token, owner, name, trunk_branch)
+            new_trunk = await gh.get_trunk_sha(token, owner, name, pushed)
         except Exception:
             return
-        if await _advance_trunk(repo, trunk_branch, new_trunk):
+        if await _advance_trunk(repo, pushed, new_trunk,
+                                legacy=(pushed == trunk_branch)):
             out["trunk_advanced"] += 1
     # check_run/check_suite/status/pull_request_review wakes are consumed by the
     # grind loop (build §6), not here; they just need to be marked delivered.
@@ -338,7 +415,8 @@ async def _handle_event(ev, out: dict, tokens: dict) -> None:
 async def _process_events(out: dict, tokens: dict) -> None:
     pool = get_pool()
     events = await pool.fetch(
-        "SELECT delivery_id, event, action, git_repo_id, repo_full_name, pr_number, merged "
+        "SELECT delivery_id, event, action, git_repo_id, repo_full_name, "
+        "       pr_number, merged, payload "
         "FROM git_webhook_events WHERE delivered = FALSE "
         "ORDER BY received_at ASC LIMIT $1",
         _EVENT_BATCH,
@@ -369,6 +447,8 @@ async def _poll_open_prs(out: dict, tokens: dict) -> None:
         "SELECT n.id, n.state, n.pr_number, n.trunk_branch, n.git_repo_id, "
         "       r.owner, r.name, r.trunk_branch AS repo_trunk "
         "FROM git_nodes n JOIN git_repos r ON r.id = n.git_repo_id "
+        # sql: safe -- `placeholders` is a generated "$2,$3,..." run and
+        # the states are bound below. This IS the parameterised form.
         f"WHERE n.pr_number IS NOT NULL AND n.state NOT IN ({placeholders}) "
         "LIMIT $1",
         _POLL_LIMIT, *_POLL_SKIP_STATES,
@@ -395,7 +475,8 @@ async def _poll_open_prs(out: dict, tokens: dict) -> None:
         if (not pr["merged"] and pr.get("state") == "closed"
                 and _closed_long_enough(pr.get("closed_at"))):
             await _cancel_node(
-                node["id"], "PR closed unmerged (poll backstop, webhook missed) — replan")
+                node["id"],
+                f"{PR_CLOSED_UNMERGED} (poll backstop, webhook missed)")
             out["cancelled"] += 1
             continue
         await _finalize_or_cancel(repo, node, pr, token, out, allow_cancel=False)

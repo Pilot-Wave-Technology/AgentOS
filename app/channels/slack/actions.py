@@ -23,6 +23,8 @@ Return value: an optional dict. Slack's interactive endpoint interprets:
 
 No imports from app.slack.* — fully self-contained in the new channel system.
 """
+
+from app.channels.slack.client import make_async_client
 import json
 import logging
 import re
@@ -123,6 +125,11 @@ async def _handle_block_actions(payload: dict) -> Optional[dict]:
                 "I don't recognize your account. Sign in to the control panel first.",
             )
             return None
+        from app.channels.slack.authz import DENIED, authorize
+        if not await authorize(pool, user_uid=user_uid, kind="story",
+                               subject_id=story_id):
+            await _respond_ephemeral(response_url, DENIED)
+            return None
         await _handle_story_control(
             ctrl_kind=ctrl_kind,
             story_id=story_id,
@@ -141,6 +148,12 @@ async def _handle_block_actions(payload: dict) -> Optional[dict]:
                 response_url,
                 "I don't recognize your account. Sign in to the control panel first.",
             )
+            return None
+
+        from app.channels.slack.authz import DENIED, authorize
+        if not await authorize(pool, user_uid=user_uid, kind="approval",
+                               subject_id=approval_id):
+            await _respond_ephemeral(response_url, DENIED)
             return None
 
         if diff_kind == "reject":
@@ -229,6 +242,93 @@ async def _handle_block_actions(payload: dict) -> Optional[dict]:
                 f"{recover_kind} failed: {result.get('user_message') or result.get('error', 'error')}")
         return None
 
+    # GO-thread cards: parked kernel questions and errand proposals.
+    # These had no buttons at all before, so the GO's work was reachable
+    # from the panel and nowhere else.
+    from app.channels.slack.go_cards import (CLOSEOUT_ACTION_RE,
+                                             ERRAND_ACTION_RE,
+                                             PARK_ACTION_RE)
+    close_m = CLOSEOUT_ACTION_RE.match(action_id)
+    if close_m:
+        story_id = close_m.group(2)
+        user_uid = await _resolve_user(slack_user_id, team_id, pool, channel_id)
+        if not user_uid:
+            await _respond_ephemeral(
+                response_url,
+                "I don't recognize your account. Sign in to the control "
+                "panel first.")
+            return None
+
+        # INLINE, like the diff family above, and not tucked inside the
+        # handler: `test_every_action_id_family_is_behind_a_check` reads
+        # this file and can only see what is in the dispatch segment.
+        # A check it cannot see is a check the next person can delete.
+        from app.channels.slack.authz import DENIED, authorize
+        if not await authorize(pool, user_uid=user_uid, kind="story",
+                               subject_id=story_id):
+            await _respond_ephemeral(response_url, DENIED)
+            return None
+
+        from app.channels.slack import go_modals
+        if not await go_modals.open_more_modal(
+                pool, team_id=team_id, trigger_id=trigger_id,
+                story_id=story_id, channel_id=channel_id,
+                message_ts=message_ts):
+            # `trigger_id` lasts three seconds and is absent on a Slack
+            # retry, so the slash command stays the fallback rather
+            # than the click being swallowed.
+            await _respond_ephemeral(
+                response_url,
+                "Could not open the box. Use `/run more <what else needs "
+                "doing>` and it will start a new plan.")
+        return None
+
+    for regex, kind in ((PARK_ACTION_RE, "park"), (ERRAND_ACTION_RE, "errand")):
+        go_m = regex.match(action_id)
+        if not go_m:
+            continue
+        user_uid = await _resolve_user(slack_user_id, team_id, pool, channel_id)
+        if not user_uid:
+            await _respond_ephemeral(
+                response_url,
+                "I don't recognize your account. Sign in to the control panel first.",
+            )
+            return None
+        # A VERDICT THAT NEEDS A SENTENCE ASKS FOR IT IN A BOX. Without
+        # this the handler returned a nudge to "reply in this channel"
+        # and recorded nothing, so the card still waited while the
+        # person who pressed the button believed they had answered it.
+        #
+        # The fallback is not optional: `trigger_id` expires in three
+        # seconds and is absent on a Slack retry, so a failed open has
+        # to leave the old behaviour intact rather than swallow the
+        # click.
+        from app.channels.slack import go_modals
+        if go_modals.needs_reason(kind, go_m.group(1)):
+            if await go_modals.open_modal(
+                    pool, team_id=team_id, trigger_id=trigger_id, kind=kind,
+                    subject_id=go_m.group(2), value=go_m.group(1),
+                    channel_id=channel_id, message_ts=message_ts):
+                return None
+            _log.info("Slack: reason modal would not open for %s %s; "
+                      "falling back to the channel prompt",
+                      kind, go_m.group(2))
+
+        # Authorization lives inside the handler, beside the service call
+        # it guards, so a second entry point cannot reach the service
+        # without it.
+        from app.channels.slack import go_actions
+        if kind == "park":
+            reply = await go_actions.handle_park(
+                pool, question_id=int(go_m.group(2)),
+                value=go_m.group(1), user_uid=user_uid)
+        else:
+            reply = await go_actions.handle_errand(
+                pool, proposal_id=int(go_m.group(2)),
+                value=go_m.group(1), user_uid=user_uid)
+        await _respond_ephemeral(response_url, reply)
+        return None
+
     m = _ACTION_RE.match(action_id)
     if not m:
         _log.info("Unrecognized action_id: %s", action_id)
@@ -245,6 +345,12 @@ async def _handle_block_actions(payload: dict) -> Optional[dict]:
             "I don't recognize your account. Sign in to the control panel with "
             "the same email as your Slack account, then try again.",
         )
+        return None
+
+    from app.channels.slack.authz import DENIED, authorize
+    if not await authorize(pool, user_uid=user_uid, kind="task",
+                           subject_id=task_id):
+        await _respond_ephemeral(response_url, DENIED)
         return None
 
     if kind == "changes":
@@ -368,29 +474,34 @@ async def _handle_story_control(
             _log.info("Story pause via Slack: goal=%s story=%s user=%s", goal_id, story_id[:8], user_uid)
 
         elif ctrl_kind == "replan":
-            await pool.execute(
-                """UPDATE tasks
-                      SET state = 'cancelled', updated_at = NOW()
-                    WHERE story_id = $1
-                      AND executor = 'claude-code-phase'
-                      AND state IN ('pending', 'ready')""",
-                story_id,
-            )
-            await pool.execute(
-                """UPDATE stories
-                      SET current_phase = 'planning',
-                          current_plan_path = NULL,
-                          execution_paused = FALSE,
-                          updated_at = NOW()
-                    WHERE id = $1""",
-                story_id,
-            )
-            await _respond_ephemeral(
-                response_url,
-                f"🔄 Replan started for *{story_title}*. Pending tasks cancelled. "
-                "Assistant will revise the plan — tell it what to change.",
-            )
-            _log.info("Story replan via Slack: goal=%s story=%s user=%s", goal_id, story_id[:8], user_uid)
+            # ROUTED THROUGH THE SERVICE, not raw SQL. This branch used to
+            # cancel every pending phase task and reset the story to
+            # `planning` itself, which meant two replan implementations
+            # reachable from the same channel -- and this one skipped the
+            # ledger emit, the recovery-card stamping and the
+            # uncommitted-work check that `replan_dag` performs. Its
+            # button is gone (see outbound.relay_phase_task_progress), but
+            # an old card in a channel still carries the action_id, so the
+            # handler has to stay and has to be the correct one.
+            from app.services import story_recovery as _sr
+            result = await _sr.replan_dag(story_id, by_uid=user_uid)
+            if result.get("needs_confirm"):
+                await _respond_ephemeral(
+                    response_url,
+                    (result.get("reason") or "Uncommitted work would be lost.")
+                    + " Use the recovery card's Review & keep, or replan from "
+                      "the web UI.")
+            elif result.get("ok"):
+                await _respond_ephemeral(
+                    response_url,
+                    f"🔄 Replan started for *{story_title}*.")
+            else:
+                await _respond_ephemeral(
+                    response_url,
+                    "Replan failed: "
+                    + str(result.get("user_message") or result.get("error", "error")))
+            _log.info("Story replan via Slack: goal=%s story=%s user=%s",
+                      goal_id, story_id[:8], user_uid)
 
     except Exception as exc:
         _log.warning(
@@ -433,7 +544,6 @@ async def _open_changes_modal(
         return False
 
     try:
-        from slack_sdk import WebClient
         from slack_sdk.errors import SlackApiError
         from app.channels.slack.config import get_workspace
     except ImportError:
@@ -483,8 +593,8 @@ async def _open_changes_modal(
     }
 
     try:
-        client = WebClient(token=ws["bot_token"])
-        client.views_open(trigger_id=trigger_id, view=view)
+        client = make_async_client(ws["bot_token"])
+        await client.views_open(trigger_id=trigger_id, view=view)
         _log.info("Opened Request Changes modal: task=%s", task_id)
         return True
     except SlackApiError as exc:
@@ -503,6 +613,17 @@ async def _handle_view_submission(payload: dict) -> Optional[dict]:
 
     if callback_id == _DIFF_REJECT_MODAL_CALLBACK_ID:
         return await _handle_diff_reject_submission(payload)
+
+    from app.channels.slack import go_modals
+    if callback_id == go_modals.CALLBACK_ID:
+        return await _handle_go_reason_submission(payload)
+
+    if callback_id == go_modals.MORE_CALLBACK_ID:
+        return await _handle_more_work_submission(payload)
+
+    from app.channels.slack import run_modals
+    if callback_id == run_modals.CALLBACK_ID:
+        return await _handle_run_control_submission(payload)
 
     if callback_id != _CHANGES_MODAL_CALLBACK_ID:
         _log.info("Ignoring view_submission with unknown callback_id=%s", callback_id)
@@ -567,11 +688,10 @@ async def _handle_view_submission(payload: dict) -> Optional[dict]:
 
     if channel_id and message_ts:
         try:
-            from slack_sdk import WebClient
             from app.channels.slack.config import get_workspace
             ws = await get_workspace(team_id, pool)
             if ws and ws.get("bot_token"):
-                client = WebClient(token=ws["bot_token"])
+                client = make_async_client(ws["bot_token"])
                 update_body = await _build_responded_update(
                     task_id=task_id,
                     original_message={"text": original_text, "blocks": []},
@@ -579,7 +699,7 @@ async def _handle_view_submission(payload: dict) -> Optional[dict]:
                     action="Changes requested",
                     value=feedback,
                 )
-                client.chat_update(
+                await client.chat_update(
                     channel=channel_id,
                     ts=message_ts,
                     text=update_body["text"],
@@ -874,7 +994,6 @@ async def _handle_view_details(
         return
 
     try:
-        from slack_sdk import WebClient
         from slack_sdk.errors import SlackApiError
         from app.channels.slack.config import get_workspace
     except ImportError:
@@ -883,12 +1002,12 @@ async def _handle_view_details(
     ws = await get_workspace(team_id, pool)
     if not ws or not ws.get("bot_token"):
         return
-    client = WebClient(token=ws["bot_token"])
+    client = make_async_client(ws["bot_token"])
 
     if len(context) > _DETAILS_MODAL_MAX_CHARS:
         filename = f"plan-{task_id[:8]}.md"
         try:
-            client.files_upload_v2(
+            await client.files_upload_v2(
                 channel=channel_id,
                 thread_ts=message_ts,
                 content=context,
@@ -918,7 +1037,7 @@ async def _handle_view_details(
         return
 
     try:
-        client.views_open(
+        await client.views_open(
             trigger_id=trigger_id,
             view=_build_details_view(title, context, task_id),
         )
@@ -1084,7 +1203,6 @@ async def _open_diff_reject_modal(
         return False
 
     try:
-        from slack_sdk import WebClient
         from slack_sdk.errors import SlackApiError
         from app.channels.slack.config import get_workspace
     except ImportError:
@@ -1134,8 +1252,8 @@ async def _open_diff_reject_modal(
     }
 
     try:
-        client = WebClient(token=ws["bot_token"])
-        client.views_open(trigger_id=trigger_id, view=view)
+        client = make_async_client(ws["bot_token"])
+        await client.views_open(trigger_id=trigger_id, view=view)
         _log.info("Opened diff reject modal: approval=%s", approval_id)
         return True
     except SlackApiError as exc:
@@ -1186,6 +1304,12 @@ async def _handle_diff_reject_submission(payload: dict) -> Optional[dict]:
             "errors": {"feedback": "Your Slack account isn't linked to the control panel yet."},
         }
 
+    from app.channels.slack.authz import DENIED, authorize
+    if not await authorize(pool, user_uid=user_uid, kind="approval",
+                           subject_id=approval_id):
+        return {"response_action": "errors",
+                "errors": {"feedback": DENIED}}
+
     try:
         from app.services.diff_review import decide_diff_review
         result = await decide_diff_review(
@@ -1209,18 +1333,17 @@ async def _handle_diff_reject_submission(payload: dict) -> Optional[dict]:
 
     if channel_id and message_ts:
         try:
-            from slack_sdk import WebClient
             from app.channels.slack.config import get_workspace
             ws = await get_workspace(team_id, pool)
             if ws and ws.get("bot_token"):
-                client = WebClient(token=ws["bot_token"])
+                client = make_async_client(ws["bot_token"])
                 update_body = await _build_diff_responded_update(
                     approval_id=approval_id,
                     original_message={},
                     responder=user_label or slack_user_id,
                     action="Rejected — sent back for revision",
                 )
-                client.chat_update(
+                await client.chat_update(
                     channel=channel_id,
                     ts=message_ts,
                     text=update_body["text"],
@@ -1268,7 +1391,6 @@ async def _handle_diff_details(
         return
 
     try:
-        from slack_sdk import WebClient
         from slack_sdk.errors import SlackApiError
         from app.channels.slack.config import get_workspace
     except ImportError:
@@ -1277,14 +1399,14 @@ async def _handle_diff_details(
     ws = await get_workspace(team_id, pool)
     if not ws or not ws.get("bot_token"):
         return
-    client = WebClient(token=ws["bot_token"])
+    client = make_async_client(ws["bot_token"])
 
     note = "\n\n_Diff was truncated — full patch available in the file viewer._" if truncated else ""
     content = preview + note
 
     if len(content) > _DETAILS_MODAL_MAX_CHARS:
         try:
-            client.files_upload_v2(
+            await client.files_upload_v2(
                 channel=channel_id,
                 thread_ts=message_ts,
                 content=content,
@@ -1304,7 +1426,7 @@ async def _handle_diff_details(
         return
 
     try:
-        client.views_open(
+        await client.views_open(
             trigger_id=trigger_id,
             view=_build_details_view(stat, content, approval_id),
         )
@@ -1330,14 +1452,13 @@ async def _resolve_user(
         return uid
 
     try:
-        from slack_sdk import WebClient
         from app.channels.slack.config import get_workspace
 
         ws = await get_workspace(team_id, pool)
         if not ws or not ws.get("bot_token"):
             return ""
-        client = WebClient(token=ws["bot_token"])
-        info = client.users_info(user=slack_user_id)
+        client = make_async_client(ws["bot_token"])
+        info = await client.users_info(user=slack_user_id)
         profile = (info.get("user") or {}).get("profile", {})
         email = profile.get("email", "")
         display_name = profile.get("display_name") or profile.get("real_name", "")
@@ -1363,3 +1484,202 @@ async def _respond_ephemeral(response_url: str, text: str) -> None:
             })
     except Exception as exc:
         _log.warning("Failed to send ephemeral response: %s", exc)
+
+async def _handle_go_reason_submission(payload: dict) -> Optional[dict]:
+    """A plan revise/decline, or an errand decline, with its reason.
+
+    RETURNS `errors` RATHER THAN RAISING on every refusal. A
+    `view_submission` that answers with an error keeps the modal open
+    with the text still in it, so the person can fix the problem; any
+    other response closes it and their sentence is gone.
+    """
+    from app.channels.slack import go_modals
+
+    view = payload.get("view") or {}
+    meta = go_modals.read_meta(view)
+    reason = go_modals.read_reason(view)
+    kind = meta.get("kind", "")
+    subject_id = meta.get("subject_id", "")
+    value = meta.get("value", "")
+
+    if not reason:
+        return {"response_action": "errors",
+                "errors": {"reason": "Please say what should change."}}
+    if kind not in ("park", "errand") or not subject_id.isdigit():
+        _log.warning("Slack: unusable reason-modal metadata: %s", meta)
+        return {"response_action": "errors",
+                "errors": {"reason": "That card is no longer available."}}
+
+    team_id = (payload.get("team") or {}).get("id", "")
+    slack_user_id = (payload.get("user") or {}).get("id", "")
+    channel_id = meta.get("channel_id", "")
+
+    from app.database import get_pool
+    pool = get_pool()
+    user_uid = await _resolve_user(slack_user_id, team_id, pool, channel_id)
+    if not user_uid:
+        return {"response_action": "errors",
+                "errors": {"reason": "Your Slack account isn't linked to the "
+                                     "control panel yet."}}
+
+    # AUTHORIZATION STAYS INSIDE THE HANDLERS, which is why none is done
+    # here: `handle_park` and `handle_errand` check `get_goal_role`
+    # beside the service call they guard. Repeating it here would be a
+    # second copy to keep in step; skipping it there would be a hole.
+    from app.channels.slack import go_actions
+    try:
+        if kind == "park":
+            reply = await go_actions.handle_park(
+                pool, question_id=int(subject_id), value=value,
+                user_uid=user_uid, text=reason)
+        else:
+            reply = await go_actions.handle_errand(
+                pool, proposal_id=int(subject_id), value=value,
+                user_uid=user_uid, reason=reason)
+    except Exception as exc:                                   # noqa: BLE001
+        _log.warning("Slack: %s reason submission failed for %s: %s",
+                     kind, subject_id, exc)
+        return {"response_action": "errors",
+                "errors": {"reason": f"Couldn't record that: {exc}"}}
+
+    # THE REPLY GOES TO THE CHANNEL, not back through the modal. A
+    # modal can only answer with an error or a close, so a refusal the
+    # handler expressed in prose -- "you don't have access", "that
+    # question no longer exists" -- would vanish on submit. Posting it
+    # is the only way the person learns their decision did not land.
+    if reply:
+        await go_modals.tell(pool, team_id=team_id, channel_id=channel_id,
+                             slack_user_id=slack_user_id, text=reply)
+    return None
+
+
+async def _handle_more_work_submission(payload: dict) -> Optional[dict]:
+    """The typed request, turned into a new plan on the story."""
+    from app.channels.slack import go_modals
+
+    view = payload.get("view") or {}
+    meta = go_modals.read_meta(view)
+    what = go_modals.read_reason(view)
+    story_id = meta.get("story_id", "")
+    channel_id = meta.get("channel_id", "")
+
+    if not what:
+        return {"response_action": "errors",
+                "errors": {"reason": "Say what else needs doing."}}
+    if not story_id:
+        return {"response_action": "errors",
+                "errors": {"reason": "That story is no longer available."}}
+
+    team_id = (payload.get("team") or {}).get("id", "")
+    slack_user_id = (payload.get("user") or {}).get("id", "")
+
+    from app.database import get_pool
+    pool = get_pool()
+    user_uid = await _resolve_user(slack_user_id, team_id, pool, channel_id)
+    if not user_uid:
+        return {"response_action": "errors",
+                "errors": {"reason": "Your Slack account isn't linked to the "
+                                     "control panel yet."}}
+
+    from app.channels.slack.authz import DENIED, authorize
+    if not await authorize(pool, user_uid=user_uid, kind="story",
+                           subject_id=story_id):
+        return {"response_action": "errors", "errors": {"reason": DENIED}}
+
+    row = await pool.fetchrow(
+        "SELECT goal_id, active_thread_id FROM stories WHERE id = $1",
+        story_id)
+    if not row or not row["active_thread_id"]:
+        # `more_work` is keyed on the thread, and a landed story that
+        # has already been closed out has none. Saying so beats a
+        # traceback the person cannot act on.
+        return {"response_action": "errors",
+                "errors": {"reason": "That story has no open thread any "
+                                     "more, so there is nothing to add to."}}
+
+    try:
+        from app.services.kernel_more_work import more_work
+        await more_work(row["active_thread_id"], row["goal_id"],
+                        user_uid, what)
+    except Exception as exc:                                   # noqa: BLE001
+        _log.warning("Slack: more work failed for story %s: %s",
+                     story_id, exc)
+        return {"response_action": "errors",
+                "errors": {"reason": f"Couldn't start that: {exc}"}}
+
+    from app.channels.slack.audit import record_decision
+    await record_decision(pool, thread_id=row["active_thread_id"],
+                          user_uid=user_uid, action="More work", detail=what)
+    await go_modals.tell(pool, team_id=team_id, channel_id=channel_id,
+                         slack_user_id=slack_user_id,
+                         text=f"Queued — a new plan is starting: {what}")
+    return None
+
+
+async def _handle_run_control_submission(payload: dict) -> Optional[dict]:
+    """Pause / resume / cancel, with the optional text the panel takes.
+
+    THE TEXT IS OPTIONAL HERE AND REQUIRED NOWHERE, which is the one
+    thing that makes this different from the other modals: a blank
+    resume is the ordinary case, and a pause with no reason is a
+    perfectly good pause. So there is no empty-input refusal.
+    """
+    from app.channels.slack import go_modals
+
+    view = payload.get("view") or {}
+    meta = go_modals.read_meta(view)
+    text = go_modals.read_reason(view)
+    action = meta.get("action", "")
+    thread_id = meta.get("thread_id", "")
+    goal_id = meta.get("goal_id", "")
+    channel_id = meta.get("channel_id", "")
+
+    if action not in ("pause", "resume", "cancel") or not thread_id:
+        _log.warning("Slack: unusable run-control metadata: %s", meta)
+        return {"response_action": "errors",
+                "errors": {"reason": "That run is no longer available."}}
+
+    team_id = (payload.get("team") or {}).get("id", "")
+    slack_user_id = (payload.get("user") or {}).get("id", "")
+
+    from app.database import get_pool
+    pool = get_pool()
+    user_uid = await _resolve_user(slack_user_id, team_id, pool, channel_id)
+    if not user_uid:
+        return {"response_action": "errors",
+                "errors": {"reason": "Your Slack account isn't linked to the "
+                                     "control panel yet."}}
+
+    from app.auth import get_goal_role
+    if await get_goal_role(user_uid, goal_id) is None:
+        return {"response_action": "errors",
+                "errors": {"reason": "You don't have access to this goal."}}
+
+    from app.services.kernel_run_control import cancel, pause, resume
+    fn = {"pause": pause, "resume": resume, "cancel": cancel}[action]
+    try:
+        out = await fn(thread_id, goal_id, user_uid, text)
+    except Exception as exc:                                   # noqa: BLE001
+        _log.warning("Slack: run %s failed for %s: %s", action,
+                     thread_id[:12], exc)
+        return {"response_action": "errors",
+                "errors": {"reason": f"Couldn't do that: {exc}"}}
+
+    if isinstance(out, dict) and out.get("error"):
+        # THE STATE MACHINE'S OWN REFUSAL, shown in the dialog rather
+        # than swallowed -- "nothing is running", "already paused" are
+        # answers, and closing the modal silently would look like it
+        # worked.
+        return {"response_action": "errors",
+                "errors": {"reason": str(out["error"])}}
+
+    said = {"pause": "Pausing at the next step boundary.",
+            "resume": "Resumed.", "cancel": "Cancelled."}[action]
+    if text:
+        said += f" Noted: {text}" if action != "resume" else f" Steer: {text}"
+    from app.channels.slack.audit import record_decision
+    await record_decision(pool, thread_id=thread_id, user_uid=user_uid,
+                          action=action.capitalize(), detail=text)
+    await go_modals.tell(pool, team_id=team_id, channel_id=channel_id,
+                         slack_user_id=slack_user_id, text=said)
+    return None

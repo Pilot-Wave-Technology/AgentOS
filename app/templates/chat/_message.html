@@ -1,0 +1,176 @@
+{# One assistant/IA chat message bubble. Single source of truth shared by the
+   full page render (chat/index.html) and the "load earlier" endpoint
+   (chat/_earlier_messages.html). Context: `msg` (a message dict with card_data
+   already parsed, human content already state-stripped, sender_name resolved). #}
+      {% if msg.card_data and msg.card_data is mapping and msg.card_data.kind == 'story_state_snapshot' %}
+      {# Phase 4 Stage 4: pre-turn state snapshot for SHCA. Expanded by  #}
+      {# default so the human sees exactly what context SHCA is reading. #}
+      <div class="flex justify-start">
+        <details class="max-w-3xl w-full" open>
+          <summary class="cursor-pointer text-2xs text-gray-400 hover:text-gray-200 select-none px-2 py-1 inline-flex items-center gap-1.5 rounded bg-indigo-500/10 border border-indigo-500/30">
+            <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
+            <span class="font-semibold text-indigo-300">Assistant context</span>
+            {% if msg.card_data.phase and msg.card_data.phase != 'none' %}<span class="text-gray-600">·</span><span class="text-gray-400">phase={{ msg.card_data.phase }}</span>{% endif %}
+            {% if msg.card_data.story_type and msg.card_data.story_type != 'none' %}<span class="text-gray-600">·</span><span class="text-gray-400">type={{ msg.card_data.story_type }}</span>{% endif %}
+            {% if msg.card_data.claude_session_id and msg.card_data.claude_session_id not in ('none', '(not spawned yet)') %}<span class="text-gray-600">·</span><span class="text-gray-400">claude={{ msg.card_data.claude_session_id[:8] }}…</span>{% endif %}
+          </summary>
+          <pre class="mt-1.5 px-3 py-2 text-2xs font-mono text-gray-300 bg-indigo-500/5 border border-indigo-500/20 rounded whitespace-pre-wrap">{{ msg.content }}</pre>
+        </details>
+      </div>
+      {% elif msg.card_data and msg.card_data is mapping and msg.card_data.kind == 'claude_tool_progress' %}
+      {# Stage 3 live progress: one-line activity card from Claude's hook #}
+      <div class="flex justify-start">
+        <div class="max-w-3xl w-full px-3 py-1.5 text-2xs font-mono border-l-2 border-indigo-500/40 bg-indigo-500/5 text-gray-400 flex items-center gap-2">
+          <span class="text-gray-600" data-utc="{{ msg.created_at.isoformat() if msg.created_at else '' }}">{{ msg.created_at.strftime('%b %d, %H:%M:%S') if msg.created_at else '' }} UTC</span>
+          {% if msg.card_data.task_id %}<span class="text-indigo-300">T{{ msg.card_data.task_id }}</span>{% endif %}
+          <span class="text-gray-300">{{ msg.content }}</span>
+        </div>
+      </div>
+      {% elif msg.card_data and msg.card_data is mapping and msg.card_data.kind == 'phase_task_progress' %}
+      {# Stage 3-i: task progress card (mechanical, bypasses SHCA LLM) #}
+      <div class="flex justify-start">
+        <div class="max-w-3xl w-full px-4 py-3 rounded-xl text-sm border
+                    {% if msg.card_data.sentinel == 'DONE' %}border-green-500/30 bg-green-500/5
+                    {% elif msg.card_data.sentinel == 'BLOCKED' %}border-amber-500/30 bg-amber-500/5
+                    {% elif msg.card_data.sentinel == 'FAILED' %}border-red-500/30 bg-red-500/5
+                    {% else %}border-gray-500/30 bg-gray-500/5{% endif %}">
+          <div class="flex items-center gap-2 text-xs font-mono mb-1">
+            <span class="px-1.5 py-0.5 rounded bg-surface text-gray-300">T{{ msg.card_data.task_id }}</span>
+            <span class="text-gray-500">·</span>
+            <span class="text-indigo-300">{{ msg.card_data.phase }}</span>
+            <span class="text-gray-500">·</span>
+            <span class="font-semibold
+                         {% if msg.card_data.sentinel == 'DONE' %}text-green-400
+                         {% elif msg.card_data.sentinel == 'BLOCKED' %}text-amber-400
+                         {% elif msg.card_data.sentinel == 'FAILED' %}text-red-400
+                         {% else %}text-gray-400{% endif %}">{{ msg.card_data.sentinel or 'output' }}</span>
+          </div>
+          {# Render markdown via the .agent-prose[data-md] page-load handler.       #}
+          {# Claude's PHASE_TASK_DONE summaries use headers/lists/bold/code. The    #}
+          {# handler falls back to escaped pre-wrap if marked.parse returns empty,  #}
+          {# so weird input can't leave the body blank.                             #}
+          <div class="agent-prose text-gray-200 text-sm" data-md="{{ msg.content | e }}">{{ msg.content }}</div>
+          {% if msg.card_data.card_subkind == 'blocked-question' %}
+          <div class="mt-2 text-2xs text-amber-300 italic">↳ Reply in chat to answer this question; it's auto-relayed to Claude.</div>
+          {% endif %}
+        </div>
+      </div>
+      {% elif msg.card_data and msg.card_data is mapping and msg.card_data.kind == 'diff_review' %}
+      {# Stage 3-l: diff review card #}
+      <div class="flex justify-start">
+        <div class="max-w-3xl w-full px-4 py-3 rounded-xl text-sm border border-blue-500/40 bg-blue-500/5">
+          <div class="flex items-center gap-2 text-xs font-semibold uppercase tracking-wider text-blue-300 mb-2">
+            <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2"/>
+            </svg>
+            Diff Review
+            <span class="text-2xs text-gray-500 font-normal ml-2">{{ msg.card_data.stat }}</span>
+          </div>
+          <div class="agent-prose text-gray-200" data-md="{{ msg.content | e }}">{{ msg.content }}</div>
+          {% if msg.card_data.decided %}
+          <div class="mt-3 text-2xs font-semibold uppercase tracking-wider
+                      {% if msg.card_data.decided == 'approve' %}text-emerald-300{% else %}text-rose-300{% endif %}">
+            {% if msg.card_data.decided == 'approve' %}✓ Approved &amp; pushed{% else %}✗ Rejected: sent back to Claude{% endif %}
+          </div>
+          {% else %}
+          <form data-approval-id="{{ msg.card_data.approval_id }}"
+                onsubmit="return decideDiff(event, '{{ msg.card_data.approval_id }}')"
+                class="mt-3 flex gap-2 items-center">
+            <textarea name="feedback" rows="2" placeholder="Optional feedback if rejecting…"
+                      class="input text-2xs flex-1"></textarea>
+            <button type="button" onclick="decideDiffAction(event, '{{ msg.card_data.approval_id }}', 'approve')"
+                    class="px-3 py-2 rounded bg-green-600 hover:bg-green-500 text-white text-2xs font-semibold">
+              ✓ Approve & push
+            </button>
+            <button type="button" onclick="decideDiffAction(event, '{{ msg.card_data.approval_id }}', 'reject')"
+                    class="px-3 py-2 rounded bg-red-600 hover:bg-red-500 text-white text-2xs font-semibold">
+              ✗ Reject
+            </button>
+          </form>
+          {% endif %}
+        </div>
+      </div>
+      {% elif msg.card_data and msg.card_data is mapping and msg.card_data.kind == 'dag_recovery' %}
+      {# Phase 3: DAG recovery card (Replan / Retry / Abandon). mode='failed' (red) | 'blocked' (amber). #}
+      {% set _blocked = msg.card_data.mode == 'blocked' %}
+      <div class="flex justify-start">
+        <div class="max-w-3xl w-full px-4 py-3 rounded-xl text-sm border {% if _blocked %}border-amber-500/40 bg-amber-500/5{% else %}border-rose-500/40 bg-rose-500/5{% endif %}">
+          <div class="flex items-center gap-2 text-xs font-semibold uppercase tracking-wider {% if _blocked %}text-amber-300{% else %}text-rose-300{% endif %} mb-2">
+            {% if _blocked %}Phase Blocked — answer in chat to resume, or:{% else %}Phase Failed{% endif %}
+          </div>
+          <div class="agent-prose text-gray-200" data-md="{{ msg.content | e }}">{{ msg.content }}</div>
+          {% if msg.card_data.decided %}
+          <div class="mt-3 text-2xs font-semibold uppercase tracking-wider text-gray-400">
+            {{ msg.card_data.decided }}
+          </div>
+          {% else %}
+          <div class="mt-3 flex gap-2 items-center flex-wrap recovery-card">
+            <input name="feedback" placeholder="Optional feedback for replan…"
+                   class="input text-2xs flex-1 min-w-40" />
+            {% for opt in msg.card_data.options %}
+            <button type="button" onclick="recoverAction(event, '{{ opt }}')"
+                    class="px-3 py-2 rounded text-white text-2xs font-semibold
+                    {% if opt == 'replan' %}bg-blue-600 hover:bg-blue-500
+                    {% elif opt == 'abandon' %}bg-red-600 hover:bg-red-500
+                    {% elif opt == 'review_keep' %}bg-emerald-600 hover:bg-emerald-500
+                    {% else %}bg-gray-600 hover:bg-gray-500{% endif %}">
+              {% if opt == 'replan' %}♻ Replan{% elif opt == 'retry' %}↻ Retry{% elif opt == 'review_keep' %}📥 Review &amp; keep{% elif opt == 'abandon' %}✕ Abandon{% else %}{{ opt }}{% endif %}
+            </button>
+            {% endfor %}
+          </div>
+          {% endif %}
+        </div>
+      </div>
+      {% elif msg.card_data %}
+      <div class="flex justify-start" data-utc="{{ msg.created_at.isoformat() if msg.created_at else '' }}">
+        <div class="card-container max-w-2xl w-full">
+          <script type="application/json" class="card-json">{{ ((msg.card_data | tojson) if msg.card_data is mapping else msg.card_data) | replace("</", "<\\/") | safe }}</script>
+        </div>
+      </div>
+      {% elif msg.sender == 'system' or (msg.content or '').startswith('# Story Mode Active') %}
+      <!-- System / story-kickoff message: distinct context banner, markdown rendered.
+           Matches sender='system' (legacy import-task path) AND the GO-attributed
+           "# Story Mode Active" kickoff that fires when a user starts working on
+           a story: both should look like context, not chat. -->
+      <div class="flex justify-center" data-utc="{{ msg.created_at.isoformat() if msg.created_at else '' }}">
+        <div class="max-w-3xl w-full px-4 py-3 rounded-xl text-sm border border-indigo-500/30 bg-indigo-500/5">
+          <div class="flex items-center gap-2 text-xs font-semibold uppercase tracking-wider text-indigo-300 mb-2">
+            <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/>
+            </svg>
+            Context loaded
+          </div>
+          <div class="agent-prose text-gray-200" data-md="{{ msg.content | e }}">{{ msg.content }}</div>
+        </div>
+      </div>
+      {% elif msg.role == 'agent' and msg.sender == 'go' %}
+      <!-- Relay from the Goal Orchestrator into this assistant's thread. It is an
+           INBOUND message to the assistant (the assistant replies to it), not the
+           assistant's own output: render it distinctly with GO attribution so it
+           never masquerades as the assistant. -->
+      <div class="flex justify-start" data-utc="{{ msg.created_at.isoformat() if msg.created_at else '' }}">
+        <div class="max-w-3xl w-full px-4 py-3 rounded-xl text-sm border border-emerald-500/30 bg-emerald-500/5">
+          <div class="flex items-center gap-2 text-xs font-semibold uppercase tracking-wider text-emerald-300 mb-2">
+            <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z"/>
+            </svg>
+            Goal Orchestrator
+          </div>
+          <div class="agent-prose text-gray-200" data-md="{{ msg.content | e }}">{{ msg.content }}</div>
+        </div>
+      </div>
+      {% else %}
+      <div class="flex flex-col {% if msg.role == 'human' %}items-end{% else %}items-start{% endif %}"
+           data-utc="{{ msg.created_at.isoformat() if msg.created_at else '' }}">
+        {# WHERE IT WAS SAID. `messages.platform` has been written by the
+           Slack inbound path since the channel rework and read by nothing,
+           so a message typed in Slack appeared here indistinguishable from
+           one typed in the browser -- and somebody reading the thread had
+           no way to tell where the conversation actually happened. #}
+        {% if msg.role == 'human' and msg.sender_name %}<span class="text-[0.67rem] text-gray-500 mb-0.5 mr-1">{{ msg.sender_name }}{% if msg.platform %} <span class="text-gray-600" title="Sent from {{ msg.platform }}">· {{ msg.platform }}</span>{% endif %}</span>{% elif msg.platform %}<span class="text-[0.67rem] text-gray-600 mb-0.5 ml-1" title="Sent from {{ msg.platform }}">{{ msg.platform }}</span>{% endif %}
+        <div class="{% if msg.role == 'human' %}max-w-xl{% else %}max-w-3xl{% endif %} px-4 py-2.5 rounded-2xl text-sm
+          {% if msg.role == 'human' %}bg-brand text-white rounded-br-sm{% else %}bg-surface border border-border text-gray-200 rounded-bl-sm{% endif %}">
+          <div class="agent-prose" data-md="{{ msg.content | e }}">{{ msg.content }}</div>
+        </div>
+      </div>
+      {% endif %}

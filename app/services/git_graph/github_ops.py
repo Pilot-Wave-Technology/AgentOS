@@ -100,6 +100,22 @@ async def create_ref(
     return "created"  # unreachable; raise_for_status throws on non-2xx
 
 
+async def delete_ref(token: str, owner: str, name: str,
+                     branch: str) -> bool:
+    """Delete a branch ref. Best-effort by design: 404/422 means already
+    gone (a human deleted it, or the repo auto-deletes heads on merge) —
+    that is success, not failure. Called only for a branch the engine
+    itself cut, and only after its merge landed on trunk, so the commits
+    are safe wherever this errs."""
+    import httpx
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await client.delete(
+            f"{_API}/repos/{owner}/{name}/git/refs/heads/{branch}",
+            headers=_headers(token),
+        )
+    return r.status_code in (204, 404, 422)
+
+
 async def compare(
     token: str, owner: str, name: str, base: str, head: str
 ) -> dict:

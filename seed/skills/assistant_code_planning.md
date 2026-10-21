@@ -4,7 +4,7 @@ title: Assistant Code Planning (unified)
 description: Single skill for ALL planning situations on a code story — first plan, edit-in-place revisions, and new-cycle rework. Picks mode from state snapshot. Points Claude to CLAUDE.md for the live phase registry; enforces YAML DAG schema and absolute paths.
 applicable_to: SHCA
 status: active
-version: 11
+version: 12
 ---
 # Code Planning
 
@@ -262,3 +262,37 @@ At any point during discovery / planning / awaiting_plan_approval the human may 
 - If the intent is ambiguous, ask one short confirming question before pointing them there.
 - Do NOT call `story_state` / `story_phase('done')` yourself — marking done is a deliberate human button action (see SOUL: never auto-close). Do NOT pressure the human to approve the plan.
 - Any half-written plan file is harmless — it just stays unused under `repo/stories/<story_id>/plans/`. Nothing to clean up.
+
+
+## Multi-repo workspaces
+
+Some stories span several repositories. You can tell from your workspace: instead of a
+single `repo/` checkout, there is a `repos/` directory containing one checkout per
+repository (e.g. `repos/acme__web/`, `repos/acme__api/`). CLAUDE.md and RESOURCES.md
+list them and mark each **write** or **read-only**.
+
+When that is the case:
+
+- **Plans and scope still live in the PRIMARY write repo**, at
+  `<primary-repo>/stories/<story_id>/`. Do not scatter plan files across repos.
+- **Every task in the `## Task DAG` block MUST include a `repo:` field** naming the
+  checkout that task works in — use the directory name shown in CLAUDE.md, e.g.
+  `repo: repos/acme__web`. This is REQUIRED for every task when the workspace has more
+  than one repo; there is no default and the plan will be rejected without it. For a
+  single-repo workspace, omit `repo:` entirely.
+- **Never plan write work in a read-only repo.** Those are cloned for reference only.
+- **Each repo merges on its own.** Plan each repo's changes so they are coherent
+  independently — do not write a plan that only works if all repos land together.
+
+Example task in a multi-repo plan:
+
+```yaml
+  - id: T3
+    phase: coder
+    title: Add the /health endpoint
+    description: |
+      Implement the endpoint and register its route.
+    acceptance: "GET /health returns 200 with {status: ok}."
+    depends_on: [T1]
+    repo: repos/acme__api
+```

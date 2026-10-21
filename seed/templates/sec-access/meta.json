@@ -3,7 +3,7 @@
   "type": "RA",
   "name": "Security — Access Control & Sensitive Data",
   "description": "Reviews a checked-out branch for broken auth/authorization, IDOR, session/JWT/crypto misuse, and sensitive-data handling (LLM + ripgrep).",
-  "model": "google-flash-500k/gemini-2.5-flash-500k",
+  "model": "google-flash38-500k/gemini-3.8-flash-500k",
   "emoji": "🔐",
   "tools_allow": [
     "read",

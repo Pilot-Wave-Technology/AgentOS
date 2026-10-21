@@ -16,7 +16,7 @@ output "project_id" {
 }
 
 output "db_name" {
-  value = "control_panel"
+  value = module.database.db_name
 }
 
 output "network_name" {
@@ -46,8 +46,22 @@ output "bucket_names" {
 }
 
 output "secret_names_created_here" {
-  description = "Empty by design — all secrets, including the DB DSNs, are created by prerequisites.sh."
-  value       = local.db_secrets
+  description = "The DSN secrets terraform writes. Every other secret is created by prerequisites.sh."
+  value       = module.database.dsn_secret_ids
+}
+
+output "extension_bucket" {
+  description = "Where ../publish-extension.sh uploads the VS Code extension."
+  value       = module.storage.extension_bucket
+}
+
+output "image_registry" {
+  value = google_artifact_registry_repository.images.id
+}
+
+output "execution_plane_cluster" {
+  description = "The GKE cluster every executor runs on."
+  value       = module.execution_plane.cluster_name
 }
 
 output "task_runner_job" {
@@ -56,13 +70,14 @@ output "task_runner_job" {
 
 output "next_steps" {
   value = <<-EOT
-    1. Secrets are already created + filled by prerequisites.sh. Overwrite any you
+    1. The DSN secrets are filled by this apply; every other secret was created
+       by prerequisites.sh. Overwrite any you
        left blank with ../set-secret.sh (never raw `gcloud secrets versions add`).
        See deploy/06-fill-in-secrets.md.
     2. Build + push your image, then deploy it (Cloud Build) — see
        deploy/07-build-and-deploy.md. Terraform ignores subsequent image changes.
     3. The OpenClaw gateway VM (agent_os_openclaw) was deployed FIRST in Stage ①;
-       openclaw_ws_url is already set from its output.
+       Its URL is looked up here from the reserved address (agentos-gateway-ip).
     4. Visit ${local.control_panel_url} and log in as ${var.bootstrap_admin_email}.
   EOT
 }

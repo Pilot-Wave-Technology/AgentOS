@@ -1,0 +1,161 @@
+{% extends "base.html" %}
+{% block title %}Refresh Agents{% endblock %}
+{% block content %}
+<div class="p-8 max-w-5xl mx-auto">
+  <a href="/settings" class="inline-flex items-center gap-1 text-xs text-gray-500 hover:text-gray-300 transition-colors mb-5">
+    <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"/></svg>
+    Settings
+  </a>
+
+  <div class="mb-6">
+    <h1 class="text-2xl font-bold">Refresh Agents</h1>
+    <p class="text-gray-400 text-sm mt-1">
+      Push the current <code>AGENTS.md</code>, <code>SOUL.md</code>, tools and
+      skills to agents that already exist. Memory and conversations are
+      preserved.
+    </p>
+  </div>
+
+  {# The one thing somebody has to understand before pressing the button,
+     so it is above the button and not in a tooltip. #}
+  <div class="mb-6 rounded border border-amber-600/40 bg-amber-500/5 p-4 text-xs text-amber-200/90 space-y-2">
+    <div class="font-semibold text-amber-200">Prompts do not go live until the gateway restarts.</div>
+    <p>
+      The gateway caches each agent's prompt files per session, so a pushed
+      <code>AGENTS.md</code> is invisible to a running conversation. A restart
+      clears that cache and <strong>keeps every conversation</strong> — sessions
+      live on disk and rehydrate. <code>sessions.reset</code> would also clear
+      it, but it ends the conversation, which is why this tool never uses it.
+    </p>
+    <p>
+      Tools and skills go live immediately, so apply and restart in the same
+      quiet window — the prompt is what names the tools, and a tool renamed
+      while its prompt still teaches the old name means every call is refused.
+    </p>
+  </div>
+
+  {# The boot-time resync, as a switch rather than a deployment detail.
+
+     It pushes AGENTS.md and SOUL.md to live kernel-template agents on
+     every control-panel boot. Off since 2026-09-23: with session reset
+     set to idle/86400 on this gateway, a session never rolls over, so a
+     pushed prompt is read by nothing until the gateway restarts. It was
+     writing identical bytes every boot and churning the mtimes of the
+     files you inspect to find out who wrote them.
+
+     Kept because it is the only thing that makes an UNPLANNED restart
+     -- an openclaw deploy done for its own reasons -- pick up current
+     prompts without anybody having thought about it. #}
+  <div class="mb-6 rounded border border-border bg-surface/20 p-4 text-xs
+              flex items-start justify-between gap-4 flex-wrap">
+    <div>
+      <div class="font-semibold text-gray-300 mb-1">
+        Push prompts on every control-panel boot
+        <span class="ml-2 px-1.5 py-0.5 rounded text-2xs
+                     {% if boot_resync_on %}bg-emerald-600/20 text-emerald-300
+                     {% else %}bg-gray-600/20 text-gray-400{% endif %}">
+          {{ 'on' if boot_resync_on else 'off' }}
+        </span>
+      </div>
+      <p class="text-gray-400 max-w-2xl">
+        When on, `AGENTS.md` and `SOUL.md` are pushed to live
+        kernel-template agents every time this service restarts. It does
+        not make them live — only a gateway restart does — but it means a
+        restart you did for some other reason picks up current prompts.
+        <strong>Takes effect on the next control-panel boot.</strong>
+      </p>
+    </div>
+    <form method="post" action="/settings/agents/refresh/resync">
+      <input type="hidden" name="on" value="{{ 'false' if boot_resync_on else 'true' }}">
+      <button type="submit" class="btn btn-sm whitespace-nowrap">
+        Switch {{ 'off' if boot_resync_on else 'on' }}
+      </button>
+    </form>
+  </div>
+
+  <form method="get" action="/settings/agents/refresh"
+        class="flex flex-wrap items-end gap-3 mb-6">
+    <div>
+      <label class="block text-2xs uppercase tracking-wider text-gray-500 mb-1">Goal</label>
+      <input type="text" name="goal_id" value="{{ goal_id }}" placeholder="all goals"
+             class="input input-sm w-48" autocomplete="off">
+    </div>
+    <div>
+      <label class="block text-2xs uppercase tracking-wider text-gray-500 mb-1">Type</label>
+      <select name="agent_type" class="input input-sm">
+        <option value="" {% if not agent_type %}selected{% endif %}>both</option>
+        <option value="SHCA" {% if agent_type == 'SHCA' %}selected{% endif %}>Assistant</option>
+        <option value="GO" {% if agent_type == 'GO' %}selected{% endif %}>Orchestrator</option>
+      </select>
+    </div>
+    <button type="submit" class="btn btn-sm">Plan</button>
+    <span class="text-2xs text-gray-500 pb-2">reads only — writes nothing</span>
+  </form>
+
+  {% if error %}
+  <div class="mb-6 rounded border border-red-600/40 bg-red-500/5 p-4 text-xs text-red-200">
+    {{ error }}
+  </div>
+  {% endif %}
+
+  {% if report %}
+  <div class="mb-3 flex items-center justify-between">
+    <h2 class="text-sm font-semibold text-gray-300">
+      {% if applied %}Result{% else %}Plan{% endif %}
+    </h2>
+    <a class="text-2xs text-gray-500 hover:text-gray-300"
+       href="/settings/agents/refresh?format=text{% if goal_id %}&goal_id={{ goal_id }}{% endif %}{% if agent_type %}&agent_type={{ agent_type }}{% endif %}">
+      plain text
+    </a>
+  </div>
+  <pre class="rounded border border-border bg-surface/30 p-4 text-2xs overflow-x-auto whitespace-pre">{{ report }}</pre>
+  {% endif %}
+
+  {% if refused %}
+  <div class="mt-6 rounded border border-amber-600/40 bg-amber-500/10 p-4 text-xs text-amber-100">
+    <div class="font-semibold mb-1">Refused — the fleet is busy</div>
+    <p>{{ refused }}</p>
+    <p class="mt-2 text-amber-200/70">
+      An agent writes <code>MEMORY.md</code> inside a turn, so stopping now
+      could truncate it. This is the memory guard, not a scheduling nicety.
+    </p>
+  </div>
+  {% endif %}
+
+  {% if partial %}
+  <div class="mt-6 rounded border border-red-600/50 bg-red-500/10 p-4 text-xs text-red-100">
+    <div class="font-semibold mb-1">Do not restart yet</div>
+    <p>
+      {{ partial|length }} agent(s) took part of the change and not the rest.
+      After a restart each would run new prompts describing tools it does not
+      have. Re-run the refresh for them until they come back clean.
+    </p>
+  </div>
+  {% endif %}
+
+  {% if report and not applied %}
+  {# A PLAIN FORM POST, deliberately NOT `data-toast-submit`.
+
+     That helper assumes every POST redirects (POST-redirect-GET): on
+     success it sets `window.location.href = resp.url`, and for a 200
+     that is the URL it just posted to. This endpoint renders its report
+     directly rather than redirecting, so the helper navigated to
+     /settings/agents/refresh/apply as a GET -- which has no handler --
+     and showed a 404 AFTER the write had already succeeded. The refresh
+     worked, both agents were written, and the operator saw an error
+     page and no report.
+
+     A plain POST renders the response where it is, which is what a page
+     whose entire output is a report wants. #}
+  <form method="post" action="/settings/agents/refresh/apply" class="mt-6"
+        onsubmit="return confirm('Write prompts, tools and skills to the agents listed above?\n\nConversations and memory are preserved. Prompts go live only when you restart the gateway.');">
+    <input type="hidden" name="goal_id" value="{{ goal_id }}">
+    <input type="hidden" name="agent_type" value="{{ agent_type }}">
+    <button type="submit" class="btn btn-sm btn-primary">Apply to the {{ count }} agent(s) above</button>
+    <span class="ml-2 text-2xs text-gray-500">
+      run this when nothing else is — it refuses if a turn is in flight
+    </span>
+  </form>
+  {% endif %}
+</div>
+{% endblock %}

@@ -96,6 +96,28 @@
           <a href="/goals/{{ pid }}/resources/{{ r.id }}" class="text-sm font-medium text-gray-200 hover:text-white">
             {{ r.name }}
           </a>
+          {# A RE-ROOTED ROW SAYS SO. It is active and it still works --
+             a trunk lane whose repo row was deleted is still resolved and
+             still merged into -- but it is sitting at top level because
+             its parent is gone, not because it was registered that way.
+             Without this it reads as a normal standalone resource and the
+             operator has no hint that anything is wrong. #}
+          {% if r.orphaned_from %}
+          <span class="ml-2 text-[10px] px-1.5 py-0.5 rounded bg-amber-900/40 text-amber-300 border border-amber-700/50"
+                title="Its parent repository resource ({{ r.orphaned_from }}) was deleted. This row is still active and still used by the engine; re-register the repository to nest it again.">
+            parent deleted
+          </span>
+          {% endif %}
+          {# THE BYTES, for anything that has some: an uploaded document
+             or a catalogued artifact. `downloadable` is computed in the
+             route because the two keep their bytes in different stores
+             and the template should not have to know which. A repo or a
+             branch has nothing to hand over and gets no button. #}
+          {% if r.downloadable %}
+          <a href="/goals/{{ pid }}/resources/{{ r.id }}/content?download=1"
+             class="text-2xs text-sky-400 hover:text-sky-300 ml-2"
+             title="Download {{ r.name }}">Download</a>
+          {% endif %}
           <div class="text-2xs text-gray-500 mt-0.5">
             {{ r.kind }}
             {% if r.uri %} &middot; <span class="text-gray-600">{{ r.uri[:60] }}{% if r.uri|length > 60 %}...{% endif %}</span>{% endif %}
@@ -118,6 +140,12 @@
         <!-- Summary status -->
         {% if r.summary_preview %}
         <span class="pill pill-success text-2xs" title="AI-generated summary is available: click to view">summary</span>
+        {% elif r.id in laned_repos %}
+        {# NOT THE SAME THING AS MISSING ONE. The scanner skips the
+           repo-level summary once the goal declares trunk lanes, so this
+           pill said "no summary" for ever and its tooltip asked for a
+           Rescan that `refresh_identity` declines for the same reason. #}
+        <span class="pill pill-neutral text-2xs" title="This goal works on the branches below and each carries its own summary. A repo-level summary could only describe one of them, and would contradict the rest.">summarised per branch</span>
         {% elif r.summary_stale %}
         <span class="pill pill-neutral text-2xs" title="No summary yet - open the resource and click Rescan">no summary</span>
         {% endif %}
@@ -133,16 +161,42 @@
       {% if children_map.get(r.id) %}
       <div class="ml-9 mt-3 space-y-1.5 border-l border-slate-700 pl-3">
         {% for child in children_map[r.id] %}
-        <a href="/goals/{{ pid }}/resources/{{ child.id }}"
-           class="flex items-center gap-2 text-sm text-gray-400 hover:text-gray-200 py-1">
-          <span class="text-xs">{% if child.kind == 'branch' %}🌿{% elif child.kind == 'file' %}📎{% elif child.kind in ('gcp_test_sa', 'gcp_deploy_sa') %}🔑{% else %}📁{% endif %}</span>
-          {{ child.name }}
-          {% if child.kind == 'gcp_test_sa' %}<span class="text-2xs text-gray-600 ml-1">(test SA)</span>{% elif child.kind == 'gcp_deploy_sa' %}<span class="text-2xs text-gray-600 ml-1">(deploy SA)</span>{% endif %}
-          {% if child.locked_by %}<span class="pill pill-warning text-2xs ml-1">locked</span>{% endif %}
-          {% if child.kind in ('gcp_test_sa', 'gcp_deploy_sa') and sa_status_map.get(child.id) in ('no_permission', 'error') %}
-          <span class="pill pill-error text-2xs ml-1" title="The control-panel service account cannot impersonate this SA - open to see fix instructions">no permission</span>
+        {# A CHILD ROW SHOWS ITS SUMMARY. It never had a summary pill of
+           any kind, which was survivable while the repo card carried the
+           summary and the branches were an index of names. Once the
+           summaries moved to the lanes -- because work happens at branch
+           level -- this became the only place they could be seen from,
+           and it showed nothing: the repo read "no summary" and the
+           branches that HAD one said nothing at all. #}
+        <div>
+          <a href="/goals/{{ pid }}/resources/{{ child.id }}"
+             class="flex items-center gap-2 text-sm text-gray-400 hover:text-gray-200 py-1">
+            <span class="text-xs">{% if child.kind == 'branch' %}🌿{% elif child.kind == 'file' %}📎{% elif child.kind in ('gcp_test_sa', 'gcp_deploy_sa') %}🔑{% else %}📁{% endif %}</span>
+            {{ child.name }}
+            {% if child.kind == 'branch' and child.role == 'trunk' %}<span class="text-2xs text-gray-600 ml-1">(trunk lane)</span>{% endif %}
+            {% if child.kind == 'gcp_test_sa' %}<span class="text-2xs text-gray-600 ml-1">(test SA)</span>{% elif child.kind == 'gcp_deploy_sa' %}<span class="text-2xs text-gray-600 ml-1">(deploy SA)</span>{% endif %}
+            {% if child.locked_by %}<span class="pill pill-warning text-2xs ml-1" title="A story is writing here - locked for story {{ child.locked_for or child.locked_by }}">locked</span>{% endif %}
+            {% if child.summary_preview %}
+            <span class="pill pill-success text-2xs ml-1" title="AI-generated summary is available: click to view">summary</span>
+            {% elif child.summary_stale %}
+            <span class="pill pill-neutral text-2xs ml-1" title="No summary yet - open the branch and click Rescan">no summary</span>
+            {% endif %}
+            {% if child.kind in ('gcp_test_sa', 'gcp_deploy_sa') and sa_status_map.get(child.id) in ('no_permission', 'error') %}
+            <span class="pill pill-error text-2xs ml-1" title="The control-panel service account cannot impersonate this SA - open to see fix instructions">no permission</span>
+            {% endif %}
+          </a>
+          {# AFTER the row link, never inside it: a nested <a> is invalid
+             and the browser closes the outer one early, which moves
+             everything after it somewhere unpredictable. #}
+          {% if child.downloadable %}
+          <a href="/goals/{{ pid }}/resources/{{ child.id }}/content?download=1"
+             class="text-2xs text-sky-400 hover:text-sky-300 ml-9"
+             title="Download {{ child.name }}">Download</a>
           {% endif %}
-        </a>
+          {% if child.summary_preview %}
+          <p class="text-xs text-gray-500 line-clamp-2 pl-6 pb-1">{{ child.summary_preview | strip_md }}</p>
+          {% endif %}
+        </div>
         {% endfor %}
       </div>
       {% endif %}
@@ -174,8 +228,7 @@
       <div>
         <label class="block text-sm text-gray-400 mb-1.5">Type</label>
         <select name="kind" id="add-kind" class="input" onchange="toggleRepoFields()">
-          <option value="repo">Git Repository</option>
-          <option value="branch">Branch (of existing repo)</option>
+          <option value="repo">Git Branch (becomes this repo's trunk)</option>
           <option value="cloud_resource">Cloud Resource</option>
         </select>
       </div>
@@ -218,62 +271,19 @@
            skipped and added later. Server-side enforcement in
            app/routers/goal_resources.py (add_resource) backs this up. -->
       <div id="repo-fields" class="space-y-3">
+        <input type="hidden" name="default_branch" id="gh-default-branch" value="main" />
+        <input type="hidden" name="working_branch_is_trunk" value="on" />
         <div>
-          <label class="block text-sm text-gray-400 mb-1.5">Default Branch</label>
-          <input name="default_branch" class="input" value="main" placeholder="main" />
-        </div>
-        <details class="pt-2 border-t border-border/40" open>
-          <summary class="text-sm text-gray-400 cursor-pointer hover:text-gray-200 select-none">
-            Configure working branch <span class="text-2xs text-amber-500">(required)</span>
-          </summary>
-          <div class="space-y-2 mt-2 pl-1">
-            <input name="working_branch" class="input" required placeholder="e.g., dev - the branch agents work from" />
-            <p class="text-2xs text-gray-600">A branch resource is auto-created alongside the repo for agents to work from.</p>
-            <label class="flex items-center gap-2 text-sm text-gray-300 cursor-pointer">
-              <input type="checkbox" name="working_branch_is_trunk" value="on" class="rounded border-gray-700 bg-gray-800" />
-              Mark as trunk for this repo
-            </label>
-            <p class="text-2xs text-gray-600 pl-6">Treat this branch as the merge target in review stories. Only one branch per repo can be trunk.</p>
-          </div>
-        </details>
-      </div>
-      <!-- Branch-specific fields. Help text trimmed; details now ride alongside
-           inputs as placeholders / inline hints instead of paragraphs. -->
-      <div id="branch-fields" class="hidden space-y-3">
-        <div>
-          <label class="block text-sm text-gray-400 mb-1.5">Parent Repository <span class="text-2xs text-gray-600">(or paste a GitHub URL above)</span></label>
-          <select name="parent_repo_id" class="input">
-            <option value="">- pick a registered repo -</option>
-            {% for r in resources if r.kind == 'repo' %}
-            <option value="{{ r.id }}">{{ r.name }}</option>
-            {% endfor %}
+          <label class="block text-sm text-gray-400 mb-1.5">Branch <span class="text-2xs text-amber-500">(required — becomes the trunk)</span></label>
+          <input id="gh-branch-filter" class="input mb-2 hidden" placeholder="Filter branches…" oninput="filterBranchOptions()" />
+          <select name="working_branch" id="gh-branch-pick" class="input" required disabled>
+            <option value="">-- pick a repository first --</option>
           </select>
+          <p class="text-2xs text-gray-600 mt-1.5">The selected branch is registered as this repo's <b>trunk</b> for this goal: the engine cuts feature branches from it and merges landed work back into it. Add the same repo again to register another of its branches as a separate trunk lane — e.g. a backend and a frontend branch, each its own merge target; GO chooses a story's lane by which branch resource it grants.</p>
+          <p id="gh-branch-error" class="text-2xs text-red-400 mt-1 hidden"></p>
         </div>
-        <div>
-          <label class="block text-sm text-gray-400 mb-1.5">Branch Name</label>
-          <input name="branch_name" class="input" placeholder="e.g. feat/auth, fix/login-bug" />
-        </div>
-        <div class="grid grid-cols-2 gap-3">
-          <div>
-            <label class="block text-sm text-gray-400 mb-1.5">Base branch</label>
-            <input name="base_branch" class="input" value="main" placeholder="main" />
-          </div>
-          <div>
-            <label class="block text-sm text-gray-400 mb-1.5">Role</label>
-            <select name="role" class="input">
-              <option value="feature">Feature</option>
-              <option value="trunk">Trunk</option>
-              <option value="release">Release</option>
-            </select>
-          </div>
-        </div>
-        <p class="text-2xs text-gray-600">Feature: short-lived for one task chain. Trunk: agents' merge target (only one per repo). Release: long-lived release branch.</p>
       </div>
-      <!-- Cloud Resource fields: paginated as 3 steps (env → test SA → deploy SA).
-           Each step is hidden by default; cloudStep state + showCloudStep() toggle. -->
-
-      <!-- Step 1: Environment (required) -->
-      <div id="cloud-step-env" class="hidden space-y-3">
+<div id="cloud-step-env" class="hidden space-y-3">
         <div class="text-xs font-semibold text-gray-300">Environment <span class="text-2xs font-normal text-gray-500">: required</span></div>
         <div>
           <label class="block text-sm text-gray-400 mb-1.5">Target GCP Project ID</label>
@@ -282,7 +292,7 @@
         </div>
         <div>
           <label class="block text-sm text-gray-400 mb-1.5">Target Region</label>
-          <input name="gcp_target_region" class="input" placeholder="${GCP_REGION}" />
+          <input name="gcp_target_region" class="input" placeholder="us-central1" />
         </div>
       </div>
 
@@ -355,15 +365,13 @@
     function toggleRepoFields() {
       const kind = document.getElementById('add-kind').value;
       const isRepo = kind === 'repo';
-      const isBranch = kind === 'branch';
-      const isGh = isRepo || isBranch;
+      const isGh = isRepo;
       const isCloud = kind === 'cloud_resource';
 
       document.getElementById('cloud-provider-section').classList.toggle('hidden', !isCloud);
       document.getElementById('gh-repo-section').classList.toggle('hidden', !isGh);
       document.getElementById('uri-manual').classList.toggle('hidden', isGh || isCloud);
       document.getElementById('repo-fields').classList.toggle('hidden', !isRepo);
-      document.getElementById('branch-fields').classList.toggle('hidden', !isBranch);
 
       // Step-indicator + cloud-only nav vs. the single-page default nav.
       document.getElementById('cloud-step-indicator').classList.toggle('hidden', !isCloud);
@@ -455,6 +463,7 @@
           opt.value = r.html_url || r.url || `https://github.com/${r.full_name}`;
           opt.textContent = r.full_name;
           opt.dataset.fullName = r.full_name;
+          opt.dataset.defaultBranch = r.default_branch || 'main';
           select.appendChild(opt);
         });
       } catch (e) {
@@ -464,15 +473,75 @@
       }
     }
 
+    let allBranches = [];
+
     function onRepoSelected() {
       const select = document.getElementById('gh-repo-select');
       document.getElementById('repo-uri').value = select.value;
+      const opt = select.selectedOptions[0];
       // Auto-fill name if empty
       const nameInput = document.querySelector('input[name="name"]');
-      if (select.selectedOptions[0] && !nameInput.value) {
-        const fullName = select.selectedOptions[0].dataset.fullName || '';
+      if (opt && !nameInput.value) {
+        const fullName = opt.dataset.fullName || '';
         nameInput.value = fullName.split('/').pop() || '';
       }
+      document.getElementById('gh-default-branch').value =
+        (opt && opt.dataset.defaultBranch) || 'main';
+      loadBranches(opt ? opt.dataset.fullName : '');
+    }
+
+    async function loadBranches(fullName) {
+      const pick = document.getElementById('gh-branch-pick');
+      const filter = document.getElementById('gh-branch-filter');
+      const errEl = document.getElementById('gh-branch-error');
+      errEl.classList.add('hidden');
+      allBranches = [];
+      if (!fullName) {
+        pick.innerHTML = '<option value="">-- pick a repository first --</option>';
+        pick.disabled = true;
+        filter.classList.add('hidden');
+        return;
+      }
+      pick.disabled = true;
+      pick.innerHTML = '<option value="">Loading branches…</option>';
+      try {
+        const resp = await fetch(`/api/github/repos/${fullName}/branches`,
+                                 { signal: AbortSignal.timeout(20000) });
+        if (!resp.ok) throw new Error('Failed to fetch branches');
+        const branches = await resp.json();
+        if (branches.error) throw new Error(branches.error);
+        allBranches = branches.map(b => b.name);
+        filter.classList.toggle('hidden', allBranches.length <= 8);
+        filter.value = '';
+        renderBranchOptions(allBranches);
+        pick.disabled = false;
+      } catch (e) {
+        pick.innerHTML = '<option value="">-- failed to load --</option>';
+        errEl.textContent = e.name === 'TimeoutError'
+          ? 'Timed out loading branches — reselect the repo to retry'
+          : e.message;
+        errEl.classList.remove('hidden');
+      }
+    }
+
+    function renderBranchOptions(names) {
+      const pick = document.getElementById('gh-branch-pick');
+      const def = document.getElementById('gh-default-branch').value;
+      pick.innerHTML = '<option value="">-- select the trunk branch --</option>';
+      for (const n of names) {
+        const o = document.createElement('option');
+        o.value = n;
+        o.textContent = n === def ? `${n} (default)` : n;
+        pick.appendChild(o);
+      }
+    }
+
+    function filterBranchOptions() {
+      const q = document.getElementById('gh-branch-filter').value
+        .trim().toLowerCase();
+      renderBranchOptions(q
+        ? allBranches.filter(n => n.toLowerCase().includes(q))
+        : allBranches);
     }
 
     toggleRepoFields();

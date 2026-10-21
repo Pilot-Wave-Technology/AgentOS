@@ -74,6 +74,12 @@
         {{ info_popover("Usage attributed to agents or conversation threads that finished more than an hour ago and no longer have a row in Agent Status below -- still real spend, just not shown per-agent anymore.", label="From finished agents") }}
       </div>
       {% endif %}
+      {% if local_story_count %}
+      <div class="flex items-center gap-1 mt-1">
+        <span class="text-2xs text-amber-600/90">excludes {{ local_story_count }} local-execution stor{{ 'y' if local_story_count == 1 else 'ies' }}</span>
+        {{ info_popover("A local-execution story's coding phases run as Claude Code in the user's own editor, on their own subscription -- the control panel never sees those token calls, so they are absent from this total and cannot be reconciled later. Real work with unobservable spend, shown here so the number is not mistaken for the full picture.", label="Local execution not metered") }}
+      </div>
+      {% endif %}
     </div>
   </div>
 

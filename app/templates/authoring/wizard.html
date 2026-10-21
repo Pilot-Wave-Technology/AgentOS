@@ -45,12 +45,23 @@
       </div>
       <div class="col-span-2">
         <label class="block text-sm text-gray-400 mb-1.5">Model <span class="text-red-500">*</span></label>
+        {% if models_empty %}
+        <select name="model" disabled
+                class="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm font-mono opacity-60">
+          <option value="">No models available</option>
+        </select>
+        <p class="text-xs text-gray-500 mt-1">
+          No models are registered.
+          <a href="/settings/model-registry" class="text-indigo-400 hover:text-indigo-300">Open Model Registry →</a>
+        </p>
+        {% else %}
         <select name="model" required
                 class="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm font-mono focus:outline-none focus:border-indigo-500">
           {% for m in models %}
-          <option value="{{ m }}" {% if m == "google/gemini-2.5-flash" %}selected{% endif %}>{{ m }}</option>
+          <option value="{{ m.id }}" {% if m.id == "google/gemini-3.8-flash" %}selected{% endif %}>{{ m.label }} — {{ m.id }}</option>
           {% endfor %}
         </select>
+        {% endif %}
       </div>
     </div>
 

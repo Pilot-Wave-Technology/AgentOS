@@ -19,6 +19,7 @@ import json
 import logging
 import re
 
+from app import local_dev
 from app.database import get_pool
 from app.openclaw import gateway_admin
 
@@ -307,7 +308,13 @@ def _build_kickoff(aspect: str, run: dict, instance_id: str, review_id: str,
         f"- Read every file above (start with docs/SECURITY_CONTEXT.json), then follow the numbered "
         f"steps in your AGENTS.md.\n"
         f"{scan_line}"
-        f"- FINISH by calling submit_security_review:\n"
+        # Mirrors the council kickoff — demand the tool call rather than "form your
+        # review, then call". NOTE it does NOT fix Gemini's MALFORMED_FUNCTION_CALL;
+        # that theory was measured and falsified (see the matching note in
+        # app/services/council/provisioning.py and
+        # research/GEMINI_OPAQUE_AGENT_FAILURES_2026-08-16.md). Clearer wording only.
+        f"- Do NOT write the review out in your reply. Put the whole review INSIDE the "
+        f"submit_security_review call — your turn should be the tool call itself:\n"
         f"    • success: status=\"success\" with a complete review_details (every required section "
         f"from your AGENTS.md) and a findings array (empty for the convener).\n"
         f"    • if you CANNOT complete: status=\"failed\" with reason=\"<what went wrong>\".\n"
@@ -395,7 +402,7 @@ async def run_stage(run: dict, stage_id: str, aspect: str) -> bool:
         return False
 
     instance_id = _safe_instance_id(aspect, run["id"])
-    workspace = f"~/.openclaw/workspace-{instance_id}"
+    workspace = local_dev.agent_workspace_path(instance_id)
     is_scan = aspect != "convener"
     schedule = _SCAN_NUDGE_SCHEDULE if is_scan else _CONVENER_NUDGE_SCHEDULE
     total_budget = sum(schedule)
@@ -412,6 +419,12 @@ async def run_stage(run: dict, stage_id: str, aspect: str) -> bool:
     )
 
     created = False
+    # Initialised outside the try because `finally` reports it — see the recovery
+    # log there. Mirrors the council path.
+    nudges_sent = 0
+    # Bound here too: `finally` reads it to fetch the transcript when explaining a
+    # failure, and the try can exit before its own assignment below is reached.
+    session_key = f"agent:{instance_id}:{run['id'].lower()}-{stage_id}"
     try:
         from app.openclaw import GatewayError
         try:
@@ -455,7 +468,7 @@ async def run_stage(run: dict, stage_id: str, aspect: str) -> bool:
         for fn, content in {**bootstrap, **_bound_docs(docs)}.items():
             await gateway_admin.set_agent_file(instance_id, fn, content or "")
 
-        session_key = f"agent:{instance_id}:{run['id'].lower()}-{stage_id}"
+        # (session_key is bound above the try — see the note there.)
         kickoff = _build_kickoff(aspect, run, instance_id, stage_id, docs)
         # Kill switch — system-pause guard just before agent kickoff so a pause
         # that lands mid-run doesn't start additional scanner agents.
@@ -493,6 +506,7 @@ async def run_stage(run: dict, stage_id: str, aspect: str) -> bool:
                 break  # final grace window elapsed with no submit → give up (failed in finally)
             log.info("security: no submit after ~%ds (run=%s aspect=%s) — nudge %d/%d",
                      elapsed, run["id"], aspect, i + 1, last_i)
+            nudges_sent += 1
             try:
                 await gateway_admin.call(
                     "agent",
@@ -508,10 +522,31 @@ async def run_stage(run: dict, stage_id: str, aspect: str) -> bool:
         row = await pool.fetchrow("SELECT status FROM security_review_stages WHERE id=$1", stage_id)
         status = row["status"] if row else None
         if status not in ("done", "failed"):
-            await _fail_stage(stage_id, "agent run ended without calling submit_security_review")
+            # See the matching note in app/services/council/provisioning.py: the bare
+            # sentence can't distinguish "the model's turn errored" from "it finished
+            # normally but skipped the tool". Read the transcript tail and say which.
+            reason = "agent run ended without calling submit_security_review"
+            try:
+                from app.services.agent_failure_reason import describe_last_agent_failure
+                detail = await describe_last_agent_failure(session_key)
+                if detail:
+                    reason = f"{reason} — {detail}"
+            except Exception as exc:  # noqa: BLE001
+                log.info("security: could not describe failure for %s: %s", stage_id, exc)
+            await _fail_stage(stage_id, reason)
             status = "failed"
         log.info("security: stage terminal run=%s aspect=%s instance=%s status=%s",
                  run["id"], aspect, instance_id, status)
+        # See the matching note in app/services/council/provisioning.py: a stage that
+        # needed nudges still reports 'done', so retry cost is invisible at run level.
+        # Distinct greppable token, no schema change, silent on the happy path.
+        if nudges_sent:
+            log.warning(
+                "security_stage_recovered_after_nudges=%d run=%s aspect=%s status=%s "
+                "instance=%s — the reviewer did not submit on its first attempt; this "
+                "run consumed %d extra model turn(s) despite its final status",
+                nudges_sent, run["id"], aspect, status, instance_id, nudges_sent,
+            )
         if created:
             from app.config import get_settings as _get_settings
             if getattr(_get_settings(), "security_keep_agent_workspaces", False):

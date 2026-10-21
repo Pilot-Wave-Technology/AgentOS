@@ -1,0 +1,42 @@
+# Coding story REVIEWER, run locally.
+#
+# The same checkout the work was written in, read after it is finished.
+#
+# HOW THIS DIFFERS FROM `profiles/story-coding-review`, and it is not a
+# detail. In a pod the reviewer is a LATER PHASE of the same execution: a
+# fresh leg, with no memory of the work, holding a surface from which every
+# writing tool has been removed by name -- "the reviewer cannot change the
+# thing it is judging because it holds no tool that could".
+#
+# Locally it runs in the author's own session. It remembers writing the code
+# and it still holds Write, Edit and Bash, because they belong to Claude Code
+# and the person is operating it. So the two guarantees the pod gets from its
+# tool surface are, here, things the PROMPT ASKS FOR -- and a prompt is weaker
+# than an absent tool. That is a deliberate choice for the local lane; it is
+# written down so the verdict is read for what it is.
+#
+# What does carry over unchanged: the verdicts, the minimum summary, the
+# `approve`-with-unexamined-churn downgrade, and the writer. A review means
+# one thing on the board whichever lane produced it.
+
+kind   = "story"
+domain = "coding"
+phase  = "review"
+
+tools_add = [
+  # The one verb with an effect. Everything else on this surface reads.
+  "submit_story_review",
+]
+
+# The tree is already here -- this is the checkout the story was worked in,
+# which is why the review runs BEFORE the checkout is released.
+workspace_driver = "git"
+
+prompt_files = ["AGENTS.md", "SOUL.md"]
+
+# A reviewer plans nothing and completes nothing. It reads, and it submits
+# one verdict.
+requires_plan      = false
+allows_completion  = false
+has_verifier       = false
+max_subagent_depth = 0

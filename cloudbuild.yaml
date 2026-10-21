@@ -1,13 +1,12 @@
-# AgentOS control plane — build, migrate, deploy — SPLIT profile (the default).
+# AgentOS control plane — build, test, migrate, deploy.
 #
-# Deploys FOUR Cloud Run services from one image, each with its own entrypoint:
+# Deploys FIVE Cloud Run services from one image, each with its own entrypoint:
 #   <prefix>-web         app.main:app              (public: web + chat + agent callbacks)
 #   <prefix>-council     app.council_worker:app    (council + security + research loops)
 #   <prefix>-git         app.git_engine_worker:app (git dependency-graph engine)
 #   <prefix>-management  app.management_worker:app (settings/dashboard/admin backends)
-#
-# Use cloudbuild-single.yaml instead if you set service_profile="single" in tfvars
-# (one service runs everything in-process — cheaper).
+#   <prefix>-scheduler   app.scheduler_worker:app  (the background loops, one leader)
+# and then the execution plane on the GKE cluster terraform created.
 #
 # Ownership split (see terraform/README.md):
 #   • Terraform owns the service CONFIG (env vars, secrets, SA, connector, Cloud
@@ -25,14 +24,29 @@ substitutions:
   _VPC_CONNECTOR: agentos-vpc-conn  # = <network_name>-conn
   _RUNTIME_SA_NAME: agentos-runtime # = <name_prefix>-runtime
   _TASK_RUNNER_JOB: agentos-task-runner
+  # The Artifact Registry repository images are pushed to. Just the
+  # repo name: the full reference is assembled in the step args,
+  # because SUBSTITUTION IS SINGLE-PASS -- a `$PROJECT_ID` written
+  # inside a substitution VALUE is never expanded, and reaches docker
+  # verbatim as part of the tag.
+  _AR_REPO: agentos
+  _TEST_DB_IMAGE: postgres:17-alpine
 
 steps:
   # ── Build images ─────────────────────────────────────────────────────────
+  # BUILD-OWNED ENV IS BAKED INTO THE IMAGE, not set on the deploy.
+  # Terraform owns each service's env list, so a value a deploy adds with
+  # `--update-env-vars` is dropped by the next `terraform apply` -- which
+  # left the control panel minting contracts that named the laptop
+  # fixture image. In the image it survives any apply.
   - id: build
     name: gcr.io/cloud-builders/docker
     env: ['DOCKER_BUILDKIT=1']
     args: [build, -t, "gcr.io/$PROJECT_ID/${_SERVICE}:$COMMIT_SHA",
-                  -t, "gcr.io/$PROJECT_ID/${_SERVICE}:latest", "."]
+                  -t, "gcr.io/$PROJECT_ID/${_SERVICE}:latest",
+                  --build-arg, "PLATFORM_BUILD_SHA=$COMMIT_SHA",
+                  --build-arg, "AGENTOS_SANDBOX_BASE_IMAGE=${_REGION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPO}/sandbox-base:$COMMIT_SHA",
+                  "."]
 
   - id: build-task-runner
     name: gcr.io/cloud-builders/docker
@@ -54,12 +68,142 @@ steps:
     waitFor: ['build-task-runner']
     args: [push, "gcr.io/$PROJECT_ID/${_TASK_RUNNER_JOB}:$COMMIT_SHA"]
 
+  # ── The sandbox base image ───────────────────────────────────────────────
+  # WITHOUT THIS, NO STORY CAN RUN. Every execution pod's sandbox
+  # container and every verifier criterion runs this image;
+  # `deploy_execution_plane.sh` resolves it by digest and fails if the
+  # tag is absent. It was missing from this pipeline entirely, and the
+  # Dockerfile was missing from the published tree, so the execution
+  # plane could not be stood up at all.
+  - id: build-sandbox
+    name: gcr.io/cloud-builders/docker
+    env: ['DOCKER_BUILDKIT=1']
+    waitFor: ['-']
+    args: [build,
+           --cache-from, "${_REGION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPO}/sandbox-base:latest",
+           --build-arg, BUILDKIT_INLINE_CACHE=1,
+           -t, "${_REGION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPO}/sandbox-base:$COMMIT_SHA",
+           -t, "${_REGION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPO}/sandbox-base:latest",
+           infra/e0/fixtures]
+
+  - id: push-sandbox
+    name: gcr.io/cloud-builders/docker
+    entrypoint: bash
+    waitFor: ['build-sandbox']
+    args:
+      - -c
+      - |
+        set -euo pipefail
+        REF="${_REGION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPO}/sandbox-base"
+        docker push "$${REF}:$COMMIT_SHA"
+        docker push "$${REF}:latest"
+
+  # ── Build guards ─────────────────────────────────────────────────────────
+  # All four refuse rather than warn, and all start immediately
+  # (waitFor '-') so a failure lands before the images finish building.
+  - id: check-sequence
+    name: ubuntu
+    entrypoint: bash
+    waitFor: ['-']
+    args: [migrations/check_sequence.sh]
+
+  # Rollback is redeploying the previous image, which only works while
+  # the CURRENT schema still serves the PREVIOUS build. So a drop or a
+  # rename must be a deliberate act, taken a deploy after the thing
+  # that read it stopped reading it.
+  - id: check-expand-contract
+    name: python:3.12-slim
+    entrypoint: python
+    waitFor: ['-']
+    args: [scripts/check_expand_contract.py]
+
+  - id: check-ledger-actors
+    name: ubuntu
+    entrypoint: bash
+    waitFor: ['-']
+    args: [scripts/check_ledger_actors.sh]
+
+  - id: check-unbound-names
+    name: python:3.12-slim
+    entrypoint: python
+    waitFor: ['-']
+    args: [scripts/check_unbound_names.py, app, kernel, scripts]
+
+  # ── Tests ────────────────────────────────────────────────────────────────
+  # A pipeline that deploys without running the suite is one that finds
+  # out in production. The SQL sweeps in tests/ are the reason this
+  # matters more here than in most projects: they PREPARE every query
+  # in the codebase against a real schema, so a column that does not
+  # exist fails HERE instead of on one endpoint, days later.
+  # `--target test` is a stage in the same Dockerfile, placed BEFORE
+  # the runtime stage, so a plain `docker build .` still produces the
+  # runtime image and this reuses the layers just built.
+  - id: test-image
+    name: gcr.io/cloud-builders/docker
+    env: ['DOCKER_BUILDKIT=1']
+    waitFor: ['build']
+    args: [build, --target, test, -t, agentos-test, "."]
+
+  # The checkout is MOUNTED rather than baked: .dockerignore keeps
+  # tests/ out of the production image, and that applies to every
+  # stage.
+  - id: test-db
+    name: gcr.io/cloud-builders/docker
+    waitFor: ['-']
+    args: [run, -d, --name=agentos-test-db, --network=cloudbuild,
+           -e, POSTGRES_USER=agentos, -e, POSTGRES_PASSWORD=agentos,
+           -e, POSTGRES_DB=agentos_test, "${_TEST_DB_IMAGE}"]
+
+  # A REAL DATABASE, AND run_suite.sh MIGRATES IT. With a DSN supplied
+  # in the environment, `conftest.py` returns early and does NOT stamp
+  # a schema -- it assumes CI has prepared one, and run_suite.sh is
+  # what prepares it, by applying SEQUENCE.
+  #
+  # That is why migration 0003 matters here as well as in production:
+  # it creates agentos_worker / agentos_verifier / agentos_human, and
+  # without it twenty tests failed with `role "agentos_human" does not
+  # exist`. Dropping the DSN to use conftest's embedded server instead
+  # does not work either -- run_suite.sh requires it, by design.
+  - id: test-suite
+    name: gcr.io/cloud-builders/docker
+    waitFor: ['test-image', 'test-db']
+    args:
+      - run
+      - --rm
+      - --network=cloudbuild
+      - -v
+      - /workspace:/src
+      - -w
+      - /src
+      - -e
+      - INTERLOCK_TEST_DSN=postgresql://agentos:agentos@agentos-test-db:5432/agentos_test
+      # Cloud Build checks out ONE repository. The kernel-vs-gateway
+      # tool-surface comparison needs the gateway branch, which is a
+      # different checkout, so half its input is absent. Said
+      # explicitly rather than inferred from a missing directory --
+      # inferring it is how that check once reported UNCHECKED
+      # everywhere and was believed.
+      - -e
+      - AGENTOS_SINGLE_REPO_CHECKOUT=1
+      - agentos-test
+      - bash
+      - scripts/ci/run_suite.sh
+
   # ── Migrate: deploy an ephemeral job at the new image, run it, --wait ──────
   # Uses the DDL migrate DSN. Fails the build (and skips deploy) on any error.
+  #
+  # THE GATE. This is the first step that changes anything, and every
+  # deploy waits on it, so it waits on the guards AND the full test suite.
+  # It used to wait on `push-sha` alone: migrations and all four deploys
+  # ran while the tests were still going, and a later failure cancelled
+  # the unfinished suite -- a build could ship before its tests finished.
+  # The internal pipelines get this by omitting waitFor (wait for
+  # everything before); naming the steps keeps the image builds parallel.
   - id: migrate-deploy
     name: gcr.io/google.com/cloudsdktool/cloud-sdk
     entrypoint: gcloud
-    waitFor: ['push-sha']
+    waitFor: ['push-sha', 'check-sequence', 'check-expand-contract',
+              'check-ledger-actors', 'check-unbound-names', 'test-suite']
     args:
       - run
       - jobs
@@ -71,7 +215,9 @@ steps:
       - --vpc-egress=private-ranges-only
       - --service-account=${_RUNTIME_SA_NAME}@$PROJECT_ID.iam.gserviceaccount.com
       - --set-cloudsql-instances=$PROJECT_ID:${_REGION}:${_DB_INSTANCE}
-      - --set-secrets=DATABASE_URL=database-url-migrate:latest
+      # AGENTOS_LEG_PASSWORD: apply.py sets the execution pods' login to
+      # it on every run, so the role and the secret cannot drift.
+      - --set-secrets=DATABASE_URL=database-url-migrate:latest,AGENTOS_LEG_PASSWORD=execution-db-password:latest
       - --set-env-vars=APP_ENV=production,BUILD_ID=$BUILD_ID
       - --command=python
       - --args=migrations/apply.py
@@ -99,10 +245,16 @@ steps:
   # per deploy. Requires the gateway to be READY (Anthropic key + control-panel
   # URL loaded) before this build runs — see deploy/07 — otherwise the recreate
   # falls back to the gemini default.
+  # THE CONTROL PANEL MINTS CONTRACTS, and a contract names the sandbox
+  # image its execution pod runs. Without AGENTOS_SANDBOX_BASE_IMAGE the
+  # web tier fell back to the laptop default (agentos-kernel/fixture:dev),
+  # so approving a plan minted pods that could never pull their image
+  # (ImagePullBackOff). It waits for `push-sandbox` so it never names a tag
+  # that is not in the registry yet.
   - id: deploy-web
     name: gcr.io/google.com/cloudsdktool/cloud-sdk
     entrypoint: gcloud
-    waitFor: ['migrate-execute']
+    waitFor: ['migrate-execute', 'push-sandbox']
     args:
       - run
       - services
@@ -110,7 +262,6 @@ steps:
       - "${_SERVICE}-web"
       - --image=gcr.io/$PROJECT_ID/${_SERVICE}:$COMMIT_SHA
       - --region=${_REGION}
-      - --update-env-vars=PLATFORM_BUILD_SHA=$COMMIT_SHA
       - --command=uvicorn
       - "--args=^@^app.main:app@--host@0.0.0.0@--port@8080"
       - --quiet
@@ -160,6 +311,25 @@ steps:
       - "--args=^@^app.management_worker:app@--host@0.0.0.0@--port@8080"
       - --quiet
 
+  # The background loops: one instance, CPU always on, leader-locked.
+  # The web tier is told to leave them alone (AGENTOS_SCHEDULER_LOOPS=0,
+  # set by terraform). Without this service the dashboard's gateway cache
+  # is never filled and the gateway reads "offline" while it is connected.
+  - id: deploy-scheduler
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: gcloud
+    waitFor: ['migrate-execute']
+    args:
+      - run
+      - services
+      - update
+      - "${_SERVICE}-scheduler"
+      - --image=gcr.io/$PROJECT_ID/${_SERVICE}:$COMMIT_SHA
+      - --region=${_REGION}
+      - --command=uvicorn
+      - "--args=^@^app.scheduler_worker:app@--host@0.0.0.0@--port@8080"
+      - --quiet
+
   # ── Update the task-runner job image ──────────────────────────────────────
   - id: deploy-task-runner
     name: gcr.io/google.com/cloudsdktool/cloud-sdk
@@ -173,6 +343,130 @@ steps:
       - --image=gcr.io/$PROJECT_ID/${_TASK_RUNNER_JOB}:$COMMIT_SHA
       - --region=${_REGION}
       - --quiet
+
+  # ── Tell the gateway where the control plane is ──────────────────────────
+  # Was a hand-run step in deploy/07.0.a, which is the sort of thing an
+  # operator does once and never again after an image changes. The
+  # gateway's refresh timer re-reads this secret within ~60s.
+  #
+  # ONE SPELLING. Cloud Run answers to both a deterministic URL and a
+  # legacy hash form; `status.url` gives the hash one while terraform
+  # put the deterministic one in the service's own CONTROL_PANEL_URL.
+  # Taking the deterministic form here keeps the gateway and the app
+  # describing the service the same way.
+  - id: sync-url
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: bash
+    waitFor: ['deploy-web']
+    args:
+      - -c
+      - |
+        set -euo pipefail
+        # Derived the way terraform derives it:
+        #   https://<name_prefix>-web-<projectnumber>.<region>.run.app
+        NUM=$$(gcloud projects describe "$PROJECT_ID" --format='value(projectNumber)')
+        URL="https://${_SERVICE}-web-$${NUM}.${_REGION}.run.app"
+        printf %s "$$URL" | gcloud secrets versions add control-panel-url \
+          --data-file=- --project "$PROJECT_ID"
+        echo "control-panel-url = $$URL"
+
+  # ── Is it actually answering? ────────────────────────────────────────────
+  # A green deploy means Cloud Run accepted the revision. It does not
+  # mean the process started.
+  - id: smoke
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: bash
+    # ALL FIVE SERVICES, and the same script the internal pipelines run.
+    # For each: it is serving the image built from THIS commit, its newest
+    # revision is ready, and it answers over HTTP without a 5xx. Any other
+    # code is an answer -- the web tier redirects an anonymous `/` to
+    # /login (307), which is a healthy process, not a failure. The inline
+    # check this replaces accepted only 200/302/303, so it failed a healthy
+    # deploy after 2.5 minutes of retries.
+    waitFor: ['sync-url', 'deploy-council', 'deploy-git', 'deploy-management', 'deploy-scheduler']
+    args:
+      - scripts/smoke.sh
+      - ${_REGION}
+      - $COMMIT_SHA
+      - ${_SERVICE}-web
+      - ${_SERVICE}-council
+      - ${_SERVICE}-git
+      - ${_SERVICE}-management
+      - ${_SERVICE}-scheduler
+
+  # ── Prune old Cloud Run revisions ────────────────────────────────────────
+  # Every build adds a revision to each of the four services and nothing
+  # removes them, so they accumulate without limit. This keeps whatever is
+  # SERVING and deletes what is older. It runs only after `smoke` has seen
+  # the new revision answer -- never prune toward a revision that does not
+  # serve. A service that does not exist yet is skipped, not failed.
+  - id: prune-revisions
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: bash
+    waitFor: ['smoke']
+    args:
+      - scripts/prune-revisions.sh
+      - ${_REGION}
+      - ${_SERVICE}-web
+      - ${_SERVICE}-council
+      - ${_SERVICE}-git
+      - ${_SERVICE}-management
+      - ${_SERVICE}-scheduler
+
+  # ── The execution plane ──────────────────────────────────────────────────
+  # THE BUILD DOES NOT CREATE GKE. The cluster, its node pools, its
+  # identities, the pod's database login and the sqlproxy key are all
+  # terraform's, applied before any build. This step only does what
+  # changes with every build or needs cluster credentials: the
+  # namespace and its service accounts, the database grants, and the
+  # conductor, verifier and egress proxy at this build's image.
+  #
+  # No cluster means terraform has not been applied. Every executor runs
+  # on that cluster, so the build FAILS here and says so, rather than
+  # deploying a control plane with nowhere to run work.
+  #
+  # Deliberately NOT a reimplementation of execution-plane.sh in YAML.
+  # Two copies of a provisioning sequence is how the two come to
+  # disagree, and the script is the one a person can also run by hand
+  # when they are debugging.
+  - id: execution-plane
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: bash
+    waitFor: ['smoke', 'push-sandbox']
+    args:
+      - -c
+      - |
+        set -euo pipefail
+        if ! gcloud container clusters describe "${_SERVICE}" --region "${_REGION}" \
+               --project "$PROJECT_ID" >/dev/null 2>&1; then
+          echo "ERROR: no cluster '${_SERVICE}' in ${_REGION}." >&2
+          echo "       Every executor runs on it, and terraform creates it:" >&2
+          echo "       run \`terraform apply\` (deploy/05), then build again." >&2
+          exit 1
+        fi
+        apt-get install -y google-cloud-cli-gke-gcloud-auth-plugin >/dev/null 2>&1 || true
+        export PROJECT="$PROJECT_ID" REGION="${_REGION}" NAME_PREFIX="${_SERVICE}"
+        export SANDBOX_BASE_IMAGE="${_REGION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPO}/sandbox-base:$COMMIT_SHA"
+        # The conductor, verifier and egress proxy run the SAME image as the
+        # control plane, at this build -- as the internal pipelines pass it.
+        export IMAGE="gcr.io/$PROJECT_ID/${_SERVICE}:$COMMIT_SHA"
+        bash ./execution-plane.sh
+
+  # ── And ask whether all of it is actually there ──────────────────────────
+  # The last word belongs to the checker, not to a green tick. It
+  # treats "could not determine" as a failure, which is the whole
+  # reason it exists.
+  - id: preflight
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: bash
+    waitFor: ['execution-plane']
+    args:
+      - -c
+      - |
+        set -euo pipefail
+        apt-get install -y google-cloud-cli-gke-gcloud-auth-plugin >/dev/null 2>&1 || true
+        export PROJECT="$PROJECT_ID" REGION="${_REGION}" NAME_PREFIX="${_SERVICE}"
+        bash ./preflight.sh
 
 images:
   - "gcr.io/$PROJECT_ID/${_SERVICE}:$COMMIT_SHA"

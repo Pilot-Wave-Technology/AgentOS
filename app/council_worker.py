@@ -29,20 +29,24 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-# Configure logging BEFORE importing app modules so their INFO logs (DB pool,
-# dispatcher, LISTEN) reach Cloud Run stdout — mirrors app/main.py. Without this
-# the app loggers sit at WARNING and the worker runs silently.
-logging.basicConfig(
-    stream=sys.stdout,
-    level=logging.INFO,
-    format="%(levelname)s %(name)s: %(message)s",
-)
+from kernel.obs import configure
+
+# Configure logging BEFORE importing app modules so their INFO logs (DB
+# pool, dispatcher, LISTEN) reach stdout. Without this the app loggers
+# sit at WARNING and the worker runs silently.
+#
+# THIS SERVICE EMITTED PLAIN TEXT, which is the whole reason an ERROR
+# here could not be filtered for: Cloud Logging reads severity from a
+# JSON field and lands every unstructured line as DEFAULT. Same
+# configuration as every other entrypoint now, and the ids come with it.
+configure(component="council-worker")
 
 from app.config import get_settings
 from app.database import init_db, close_db
 from app.services.council.dispatcher import council_dispatcher
 from app.services.council.scheduler import council_scheduler
 from app.services.goal_summary.scheduler import goal_summary_scheduler
+from kernel.obs import configure
 
 _log = logging.getLogger("app.council_worker")
 

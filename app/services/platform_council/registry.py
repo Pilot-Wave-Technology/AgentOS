@@ -172,7 +172,7 @@ async def set_verdict(
             op_type = "change_template_model"
             if not op_params:
                 role = (frow["target_role"] or "").strip().upper()
-                tmpl = {"GO": "go", "SHCA": "default-shca"}.get(role, "")
+                tmpl = {"GO": "go-v2", "SHCA": "kernel-assistant"}.get(role, "")
                 fp = (frow["fingerprint"] or "").split(":")
                 model_guess = fp[1] if len(fp) >= 2 and fp[0] == "model" else ""
                 op_params = {k: v for k, v in (("template_id", tmpl), ("model", model_guess)) if v}

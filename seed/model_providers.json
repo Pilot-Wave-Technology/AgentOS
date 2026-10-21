@@ -1,0 +1,32 @@
+[
+  {
+    "id": "anthropic",
+    "label": "Anthropic",
+    "kind": "native",
+    "base_url": "https://api.anthropic.com/v1",
+    "api_key_source": "ANTHROPIC_API_KEY",
+    "api_type": "anthropic-messages",
+    "runtime_status": "provisioned",
+    "status": "active"
+  },
+  {
+    "id": "claude-cli",
+    "label": "Claude CLI",
+    "kind": "native",
+    "base_url": null,
+    "api_key_source": null,
+    "api_type": "cli",
+    "runtime_status": "provisioned",
+    "status": "active"
+  },
+  {
+    "id": "google",
+    "label": "Google",
+    "kind": "native",
+    "base_url": "https://generativelanguage.googleapis.com/v1beta",
+    "api_key_source": "GEMINI_API_KEY",
+    "api_type": "google-generative-ai",
+    "runtime_status": "provisioned",
+    "status": "active"
+  }
+]

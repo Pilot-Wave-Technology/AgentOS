@@ -33,9 +33,20 @@
     ]
   },
   {
+    "id": "log-worker",
+    "name": "Log Worker (test)",
+    "description": "Test profile",
+    "status": "active",
+    "tools": [
+      "agents_list",
+      "message",
+      "today_quote"
+    ]
+  },
+  {
     "id": "shca-coordinator",
-    "name": "SHCA Coordinator",
-    "description": "Toolset for the assistant: memory, messaging, task awareness, session management, and story visibility.",
+    "name": "Assistant Coordinator",
+    "description": "Toolset for the assistant: memory, messaging, task awareness, session management, and story visibility",
     "status": "active",
     "tools": [
       "agents_list",
@@ -70,28 +81,12 @@
     "status": "active",
     "tools": [
       "agents_list",
-      "cancel_story",
-      "create_branch",
-      "create_story",
-      "critical_path",
       "edit",
-      "grant_resource",
-      "list_allocations",
-      "list_decisions",
       "memory_get",
       "memory_search",
       "message",
-      "message_go",
       "read",
-      "record_decision",
-      "register_resource",
-      "reply_assistant",
-      "revoke_resource",
       "sessions_list",
-      "story_detail",
-      "story_list",
-      "story_update",
-      "update_story",
       "web_fetch",
       "web_search",
       "write"

@@ -117,6 +117,11 @@ async def _recover_stalled_subtasks(pool) -> None:
                SELECT 1 FROM goals g
                 WHERE g.id = t.goal_id AND g.status = 'active'
            )
+           -- NEVER reap LOCAL stories: a local phase runs in the human's Claude Code turn
+           -- (which has no 30-min cap), and its session id is stored as '' so the
+           -- session-dead heuristic below would wrongly hard-fail a LIVE task and cascade
+           -- the DAG. Local stall recovery is human-driven (extension Retry/Replan, C6).
+           AND s.execution_mode IS DISTINCT FROM 'local'
         """,
     )
     for r in rows:

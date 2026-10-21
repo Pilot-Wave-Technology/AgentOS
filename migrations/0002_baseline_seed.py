@@ -169,6 +169,36 @@ async def up(conn) -> None:
                 a["id"], a["type"], a.get("uid"), a.get("agent_id"), a["display_name"],
             )
 
+    # 7b. kernel.run_state_machine — the run state machine itself ------------
+    #
+    # THE EXECUTION PLANE READS NOTHING WITHOUT THIS. Eight-plus queries in
+    # the conductor and the assistant do
+    # `JOIN run_state_machine m ON m.version = e.machine_version`, and an
+    # INNER JOIN with no row returns ZERO ROWS rather than failing — so an
+    # install missing these reports no executions, no parks and no
+    # transitions, and looks idle rather than broken.
+    #
+    # Internally the rows come from `kernel_single_database.sql`; the OSS
+    # branch replaces `migrations/**` with this baseline, so they arrive
+    # here or not at all.
+    #
+    # The jsonb columns are written as TEXT by the extractor (asyncpg hands
+    # them back as JSON strings), so they are cast back on the way in
+    # rather than re-parsed in Python.
+    mf = SEED / "run_state_machine.json"
+    if mf.exists():
+        for m in json.loads(_read(mf)):
+            await conn.execute(
+                """INSERT INTO kernel.run_state_machine
+                     (version, states, transitions, park_states,
+                      terminal_states, is_fixture)
+                   VALUES ($1,$2::jsonb,$3::jsonb,$4::jsonb,$5::jsonb,$6)
+                   ON CONFLICT (version) DO NOTHING""",
+                m["version"], m["states"], m["transitions"],
+                m["park_states"], m["terminal_states"],
+                bool(m.get("is_fixture", False)),
+            )
+
     # 8. claude-code phase registry --------------------------------------------
     cpdir = SEED / "claude_phases"
     if cpdir.exists():
@@ -184,17 +214,71 @@ async def up(conn) -> None:
                 meta.get("model", ""), meta.get("status", "active"),
             )
 
+    # 8b. THE MODEL REGISTRY -----------------------------------------------
+    #
+    # WITHOUT THIS A FRESH INSTALL HAS NO MODELS AT ALL. The `models`
+    # and `model_providers` tables were filled by the Phase A3
+    # migrations, which the squashed baseline replaces -- and
+    # `0001_baseline_schema.sql` is schema-only. Nothing else fills
+    # them: `llm_models_bootstrap` READS the table and checks it
+    # against the on-disk list, and the startup sync pushes the
+    # catalogue TO the gateway. So every dropdown came up empty and
+    # the goal-creation picker had no bases to choose from.
+    #
+    # Providers first: `models.provider_id` references them.
+    pf = SEED / "model_providers.json"
+    if pf.exists():
+        for p in json.loads(_read(pf)):
+            await conn.execute(
+                """INSERT INTO model_providers
+                     (id, label, kind, base_url, api_key_source, api_type,
+                      runtime_status, status)
+                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+                   ON CONFLICT (id) DO NOTHING""",
+                p["id"], p["label"], p["kind"], p.get("base_url"),
+                p.get("api_key_source"), p.get("api_type"),
+                p.get("runtime_status", "provisioned"),
+                p.get("status", "active"),
+            )
+
+    # `wire_id` is GENERATED ALWAYS and cannot be supplied.
+    mf = SEED / "models.json"
+    if mf.exists():
+        for m in json.loads(_read(mf)):
+            await conn.execute(
+                """INSERT INTO models
+                     (id, provider_id, model_name, label, tier,
+                      context_window, max_output_tokens, gateway_params,
+                      status, provider_shorthand, available_context_windows)
+                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,$10,$11)
+                   ON CONFLICT (id) DO NOTHING""",
+                m["id"], m["provider_id"], m["model_name"], m["label"],
+                m["tier"], m["context_window"], m.get("max_output_tokens"),
+                m.get("gateway_params") or "{}", m.get("status", "active"),
+                m.get("provider_shorthand"),
+                m.get("available_context_windows") or [],
+            )
+
     # 9. model pricing ---------------------------------------------------------
     mp = SEED / "model_pricing.json"
     if mp.exists():
         for r in json.loads(_read(mp)):
+            # effective_from IS DATA. Each row prices the calls made from its
+            # date on; omitted, it defaults to now() and a future price change
+            # applies from install. model_id links the price to a registry row
+            # for the admin coverage view -- only when that model is seeded,
+            # since prices outlive the models they priced.
             await conn.execute(
                 """INSERT INTO model_pricing
-                     (provider, model, provider_label, notes, input_rate, output_rate,
-                      cache_read_rate, cache_write_rate, thinking_rate)
-                   VALUES ($1,$2,$3,$4,$5::numeric,$6::numeric,$7::numeric,$8::numeric,$9::numeric)
+                     (provider, model, model_id, effective_from, provider_label, notes,
+                      input_rate, output_rate, cache_read_rate, cache_write_rate,
+                      thinking_rate)
+                   VALUES ($1, $2, (SELECT id FROM models WHERE id = $3),
+                           $4::text::timestamptz, $5, $6, $7::numeric, $8::numeric,
+                           $9::numeric, $10::numeric, $11::numeric)
                    ON CONFLICT DO NOTHING""",
-                r["provider"], r["model"], r.get("provider_label"), r.get("notes"),
+                r["provider"], r["model"], r.get("model_id"), r["effective_from"],
+                r.get("provider_label"), r.get("notes"),
                 r["input_rate"], r["output_rate"], r["cache_read_rate"],
                 r["cache_write_rate"], r.get("thinking_rate"),
             )

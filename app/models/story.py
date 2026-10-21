@@ -48,6 +48,15 @@ STORY_WEIGHT_EFFORT_LABELS: dict[int, str] = {
 }
 
 
+# MOVED TO `kernel/story_kinds.py`, RE-EXPORTED HERE. The acceptance
+# seam in `kernel/harness/park_resolve.py` needs this predicate to decide
+# whether a finished run owes a review, and the kernel may not import
+# from `app/`. Re-exporting rather than duplicating is the whole point:
+# the docstring records what happened the last time two callers tested
+# different conditions. Every existing import of this name still works.
+from kernel.story_kinds import is_engine_git_story  # noqa: E402,F401
+
+
 def story_weight_effort_label(story_weight: Optional[int]) -> str:
     """Human-friendly time estimate for a story_weight value, or a
     placeholder if the story hasn't been sized yet."""

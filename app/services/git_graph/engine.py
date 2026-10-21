@@ -216,6 +216,8 @@ class GitGraphController:
         from app.services.git_graph.lease import promote_pending, sweep_zombie_active
         from app.services.git_graph.grind import run_grind_pass
         from app.services.git_graph.reconcile import reconcile
+        from app.services.git_graph.branch_cleanup_state import (
+            retry_pending as retry_branch_cleanup)
 
         # EVERY tick: reclaim 'active' lease slots held by terminal nodes. A crash —
         # or a torn write before _finalize_merged/_cancel_node committed — can strand an
@@ -267,14 +269,24 @@ class GitGraphController:
         async with get_pool().acquire() as conn:
             promoted = await promote_pending(conn)   # fill freed/empty slots from the FIFO head
         grind = await run_grind_pass()     # drive active holders: sync / open PR / spawn diff
+        # F1 — RETRY THE BRANCH DELETIONS THAT FAILED. Cleanup runs once,
+        # at the moment a node merges or an errand is accepted, and a
+        # transient 502 there used to be final: the branch stayed, the
+        # node stayed at READY, and nothing could tell that row from a
+        # successful one. Now it can, so this re-asks. Bounded by tries,
+        # so a branch that genuinely cannot be deleted stops being swept
+        # and starts being a row in `exhausted()`.
+        cleanup = await retry_branch_cleanup(get_pool())
         if (reaped or res["created"] or res["resumed"] or adv["to_in_progress"] or adv["to_ready"]
                 or reconciled or demoted
                 or enq or det["finalized"] or det["cancelled"] or det["trunk_advanced"]
                 or promoted or grind["synced"] or grind["diffs_spawned"]
-                or grind["fixes_spawned"] or grind["prs_opened"] or grind["noop_merged"]):
+                or grind["fixes_spawned"] or grind["prs_opened"] or grind["noop_merged"]
+                or cleanup["attempted"]):
             log.info("git-engine: reaped=%s create=%s lifecycle=%s reconciled=%d demoted=%d "
-                     "enqueued=%s detect=%s promoted=%s grind=%s",
-                     reaped, res, adv, reconciled, demoted, enq, det, promoted, grind)
+                     "enqueued=%s detect=%s promoted=%s grind=%s cleanup=%s",
+                     reaped, res, adv, reconciled, demoted, enq, det, promoted, grind,
+                     cleanup)
 
 
 git_graph_controller = GitGraphController()

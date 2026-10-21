@@ -6,6 +6,7 @@ using Bearer token auth (same as existing agent callback endpoints).
 import json
 from fastapi import Depends as _sec_Depends
 from app.internal_auth import ownership_guard as _ownership_guard
+import asyncio
 import logging
 import uuid
 
@@ -48,6 +49,27 @@ async def resource_summary(goal_id: str, resource_id: str, request: Request):
         if not resource:
             return JSONResponse({"error": "Resource not found"}, status_code=404)
 
+        # WHY, NOT JUST "NO". A repo row in a goal that works on
+        # declared trunk lanes has no summary BY DESIGN -- the lanes
+        # carry them -- and "use resource_scan to generate one" sends
+        # the caller round a loop whose scan is a deliberate no-op.
+        from app.services.resource_scanner import declared_trunks
+
+        lanes = []
+        if (resource["kind"] or "") == "repo":
+            lanes = await declared_trunks(goal_id, resource["repo_name"] or "",
+                                          resource["repo_owner"] or "")
+        if lanes:
+            named = ", ".join(sorted(lanes))
+            return JSONResponse({
+                "resource_name": resource["name"],
+                "resource_kind": resource["kind"],
+                "summary": (f"A repo row carries no summary. This goal works "
+                            f"on {named} — each is its own resource with its "
+                            f"own summary. Ask about the branch you mean."),
+                "trunk_lanes": sorted(lanes),
+                "is_stale": False,
+            })
         return JSONResponse({
             "resource_name": resource["name"],
             "resource_kind": resource["kind"],
@@ -62,19 +84,70 @@ async def resource_summary(goal_id: str, resource_id: str, request: Request):
 
 @router.post("/{goal_id}/resources/{resource_id}/scan")
 async def resource_scan(goal_id: str, resource_id: str, request: Request):
-    """Trigger a fresh scan of a resource. Slow — fetches from GitHub/GCS + LLM."""
+    """Start a fresh scan. Returns as soon as it is started, not done.
+
+    IT USED TO AWAIT, and its own docstring said "Slow — fetches from
+    GitHub/GCS + LLM": a repository fetch, a gitingest pass and a Gemini
+    summary, held open as one HTTP request. Whatever asked for the scan
+    waited for all of it, and a caller with a timeout shorter than a
+    large repository got an error for work that was proceeding fine.
+
+    A scan produces a SUMMARY ROW, not a response. `resource_brief`
+    reads that row and `summary_stale` says whether it is current, so
+    there is already a way to find out the answer -- waiting on this
+    call was never how you learned it.
+    """
     _verify_auth(request)
     goal_id = await resolve_goal_id(goal_id)
 
-    try:
-        result = await scan_resource(goal_id, resource_id)
-        return JSONResponse(result)
-    except ValueError as exc:
-        status = 404 if "not found" in str(exc).lower() else 400
-        return JSONResponse({"error": str(exc)}, status_code=status)
-    except Exception as exc:
-        _log.error("Resource scan failed: %s/%s: %s", goal_id, resource_id, exc)
-        return JSONResponse({"error": str(exc)}, status_code=500)
+    # REFUSE A RESOURCE THAT IS NOT THERE, BEFORE SCHEDULING. Otherwise
+    # every mistyped id returns "started" and the failure only exists in
+    # a log line nobody is reading.
+    from app.database import get_pool
+    exists = await get_pool().fetchval(
+        "SELECT 1 FROM goal_resources WHERE id = $1 AND goal_id = $2",
+        resource_id, goal_id)
+    if not exists:
+        return JSONResponse({"error": f"no resource {resource_id} in this "
+                                      f"goal"}, status_code=404)
+
+    async def _run():
+        try:
+            await scan_resource(goal_id, resource_id)
+        except Exception as exc:                            # noqa: BLE001
+            _log.error("Resource scan failed: %s/%s: %s",
+                       goal_id, resource_id, exc)
+
+    # THE REFUSAL HAS TO REACH THE CALLER, and a fire-and-forget task
+    # cannot carry one: `scan_resource` returns `{"skipped": ...}` for a
+    # repo row whose goal works on lanes, and that answer would be
+    # written to a log after this function had already replied "being
+    # rebuilt". The caller reads again, finds nothing, scans again.
+    #
+    # One indexed query, taken before scheduling, is what makes a
+    # deliberate no-op say so.
+    from app.services.resource_scanner import declared_trunks
+
+    row = await get_pool().fetchrow(
+        "SELECT kind, repo_name, repo_owner FROM goal_resources "
+        "WHERE id = $1", resource_id)
+    if row is not None and (row["kind"] or "") == "repo":
+        lanes = await declared_trunks(goal_id, row["repo_name"] or "",
+                                      row["repo_owner"] or "")
+        if lanes:
+            return JSONResponse(
+                {"skipped": True, "resource_id": resource_id,
+                 "trunk_lanes": sorted(lanes),
+                 "detail": ("a repo row is not summarised in a goal that "
+                            "works on declared trunk branches; scan the "
+                            "lane you mean")})
+
+    asyncio.create_task(_run())
+    return JSONResponse({"scheduled": True, "resource_id": resource_id,
+                         "detail": "the summary is being rebuilt; read it "
+                                   "with resource_brief, which reports "
+                                   "whether it is stale"},
+                        status_code=202)
 
 
 # ── Resource Read (read specific file from repo) ────────────────────────────
@@ -82,9 +155,12 @@ async def resource_scan(goal_id: str, resource_id: str, request: Request):
 @router.get("/{goal_id}/resources/{resource_id}/read")
 async def resource_read(
     goal_id: str, resource_id: str, request: Request,
-    path: str = "", lines: int = 500,
+    path: str = "", lines: int = 1500, offset: int = 0,
 ):
-    """Read a file: from repo via GitHub API, or uploaded document from GCS."""
+    """Read a file: from repo via the GitHub raw endpoint, or an uploaded
+    document from GCS. Returns a line window [offset : offset+lines]; large
+    files/documents are paged via `offset` (the response carries `next_offset`)
+    rather than erroring or being cut at a fixed line."""
     _verify_auth(request)
 
     goal_id = await resolve_goal_id(goal_id)
@@ -99,7 +175,9 @@ async def resource_read(
     # For uploaded documents — return extracted text from GCS
     if resource["kind"] in ("document", "file") and resource.get("gcs_uri"):
         try:
-            from app.services.resource_scanner import _download_from_gcs, _extract_pdf, _extract_excel, _extract_word
+            from app.services.resource_scanner import (
+                _download_from_gcs, _extract_pdf, _extract_excel, _extract_word, window_lines,
+            )
             data = await _download_from_gcs(resource["gcs_uri"])
             if not data:
                 return JSONResponse({"error": "Failed to download file from storage"}, status_code=500)
@@ -119,19 +197,13 @@ async def resource_read(
             else:
                 return JSONResponse({"error": f"Cannot read file type: {file_type}"}, status_code=400)
 
-            # Trim to line limit
-            content_lines = content.split("\n")
-            truncated = len(content_lines) > lines
-            if truncated:
-                content = "\n".join(content_lines[:lines]) + f"\n\n... truncated ({len(content_lines)} total lines)"
-
+            # Window to the requested line range (offset paging for big docs).
+            win = window_lines(content, offset, lines)
             return JSONResponse({
                 "path": resource["name"],
-                "content": content,
                 "size": resource.get("file_size_bytes", len(data)),
-                "truncated": truncated,
-                "total_lines": len(content_lines),
                 "file_type": file_type,
+                **win,
             })
         except Exception as exc:
             return JSONResponse({"error": f"Failed to read document: {exc}"}, status_code=500)
@@ -163,7 +235,8 @@ async def resource_read(
     github_token = await _get_github_token(goal_id)
 
     result = await read_repo_file(
-        repo_owner, repo_name, path, branch, github_token, max_lines=lines,
+        repo_owner, repo_name, path, branch, github_token,
+        max_lines=lines, offset=offset,
     )
 
     return JSONResponse(result)

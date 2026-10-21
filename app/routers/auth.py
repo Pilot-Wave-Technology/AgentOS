@@ -7,6 +7,7 @@ from fastapi import APIRouter, Request, Response, Form
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
+from app import local_dev
 from app.auth import verify_firebase_token, SYSTEM_ACTOR_ID
 from app.config import get_settings
 from app.database import get_pool
@@ -22,14 +23,29 @@ templates = Jinja2Templates(directory="app/templates")
 SIGNUP_RESUBMIT_COOLDOWN = timedelta(hours=1)
 
 
+def _is_loopback_redirect(url: str) -> bool:
+    """Only echo a sign-in code back to a local loopback (the VS Code extension's
+    ephemeral listener) — never an arbitrary URL, so the code can't be exfiltrated."""
+    return url.startswith("http://127.0.0.1:") or url.startswith("http://localhost:")
+
+
 @router.get("/login", response_class=HTMLResponse)
-async def login_page(request: Request):
+async def login_page(request: Request, ext_redirect: str = ""):
+    # ext_redirect (loopback only): after sign-in, hand a one-time code to the
+    # VS Code extension's loopback listener instead of setting the browser session.
+    is_loopback = _is_loopback_redirect(ext_redirect) if ext_redirect else False
+    if ext_redirect:
+        _log.info(
+            "login_page: ext_redirect=%s accepted=%s", ext_redirect, is_loopback,
+        )
     return templates.TemplateResponse(
         "login.html",
         {
             "request": request,
             "firebase_api_key": get_settings().firebase_web_api_key,
             "firebase_project_id": get_settings().firebase_project_id,
+            "firebase_auth_emulator_host": local_dev.firebase_auth_emulator_host(),
+            "ext_redirect": ext_redirect if _is_loopback_redirect(ext_redirect) else "",
         },
     )
 
@@ -38,6 +54,7 @@ async def login_page(request: Request):
 async def create_session(
     response: Response,
     id_token: str = Form(...),
+    ext_redirect: str = Form(""),
 ):
     """
     Called by the login/signup page JS after Firebase sign-in succeeds.
@@ -47,7 +64,30 @@ async def create_session(
     max_age is 7 days — the cookie is just a container. The token inside
     is refreshed by the client-side refresh loop in base.html every
     50 minutes (Firebase ID tokens expire after 60 min).
+
+    Local Execution Mode (option B, §6): when ext_redirect is a loopback URL, this
+    is the VS Code extension sign-in — verify the Firebase token, issue a one-time
+    code, and hand it to the extension's loopback listener instead of setting a
+    browser cookie. The extension exchanges the code for short-lived tokens.
     """
+    if ext_redirect and _is_loopback_redirect(ext_redirect):
+        _log.info("create_session: extension sign-in attempt ext_redirect=%s", ext_redirect)
+        try:
+            claims = verify_firebase_token(id_token)
+        except Exception as exc:
+            _log.warning(
+                "create_session: extension sign-in aborted — token verification "
+                "failed ext_redirect=%s error=%s", ext_redirect, exc,
+            )
+            return RedirectResponse(url="/login", status_code=303)
+        from app.services.ext_auth import issue_code  # noqa: PLC0415
+        code = await issue_code(claims["uid"])
+        _log.info(
+            "create_session: extension sign-in succeeded uid=%s ext_redirect=%s",
+            claims["uid"], ext_redirect,
+        )
+        sep = "&" if "?" in ext_redirect else "?"
+        return RedirectResponse(url=f"{ext_redirect}{sep}code={code}", status_code=303)
     response = RedirectResponse(url="/goals", status_code=303)
     response.set_cookie(
         key="firebase_token",
@@ -107,6 +147,7 @@ async def signup_page(request: Request):
             "request": request,
             "firebase_api_key": get_settings().firebase_web_api_key,
             "firebase_project_id": get_settings().firebase_project_id,
+            "firebase_auth_emulator_host": local_dev.firebase_auth_emulator_host(),
         },
     )
 

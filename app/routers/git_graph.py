@@ -262,11 +262,14 @@ async def git_ui_retry(
                 node_id)
             # If the escalation rejected the merge story (human PR-close), reactivate it
             # so enqueue_ready_merges re-enqueues the node once it reaches READY again.
-            await conn.execute(
-                "UPDATE stories SET state = 'proposed', updated_at = now() "
-                "WHERE story_kind = 'merge' AND state = 'rejected' AND merge_group_id IN ("
-                "  SELECT merge_group_id FROM git_merge_group_nodes WHERE git_node_id = $1)",
-                node_id)
+            from app.services.story_state_ledger import record_states_where
+            await record_states_where(
+                conn, "proposed",
+                where=("story_kind = 'merge' AND state = 'rejected' "
+                       "AND merge_group_id IN (SELECT merge_group_id FROM "
+                       "git_merge_group_nodes WHERE git_node_id = $1)"),
+                params=(node_id,), actor_uid=user["uid"],
+                action="merge_retry_requeued")
         _log.info("git retry: node %s re-queued (PLANNED) by %s", node_id, user["uid"])
         await notify_git_dispatch(pid)
     state = await _git_state(pid)
@@ -445,7 +448,13 @@ async def cancel_merge_lane(
     # cancel the group's engine diff/fix stories so their assistant integration tasks
     # don't keep running on a torn-down branch (the orphaned 'Integrate dev …' stories).
     # One transaction so a crash can't leave a torn abandon state.
-    from app.services.git_graph.merge_lane import cancel_engine_stories_for_group
+    from app.services.git_graph.merge_lane import (
+        cancel_engine_stories_for_node,
+        fan_out_cancel_notices,
+        notify_merge_group_node_cancelled,
+        reject_merge_story_if_last_live_node,
+    )
+    _pending_notices: list[tuple[str, str]] = []
     async with pool.acquire() as conn, conn.transaction():
         await conn.execute(
             "UPDATE git_nodes SET state = 'ABANDONED', last_error = $2, updated_at = now() "
@@ -453,16 +462,26 @@ async def cancel_merge_lane(
             node_id, f"merge cancelled by {user['uid']}"[:500])
         await conn.execute(
             "UPDATE git_merge_queue SET status = 'parked' WHERE node_id = $1", node_id)
-        await conn.execute(
-            "UPDATE stories SET state = 'rejected', updated_at = now() "
-            "WHERE story_kind = 'merge' AND state NOT IN ('done', 'rejected', 'cancelled') "
-            "  AND merge_group_id IN (SELECT merge_group_id FROM git_merge_group_nodes "
-            "                         WHERE git_node_id = $1)",
-            node_id)
+        # Reject the merge story only if this was the group's last live node — on a
+        # multi-repo story the healthy sibling repos must stay landable. When they
+        # survive, tell the operator instead: the merge story stays open and would
+        # otherwise never complete, with nothing on screen explaining why.
+        _rejected = await reject_merge_story_if_last_live_node(
+            conn, node_id, f"merge cancelled by {user['uid']}",
+        )
+        if not _rejected:
+            _pending_notices = await notify_merge_group_node_cancelled(
+                conn, node_id, f"merge cancelled by {user['uid']}",
+            )
+        # Node-scoped (M2.4): the operator cancelled THIS lane. A sibling repo sharing
+        # the merge group is untouched and its diff/fix story must keep running.
         for g in await conn.fetch(
             "SELECT merge_group_id FROM git_merge_group_nodes WHERE git_node_id = $1", node_id
         ):
-            await cancel_engine_stories_for_group(conn, g["merge_group_id"])
+            await cancel_engine_stories_for_node(conn, node_id, g["merge_group_id"])
+    # After COMMIT — notify_new_message takes its own pool connection, so firing it
+    # inside the transaction would announce a message that a rollback then removed.
+    await fan_out_cancel_notices(_pending_notices)
     await notify_git_dispatch(node["goal_id"])
     _log.info("git cancel: node %s (lane %s) cancelled by %s", node_id,
               node["branch_name"], user["uid"])

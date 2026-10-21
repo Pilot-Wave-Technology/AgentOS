@@ -11,7 +11,16 @@
     <p class="text-sm text-gray-500 mt-0.5">{{ goal.name }}</p>
   </div>
 
-  {% set can_manage = (role == 'admin') %}
+  {# `role` is a plain string -- GoalRole.GOAL_ADMIN is "admin", and the
+     dotted "goal.manager" in GOAL_ROLE_LABELS is a DISPLAY label, never a
+     stored value. Compare against the stored one.
+
+     A PLATFORM ADMIN COUNTS TOO, matching the route handlers: both
+     `change_go_model` and `change_kernel_models` accept goal admin OR
+     platform admin, and a page that hides a control the API would have
+     allowed is the same bug in the other direction. #}
+  {% set can_manage = (role == 'admin'
+                       or user.system_role == 'admin') %}
 
   <!-- Goal Orchestrator Model -->
   <section class="card p-6">
@@ -50,6 +59,119 @@
     </form>
     {% else %}
     <p class="text-2xs text-gray-600 mt-3">Only a goal manager can change the model.</p>
+    {% endif %}
+  </section>
+
+  <!-- Executor and verifier run in the KERNEL, not on the gateway, so
+       their menu is kernel.harness.models.registry.SUPPORTED and not the
+       `models` table the GO picker above reads. Offering the gateway's
+       list would let somebody choose a model the kernel cannot serve. -->
+  <section class="card p-4 mt-4">
+    <h2 class="text-sm font-semibold text-gray-200 mb-1">Executor and Verifier Models</h2>
+    <p class="text-2xs text-gray-500">
+      The <strong>executor</strong> does the work; the <strong>verifier</strong>
+      judges it. Leaving either blank uses the deployment default.
+      A story can override the executor for itself.
+    </p>
+    <p class="text-2xs text-gray-600 mt-1">
+      They are usually worth setting differently: a model that judges its
+      own work makes a verdict harder to trust.
+    </p>
+
+    {# WAS `role.value == 'goal_admin'`, which rendered this form for
+       NOBODY. `role` is a string, so `.value` is Undefined and therefore
+       falsy, and 'goal_admin' is not a value this codebase has ever
+       stored -- GoalRole.GOAL_ADMIN is "admin". Two independent errors in
+       one condition, each enough on its own.
+
+       So the executor model, the verifier model and the machine size were
+       unreachable in the UI for every user, including a platform admin
+       who created the goal. The route behind it was reachable and correct;
+       nothing ever got that far. The GO-model block ten lines above used
+       `can_manage` and worked, which is why the page looked fine. #}
+    {% if can_manage %}
+    <form action="/goals/{{ pid }}/settings/kernel-models" method="post"
+          class="space-y-3 mt-3"
+          data-toast-submit data-fail="Failed to save models.">
+      {% for field, current, title in [
+           ('executor_model', executor_model, 'Executor'),
+           ('verifier_model', verifier_model, 'Verifier')] %}
+      <div>
+        <label class="block text-sm text-gray-400 mb-1.5">{{ title }}</label>
+        <select name="{{ field }}" class="input input-sm w-full">
+          <option value="" {% if not current %}selected{% endif %}>
+            Deployment default
+          </option>
+          {% for group in kernel_models %}
+          <optgroup label="{{ group.provider }}">
+            {% for m in group.models %}
+            <option value="{{ m }}" {% if current == m %}selected{% endif %}>{{ m }}</option>
+            {% endfor %}
+          </optgroup>
+          {% endfor %}
+        </select>
+      </div>
+      {% endfor %}
+
+      {# THE MACHINE, and for an ERRAND this is the only place it can
+         come from: an errand's story is created at approval and
+         dispatched immediately, so there is no window to edit it on the
+         story page the way a story has. #}
+      <div>
+        <label class="block text-sm text-gray-400 mb-1.5">Machine</label>
+        <select name="sandbox_size" class="input input-sm w-full">
+          <option value="" {% if not sandbox_size %}selected{% endif %}>
+            Default for the work (small for most)
+          </option>
+          {% for rung, blurb in [
+               ('small',  '2.5 CPU / 9 GiB - fits most work'),
+               ('medium', '6.5 CPU / 23 GiB - a suite that needs it'),
+               ('large',  '14 CPU / 52 GiB - measured need only')] %}
+          <option value="{{ rung }}" {% if sandbox_size == rung %}selected{% endif %}>
+            {{ rung }} — {{ blurb }}
+          </option>
+          {% endfor %}
+        </select>
+        <p class="text-2xs text-gray-600 mt-1">
+          A tier is real money. medium and large keep no warm node, so
+          the first run on one waits for a machine.
+        </p>
+      </div>
+
+      {# THE EXECUTOR'S LEGS. A leg is one executor session: when its
+         context reaches this size it ends and a fresh leg picks up from
+         a brief. Blank keeps the default for the model and the work.
+         Applies to the work, not to the review, which has its own. #}
+      <div class="grid grid-cols-2 gap-3">
+        <div>
+          <label class="block text-sm text-gray-400 mb-1.5">Tokens per leg</label>
+          <input type="number" name="leg_context_tokens" min="20000" max="1000000"
+                 step="1000" value="{{ leg_context_tokens }}"
+                 placeholder="Model default" class="input input-sm w-full">
+        </div>
+        <div>
+          <label class="block text-sm text-gray-400 mb-1.5">Max legs</label>
+          <input type="number" name="max_legs" min="-1" max="200" step="1"
+                 value="{{ max_legs }}" placeholder="12"
+                 class="input input-sm w-full">
+        </div>
+      </div>
+      <p class="text-2xs text-gray-600 -mt-1">
+        Tokens per leg: 20,000 to 1,000,000, capped at what the executor
+        model can hold. Max legs: 1 to 200, or -1 for no limit. Smaller
+        legs need more of them. Takes effect on the next run.
+      </p>
+
+      <div class="flex items-center justify-between pt-2">
+        <span class="text-2xs text-gray-600">
+          A run already dispatched keeps the model and machine it
+          started with.
+        </span>
+        <button type="submit" class="btn btn-primary btn-sm">Save</button>
+      </div>
+    </form>
+    {% else %}
+    <p class="text-2xs text-gray-600 mt-3">Only a goal manager can change these.</p>
     {% endif %}
   </section>
 

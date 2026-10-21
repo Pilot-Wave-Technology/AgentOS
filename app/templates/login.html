@@ -61,6 +61,7 @@
 <!-- Hidden form to POST token to server -->
 <form id="session-form" action="/auth/session" method="post" class="hidden">
   <input type="hidden" name="id_token" id="id_token_input" />
+  <input type="hidden" name="ext_redirect" value="{{ ext_redirect }}" />
 </form>
 
 <script>
@@ -71,6 +72,14 @@
   };
   firebase.initializeApp(firebaseConfig);
   const auth = firebase.auth();
+  {% if firebase_auth_emulator_host %}
+  // LOCAL_SERVER on — route auth to the local Firebase Auth Emulator.
+  auth.useEmulator("http://{{ firebase_auth_emulator_host }}");
+  // The Firebase SDK auto-injects a fixed "Running in emulator mode..." banner
+  // with no public API to disable it; hide it via its documented class name.
+  document.head.insertAdjacentHTML('beforeend',
+    '<style>.firebase-emulator-warning{display:none!important}</style>');
+  {% endif %}
 
   function showError(msg) {
     const el = document.getElementById('error-msg');

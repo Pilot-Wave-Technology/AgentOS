@@ -53,9 +53,31 @@ test_*
 *_test.py
 pytest.ini
 .pytest_cache/
+pytest-report.xml
 coverage.xml
 .coverage
 htmlcov/
+
+# --- Local development and generated trees ----------------------------------
+# Docker does NOT read .gitignore, only this file, and unlike .gitignore a
+# TRAILING SLASH here does not reliably match -- the first version of this
+# block used `.venv/` and friends and excluded nothing at all.
+#
+# Everything below is generated locally and gitignored, so a Cloud Build
+# context (a fresh checkout) never contains it. A build on a developer's
+# machine sends every byte: measured at 2.5GB, several minutes of
+# "transferring context" before the first layer starts. None of it is used
+# at runtime.
+.venv
+graphify-out
+pgdata
+pgdata.log
+infra/e0/artifacts
+local-development/vendor
+local-development/pgdata
+local-development/gateway-data
+local-development/local-gateway-data
+local-development/logs
 
 # ─── Node (if any tooling exists) ─────────────────────────────────────────────
 node_modules/

@@ -5,6 +5,7 @@ Flow:
   2. Exchange it for an installation access token scoped to specific repos
   3. Token expires in 1 hour — no long-lived secrets in agent workspaces
 """
+import asyncio
 import logging
 import time
 from typing import Optional
@@ -67,9 +68,20 @@ def _make_app_jwt() -> str:
 
     pem = _get_private_key()
     now = int(time.time())
+    # 540, NOT 600. GitHub rejects a JWT whose `exp` is more than ten
+    # minutes ahead of ITS clock, and 600 leaves exactly zero margin --
+    # so the token is valid only while the local clock is not running
+    # fast. Four seconds of skew was enough to fail every request with
+    # "'Expiration time' claim ('exp') is too far in the future".
+    #
+    # It never showed on Cloud Run, whose clock is NTP-tight, and that
+    # is the point: a boundary value that depends on the caller's clock
+    # is a bug that only appears somewhere else.
+    #
+    # `iat` is backdated for the same reason in the other direction.
     payload = {
         "iat": now - 60,
-        "exp": now + 600,
+        "exp": now + 540,
         "iss": settings.github_app_id,
     }
     return jwt.encode(payload, pem, algorithm="RS256")
@@ -200,6 +212,87 @@ async def list_repo_branches(repo_full_name: str) -> list[dict]:
         return branches
 
 
+async def verify_commit_pushed(
+    repo_full_name: str, branch: str, sha: str,
+) -> tuple[str, str]:
+    """Is `sha` actually reachable from `branch` on the REMOTE?
+
+    Returns ``(status, detail)`` where status is one of:
+
+      * ``"verified"`` — the commit is on the branch.
+      * ``"missing"``  — the remote answered, and it is not. A definitive negative.
+      * ``"unknown"``  — we could not tell (network, rate limit, auth, unexpected shape).
+
+    The three-way result is deliberate. A caller must be able to distinguish "the push
+    did not happen" from "we could not check", because the safe response differs: the
+    first is a refusal, the second must be recorded as unverified rather than quietly
+    reported as success. Collapsing them into a bool is how a transient outage becomes
+    either a blocked user or a false claim.
+
+    Uses `compare/{branch}...{sha}` rather than comparing the branch HEAD to `sha`. The
+    question is "is this commit ON the branch", not "is it the tip" — anything else
+    pushing to the branch afterwards would make a tip check report a good push as bad.
+    GitHub reports `identical` when they are the same commit and `behind` when `sha` is
+    an ancestor of the branch; both mean the commit landed.
+    """
+    settings = get_settings()
+    if not settings.github_app_installation_id:
+        return "unknown", "github_app_installation_id is not configured"
+    if not (repo_full_name and branch and sha):
+        return "unknown", "repo, branch and sha are all required"
+
+    try:
+        app_jwt = _make_app_jwt()
+        repo_name = repo_full_name.split("/")[-1]
+        async with httpx.AsyncClient() as client:
+            token_resp = await client.post(
+                f"https://api.github.com/app/installations/"
+                f"{settings.github_app_installation_id}/access_tokens",
+                headers={
+                    "Authorization": f"Bearer {app_jwt}",
+                    "Accept": "application/vnd.github+json",
+                    "X-GitHub-Api-Version": "2022-11-28",
+                },
+                json={
+                    "repositories": [repo_name],
+                    "permissions": {"contents": "read", "metadata": "read"},
+                },
+                timeout=15,
+            )
+            if token_resp.status_code != 201:
+                return "unknown", f"token mint failed: HTTP {token_resp.status_code}"
+            token = token_resp.json()["token"]
+
+            resp = await client.get(
+                f"https://api.github.com/repos/{repo_full_name}/compare/{branch}...{sha}",
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Accept": "application/vnd.github+json",
+                    "X-GitHub-Api-Version": "2022-11-28",
+                },
+                timeout=20,
+            )
+            if resp.status_code == 404:
+                # The branch or the commit is not there. Definitive: a push that landed
+                # would have created both.
+                return "missing", "branch or commit not found on the remote"
+            if resp.status_code != 200:
+                return "unknown", f"compare failed: HTTP {resp.status_code}"
+
+            status = (resp.json() or {}).get("status") or ""
+            if status in ("identical", "behind"):
+                return "verified", status
+            if status in ("ahead", "diverged"):
+                return "missing", f"commit is not on the branch (compare status {status!r})"
+            return "unknown", f"unrecognised compare status {status!r}"
+    except Exception as exc:  # noqa: BLE001 — any fault is "could not tell", never "did not happen"
+        _log.warning(
+            "verify_commit_pushed: could not verify %s@%s on %s: %s",
+            sha[:12], branch, repo_full_name, exc,
+        )
+        return "unknown", str(exc)
+
+
 async def generate_installation_token(
     repo_names: list[str],
     permissions: Optional[dict] = None,
@@ -229,16 +322,7 @@ async def generate_installation_token(
     }
 
     async with httpx.AsyncClient() as client:
-        resp = await client.post(
-            f"https://api.github.com/app/installations/{settings.github_app_installation_id}/access_tokens",
-            headers={
-                "Authorization": f"Bearer {app_jwt}",
-                "Accept": "application/vnd.github+json",
-                "X-GitHub-Api-Version": "2022-11-28",
-            },
-            json=body,
-            timeout=15,
-        )
+        resp = await _post_access_token(client, settings, app_jwt, body)
         if resp.status_code != 201:
             _log.error(
                 "GitHub token request failed (%d): %s",
@@ -248,9 +332,83 @@ async def generate_installation_token(
             resp.raise_for_status()
 
         data = resp.json()
+        # WHAT GITHUB GRANTED, not what we asked for. The old line said
+        # only how many repos and when it expires, so when a token came
+        # back WITHOUT the write we requested there was nothing anywhere
+        # that said so -- the caller logged "issued write credential"
+        # (its own request) and the push failed with a 403 three layers
+        # away. Execution 204 cost three rounds of guessing at GitHub App
+        # settings that turned out to be fine; the answer was in this
+        # response object all along and we threw it away.
+        #
+        # The repositories come back with `full_name`, which is the other
+        # half: `body["repositories"]` is sent as bare NAMES, so an
+        # installation spanning two accounts with a same-named repo would
+        # scope somewhere nobody asked for, silently. Logging what came
+        # back is how that becomes visible rather than inferred.
+        granted = data.get("permissions") or {}
+        scoped = [r.get("full_name") or r.get("name")
+                  for r in (data.get("repositories") or [])]
         _log.info(
-            "Generated GitHub token for %d repos, expires %s",
-            len(repo_names),
+            "Generated GitHub token: asked=%s granted=%s repos=%s "
+            "expires %s",
+            permissions, granted, scoped or repo_names,
             data.get("expires_at", "?"),
         )
+        missing = {k: v for k, v in permissions.items()
+                   if granted.get(k) != v}
+        if missing:
+            # LOUD, because every symptom of this is somewhere else. A
+            # narrowed token does not fail here; it fails later, as a
+            # forge refusal, in a container, on a path that reads like
+            # the work being wrong.
+            _log.error(
+                "GitHub NARROWED the token: asked %s, granted %s. The "
+                "installation does not hold %s for these repos. Expect a "
+                "403 from git, not an error here.",
+                permissions, granted, sorted(missing),
+            )
         return data
+
+
+# F5 — A 5xx HERE IS INVISIBLE THREE LAYERS DOWN. A transient 500 on
+# `access_tokens` used to surface as GitHub's `Repository not found` on
+# the clone, which reads as a missing repository rather than an auth
+# failure; a 502 on the same endpoint stranded a branch. Both were
+# transient and neither was retried.
+#
+# Only 5xx and transport errors are retried. A 401/403/404 is an answer
+# — the app is not installed, or not on that repo — and retrying it just
+# delays a correct failure by three seconds.
+_TOKEN_RETRY_STATUSES = (500, 502, 503, 504)
+
+
+async def _post_access_token(client, settings, app_jwt: str, body: dict):
+    """POST to `access_tokens`, retrying only what is worth retrying."""
+    url = (f"https://api.github.com/app/installations/"
+           f"{settings.github_app_installation_id}/access_tokens")
+    headers = {
+        "Authorization": f"Bearer {app_jwt}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    last_error: Exception | None = None
+    for attempt in range(3):
+        if attempt:
+            await asyncio.sleep(2 ** (attempt - 1))
+        try:
+            resp = await client.post(url, headers=headers, json=body,
+                                     timeout=15)
+        except httpx.HTTPError as exc:
+            last_error = exc
+            _log.warning("GitHub token request transport error "
+                         "(attempt %d/3): %s", attempt + 1, exc)
+            continue
+        if resp.status_code not in _TOKEN_RETRY_STATUSES:
+            return resp
+        last_error = None
+        _log.warning("GitHub token request returned %d (attempt %d/3); "
+                     "retrying", resp.status_code, attempt + 1)
+    if last_error is not None:
+        raise last_error
+    return resp

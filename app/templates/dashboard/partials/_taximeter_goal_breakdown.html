@@ -34,7 +34,9 @@
   <thead>
     <tr class="text-2xs text-gray-500 uppercase border-b border-gray-800">
       <th class="text-left py-2 pr-2 font-medium">Goal</th>
-      <th class="text-right py-2 px-2 font-medium" title="This goal's weightage relative to other goals: set by an LLM, evolving as scope grows">Weightage</th>
+      {# NO LONGER "set by an LLM". A goal weighs 1 + the work items
+         finished in it this period, computed from the work itself. #}
+      <th class="text-right py-2 px-2 font-medium" title="One, plus the work items finished in this goal during the period. Computed from the work itself — no model is asked, and a goal that finished nothing still weighs one.">Goal weight</th>
       <th class="text-right py-2 px-2 font-medium">Oversight</th>
       <th class="text-right py-2 px-2 font-medium">Throughput</th>
       <th class="text-right py-2 px-2 font-medium">Efficiency</th>
@@ -45,7 +47,12 @@
     {% for g in breakdown.goals %}
     <tr>
       <td class="py-2 pr-2 text-gray-300">{{ g.goal_name }}</td>
-      <td class="py-2 px-2 text-gray-500 tabular-nums text-right">{{ "%.2f"|format(g.weightage) }}</td>
+      {# `goal_weight`, NOT `weightage`. The header was renamed in S6 while
+         this cell still rendered the retired `goals.weightage` column --
+         the one the Gemini job used to write and nothing sets any more --
+         so it showed 1.00 for every goal under a label claiming it meant
+         something. v1 still sends `weightage`, hence the fallback. #}
+      <td class="py-2 px-2 text-gray-500 tabular-nums text-right">{{ "%.2f"|format(g.goal_weight if g.goal_weight is defined else g.weightage) }}</td>
       <td class="py-2 px-2 text-right">{{ score_pct(g.oversight) }}</td>
       <td class="py-2 px-2 text-right">{{ score_pct(g.throughput) }}</td>
       <td class="py-2 px-2 text-right">{{ score_pct(g.efficiency) }}</td>

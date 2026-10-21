@@ -1,0 +1,12 @@
+{# Response body for the read-only channels' "load earlier" endpoint.
+
+   Replaces the #load-earlier sentinel via hx-swap="outerHTML". Order matters:
+   the next sentinel comes FIRST so it stays at the top of the scroll container,
+   then the older messages ascending beneath it.
+
+   Shared by council_thread, security_thread and orchestrator — the accent and
+   label_mode passed by the router are what distinguish them. #}
+{% if has_older %}{% include "_shared/load_earlier.html" %}{% else %}
+<div class="py-2 text-center text-2xs text-gray-600">Beginning of channel history</div>
+{% endif %}
+{% for msg in messages %}{% include "channels/_message.html" %}{% endfor %}

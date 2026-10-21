@@ -25,6 +25,7 @@ async def enroll_agent_principal(
     tools_deny: list,
     memory_enabled: bool,
     created_by: str,
+    model_id: Optional[str] = None,
     max_tokens: Optional[int] = None,
     notes: str = "",
     synced_config_version: Optional[int] = None,
@@ -37,6 +38,13 @@ async def enroll_agent_principal(
     (e.g. go_agent.py uses ON CONFLICT DO NOTHING on its agents INSERT — if the
     row already existed, actor_id comes back NULL, and the caller guards with
     `if actor_id:` before calling here).
+
+    model_id: the resolved Model Registry FK companion to `model` (see
+    `app.services.model_registry.dropdowns.resolve_model_id`) — optional
+    and defaults to None so existing callers that haven't been updated to
+    resolve it (e.g. go_agent.py) keep working unchanged; `agent_configs`
+    just gets a NULL `model_id` in that case, same as before this column
+    was ever written to.
 
     synced_config_version: pass the version number when the gateway was fully
     configured during this provision (sets last_synced_at = now()); pass None
@@ -51,11 +59,11 @@ async def enroll_agent_principal(
     )
     await conn.execute(
         """INSERT INTO agent_configs
-               (agent_id, config_version, model, type, scope, emoji,
+               (agent_id, config_version, model, model_id, type, scope, emoji,
                 tools_allow, tools_deny, memory_enabled, max_tokens, notes, created_by)
-           VALUES ($1, 1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+           VALUES ($1, 1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
            ON CONFLICT (agent_id, config_version) DO NOTHING""",
-        agent_id, model, agent_type, scope, emoji,
+        agent_id, model, model_id, agent_type, scope, emoji,
         tools_allow, tools_deny, memory_enabled, max_tokens, notes, created_by,
     )
     await conn.execute(

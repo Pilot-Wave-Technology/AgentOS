@@ -108,14 +108,35 @@ async def resource_browser(
         ORDER BY gr.kind, gr.name
     """, pid)
     resources = [dict(r) for r in rows]
-
-    # Build tree (group by parent)
-    root_resources = [r for r in resources if not r.get("parent_id")]
-    children_map = {}
+    # WHICH ROWS HAVE BYTES A PERSON CAN TAKE AWAY. Worked out here and
+    # not in the template, because "downloadable" is two different facts
+    # -- an uploaded document has a `gcs_uri`, and a catalogued artifact
+    # has none and lives in the artifact store under an id derived from
+    # its own -- and a template that had to know both would be a third
+    # place to keep that in step.
     for r in resources:
-        parent = r.get("parent_id")
-        if parent:
-            children_map.setdefault(parent, []).append(r)
+        r["downloadable"] = bool(r.get("gcs_uri")) or             str(r.get("id") or "").startswith("art_")
+
+    # Build tree (group by parent). An orphan -- a row whose parent is not
+    # in this result set -- is RE-ROOTED rather than dropped; see
+    # `resource_tree` for the goal that lost three lanes to the old rule.
+    from app.services.resource_tree import build_tree
+    root_resources, children_map = build_tree(resources)
+
+    # A REPO WHOSE LANES CARRY THE SUMMARIES IS NOT A REPO MISSING ONE.
+    # `scan_resource` skips the repo-level summary once the goal has
+    # declared trunk lanes -- work happens at branch level and a repo
+    # card can only show one lane, so it would contradict the cards
+    # beneath it. The panel had one word for both cases: "no summary",
+    # with the tooltip "open the resource and click Rescan". Clicking it
+    # calls `refresh_identity`, which declines for the same reason, so
+    # the pill asked for something nothing would ever do.
+    laned_repos = {
+        r["parent_id"] for r in resources
+        if r.get("kind") == "branch"
+        and (r.get("role") or "") == "trunk"
+        and r.get("parent_id")
+    }
 
     # Fetch resources from user's OTHER goals (for "Link Existing" dropdown)
     other_resources = await pool.fetch("""
@@ -211,6 +232,7 @@ async def resource_browser(
             "role": role or GoalRole.GOAL_ADMIN,
             "resources": root_resources,
             "children_map": children_map,
+            "laned_repos": laned_repos,
             "resource_count": len(resources),
             "linkable_resources": linkable_resources,
             "show_archived": show_archived,
@@ -298,6 +320,12 @@ async def add_resource(
     working_branch = ""
     working_branch_is_trunk = False
     working_branch_id = ""  # filled in after the branch row insert
+    # Same reason, and it is load-bearing: the scan below reads it on
+    # every repo path, and G5 only assigns it when no working branch was
+    # named. Undefined here is a NameError in the success case.
+    trunk_row_id = ""
+    existing_repo = None    # the goal's existing row for this repo, if any
+    revive_lane = None      # a retired lane row for this branch, to bring back
 
     if kind == "repo":
         if not name and uri:
@@ -325,6 +353,62 @@ async def add_resource(
         )
         if not working_branch:
             raise HTTPException(status_code=400, detail="Working branch required")
+
+        # THE SAME REPO AGAIN IS A NEW TRUNK, NOT A DUPLICATE. The
+        # branch-first flow registers "repo + this branch as trunk" in
+        # one act; governing a second branch of a repo the goal already
+        # holds must reuse the existing repo row as the parent -- the
+        # old behaviour was a unique-constraint 400 that made
+        # multi-trunk monorepos impossible to register at all.
+        if repo_owner and repo_name:
+            existing_repo = await pool.fetchrow(
+                "SELECT id FROM goal_resources WHERE goal_id = $1 "
+                "AND kind = 'repo' AND repo_owner = $2 AND repo_name = $3",
+                pid, repo_owner, repo_name)
+            # A SECOND LANE IS WELCOME; A DUPLICATE IS NOT. Each branch
+            # registered here is its own trunk LANE -- the engine keys
+            # nodes per lane (git_nodes.trunk_branch, git_repo_trunks per
+            # (repo, trunk)), and a story lands on the lane GO granted
+            # it. Only the exact same branch twice is refused.
+            if working_branch_is_trunk:
+                # A RETIRED LANE IS RE-ADDABLE. This check had no status
+                # filter, so a lane that had been deleted or archived went
+                # on refusing its own branch for ever -- and `unarchive`
+                # only accepts status='archived', so a DELETED lane could
+                # not be restored either. Between them, deleting a trunk
+                # lane was irreversible through the UI: exactly the dead
+                # end the operator in goal GOAL1 was in. Found on dev the
+                # first time anyone deleted a lane and tried again
+                # (MREP1, 2026-10-06).
+                #
+                # The retired row is REVIVED rather than duplicated. Its id
+                # is what `story_resources` grants and `parent_id` chains
+                # point at, so bringing it back is both cheaper and more
+                # honest than minting a second row for the same branch --
+                # and the INSERT below carries
+                # `ON CONFLICT (goal_id, kind, name) DO NOTHING`, so a
+                # duplicate would have silently produced no row at all.
+                dup = await pool.fetchval(
+                    "SELECT 1 FROM goal_resources "
+                    "WHERE goal_id = $1 AND kind = 'branch' "
+                    "AND repo_owner = $2 AND repo_name = $3 "
+                    "AND role = 'trunk' AND branch_name = $4 "
+                    "AND coalesce(status, 'active') = 'active'",
+                    pid, repo_owner, repo_name, working_branch)
+                if not dup:
+                    revive_lane = await pool.fetchval(
+                        "SELECT id FROM goal_resources "
+                        "WHERE goal_id = $1 AND kind = 'branch' "
+                        "AND repo_owner = $2 AND repo_name = $3 "
+                        "AND branch_name = $4 "
+                        "AND coalesce(status, 'active') <> 'active' "
+                        "ORDER BY created_at DESC LIMIT 1",
+                        pid, repo_owner, repo_name, working_branch)
+                if dup:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(f"'{working_branch}' is already a trunk "
+                                f"lane of {repo_name} in this goal."))
 
     elif kind == "branch":
         parent_repo_id = form.get("parent_repo_id", "").strip()
@@ -378,11 +462,20 @@ async def add_resource(
 
     # Pre-check for duplicate (goal_id, kind, name) — uq_goal_resource_kind_name.
     # Surface a friendly 400 instead of letting the constraint produce a 500.
+    #
+    # EXCEPT for a repo the goal already holds: the branch-first flow adds
+    # the same repo again to register ANOTHER trunk lane, and the existing
+    # repo row is deliberately REUSED as the parent (see existing_repo
+    # below). This pre-check firing first is exactly how adding
+    # cal_backend after cal_frontend died with "already registered" —
+    # the lane dedupe never got to run.
     existing = await pool.fetchrow(
         """SELECT id, status FROM goal_resources
             WHERE goal_id = $1 AND kind = $2 AND name = $3""",
         pid, kind, name,
     )
+    if existing and kind == "repo" and existing_repo:
+        existing = None  # the reuse path owns this case
     if existing:
         _log.info(
             "Resource already exists: goal=%s kind=%s name=%s rid=%s status=%s",
@@ -396,6 +489,18 @@ async def add_resource(
                 f"If you want a different one, give it a different display name."
             ),
         )
+
+    # THE EVENT NAMES THE ROW THAT ENDS UP EXISTING. The dedupe below can
+    # rebind `resource_id` to the goal's existing repo row, and the event
+    # used to be appended BEFORE that happened -- so a re-registration
+    # logged `resource.goal.registered` for a freshly minted id that was
+    # then thrown away, with no `goal_resources` row and no
+    # `resource_events` row to match. Goal GOAL1 has one such ghost
+    # (`01b84264-b1a`, 2026-10-05 12:42). Deciding the id first makes the
+    # ledger describe what happened: a reuse, with the id reused.
+    reused = bool(kind == "repo" and existing_repo)
+    if reused:
+        resource_id = existing_repo["id"]
 
     import asyncpg
     try:
@@ -411,18 +516,34 @@ async def add_resource(
                         "uri": uri,
                         "branch_name": branch_name,
                         "parent_id": parent_id or "",
+                        "reused": reused,
                     },
                     actor_id=user["actor_id"],
                     context_goal_id=pid,
                 )
 
-                await conn.execute("""
+                # default_writable TRUE for code. It is the CEILING --
+                # whether any story in this goal may EVER write this --
+                # not a grant: a story still holds it read-only until GO
+                # grants otherwise. A repository is attached to a goal
+                # in order to be worked on, so a false ceiling here made
+                # every repo added through this page permanently
+                # unwritable, and the executor's own criteria
+                # unsatisfiable. Documents and environments keep the
+                # column's false default, which is right for them.
+                if reused:
+                    # Reuse the goal's existing repo row as the parent.
+                    # `resource_id` was rebound above, before the event.
+                    pass
+                else:
+                    await conn.execute("""
                     INSERT INTO goal_resources
                         (id, goal_id, kind, name, uri, created_by, human_context,
                          repo_owner, repo_name, default_branch, clone_url,
-                         parent_id, branch_name, base_branch, role, metadata, summary_stale)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, true)
-                """, resource_id, pid, kind, name, uri, user["uid"], human_context,
+                         parent_id, branch_name, base_branch, role, metadata,
+                         summary_stale, default_writable)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, true, true)
+                    """, resource_id, pid, kind, name, uri, user["uid"], human_context,
                     repo_owner, repo_name, default_branch, clone_url,
                     parent_id, branch_name, base_branch,
                     # For kind='repo' the role column is unused (the
@@ -431,49 +552,105 @@ async def add_resource(
                     role if kind == "branch" else "feature",
                     json.dumps(metadata) if metadata else None)
 
-                await conn.execute("""
-                    INSERT INTO resource_events (resource_id, goal_id, event_type, actor, details)
-                    VALUES ($1, $2, 'created', $3, $4)
-                """, resource_id, pid, user["uid"],
-                    json.dumps({"kind": kind, "name": name,
-                                "branch_name": branch_name, "role": role}))
+                    await conn.execute("""
+                        INSERT INTO resource_events (resource_id, goal_id, event_type, actor, details)
+                        VALUES ($1, $2, 'created', $3, $4)
+                    """, resource_id, pid, user["uid"],
+                        json.dumps({"kind": kind, "name": name,
+                                    "branch_name": branch_name, "role": role}))
 
                 # If a working branch was supplied alongside a repo, also
                 # create the branch row in the same transaction. Mirrors
                 # what the user would do as a separate "add a branch"
                 # step — but folded into one operation so the common
                 # "this repo + work on this branch" flow is one click.
+                # G5: a repo with NO working branch named still gets its
+                # trunk DESIGNATED, as a one-act registration. The trunk
+                # row is role='trunk' at the repo's default branch --
+                # provisioning already excludes trunk-role rows from
+                # story mounts, so this designates without granting.
+                # Kills the ritual of answering the trunk question on
+                # every addition; override by adding a branch explicitly.
+                if kind == "repo" and not working_branch and repo_owner and repo_name:
+                    trunk_row_id = str(uuid.uuid4())[:12]
+                    await conn.execute("""
+                        INSERT INTO goal_resources
+                            (id, goal_id, kind, name, uri, created_by,
+                             human_context, repo_owner, repo_name,
+                             default_branch, clone_url, parent_id,
+                             branch_name, base_branch, role, summary_stale)
+                        VALUES ($1, $2, 'branch', $3, $4, $5,
+                                'auto-designated trunk', $6, $7, $8, $9,
+                                $10, $11, $8, 'trunk', false)
+                        ON CONFLICT (goal_id, kind, name) DO NOTHING
+                    """, trunk_row_id, pid, f"{repo_name}:{default_branch}",
+                        clone_url, user["uid"], repo_owner, repo_name,
+                        default_branch, clone_url, resource_id,
+                        default_branch)
+
                 if kind == "repo" and working_branch and repo_owner and repo_name:
                     working_branch_id = str(uuid.uuid4())[:12]
                     branch_display_name = f"{repo_name}:{working_branch}"
                     branch_role = "trunk" if working_branch_is_trunk else "feature"
-                    await conn.execute("""
+                    if revive_lane:
+                        # Bring the retired row back rather than minting a
+                        # second one for the same branch. Re-points it at
+                        # the repo row in play and restores the role, in
+                        # case it was retired as something else.
+                        working_branch_id = revive_lane
+                        await conn.execute(
+                            "UPDATE goal_resources SET status = 'active', "
+                            "  role = $3, parent_id = $4, base_branch = $5, "
+                            "  updated_at = now() "
+                            " WHERE id = $1 AND goal_id = $2",
+                            revive_lane, pid, branch_role, resource_id,
+                            default_branch)
+                        await conn.execute("""
+                            INSERT INTO resource_events
+                                (resource_id, goal_id, event_type, actor, details)
+                            VALUES ($1, $2, 'created', $3, $4)
+                        """, revive_lane, pid, user["uid"],
+                            json.dumps({
+                                "kind": "branch", "name": branch_display_name,
+                                "branch_name": working_branch,
+                                "role": branch_role, "revived": True,
+                                "created_with_repo": resource_id,
+                            }))
+                        _log.info(
+                            "Revived retired trunk lane %s (%s) under repo %s "
+                            "on goal %s", revive_lane, branch_display_name,
+                            resource_id, pid,
+                        )
+                    else:
+                        await conn.execute("""
                         INSERT INTO goal_resources
                             (id, goal_id, kind, name, uri, created_by, human_context,
                              repo_owner, repo_name, default_branch, clone_url,
-                             parent_id, branch_name, base_branch, role, summary_stale)
+                             parent_id, branch_name, base_branch, role,
+                             summary_stale, default_writable)
                         VALUES ($1, $2, 'branch', $3, $4, $5, $6, $7, $8, $9, $10,
-                                $11, $12, $13, $14, true)
+                                $11, $12, $13, $14, true, true)
                         ON CONFLICT (goal_id, kind, name) DO NOTHING
                     """, working_branch_id, pid, branch_display_name,
                         clone_url, user["uid"], "",
                         repo_owner, repo_name, default_branch, clone_url,
                         resource_id, working_branch, default_branch, branch_role)
-                    await conn.execute("""
-                        INSERT INTO resource_events
-                            (resource_id, goal_id, event_type, actor, details)
-                        VALUES ($1, $2, 'created', $3, $4)
-                    """, working_branch_id, pid, user["uid"],
-                        json.dumps({
-                            "kind": "branch", "name": branch_display_name,
-                            "branch_name": working_branch, "role": branch_role,
-                            "created_with_repo": resource_id,
-                        }))
-                    _log.info(
-                        "Auto-created branch resource %s (%s, role=%s) under repo %s",
-                        working_branch_id, branch_display_name, branch_role,
-                        resource_id,
-                    )
+                        await conn.execute("""
+                            INSERT INTO resource_events
+                                (resource_id, goal_id, event_type, actor, details)
+                            VALUES ($1, $2, 'created', $3, $4)
+                        """, working_branch_id, pid, user["uid"],
+                            json.dumps({
+                                "kind": "branch", "name": branch_display_name,
+                                "branch_name": working_branch,
+                                "role": branch_role,
+                                "created_with_repo": resource_id,
+                            }))
+                        _log.info(
+                            "Auto-created branch resource %s (%s, role=%s) "
+                            "under repo %s", working_branch_id,
+                            branch_display_name, branch_role, resource_id,
+                        )
     except asyncpg.exceptions.UniqueViolationError as exc:
         # Race against the pre-check (or a hidden constraint we forgot about).
         _log.warning(
@@ -488,7 +665,27 @@ async def add_resource(
     # Trigger initial scan in background
     if kind == "repo" and repo_owner and repo_name:
         import asyncio
-        asyncio.create_task(_background_scan(resource_id, pid, repo_owner, repo_name, default_branch))
+        asyncio.create_task(_background_scan(resource_id, pid, repo_owner,
+                                             repo_name))
+        # THE AUTO-DESIGNATED TRUNK ROW IS SCANNED TOO, and without this
+        # the ordinary flow ends with NO summary anywhere.
+        #
+        # G5 above creates a `role='trunk'` row at the repo's default
+        # branch the moment a repo is added, so from that instant the
+        # goal HAS a declared trunk -- which means `scan_resource` skips
+        # the repo-level summary, correctly, because the lane is
+        # supposed to carry it. Nothing scheduled the lane. Repo card
+        # skipped, lane card never built, and the row is inserted with
+        # `summary_stale = false` so the panel does not even show a
+        # "no summary" pill to say so.
+        #
+        # The skip and the scan that makes it harmless were added in
+        # different places; this is the second half.
+        if trunk_row_id:
+            asyncio.create_task(_background_branch_scan(
+                trunk_row_id, pid, repo_owner, repo_name,
+                default_branch, default_branch,
+            ))
         # If we also created a working-branch row, scan it too.
         if working_branch_id and working_branch:
             asyncio.create_task(_background_branch_scan(
@@ -949,12 +1146,25 @@ async def upload_resource_file(
                 )
 
                 await conn.execute("""
+                    -- `uri` IS THE LOCATOR, and writing only `gcs_uri`
+                    -- makes the resource INVISIBLE TO THE KERNEL: no
+                    -- mount, no egress host, and nothing raises.
+                    -- `test_resource_uri_is_one_column` names this
+                    -- exact failure as the one thing its removal of
+                    -- `gcs_uri` from kernel/ depends on -- "every
+                    -- writer populates `uri`" -- and this writer did
+                    -- not. GOAL1 story 4bb5e544: three documents
+                    -- uploaded from the resources page, an empty
+                    -- `/workspace/docs/`, and a WORKSPACE.md telling
+                    -- the executor to read them.
                     INSERT INTO goal_resources
-                        (id, goal_id, kind, name, created_by, human_context,
-                         file_type, file_size_bytes, gcs_uri, summary_stale)
-                    VALUES ($1, $2, 'document', $3, $4, $5, $6, $7, $8, true)
-                """, resource_id, pid, resource_name, user["uid"], human_context,
-                    ext, len(data), gcs_uri)
+                        (id, goal_id, kind, name, uri, created_by,
+                         human_context, file_type, file_size_bytes,
+                         gcs_uri, summary_stale)
+                    VALUES ($1, $2, 'document', $3, $4, $5, $6, $7, $8, $9,
+                            true)
+                """, resource_id, pid, resource_name, gcs_uri, user["uid"],
+                    human_context, ext, len(data), gcs_uri)
 
                 await conn.execute("""
                     INSERT INTO resource_attachments
@@ -1471,6 +1681,17 @@ async def resource_detail(
             viewer_url_is_external = True
             _log.info("resource_detail: using external URI as viewer URL for %s", rid)
 
+    # A repo page says where work lands. Cheap, and only for repos: the
+    # question is meaningless for a document and the two queries would be
+    # paid on every resource view.
+    lane_summary = None
+    if resource_dict.get("kind") == "repo" and resource_dict.get("repo_name"):
+        from app.services.git_graph.trunk_lane import lane_summary as _lanes
+        async with pool.acquire() as _c:
+            lane_summary = await _lanes(
+                _c, pid, resource_dict.get("repo_owner") or "",
+                resource_dict["repo_name"])
+
     return templates.TemplateResponse(
         "resources/detail.html",
         {
@@ -1480,6 +1701,9 @@ async def resource_detail(
             "pid": pid,
             "role": role,
             "resource": resource_dict,
+            # Where this goal's work on the repo actually lands, declared
+            # or not -- see trunk_lane.lane_summary.
+            "lane_summary": lane_summary,
             "summary": summary_dict,
             "scan_stats": scan_stats,
             "events": [dict(e) for e in events],
@@ -1564,31 +1788,96 @@ async def resource_content(
 
     pool = get_pool()
     row = await pool.fetchrow(
-        "SELECT gcs_uri, file_type, name FROM goal_resources WHERE id = $1 AND goal_id = $2",
-        rid, pid,
+        "SELECT id, gcs_uri, file_type, name FROM goal_resources "
+        " WHERE id = $1 AND goal_id = $2", rid, pid,
     )
-    if not row or not row["gcs_uri"]:
+    if not row:
         raise HTTPException(status_code=404)
 
     file_type = (row["file_type"] or "").lower().lstrip(".")
     content_type = ALLOWED_FILE_TYPES.get(file_type, "application/octet-stream")
 
-    try:
-        data = await download_gcs_uri_bytes(row["gcs_uri"])
-    except Exception:
-        _log.error("resource_content: failed to fetch %s from GCS", row["gcs_uri"], exc_info=True)
-        raise HTTPException(status_code=502, detail="Could not fetch file from storage")
+    if row["gcs_uri"]:
+        try:
+            data = await download_gcs_uri_bytes(row["gcs_uri"])
+        except Exception:
+            _log.error("resource_content: failed to fetch %s from GCS",
+                       row["gcs_uri"], exc_info=True)
+            raise HTTPException(
+                status_code=502, detail="Could not fetch file from storage")
+    else:
+        # A CATALOGUED ARTIFACT HAS NO `gcs_uri`. Its bytes are in the
+        # content-addressed artifact store, and its resource id is
+        # `art_` + the first twelve characters of the artifact id -- see
+        # the join in `app/routers/artifacts.py`. That is a TRUNCATION,
+        # so the full id has to be looked up rather than reconstructed.
+        #
+        # SERVED FROM HERE rather than sending the page at a second
+        # endpoint: one download URL per resource row means the template
+        # does not have to know where any particular resource keeps its
+        # bytes, and a new kind of store is one branch here instead of a
+        # new branch in every page that lists resources.
+        data, content_type = await _artifact_bytes(pool, pid, rid,
+                                                   content_type)
 
-    _log.info("resource_content: served %s (%d bytes, %s)", rid, len(data), content_type)
+    want_download = (request.query_params.get("download") or "") not in ("", "0")
+    # ATTACHMENT WHEN ASKED. The default stays `inline` because this
+    # route also backs the in-page viewer, where a PDF must render
+    # rather than land in the downloads folder. An HTML `download`
+    # attribute alone is not enough: browsers ignore it in cases a
+    # person cannot predict, and the failure looks like a broken button.
+    disposition = "attachment" if want_download else "inline"
+    _log.info("resource_content: served %s (%d bytes, %s, %s)",
+              rid, len(data), content_type, disposition)
+    from app.services.content_disposition import (  # noqa: PLC0415
+        content_disposition)
+
     return HTTPResponse(
         content=data,
         media_type=content_type,
         headers={
-            # inline so PDFs/images open in the browser rather than trigger a download
-            "Content-Disposition": f'inline; filename="{row["name"]}"',
+            # NOT AN f-STRING WITH THE NAME IN IT. HTTP headers are
+            # latin-1, and an em dash in a report title -- which is what
+            # an LLM writes unprompted -- made this raise
+            # `UnicodeEncodeError` inside Starlette, several frames from
+            # anything mentioning a filename. Seen as a 500 on
+            # `art_a60f320cfa72`.
+            "Content-Disposition": content_disposition(disposition,
+                                                       row["name"]),
             "Cache-Control": "private, max-age=3600",
         },
     )
+
+
+async def _artifact_bytes(pool, pid: str, rid: str, fallback_type: str):
+    """The bytes of a catalogued artifact, scoped to the goal."""
+    from kernel.artifacts.aio import aget                 # noqa: PLC0415
+    from kernel.artifacts.store import ArtifactNotFound   # noqa: PLC0415
+
+    prefix = rid[4:]
+    art = await pool.fetchrow(
+        """
+        SELECT m.artifact_id, m.media_type
+          FROM kernel.artifact_manifest m
+          LEFT JOIN kernel.executions e ON e.id = m.execution_id
+         WHERE left(m.artifact_id, 12) = $1
+           AND COALESCE(e.goal_id, m.goal_id) = $2
+         LIMIT 1
+        """, prefix, pid)
+    if art is None:
+        # SCOPED BY THE JOIN: the artifact store is content-addressed
+        # and goal-blind, so this is what stops one goal reading
+        # another's bytes by guessing a resource id.
+        raise HTTPException(status_code=404)
+    try:
+        return (await aget(art["artifact_id"]),
+                art["media_type"] or fallback_type)
+    except (ArtifactNotFound, OSError) as exc:
+        _log.warning("resource_content: %s is catalogued and not in the "
+                     "store: %s", rid, exc)
+        raise HTTPException(
+            status_code=410,
+            detail="recorded but the content is no longer in the store")             from None
 
 
 # ── Lock / Unlock ────────────────────────────────────────────────────────────
@@ -1694,14 +1983,46 @@ async def archive_resource(
     request: Request,
     user: dict = Depends(get_current_user),
 ):
-    """Archive (soft-delete) a resource."""
+    """Archive (soft-delete) a resource.
+
+    ARCHIVE IS AS STRONG AS DELETE, FOR EVERYTHING THAT MATTERS HERE. Every
+    lane and provisioning query filters `status = 'active'`, so an archived
+    trunk lane is as absent from the model as a deleted one -- it simply
+    stays recoverable. This used to be a blind UPDATE with no checks at
+    all, which made the Archive button a one-click bypass of the guard on
+    the Delete button beside it.
+    """
     role = await get_goal_role(user["uid"], pid)
     if role != GoalRole.GOAL_ADMIN:
         raise HTTPException(status_code=403)
 
     pool = get_pool()
+    row = await pool.fetchrow(
+        "SELECT kind, name FROM goal_resources WHERE id = $1 AND goal_id = $2",
+        rid, pid,
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="Resource not found")
+
+    from app.services.resource_dependents import (
+        blocking_dependents, describe_stories,
+    )
+    deps = await blocking_dependents(pool, pid, rid, row["kind"] or "")
+    if deps["stories"]:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"'{row['name']}' is still granted to "
+                f"{describe_stories(deps['stories'])}. An archived resource is "
+                f"invisible to the engine, so this would move their work to "
+                f"whichever branch the fallback picks. Re-grant those stories "
+                f"first (your assistant can: revoke_resource / grant_resource)."
+            ),
+        )
+
     await pool.execute(
-        "UPDATE goal_resources SET status = 'archived' WHERE id = $1 AND goal_id = $2",
+        "UPDATE goal_resources SET status = 'archived', updated_at = now() "
+        " WHERE id = $1 AND goal_id = $2",
         rid, pid,
     )
 
@@ -1812,6 +2133,35 @@ async def unarchive_resource(
     return RedirectResponse(url=f"/goals/{pid}/resources/{rid}", status_code=303)
 
 
+_TRUTHY = ("1", "true", "yes", "on")
+
+
+async def wants_cascade(request: Request) -> bool:
+    """Did this request ask to cascade? Query string first, then the body.
+
+    THE BODY READ MUST NOT BE ABLE TO FAIL. The Delete form carries no input
+    fields -- it is a button and two `data-confirm` attributes -- and the
+    shared interceptor in static/js/app.js submits `new FormData(form)`. For
+    a field-less form that is an EMPTY multipart body: just the closing
+    boundary, with no leading CRLF. python-multipart rejects it with
+    `MultipartParseError: Did not find CR at end of boundary`, so a plain
+    `await request.form()` here turned every delete into a 500 -- including
+    the ones the dependency guard was about to refuse with a useful message,
+    which is how it was found (dev, goal MREP1, 2026-10-06).
+
+    Query string first so `?cascade=1` works whatever the body is, and the
+    body read is tolerant because an unreadable body means "no flag", never
+    "crash the endpoint".
+    """
+    if (request.query_params.get("cascade") or "").lower() in _TRUTHY:
+        return True
+    try:
+        form = await request.form()
+    except Exception:  # noqa: BLE001 -- any parse failure means "not asked for"
+        return False
+    return (str(form.get("cascade") or "")).lower() in _TRUTHY
+
+
 # ── Delete resource (hard) ───────────────────────────────────────────────────
 
 @router.post("/goals/{pid}/resources/{rid}/delete")
@@ -1846,6 +2196,43 @@ async def delete_resource(
     gcs_uri = resource.get("gcs_uri") or resource.get("uri") or ""
     kind = resource.get("kind") or ""
 
+    # 0. SAY WHAT IS ATTACHED BEFORE DETACHING IT. A repo resource carries
+    #    trunk lanes, and the lanes are what stories are granted. Deleting
+    #    one used to succeed in silence and strand them (goal GOAL1,
+    #    2026-10-05). `cascade=1` is the operator confirming they meant it,
+    #    and archives the children with it rather than leaving them parented
+    #    to a row that is gone.
+    from app.services.resource_dependents import (
+        blocking_dependents, describe_children, describe_stories,
+    )
+    cascade = await wants_cascade(request)
+    deps = await blocking_dependents(pool, pid, rid, kind)
+
+    # A STORY GRANT HAS NO CASCADE. Removing what a story points at
+    # re-routes its work to whatever the fallback happens to be -- the
+    # original failure in miniature -- so this refuses outright rather
+    # than offering a confirmation that silently does it anyway.
+    if deps["stories"]:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"'{name}' is still granted to {describe_stories(deps['stories'])}. "
+                f"Re-grant those stories to the branch they should land on "
+                f"first (your assistant can do this with revoke_resource / "
+                f"grant_resource); deleting this would move their work to "
+                f"whichever branch the fallback picks."
+            ),
+        )
+    if deps["children"] and not cascade:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"'{name}' still has {describe_children(deps['children'])}. "
+                f"Archive them first, or re-submit with cascade=1 to archive "
+                f"them along with it."
+            ),
+        )
+
     # 1. Soft-delete the DB row (keeps audit trail + allows future re-upload
     #    via the upload_and_register_resource revive path).
     await pool.execute(
@@ -1860,6 +2247,31 @@ async def delete_resource(
         actor_id=user["actor_id"],
         context_goal_id=pid,
     )
+
+    # 1b. Cascade: ARCHIVE the children, never delete them. Archive is
+    #     reversible from the UI and a lane the goal may still want is not
+    #     the operator's to destroy as a side effect of removing its
+    #     parent. Each one gets its own event so the trail names what went.
+    if cascade and deps["children"]:
+        for child in deps["children"]:
+            await pool.execute(
+                "UPDATE goal_resources SET status = 'archived', updated_at = now() "
+                " WHERE id = $1 AND goal_id = $2", child["id"], pid,
+            )
+            await append_event(
+                pool,
+                event_type="resource.goal.archived",
+                payload={
+                    "resource_id": child["id"], "name": child.get("name") or "",
+                    "kind": child.get("kind") or "", "cascaded_from": rid,
+                },
+                actor_id=user["actor_id"],
+                context_goal_id=pid,
+            )
+        _log.info(
+            "Delete cascade archived %d child resource(s) of %s on goal %s",
+            len(deps["children"]), rid, pid,
+        )
 
     # 2. Remove the GCS blob (best-effort; if it fails the row is still
     #    soft-deleted and the workspace cleanup continues).
@@ -2112,9 +2524,11 @@ async def trigger_scan(
 
     import asyncio
     if resource["kind"] == "repo" and resource.get("repo_owner"):
+        # No branch: `scan_resource` decides which branch, and whether
+        # to scan the repo row at all -- a goal with declared trunk
+        # branches gets its summaries from those, not from here.
         asyncio.create_task(_background_scan(
             rid, pid, resource["repo_owner"], resource["repo_name"],
-            resource.get("default_branch", "main"),
         ))
     elif resource.get("gcs_uri"):
         asyncio.create_task(_background_doc_scan(
@@ -2127,14 +2541,31 @@ async def trigger_scan(
 
 # ── Background helpers ───────────────────────────────────────────────────────
 
-async def _background_scan(resource_id, goal_id, repo_owner, repo_name, branch):
-    """Background: scan a repo."""
+async def _background_scan(resource_id, goal_id, repo_owner, repo_name):
+    """Background: scan a repo resource.
+
+    THROUGH `scan_resource`, NOT `scan_repo_full`. This used to call the
+    repo scanner directly with a branch the CALLER chose, which is how
+    it came to pass `default_branch` -- GitHub's `main` -- for years.
+    Going through the one entry point means the branch, and whether to
+    scan at all, are decided in one place: a goal that has declared
+    trunk branches gets no repo-level summary, because each of those
+    branches is its own resource with its own summary and a repo card
+    can only ever show one of them.
+
+    Duplicating that rule here is how the two would drift, and the
+    version that drifts is this one -- the UI path, which nobody runs in
+    a test.
+    """
     try:
-        from app.services.resource_scanner import scan_repo_full
-        from app.routers.go_internal import _get_github_token
-        token = await _get_github_token(goal_id, repo_name)
-        await scan_repo_full(resource_id, goal_id, repo_owner, repo_name, branch, token)
-        _log.info("Background repo scan complete: %s/%s", repo_owner, repo_name)
+        from app.services.resource_scanner import scan_resource
+        out = await scan_resource(goal_id, resource_id) or {}
+        if out.get("skipped"):
+            _log.info("Repo scan skipped for %s/%s: %s",
+                      repo_owner, repo_name, out.get("reason"))
+        else:
+            _log.info("Background repo scan complete: %s/%s",
+                      repo_owner, repo_name)
     except Exception as exc:
         _log.error("Background repo scan failed: %s", exc)
 

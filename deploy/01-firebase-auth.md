@@ -75,14 +75,18 @@ Project settings → **Service accounts** tab → **Generate new private key** �
 > **`firebase-sa.json`**.) That exact name is already in `.gitignore`, so it can
 > never be committed. File **04, step 4.3** loads it from there. Don't rename it.
 
-## 1.5 Authorized domains — LATER (after file 07)
-Login only works from domains Firebase trusts, and your app URL doesn't exist
-until you deploy (file 07). **Come back after file 07** and add your Cloud Run
-hostname:
-- **Authentication → Settings → Authorized domains → Add domain** → paste the
-  `service_url` hostname (e.g. `agentos-….run.app`, no `https://`).
+## 1.5 Authorized domains — do it now
+Login only works from domains Firebase trusts. Your app's hostname is
+deterministic (`<prefix>-web-<project-number>.<region>.run.app`), so you can add
+it before it exists. Print it (`<prefix>` is `agentos` unless you change
+`name_prefix`):
+```bash
+echo "<prefix>-web-$(gcloud projects describe <PROJECT_ID> --format='value(projectNumber)').<REGION>.run.app"
+```
+- **Authentication → Settings → Authorized domains → Add domain** → paste that
+  hostname (no `https://`).
 
-File 07 reminds you to do this — skipping it is the #1 cause of login failing.
+File 07 reminds you to check this — skipping it is the #1 cause of login failing.
 
 ---
 

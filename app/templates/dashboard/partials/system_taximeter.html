@@ -86,9 +86,9 @@
      whichever matches the current mode (tx-mode-percent / tx-mode-score):
      simpler and more robust than rewriting text with JS string logic. #}
   <p class="text-2xs text-gray-600 mb-4">
-    Each score is relative to the platform average that period:
-    <span class="tx-mode-percent">100% means exactly your fair share of the total, <span class="text-green-400">above 100%</span> means more than that, <span class="text-blue-400">below 100%</span> means less.</span><span class="tx-mode-score hidden">1.0 means exactly your fair share of the total, <span class="text-green-400">above 1.0</span> means more than that, <span class="text-blue-400">below 1.0</span> means less.</span>
-    Overall blends Throughput at 50%, Oversight at 30%, and Efficiency at 20%. Click "How is this calculated?" before reading it as a performance ranking.
+    Each score is your share of the team&rsquo;s work this period. Across everyone shown the scores add up to the number of people, so
+    <span class="tx-mode-percent">100% is exactly a fair share, <span class="text-green-400">above 100%</span> is more than that, <span class="text-blue-400">below 100%</span> is less.</span><span class="tx-mode-score hidden">1.0 is exactly a fair share, <span class="text-green-400">above 1.0</span> is more than that, <span class="text-blue-400">below 1.0</span> is less.</span>
+    Overall blends Throughput at {{ (tx.scoring.categories.throughput * 100)|round|int }}%, Oversight at {{ (tx.scoring.categories.oversight * 100)|round|int }}%, and Efficiency at {{ (tx.scoring.categories.efficiency * 100)|round|int }}%. Click &ldquo;How is this calculated?&rdquo; before reading it as a performance ranking.
   </p>
 
     {% if tx and tx.rows %}
@@ -96,10 +96,14 @@
       <thead>
         <tr class="text-2xs text-gray-600 uppercase text-left border-b border-gray-800">
           {{ sort_th('name', 'Name', 'Sort by name') }}
-          {{ sort_th('overall', 'Overall', '30% Oversight + 50% Throughput + 20% Efficiency, blended into one number') }}
-          {{ sort_th('oversight', 'Oversight', 'Goal and team management, plus goal thread interactions, relative to the platform average') }}
-          {{ sort_th('throughput', 'Throughput', 'Stories completed and weighted output, relative to the platform average') }}
-          {{ sort_th('efficiency', 'Efficiency', 'Speed and cost of completed work, relative to the platform average') }}
+          {{ sort_th('overall', 'Overall', (tx.scoring.categories.oversight * 100)|round|int ~ '% Oversight + ' ~ (tx.scoring.categories.throughput * 100)|round|int ~ '% Throughput + ' ~ (tx.scoring.categories.efficiency * 100)|round|int ~ '% Efficiency, blended into one number') }}
+          {{ sort_th('oversight', 'Oversight', 'The decisions made in stories assigned to you, plus setting up goals, teams and stories') }}
+          {{ sort_th('throughput', 'Throughput', 'Stories assigned to you that reached done or reviewed, and errand runs that finished, weighted by priority') }}
+          {{ sort_th('efficiency', 'Efficiency', 'Priority-weighted work delivered per hour from start to finish, against others who finished work this period') }}
+          {# COST IS REPORTED, NOT SCORED, so it is a plain header with no
+             sort link: sorting by it would make it look like a ranking,
+             which is the thing it deliberately is not. #}
+          <th class="py-2 pr-4 font-medium" title="Model spend on this person's completed work. Reported, not scored — work done in VS Code records no tokens, so its cost is unknown rather than zero.">Cost</th>
         </tr>
       </thead>
       <tbody class="divide-y divide-gray-800">
@@ -129,6 +133,7 @@
           <td class="py-3 pr-4 text-xs">{{ score_pct(row.oversight) }}</td>
           <td class="py-3 pr-4 text-xs">{{ score_pct(row.throughput) }}</td>
           <td class="py-3 pr-4 text-xs">{{ score_pct(row.efficiency) }}</td>
+          <td class="py-3 pr-4 text-xs text-gray-500 tabular-nums">{% if row.cost_usd %}${{ "%.2f"|format(row.cost_usd) }}{% else %}&mdash;{% endif %}</td>
         </tr>
         {% endfor %}
       </tbody>
@@ -150,18 +155,46 @@
           <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/></svg>
         </button>
       </div>
+      {# EVERY NUMBER BELOW IS RENDERED FROM `tx.scoring`, never typed.
+         The weights, the decision points, the priority points and the
+         clamp bounds come from categories.py and v2/points.py, so a
+         change to a weight cannot leave this panel describing the old
+         one. test_taximeter_explainer_render.py asserts each rendered
+         value equals its constant. #}
       <div class="space-y-3 mb-4">
         <div>
-          <h3 class="text-sm font-medium text-gray-200">Oversight</h3>
-          <p class="text-xs text-gray-500">How actively you're steering the work: creating goals, managing who's on the team, and having interactions within the goal thread.</p>
+          <h3 class="text-sm font-medium text-gray-200">Everything in a story belongs to the person it is assigned to</h3>
+          <p class="text-xs text-gray-500">Its completion, its priority points, its cost and time, and every decision answered in it &mdash; whoever answered. The kernel, the goal orchestrator, your assistant and a standing grant are all working for you, so what they do on your story counts for you.</p>
         </div>
         <div>
-          <h3 class="text-sm font-medium text-gray-200">Throughput</h3>
-          <p class="text-xs text-gray-500">How many stories you've completed: stories are given a weightage based on how impactful a story is.</p>
+          <h3 class="text-sm font-medium text-gray-200">The score</h3>
+          <p class="text-xs text-gray-500">Your share of the team&rsquo;s work: the number of people shown, multiplied by your rate, divided by everyone&rsquo;s rate. Your rate is your total over <em>your own</em> active weeks, so joining partway through a period does not read as working less. Every column adds up to the number of people, which is why a fair share is exactly 1.0.</p>
         </div>
         <div>
-          <h3 class="text-sm font-medium text-gray-200">Efficiency</h3>
-          <p class="text-xs text-gray-500">How fast and how cost-effectively those stories were completed.</p>
+          <h3 class="text-sm font-medium text-gray-200">Oversight &mdash; {{ (tx.scoring.categories.oversight * 100)|round|int }}% of Overall</h3>
+          <p class="text-xs text-gray-500">The decisions made in stories assigned to you: plans approved, work accepted or sent back, merges approved, escalations and questions answered, runs paused or steered. Plus setting up goals, teams and stories. Decisions in goals that finished more work this period count for more.</p>
+          <p class="text-2xs text-gray-600 mt-1">
+            {% for kind, pts in tx.scoring.decisions|dictsort(by='value', reverse=true) %}{{ kind }} {{ pts }}{% if not loop.last %} &middot; {% endif %}{% endfor %}
+          </p>
+        </div>
+        <div>
+          <h3 class="text-sm font-medium text-gray-200">Throughput &mdash; {{ (tx.scoring.categories.throughput * 100)|round|int }}% of Overall</h3>
+          <p class="text-xs text-gray-500">Stories assigned to you that reached done or reviewed, and errand runs that finished, each weighted by priority
+            ({% for name, pts in tx.scoring.priority|dictsort(by='value') %}{{ name }} {{ pts }}{% if not loop.last %}, {% endif %}{% endfor %}).
+            Engine merge stories are not counted: they integrate work that was already counted.</p>
+        </div>
+        <div>
+          <h3 class="text-sm font-medium text-gray-200">Efficiency &mdash; {{ (tx.scoring.categories.efficiency * 100)|round|int }}% of Overall</h3>
+          <p class="text-xs text-gray-500">Priority-weighted work delivered per hour, from when a story started to when it finished, compared with others who finished work this period. Rates are held within {{ tx.scoring.clamp_low }}&times; and {{ tx.scoring.clamp_high }}&times; the median, so one unusually fast story cannot take the column.</p>
+          <p class="text-2xs text-gray-600 mt-1">Cost is shown beside the scores and is <em>not</em> scored. Work done in VS Code records no model spend at all, so its cost is unknown rather than zero &mdash; and ranking people on a measurement that exists for only some of them would score the lane they worked in rather than the work they did.</p>
+        </div>
+        <div>
+          <h3 class="text-sm font-medium text-gray-200">Goal weight</h3>
+          <p class="text-xs text-gray-500">One, plus the work items finished in that goal this period. It is computed from the work itself each time the page is drawn &mdash; no model is asked, and a goal that finished nothing still weighs one, because the decisions made in it were still decisions.</p>
+        </div>
+        <div>
+          <h3 class="text-sm font-medium text-gray-200">Not counted</h3>
+          <p class="text-xs text-gray-500">Deleted and archived goals, which give no credit and never appear here. Engine merge stories, as above. And machine bookkeeping &mdash; a run proposing its own completion is not a decision anybody made.</p>
         </div>
       </div>
 

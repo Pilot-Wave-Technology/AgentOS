@@ -1,12 +1,16 @@
 variable "project_id" { type = string }
 variable "region" { type = string }
 variable "service_name" { type = string }
-variable "service_profile" { type = string }
 variable "image" { type = string }
 variable "runtime_sa_email" { type = string }
 variable "cloudsql_conn" { type = string }
 variable "vpc_connector_id" { type = string }
 variable "env_vars" { type = map(string) }
+variable "per_service_env" {
+  type        = map(map(string))
+  description = "Env layered over env_vars, keyed by role (web, council, git, management, scheduler)."
+  default     = {}
+}
 variable "secret_env" { type = map(string) }
 variable "cpu" { type = string }
 variable "memory" { type = string }
@@ -17,15 +21,23 @@ variable "task_runner_job" { type = string }
 variable "task_runner_image" { type = string }
 
 locals {
-  # In "single" one service runs the combined app.single entrypoint. In "split"
-  # the same image runs the four dedicated entrypoints as separate services.
-  services = var.service_profile == "single" ? {
-    (var.service_name) = { entrypoint = "app.single:app", public = true, min = var.min_instances, max = var.max_instances }
-    } : {
-    "${var.service_name}-web"        = { entrypoint = "app.main:app", public = true, min = var.min_instances, max = var.max_instances }
-    "${var.service_name}-council"    = { entrypoint = "app.council_worker:app", public = false, min = 1, max = 1 }
-    "${var.service_name}-git"        = { entrypoint = "app.git_engine_worker:app", public = false, min = 1, max = 1 }
-    "${var.service_name}-management" = { entrypoint = "app.management_worker:app", public = false, min = 1, max = 2 }
+  # One image, five dedicated entrypoints, five services.
+  #
+  # There was a second "single" profile here that ran everything from
+  # `app/single.py`. It was removed before v0.2.0: that module existed
+  # ONLY in the published overlay, so no test in the repo could import
+  # it, and it had drifted into importing a router this branch no longer
+  # has -- the cheap on-ramp did not start. Reintroduce it behind an
+  # import test, not as a deploy-time branch nothing exercises.
+  services = {
+    "${var.service_name}-web"        = { role = "web", entrypoint = "app.main:app", public = true, min = var.min_instances, max = var.max_instances }
+    "${var.service_name}-council"    = { role = "council", entrypoint = "app.council_worker:app", public = false, min = 1, max = 1 }
+    "${var.service_name}-git"        = { role = "git", entrypoint = "app.git_engine_worker:app", public = false, min = 1, max = 1 }
+    "${var.service_name}-management" = { role = "management", entrypoint = "app.management_worker:app", public = false, min = 1, max = 2 }
+    # The background loops (reapers, backstops, the dashboard refresh that
+    # fills the gateway cache). One leader, CPU always on: `resources` is
+    # set below without `cpu_idle`, so CPU is allocated outside requests.
+    "${var.service_name}-scheduler" = { role = "scheduler", entrypoint = "app.scheduler_worker:app", public = false, min = 1, max = 1 }
   }
 
   # The first apply on a clean project runs the Google "hello" placeholder image
@@ -87,9 +99,9 @@ resource "google_cloud_run_v2_service" "svc" {
         mount_path = "/cloudsql"
       }
 
-      # Plain (non-secret) env.
+      # Plain (non-secret) env: the shared map, then this service's own.
       dynamic "env" {
-        for_each = var.env_vars
+        for_each = merge(var.env_vars, lookup(var.per_service_env, each.value.role, {}))
         content {
           name  = env.key
           value = env.value
@@ -170,12 +182,20 @@ resource "google_cloud_run_v2_job" "task_runner" {
           name       = "cloudsql"
           mount_path = "/cloudsql"
         }
-        env {
-          name  = "GCS_RESOURCE_BUCKET"
-          value = lookup(var.env_vars, "GCS_RESOURCE_BUCKET", "")
+        dynamic "env" {
+          # What the internal task runner gets: where resources and
+          # artifacts live, and the multi-repo switch.
+          for_each = { for k in ["GCS_RESOURCE_BUCKET", "ARTIFACT_STORE", "ARTIFACT_BUCKET", "MULTI_REPO_ENABLED"] : k => lookup(var.env_vars, k, "") }
+          content {
+            name  = env.key
+            value = env.value
+          }
         }
         dynamic "env" {
-          for_each = { for k, v in var.secret_env : k => v if contains(["DATABASE_URL", "GEMINI_API_KEY"], k) }
+          # DATABASE_URL only. The task runner used to get the Gemini key for
+          # the taximeter's model calls; the taximeter is retired, and a
+          # credential nothing reads is one more thing to leak.
+          for_each = { for k, v in var.secret_env : k => v if contains(["DATABASE_URL"], k) }
           content {
             name = env.key
             value_source {

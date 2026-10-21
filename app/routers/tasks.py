@@ -2399,7 +2399,7 @@ async def create_task_spec(pid: str, request: Request):
             SELECT s.id FROM stories s
             JOIN messages m ON m.thread_id = $1
             WHERE s.goal_id = $2
-            AND s.state IN ('in_progress', 'accepted')
+            AND s.state IN ('in_progress', 'accepted', 'awaiting_merge')
             AND m.content LIKE '%Story Mode Active%'
             LIMIT 1
         """, source_thread_id, pid)

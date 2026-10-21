@@ -17,7 +17,7 @@ registered handler automatically.
 from dataclasses import dataclass
 from typing import Callable
 
-from task_runner.tasks import document_render, goal_weightage_recompute
+from task_runner.tasks import document_render
 
 
 @dataclass(frozen=True)
@@ -32,5 +32,4 @@ class TaskHandler:
 # priority order the dispatcher tries them in.
 HANDLERS: list[TaskHandler] = [
     TaskHandler(name="document_render", run_once=document_render.run_once),
-    TaskHandler(name="goal_weightage_recompute", run_once=goal_weightage_recompute.run_once),
 ]

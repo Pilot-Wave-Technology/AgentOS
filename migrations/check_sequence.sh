@@ -77,6 +77,8 @@ MIGRATION_FILES=$(
         # Skip the runner and utility scripts themselves — not migrations.
         [ "$base" = "apply.py" ] && continue
         [ "$base" = "reset_db.py" ] && continue
+        # `_name.py` is a helper apply.py imports, never a migration.
+        case "$base" in _*) continue ;; esac
         [ "$base" = "check_sequence.sh" ] && continue
         basename "$f" | sed 's/\.[^.]*$//'
     done | sort

@@ -11,6 +11,8 @@ Entry points registered in channels/registry.py:
 Echo prevention: bot posts are filtered in inbound.py via bot_user_id check, so
 posting here does not trigger another inbound event.
 """
+
+from app.channels.slack.client import make_async_client
 import logging
 
 _log = logging.getLogger(__name__)
@@ -42,9 +44,8 @@ async def _post_message(
 
     Returns the Slack message ts (timestamp) so callers can stamp external_message_id.
     """
-    from slack_sdk import WebClient
-    client = WebClient(token=bot_token)
-    resp = client.chat_postMessage(
+    client = make_async_client(bot_token)
+    resp = await client.chat_postMessage(
         channel=channel,
         text=text,
         username=username,
@@ -114,11 +115,16 @@ async def relay_agent_message(
                     slack_ts, msg_id,
                 )
         except SlackApiError as exc:
-            _log.warning(
-                "Slack relay failed: goal=%s thread=%s channel=%s: %s",
-                goal_id, thread_id[:12], external_channel_id,
-                exc.response.get("error", str(exc)),
-            )
+            # One place decides what a Slack error MEANS, and records it:
+            # a dead channel archives its binding so the next thousand
+            # messages do not retry it, and a dead token marks the
+            # integration so somebody can see Slack has stopped working
+            # instead of inferring it from silence.
+            from app.channels.slack.client import on_failure
+            await on_failure(
+                exc, pool=pool,
+                integration_id=str(binding.get("integration_id") or ""),
+                binding_id=str(binding.get("id") or ""), where="relay")
     except Exception as exc:
         _log.warning(
             "Slack relay error: goal=%s thread=%s: %s",
@@ -175,11 +181,16 @@ async def relay_human_message(
                     slack_ts, msg_id,
                 )
         except SlackApiError as exc:
-            _log.warning(
-                "Slack human relay failed: goal=%s thread=%s: %s",
-                goal_id, thread_id[:12],
-                exc.response.get("error", str(exc)),
-            )
+            # One place decides what a Slack error MEANS, and records it:
+            # a dead channel archives its binding so the next thousand
+            # messages do not retry it, and a dead token marks the
+            # integration so somebody can see Slack has stopped working
+            # instead of inferring it from silence.
+            from app.channels.slack.client import on_failure
+            await on_failure(
+                exc, pool=pool,
+                integration_id=str(binding.get("integration_id") or ""),
+                binding_id=str(binding.get("id") or ""), where="relay")
     except Exception as exc:
         _log.warning(
             "Slack human relay error: goal=%s thread=%s: %s",
@@ -221,10 +232,16 @@ async def post_to_goal_page(
                 goal_id, cfg["goal_channel_id"], username, len(text),
             )
         except SlackApiError as exc:
-            _log.warning(
-                "Slack goal-channel relay failed: goal=%s: %s",
-                goal_id, exc.response.get("error", str(exc)),
-            )
+            # One place decides what a Slack error MEANS, and records it:
+            # a dead channel archives its binding so the next thousand
+            # messages do not retry it, and a dead token marks the
+            # integration so somebody can see Slack has stopped working
+            # instead of inferring it from silence.
+            from app.channels.slack.client import on_failure
+            # No binding row in this path -- it posts to a channel resolved
+            # from the goal's Slack config, so there is nothing to archive.
+            # The classification and the dead-token check still apply.
+            await on_failure(exc, pool=pool, where="relay")
     except Exception as exc:
         _log.warning("Slack goal-channel relay error: goal=%s: %s", goal_id, exc, exc_info=True)
 
@@ -272,11 +289,16 @@ async def post_to_thread_page(
                 goal_id, thread_id[:12], external_channel_id, username,
             )
         except SlackApiError as exc:
-            _log.warning(
-                "Slack thread relay failed: goal=%s thread=%s: %s",
-                goal_id, thread_id[:12],
-                exc.response.get("error", str(exc)),
-            )
+            # One place decides what a Slack error MEANS, and records it:
+            # a dead channel archives its binding so the next thousand
+            # messages do not retry it, and a dead token marks the
+            # integration so somebody can see Slack has stopped working
+            # instead of inferring it from silence.
+            from app.channels.slack.client import on_failure
+            await on_failure(
+                exc, pool=pool,
+                integration_id=str(binding.get("integration_id") or ""),
+                binding_id=str(binding.get("id") or ""), where="relay")
     except Exception as exc:
         _log.warning(
             "Slack thread relay error: goal=%s thread=%s: %s",
@@ -291,44 +313,50 @@ async def post_to_orchestrator_channel(
     content: str,
     username: str = "System",
 ) -> None:
-    """Post to the goal's Slack orchestrator channel (read-only coordination log)."""
+    """Post to the goal's orchestrator thread, via its binding.
+
+    REWRITTEN. This used to read `orch_channel_id` out of the goal's
+    Slack config -- a field whose provisioning had been commented out
+    for some time, so for every goal created since then it was empty and
+    this function returned immediately. Eight call sites across
+    orchestrator.py and orchestrator_delivery.py were posting into
+    nothing and logging nothing, which is why nobody noticed.
+
+    The orchestrator thread is a thread. Under one-channel-per-thread it
+    has a binding like any other, so this is now a thin alias for the
+    generic thread relay and the dead config field is out of the path.
+    """
     if not content or not content.strip():
         return
-
     try:
-        from slack_sdk.errors import SlackApiError
-        from app.channels.slack.config import get_slack_config_for_goal
         from app.database import get_pool
 
         pool = get_pool()
-        cfg = await get_slack_config_for_goal(goal_id, pool)
-        if not cfg or not cfg.get("orch_channel_id") or not cfg.get("bot_token"):
+        orch_thread_id = await pool.fetchval(
+            "SELECT orchestrator_thread_id FROM goals WHERE id = $1", goal_id)
+        if not orch_thread_id:
             return
-
-        text = _truncate_text(content)
-        try:
-            await _post_message(cfg["bot_token"], cfg["orch_channel_id"], text, username=username)
-            _log.info(
-                "Slack orch relay OK: goal=%s channel=%s username=%r len=%d",
-                goal_id, cfg["orch_channel_id"], username, len(text),
-            )
-        except SlackApiError as exc:
-            _log.warning(
-                "Slack orch relay failed: goal=%s: %s",
-                goal_id, exc.response.get("error", str(exc)),
-            )
-    except Exception as exc:
-        _log.warning("Slack orch relay error: goal=%s: %s", goal_id, exc, exc_info=True)
-
+        await relay_agent_message(goal_id, str(orch_thread_id), content)
+    except Exception as exc:                                   # noqa: BLE001
+        _log.warning("Slack orchestrator relay error: goal=%s: %s",
+                     goal_id, exc, exc_info=True)
 
 async def relay_orchestrator_message(goal_id: str, content: str) -> None:
     """Post an orchestrator-scoped message to both goal channel and orch channel.
 
     Called from lifecycle.py for orchestrator.message events, mirroring the
     Notion side's relay_orchestrator_message signature.
+
+    Wrapped even though both callees already swallow: a pure delegator is
+    safe only transitively, and the next line added here would make it
+    able to raise into a caller that has no reason to expect it.
     """
-    await post_to_goal_page(goal_id, content, username="Goal Orchestrator")
-    await post_to_orchestrator_channel(goal_id, content, username="Goal Orchestrator")
+    try:
+        await post_to_goal_page(goal_id, content, username="Goal Orchestrator")
+        await post_to_orchestrator_channel(goal_id, content, username="Goal Orchestrator")
+    except Exception as exc:
+        _log.warning("Slack orchestrator relay error: goal=%s: %s",
+                     goal_id, exc, exc_info=True)
 
 
 # ── Card relay ────────────────────────────────────────────────────────────────
@@ -338,6 +366,7 @@ async def relay_card(
     thread_id: str,
     card: dict,
     fallback_text: str,
+    msg_id: str = "",
 ) -> None:
     """Post an agent card as Block Kit to the Slack channel mapped to this thread.
 
@@ -347,7 +376,6 @@ async def relay_card(
         return
 
     try:
-        from slack_sdk import WebClient
         from slack_sdk.errors import SlackApiError
         from app.channels.base import get_binding_by_thread
         from app.channels.slack.blocks import render_card_as_blocks
@@ -374,9 +402,9 @@ async def relay_card(
         username = card.get("agent_name") or "Agent"
         text = fallback_text[:2500] + "…" if len(fallback_text) > 2500 else fallback_text
 
-        client = WebClient(token=bot_token)
+        client = make_async_client(bot_token)
         try:
-            client.chat_postMessage(
+            resp = await client.chat_postMessage(
                 channel=external_channel_id,
                 text=text,
                 blocks=blocks or None,
@@ -387,12 +415,29 @@ async def relay_card(
                 goal_id, thread_id[:12] if thread_id else "", external_channel_id,
                 card.get("card_type", "?"),
             )
+            # STAMP THE TS. `messages.external_message_id` has existed for
+            # exactly this since migration 038 -- "filled after successful
+            # outbound relay (for edit/delete)" -- and the card path never
+            # filled it. Without it, a card decided in the panel keeps its
+            # live buttons in Slack for ever, because nothing knows which
+            # message to edit.
+            slack_ts = (resp or {}).get("ts", "")
+            if slack_ts and msg_id:
+                await pool.execute(
+                    "UPDATE messages SET external_message_id = $1 "
+                    " WHERE id = $2 AND external_message_id IS NULL",
+                    slack_ts, msg_id)
         except SlackApiError as exc:
-            _log.warning(
-                "Slack card relay failed: thread=%s type=%s: %s",
-                thread_id[:12] if thread_id else "", card.get("card_type", "?"),
-                exc.response.get("error", str(exc)),
-            )
+            # One place decides what a Slack error MEANS, and records it:
+            # a dead channel archives its binding so the next thousand
+            # messages do not retry it, and a dead token marks the
+            # integration so somebody can see Slack has stopped working
+            # instead of inferring it from silence.
+            from app.channels.slack.client import on_failure
+            await on_failure(
+                exc, pool=pool,
+                integration_id=str(binding.get("integration_id") or ""),
+                binding_id=str(binding.get("id") or ""), where="relay")
     except Exception as exc:
         _log.warning(
             "Slack card relay error: thread=%s: %s",
@@ -416,7 +461,6 @@ async def relay_plan_ready(
     without requiring a page refresh in the web UI.
     """
     try:
-        from slack_sdk import WebClient
         from slack_sdk.errors import SlackApiError
         from app.channels.base import get_binding_by_thread
         from app.channels.slack.blocks import plan_ready_blocks
@@ -439,9 +483,9 @@ async def relay_plan_ready(
         blocks = plan_ready_blocks(story_id, story_title, plan_path)
         fallback = f"Plan ready for story '{story_title}'. Approve or request changes in the control panel."
 
-        client = WebClient(token=bot_token)
+        client = make_async_client(bot_token)
         try:
-            client.chat_postMessage(
+            await client.chat_postMessage(
                 channel=external_channel_id,
                 text=fallback,
                 blocks=blocks,
@@ -452,10 +496,16 @@ async def relay_plan_ready(
                 goal_id, story_id[:8], external_channel_id,
             )
         except SlackApiError as exc:
-            _log.warning(
-                "relay_plan_ready Slack error: story=%s: %s",
-                story_id[:8], exc.response.get("error", str(exc)),
-            )
+            # One place decides what a Slack error MEANS, and records it:
+            # a dead channel archives its binding so the next thousand
+            # messages do not retry it, and a dead token marks the
+            # integration so somebody can see Slack has stopped working
+            # instead of inferring it from silence.
+            from app.channels.slack.client import on_failure
+            await on_failure(
+                exc, pool=pool,
+                integration_id=str(binding.get("integration_id") or ""),
+                binding_id=str(binding.get("id") or ""), where="relay")
     except Exception as exc:
         _log.warning("relay_plan_ready error: story=%s: %s", story_id[:8], exc, exc_info=True)
 
@@ -479,7 +529,6 @@ async def relay_phase_task_progress(
     if not thread_id:
         return
     try:
-        from slack_sdk import WebClient
         from slack_sdk.errors import SlackApiError
         from app.channels.base import get_binding_by_thread
         from app.database import get_pool
@@ -512,29 +561,22 @@ async def relay_phase_task_progress(
                 "type": "context",
                 "elements": [{"type": "mrkdwn", "text": summary}],
             })
-        if story_id:
-            blocks.append({
-                "type": "actions",
-                "elements": [
-                    {
-                        "type": "button",
-                        "text": {"type": "plain_text", "text": "⏸ Pause", "emoji": True},
-                        "style": "danger",
-                        "action_id": f"ctrl_pause_{story_id}",
-                        "value": story_id,
-                    },
-                    {
-                        "type": "button",
-                        "text": {"type": "plain_text", "text": "🔄 Replan", "emoji": True},
-                        "action_id": f"ctrl_replan_{story_id}",
-                        "value": story_id,
-                    },
-                ],
-            })
+        # NO BUTTONS. This card used to carry Pause and Replan, which the
+        # panel's version of the same card does not have -- so Slack
+        # offered two actions nobody could take in the product, on a
+        # message re-posted on EVERY progress update. The Replan one ran
+        # raw SQL that cancelled every pending phase task and reset the
+        # story to `planning`: no confirm, no idempotency, and bypassing
+        # story_recovery.replan_dag, so it skipped the ledger emit and the
+        # card stamping the equivalent recovery button performs. A busy
+        # story filled its channel with one-click story-wipers.
+        #
+        # Pausing and replanning live on the recovery card, which is
+        # posted when there is something to recover, and on /run.
 
-        client = WebClient(token=bot_token)
+        client = make_async_client(bot_token)
         try:
-            client.chat_postMessage(
+            await client.chat_postMessage(
                 channel=external_channel_id,
                 text=header_line,
                 blocks=blocks,
@@ -545,10 +587,16 @@ async def relay_phase_task_progress(
                 goal_id, thread_id[:12], short_id, sentinel_label,
             )
         except SlackApiError as exc:
-            _log.warning(
-                "Slack task progress relay failed: thread=%s task=%s: %s",
-                thread_id[:12], short_id, exc.response.get("error", str(exc)),
-            )
+            # One place decides what a Slack error MEANS, and records it:
+            # a dead channel archives its binding so the next thousand
+            # messages do not retry it, and a dead token marks the
+            # integration so somebody can see Slack has stopped working
+            # instead of inferring it from silence.
+            from app.channels.slack.client import on_failure
+            await on_failure(
+                exc, pool=pool,
+                integration_id=str(binding.get("integration_id") or ""),
+                binding_id=str(binding.get("id") or ""), where="relay")
     except Exception as exc:
         _log.warning(
             "Slack task progress relay error: thread=%s: %s",

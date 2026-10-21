@@ -11,7 +11,8 @@ documents by calling the LLM directly:
 
 Both documents are written directly to goal_documents by this module —
 no tool calls, no GO agent involvement. The LLM is called twice in
-parallel (once per doc_type) via the Gemini API.
+parallel (once per doc_type) via app.services.utility_llm, using
+whichever provider/model the `goal_summary_doc` purpose is configured for.
 
 External commit detection: a commit is flagged as external when its actor_id
 does not belong to any goal_member AND the commit author_email is not in the
@@ -26,9 +27,6 @@ import logging
 from app.database import get_pool
 
 log = logging.getLogger(__name__)
-
-# Model used for document generation.
-_DOC_MODEL = "gemini-2.5-flash"
 
 # Characters of plan content to include per task.
 _MAX_PLAN_CHARS = 5000
@@ -164,25 +162,11 @@ async def _generate_document(
     )
 
     try:
-        from app.config import get_settings
-        from google import genai
-        from google.genai import types
+        from app.services.utility_llm import generate_utility_text
 
-        settings = get_settings()
-        if not settings.gemini_api_key:
-            log.warning(
-                "goal-summary: GEMINI_API_KEY not configured — cannot generate %s document",
-                doc_type,
-            )
-            return ""
-
-        client = genai.Client(api_key=settings.gemini_api_key)
-        response = await client.aio.models.generate_content(
-            model=_DOC_MODEL,
-            contents=user_prompt,
-            config=types.GenerateContentConfig(system_instruction=system_prompt),
+        content = await generate_utility_text(
+            "goal_summary_doc", user_prompt, system_instruction=system_prompt,
         )
-        content = (response.text or "").strip()
         if not content:
             log.warning(
                 "goal-summary: LLM returned empty response for %s document, goal %s",

@@ -13,6 +13,8 @@ Standard event types handled:
   goal.deleted         → payload: {goal_name} — archive all Slack channels
   orchestrator.message → payload: {content, username}
 """
+
+from app.channels.slack.client import make_async_client
 import logging
 import re
 from typing import Optional
@@ -23,39 +25,79 @@ _log = logging.getLogger(__name__)
 
 
 def _channel_env_suffix() -> str:
-    """Return a Slack-safe channel name suffix for the current environment.
+    """The environment's channel-name suffix, e.g. "-dev".
 
-    Uses SLACK_COMMAND_SUFFIX (e.g. 'dev', 'feature', 'prod') so channel names
-    stay consistent with slash-command suffixes across environments. Returns an
-    empty string when the suffix is not configured (local dev / single-env).
+    Empty for the PRODUCTION environment, which takes the clean names --
+    `#goal1`, not `#goal1-next`. Every other environment must set
+    SLACK_COMMAND_SUFFIX, and `require_env_separation()` below refuses to
+    provision if it has not, because all environments share one Slack
+    workspace and the suffix is the only thing keeping their channels
+    apart.
     """
     from app.config import get_settings
     suffix = (get_settings().slack_command_suffix or "").strip().lower()
     return f"-{suffix}" if suffix else ""
 
 
-def _slugify_for_slack(text: str, max_len: int = 21) -> str:
-    s = (text or "").strip().lower()
-    s = re.sub(r"[^a-z0-9]+", "-", s)
-    s = s.strip("-")
-    if len(s) > max_len:
-        s = s[:max_len].rstrip("-")
-    return s or "user"
+def require_env_separation() -> None:
+    """Refuse to create channels from a non-production env with no suffix.
+
+    An unsuffixed name from dev lands in the same namespace as production's,
+    and `create_private_channel` will now raise on the collision --
+    but only AFTER asking Slack, and only for a goal whose name happens to
+    clash. Checking up front turns "a confusing failure, eventually, for
+    one goal" into "this environment is misconfigured, now, for all of
+    them".
+    """
+    from app.config import get_settings
+    st = get_settings()
+    if (st.slack_command_suffix or "").strip():
+        return
+    if (getattr(st, "app_env", "") or "").lower() == "production":
+        return          # production legitimately runs unsuffixed
+    raise RuntimeError(
+        "SLACK_COMMAND_SUFFIX is not set and this is not the production "
+        "environment. All environments share one Slack workspace, so an "
+        "unsuffixed channel name here would collide with production's."
+    )
 
 
-def _channel_name_for(goal_id: str, user_display_name: str) -> str:
-    env_suffix = _channel_env_suffix()
-    goal_part = (goal_id or "").lower()[:30]
-    user_budget = max(8, 80 - len(goal_part) - 1 - len(env_suffix))
-    user_part = _slugify_for_slack(user_display_name, max_len=user_budget)
-    return f"{goal_part}-{user_part}{env_suffix}"
-
+# `_slugify_for_slack`, `_channel_name_for` and `ensure_user_goal_channel`
+# WERE HERE AND ARE GONE (2026-10-19).
+#
+# They maintained a private Slack channel per (member x goal) -- a tier
+# that predated story channels and had stopped carrying anything: the
+# conversation, the cards and the agent's replies all land in the story's
+# own channel now.
+#
+# It was also actively wrong. The lookup matched only an UNARCHIVED
+# binding for the actor, so once a binding was archived it created a
+# FRESH Slack channel while the old one still existed -- Slack appended a
+# suffix, and `goal2-<name>-feature-2` appeared. The unarchive handling it
+# carried sat on the found-a-binding branch, unreachable from the single
+# state that needed it. Left alone it would have produced -3, -4.
+#
+# `thread_channels.ensure_channel_for_thread` replaces it and does not
+# have that failure mode: a unique index on (integration_id, thread_id)
+# makes a second caller adopt the first's channel instead of creating
+# another, and it records `channel_name` and invites participants --
+# neither of which this path did, which is why those bindings are the
+# only ones in the table with a NULL name.
+# EVERY state a story can be in, not most of them. `awaiting_merge` and
+# `reviewed` were missing, so a story entering either announced itself in
+# Slack with the raw column value -- "Story status update: Build the thing
+# → awaiting_merge" -- which reads like a bug to anyone who does not know
+# the schema. The fallback hides the omission instead of surfacing it,
+# which is why nobody noticed; a test now walks the states the code
+# actually transitions to and fails on one with no label.
 _STATE_LABELS = {
     "proposed": "📋 Proposed",
     "accepted": "✅ Accepted",
     "in_progress": "🔄 In Progress",
     "blocked": "⚠️ Blocked",
+    "awaiting_merge": "⏳ Waiting to merge",
     "done": "✅ Done",
+    "reviewed": "🔍 Reviewed",
     "cancelled": "🚫 Cancelled",
     "rejected": "❌ Rejected",
 }
@@ -236,21 +278,23 @@ async def _on_story_state_changed(
                 story_id, goal_id, assigned_actor_id,
             )
             if update_tag == "UPDATE 0":
-                # No existing binding for this member in this goal - their
-                # personal Slack channel has never been created. Provision it.
-                _log.info(
-                    "Slack lifecycle: story %s -> %s, no existing binding for actor=%s goal=%s "
-                    "- provisioning personal channel",
+                # NOTHING TO PROVISION ANY MORE. This used to call
+                # `_do_provision_member` to create the member's private
+                # (member x goal) channel, and that tier is gone -- it is
+                # also exactly where `<goal>-<name>-<env>-2` was born,
+                # because an archived binding sent it to create a second
+                # Slack channel beside the live one.
+                #
+                # `UPDATE 0` now means only that the member has no
+                # user-goal binding, which after the removal is the
+                # ordinary case rather than a gap to fill. The story's
+                # own channel carries the story; `current_story_id` on a
+                # tier that no longer exists has nothing to point at.
+                _log.debug(
+                    "Slack lifecycle: story %s -> %s, no user-goal binding for "
+                    "actor=%s goal=%s (expected; story channels carry this)",
                     story_id[:8], new_state, str(assigned_actor_id)[:8], goal_id,
                 )
-                try:
-                    from app.channels.slack.provisioner import _do_provision_member
-                    await _do_provision_member(goal_id, assigned_uid, pool)
-                except Exception as exc:
-                    _log.warning(
-                        "Slack lifecycle: personal channel creation failed uid=%s goal=%s: %s",
-                        assigned_uid, goal_id, exc,
-                    )
                 return
             _log.info(
                 "Slack lifecycle: set current_story_id=%s on binding for actor=%s goal=%s",
@@ -324,7 +368,6 @@ async def _on_goal_deleted(goal_id: str, payload: dict) -> None:
     from app.channels.slack.config import get_slack_config_for_goal, get_integration_credentials
     from app.channels.slack.outbound import _post_message
     from app.database import get_pool
-    from slack_sdk import WebClient
     from slack_sdk.errors import SlackApiError
 
     goal_name = payload.get("goal_name", f"`{goal_id[:8]}`")
@@ -341,7 +384,7 @@ async def _on_goal_deleted(goal_id: str, payload: dict) -> None:
         return
 
     bot_token = cfg["bot_token"]
-    client = WebClient(token=bot_token)
+    client = make_async_client(bot_token)
 
     # Post farewell to goal channel, then archive
     if cfg.get("goal_channel_id"):
@@ -350,7 +393,7 @@ async def _on_goal_deleted(goal_id: str, payload: dict) -> None:
         except Exception as exc:
             _log.warning("Slack lifecycle: goal farewell failed channel=%s: %s", cfg["goal_channel_id"], exc)
         try:
-            client.conversations_archive(channel=cfg["goal_channel_id"])
+            await client.conversations_archive(channel=cfg["goal_channel_id"])
             _log.info("Slack lifecycle: archived goal channel=%s", cfg["goal_channel_id"])
         except SlackApiError as exc:
             err = exc.response.get("error", str(exc))
@@ -360,7 +403,7 @@ async def _on_goal_deleted(goal_id: str, payload: dict) -> None:
     # Archive orch channel
     if cfg.get("orch_channel_id"):
         try:
-            client.conversations_archive(channel=cfg["orch_channel_id"])
+            await client.conversations_archive(channel=cfg["orch_channel_id"])
             _log.info("Slack lifecycle: archived orch channel=%s", cfg["orch_channel_id"])
         except SlackApiError as exc:
             err = exc.response.get("error", str(exc))
@@ -385,7 +428,7 @@ async def _on_goal_deleted(goal_id: str, payload: dict) -> None:
         except Exception as exc:
             _log.warning("Slack lifecycle: user channel farewell failed channel=%s: %s", chan, exc)
         try:
-            client.conversations_archive(channel=chan)
+            await client.conversations_archive(channel=chan)
             _log.info("Slack lifecycle: archived user-goal channel=%s", chan)
         except SlackApiError as exc:
             err = exc.response.get("error", str(exc))
@@ -502,54 +545,123 @@ async def _on_resource_registered(goal_id: str, payload: dict) -> None:
 
 # ── Slack channel lifecycle helpers (used by provisioner) ─────────────────────
 
-def _find_channel_by_name(client, name: str, is_private: bool = False) -> Optional[str]:
-    """Find a Slack channel by name. Returns channel_id or None."""
-    from slack_sdk.errors import SlackApiError
-    types = "private_channel" if is_private else "public_channel"
-    cursor = None
-    for _ in range(10):
-        resp = client.conversations_list(types=types, limit=200, cursor=cursor)
-        for ch in resp.get("channels", []):
-            if ch.get("name") == name:
-                return ch.get("id")
-        cursor = resp.get("response_metadata", {}).get("next_cursor", "")
-        if not cursor:
-            break
-    return None
+class ChannelNameTaken(RuntimeError):
+    """A name we expected to own is already in use by somebody else."""
 
 
-def create_or_join_public_channel(client, name: str) -> str:
-    """Create a public channel; if name_taken, find and join it. Returns channel_id."""
+async def _adopt_own_orphan(client, name: str) -> str:
+    """The id of a channel of this name that OUR bot created, or "".
+
+    Only ever called on `name_taken`. Returns "" for anything we did not
+    create, for an archived channel (joining one is not possible and the
+    name is gone for good), and for any lookup failure -- the caller
+    then raises, which is the safe direction.
+    """
     from slack_sdk.errors import SlackApiError
     try:
-        result = client.conversations_create(name=name, is_private=False)
-        channel_id = result["channel"]["id"]
-        _log.info("Created public channel #%s (%s)", name, channel_id)
-    except SlackApiError as exc:
-        if exc.response.get("error") == "name_taken":
-            _log.info("Channel #%s already exists, finding it", name)
-            channel_id = _find_channel_by_name(client, name, is_private=False)
-            if not channel_id:
-                _log.error("Channel #%s reported name_taken but not found in list", name)
-                raise
-        else:
+        me = (await client.auth_test()).get("user_id", "")
+        if not me:
+            return ""
+        cursor = None
+        for _ in range(10):                      # 10 x 200 channels
+            resp = await client.conversations_list(
+                types="private_channel,public_channel", limit=200,
+                exclude_archived=True, cursor=cursor)
+            for ch in resp.get("channels", []):
+                if ch.get("name") != name:
+                    continue
+                if ch.get("creator") != me:
+                    return ""                    # somebody else's
+                _log.warning(
+                    "Adopting #%s (%s) — this bot created it and nothing is "
+                    "bound to it, so it is an orphan from a failed run.",
+                    name, ch.get("id"))
+                # NO JOIN FOR A PRIVATE CHANNEL. `conversations.join` is
+                # public-channels-only and answers
+                # `method_not_supported_for_channel_type` -- and the bot
+                # is already a member of one it created, so there is
+                # nothing to join. The first version of this treated any
+                # error but `already_in_channel` as fatal and so threw
+                # away an adoption it had already got right.
+                if not ch.get("is_private"):
+                    try:
+                        await client.conversations_join(channel=ch["id"])
+                    except SlackApiError as exc:
+                        if exc.response.get("error") not in (
+                                "already_in_channel",
+                                "method_not_supported_for_channel_type"):
+                            raise
+                return ch.get("id") or ""
+            cursor = (resp.get("response_metadata") or {}).get("next_cursor", "")
+            if not cursor:
+                break
+    except Exception as exc:                                   # noqa: BLE001
+        _log.warning("Could not check whether #%s is our own orphan: %s",
+                     name, exc)
+    return ""
+
+
+async def create_private_channel(client, name: str, *,
+                                 allow_suffix: bool = False) -> str:
+    """Create a private channel. Returns channel_id.
+
+    `allow_suffix=False` (the default) means a taken name RAISES, for
+    the same reason the goal channel does: a name we
+    expect to own being taken is a misconfiguration -- usually a missing
+    environment prefix -- and quietly taking a different name hides it.
+
+    `allow_suffix=True` is for the one family of names that can
+    legitimately collide: the legacy per-member channels, derived from a
+    display name, where two people really can be called the same thing.
+    Names built by `naming.channel_name` carry a thread id and are unique
+    by construction, so they never need it.
+    """
+    from slack_sdk.errors import SlackApiError
+    if not allow_suffix:
+        try:
+            result = await client.conversations_create(name=name[:80],
+                                                       is_private=True)
+            _log.info("Created private channel #%s (%s)", name,
+                      result["channel"]["id"])
+            return result["channel"]["id"]
+        except SlackApiError as exc:
+            if exc.response.get("error") == "name_taken":
+                # OUR OWN ORPHAN IS THE ONE EXCEPTION, and it is the
+                # common case rather than a rare one: a provisioning run
+                # that creates the channel and then fails before writing
+                # the binding leaves exactly this -- a channel with our
+                # bot as its creator and nothing pointing at it. Seen on
+                # feature within an hour of the guard shipping.
+                #
+                # Refusing it permanently would be worse than joining a
+                # stranger's channel, because there is no way back:
+                # archiving does not release the name, so the only
+                # recovery is a human renaming the channel by hand, and
+                # nothing tells them that.
+                #
+                # Adopting is still narrow. The channel must have been
+                # created BY THIS BOT -- not merely be reachable -- which
+                # is the distinction the old join-on-name_taken behaviour
+                # failed to draw when it bound one environment's goal to
+                # another's channel.
+                adopted = await _adopt_own_orphan(client, name)
+                if adopted:
+                    return adopted
+                _log.error(
+                    "Private channel #%s already exists and was not created "
+                    "by this bot — refusing to take it over. Check "
+                    "SLACK_COMMAND_SUFFIX.", name)
+                raise ChannelNameTaken(
+                    f"#{name} already exists in this workspace and was not "
+                    f"created by this deployment. Rename it in Slack "
+                    f"(archiving does NOT free the name) and try again."
+                ) from exc
             raise
 
-    try:
-        client.conversations_join(channel=channel_id)
-    except SlackApiError as exc:
-        if exc.response.get("error") != "already_in_channel":
-            _log.warning("Failed to join channel %s: %s", channel_id, exc)
-    return channel_id
-
-
-def create_private_channel(client, name: str) -> str:
-    """Create a private channel, appending -2..-9 on name collision. Returns channel_id."""
-    from slack_sdk.errors import SlackApiError
     for suffix in ("", "-2", "-3", "-4", "-5", "-6", "-7", "-8", "-9"):
         candidate = f"{name}{suffix}"[:80]
         try:
-            result = client.conversations_create(name=candidate, is_private=True)
+            result = await client.conversations_create(name=candidate, is_private=True)
             channel_id = result["channel"]["id"]
             _log.info("Created private channel #%s (%s)", candidate, channel_id)
             return channel_id
@@ -573,49 +685,50 @@ async def setup_goal_channels(
 
     Returns: {goal_channel_id, goal_channel_name, orch_channel_id, orch_channel_name}
     """
-    from slack_sdk import WebClient
     from slack_sdk.errors import SlackApiError
     from app.channels.slack.thread_map import map_slack_user
 
-    client = WebClient(token=bot_token)
+    require_env_separation()
+    client = make_async_client(bot_token)
     goal_slug = goal_id.lower() + _channel_env_suffix()
 
     # 1. Goal channel
     if existing_channel_id:
         goal_channel_id = existing_channel_id
         try:
-            client.conversations_join(channel=goal_channel_id)
+            await client.conversations_join(channel=goal_channel_id)
         except SlackApiError as exc:
             if exc.response.get("error") != "already_in_channel":
                 _log.warning("Failed to join existing channel %s: %s", goal_channel_id, exc)
     else:
-        goal_channel_id = create_or_join_public_channel(client, goal_slug)
+        # PRIVATE. The goal channel used to be public, so anyone in the
+        # Slack workspace could find and read a goal's conversation --
+        # including people with no role on it. Slack has no public-API
+        # way to convert a public channel to private
+        # (admin.conversations.convertToPrivate is Enterprise Grid only),
+        # so goals provisioned before this keep their public channel until
+        # somebody archives it and re-enables Slack for the goal. New ones
+        # are private from the start.
+        goal_channel_id = await create_private_channel(client, goal_slug)
 
     try:
-        info = client.conversations_info(channel=goal_channel_id)
+        info = await client.conversations_info(channel=goal_channel_id)
         goal_channel_name = info["channel"]["name"]
     except Exception:
         goal_channel_name = goal_slug
 
-    # 2. Orchestrator channel — DISABLED for goals provisioned from now on.
-    # Agent Mesh / Goal Review Council / Security Council are staying
-    # in-app-only for new goals (see council_thread.py, security_thread.py,
-    # orchestrator.py); goals that already have an orch_channel_id keep
-    # working unchanged (post_to_orchestrator_channel no-ops when it's
-    # missing). Commented out, not deleted — intended to come back later.
-    # orch_slug = _slugify(f"{goal_channel_name}-orchestrator")
-    # orch_channel_id = create_or_join_public_channel(client, orch_slug)
-    # try:
-    #     info = client.conversations_info(channel=orch_channel_id)
-    #     orch_channel_name = info["channel"]["name"]
-    # except Exception:
-    #     orch_channel_name = orch_slug
+    # The orchestrator channel is GONE, not disabled. Its provisioning
+    # had been commented out for some time while post_to_orchestrator_channel
+    # and find_goal_by_orch_channel stayed live -- a half-path nobody owned,
+    # which read as a feature in the code and did nothing in practice. Under
+    # one-channel-per-thread an orchestrator thread is simply a thread and
+    # gets a channel the same way every other thread does.
     orch_channel_id = ""
     orch_channel_name = ""
 
     # 3. Welcome messages
     try:
-        client.chat_postMessage(
+        await client.chat_postMessage(
             channel=goal_channel_id,
             text=(
                 f"*Goal:* {goal_name}\n"
@@ -630,7 +743,7 @@ async def setup_goal_channels(
     # Orchestrator channel welcome — disabled alongside its provisioning above.
     # if orch_channel_id:
     #     try:
-    #         client.chat_postMessage(
+    #         await client.chat_postMessage(
     #             channel=orch_channel_id,
     #             text=(
     #                 ":information_source: *Orchestrator channel (read-only).*\n"
@@ -654,7 +767,7 @@ async def setup_goal_channels(
     workspace_id = ""
     for m in members:
         try:
-            resp = client.users_lookupByEmail(email=m["email"])
+            resp = await client.users_lookupByEmail(email=m["email"])
             slack_id = (resp.get("user") or {}).get("id", "")
             profile = (resp.get("user") or {}).get("profile") or {}
         except SlackApiError as exc:
@@ -688,7 +801,7 @@ async def setup_goal_channels(
             invite_targets.append((orch_channel_id, "orch"))
         for channel_id, label in invite_targets:
             try:
-                client.conversations_invite(channel=channel_id, users=users_csv)
+                await client.conversations_invite(channel=channel_id, users=users_csv)
                 _log.info("Invited %d members to %s channel %s", len(slack_user_ids), label, channel_id)
             except SlackApiError as exc:
                 err = (exc.response or {}).get("error", str(exc))
@@ -706,184 +819,3 @@ async def setup_goal_channels(
         "orch_channel_id": orch_channel_id,
         "orch_channel_name": orch_channel_name,
     }
-
-
-async def ensure_user_goal_channel(
-    goal_id: str,
-    user_uid: str,
-    user_actor_id,
-    user_display_name: str,
-    slack_user_id: str,
-    thread_id: str,
-    agent_id: str,
-    integration_id: str,
-    bot_token: str,
-    pool,
-    story: Optional[dict] = None,
-) -> Optional[str]:
-    """Find or create the private (user × goal) Slack channel.
-
-    Stores the binding in platform_channel_bindings.
-    Returns the Slack channel_id, or None on failure.
-    """
-    from slack_sdk import WebClient
-    from slack_sdk.errors import SlackApiError
-
-    client = WebClient(token=bot_token)
-
-    # Check for existing binding
-    existing = await pool.fetchrow(
-        """SELECT external_channel_id FROM platform_channel_bindings
-           WHERE goal_id = $1 AND integration_id = $2 AND actor_id = $3 AND archived_at IS NULL
-           LIMIT 1""",
-        goal_id, integration_id, user_actor_id,
-    )
-
-    if existing:
-        channel_id = existing["external_channel_id"]
-
-        # Rejoin case: this channel may have been shared read-only with the
-        # rest of the goal while this member was removed (see
-        # SlackProvisioner.deprovision_member / _archive_and_share_personal_channel
-        # in app/channels/slack/provisioner.py). Unarchive it and kick out
-        # everyone but the returning member before continuing — the same
-        # channel is reused, not recreated, so history/context survive intact.
-        try:
-            info = client.conversations_info(channel=channel_id)
-            if info.get("channel", {}).get("is_archived"):
-                client.conversations_unarchive(channel=channel_id)
-                _log.info(
-                    "ensure_user_goal_channel: unarchived channel=%s for returning actor=%s goal=%s",
-                    channel_id, str(user_actor_id)[:8], goal_id,
-                )
-                try:
-                    members_resp = client.conversations_members(channel=channel_id)
-                    for member_id in members_resp.get("members", []):
-                        if member_id == slack_user_id:
-                            continue
-                        try:
-                            client.conversations_kick(channel=channel_id, user=member_id)
-                        except SlackApiError as exc:
-                            err = (exc.response or {}).get("error", "")
-                            if err not in ("cant_kick_self", "cant_kick_from_general"):
-                                _log.warning(
-                                    "ensure_user_goal_channel: kick failed member=%s channel=%s: %s",
-                                    member_id, channel_id, exc,
-                                )
-                except SlackApiError as exc:
-                    _log.warning(
-                        "ensure_user_goal_channel: could not list members to clear channel=%s: %s",
-                        channel_id, exc,
-                    )
-        except SlackApiError as exc:
-            _log.warning(
-                "ensure_user_goal_channel: archive-state check failed channel=%s: %s", channel_id, exc,
-            )
-
-        # Re-invite (silent if already member)
-        if slack_user_id:
-            try:
-                client.conversations_invite(channel=channel_id, users=slack_user_id)
-            except SlackApiError as exc:
-                err = (exc.response or {}).get("error", "")
-                if err not in ("already_in_channel", "user_is_bot", "cant_invite_self"):
-                    _log.warning("ensure_user_goal_channel re-invite failed %s/%s: %s", slack_user_id, channel_id, exc)
-
-        if story:
-            # Rotate current_story_id
-            await pool.execute(
-                """UPDATE platform_channel_bindings
-                      SET current_story_id = $1, thread_id = $2, agent_id = $3
-                    WHERE goal_id = $4 AND integration_id = $5 AND actor_id = $6 AND archived_at IS NULL""",
-                story["id"], thread_id, agent_id, goal_id, integration_id, user_actor_id,
-            )
-            try:
-                client.chat_postMessage(
-                    channel=channel_id,
-                    text=(
-                        f":arrows_counterclockwise: *Now working on:* {story['title']}\n"
-                        f"_The assistant is reading RESOURCES.md and will start planning shortly._"
-                    ),
-                    username="System",
-                )
-            except SlackApiError as exc:
-                _log.warning("Failed to post story-rotate notice: %s", exc)
-        else:
-            # Update thread_id / agent_id in case SHCA was reaped and recreated
-            await pool.execute(
-                """UPDATE platform_channel_bindings
-                      SET thread_id = $1, agent_id = $2
-                    WHERE goal_id = $3 AND integration_id = $4 AND actor_id = $5 AND archived_at IS NULL""",
-                thread_id, agent_id, goal_id, integration_id, user_actor_id,
-            )
-        _log.info(
-            "ensure_user_goal_channel: reused channel=%s for actor=%s goal=%s",
-            channel_id, str(user_actor_id)[:8], goal_id,
-        )
-        return channel_id
-
-    # First time: build channel name and create it
-    channel_name = _channel_name_for(goal_id, user_display_name)
-
-    try:
-        channel_id = create_private_channel(client, channel_name)
-    except Exception as exc:
-        _log.error("ensure_user_goal_channel: failed to create channel %s: %s", channel_name, exc)
-        return None
-
-    try:
-        info = client.conversations_info(channel=channel_id)
-        final_name = info["channel"]["name"]
-    except Exception:
-        final_name = channel_name
-
-    if slack_user_id:
-        try:
-            client.conversations_invite(channel=channel_id, users=slack_user_id)
-        except SlackApiError as exc:
-            err = (exc.response or {}).get("error", "")
-            if err not in ("already_in_channel", "user_is_bot"):
-                _log.warning("Failed to invite user %s to new channel %s: %s", slack_user_id, channel_id, exc)
-
-    # Persist binding in platform_channel_bindings
-    await pool.execute(
-        """INSERT INTO platform_channel_bindings
-               (goal_id, integration_id, thread_id, actor_id, agent_id,
-                external_channel_id, current_story_id)
-           VALUES ($1, $2, $3, $4, $5, $6, $7)
-           ON CONFLICT (goal_id, integration_id, external_channel_id)
-           DO UPDATE SET thread_id = $3, agent_id = $5,
-                         current_story_id = $7, archived_at = NULL""",
-        goal_id, integration_id, thread_id, user_actor_id, agent_id,
-        channel_id, story["id"] if story else None,
-    )
-
-    # Welcome message
-    try:
-        if story:
-            desc = (story.get("description") or "")[:500]
-            parts = [
-                "*Welcome.* This is your assistant channel for this goal.",
-                f"*Now working on:* {story['title']}",
-            ]
-            if desc:
-                parts.append(f"\n{desc}")
-            parts.append(
-                "\n_The assistant has loaded the story context and will start planning shortly. "
-                "Stories rotate through this channel — your history persists for the lifetime of the goal._"
-            )
-            text = "\n".join(parts)
-        else:
-            text = (
-                "*Welcome.* This is your assistant channel for this goal. "
-                "Ask the Goal Orchestrator to assign you a story to start working on it."
-            )
-        client.chat_postMessage(channel=channel_id, text=text, username="System")
-    except SlackApiError as exc:
-        _log.warning("Failed to post user-goal-channel welcome: %s", exc)
-
-    _log.info(
-        "ensure_user_goal_channel: created channel=%s (#%s) for actor=%s goal=%s",
-        channel_id, final_name, str(user_actor_id)[:8], goal_id,
-    )
-    return channel_id

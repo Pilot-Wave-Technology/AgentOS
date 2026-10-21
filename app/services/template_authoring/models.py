@@ -32,7 +32,7 @@ class WizardInputs(BaseModel):
     template_id: str = Field(..., min_length=1, max_length=64)
     name: str = Field(..., min_length=1, max_length=200)
     emoji: str = Field(default="", max_length=8)
-    model: str = Field(default="google/gemini-2.5-flash", min_length=1)
+    model: str = Field(default="google/gemini-3.8-flash", min_length=1)
     description: str = Field(default="", max_length=500)
     # agent_type is selected by the operator in the form; archetype is derived
     # from it automatically (IA → coding-pipeline, RA → code-reviewer).

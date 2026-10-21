@@ -36,7 +36,7 @@ gcloud run jobs deploy "${SERVICE}-dbreset" \
   --vpc-connector="$CONNECTOR" --vpc-egress=private-ranges-only \
   --service-account="$SA" \
   --set-cloudsql-instances="${PROJECT}:${REGION}:${INSTANCE}" \
-  --set-secrets=DATABASE_URL=database-url-migrate:latest \
+  --set-secrets=DATABASE_URL=database-url-migrate:latest,AGENTOS_LEG_PASSWORD=execution-db-password:latest \
   --set-env-vars=APP_ENV=production \
   --command=python --args=migrations/reset_db.py \
   --max-retries=0 --task-timeout=600 --quiet
@@ -45,5 +45,4 @@ gcloud run jobs execute "${SERVICE}-dbreset" --region="$REGION" --wait
 
 echo "[db-reset] done — fresh schema + seed applied."
 echo "[db-reset] restart the service(s) so they reconnect cleanly:"
-echo "           # split (default): all four; single: just ${SERVICE}"
-echo "           for s in ${SERVICE}-web ${SERVICE}-council ${SERVICE}-git ${SERVICE}-management; do gcloud run services update \"\$s\" --region ${REGION}; done"
+echo "           for s in ${SERVICE}-web ${SERVICE}-council ${SERVICE}-git ${SERVICE}-management ${SERVICE}-scheduler; do gcloud run services update \"\$s\" --region ${REGION}; done"

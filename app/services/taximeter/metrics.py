@@ -74,6 +74,14 @@ Category = Literal["oversight", "throughput", "efficiency"]
 class MetricSpec:
     """One row in the Taximeter's metric taxonomy.
 
+    THESE DESCRIBE v1. The registry below is what `scoring.py` reads;
+    v2 does not use it at all -- its metrics are the `metric_key` rows
+    in `mv_taximeter_v2` and its weights are `taximeter/v2/points.py`.
+    Both are live: the scorer is chosen by the `taximeter_scoring`
+    setting, so neither set of descriptions is stale, they describe
+    different engines. A reader wanting to know what the DASHBOARD
+    currently counts should start from the setting.
+
     `key` must match the `metric_key` produced in the mat view.
     `label`/`description` are documentation only (no UI currently renders
     per-metric detail — the dashboard's "How is this calculated?" panel is

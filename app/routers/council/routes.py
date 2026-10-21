@@ -10,7 +10,7 @@ from fastapi.responses import JSONResponse
 
 from app.auth import require_admin
 from app.database import get_pool
-from app.services.council.runs import enqueue_run
+from app.services.council.runs import enqueue_run, force_run
 from app.services.council.dispatcher import council_dispatcher
 
 log = logging.getLogger(__name__)
@@ -19,11 +19,24 @@ router = APIRouter()
 
 
 @router.post("/goals/{pid}/council/run")
-async def trigger_council_review(pid: str, request: Request, user: dict = Depends(require_admin)):
-    """Manually trigger a council review for this goal (deduped + global single-run).
-    Goal Review Council is platform.admin-only, regardless of goal membership."""
+async def trigger_council_review(pid: str, request: Request, force: bool = False,
+                                 user: dict = Depends(require_admin)):
+    """Manually trigger a council review for this goal.
+
+    `?force=1` cancels whatever is in the way first: this goal's own active
+    run, and any run holding the GLOBAL single-run slot. The second is the
+    one that matters for testing -- a run wedged on some other goal blocks
+    the goal you actually want, and from here that is indistinguishable from
+    a broken trigger.
+
+    Cancelled runs are marked failed, not deleted, and the findings they
+    recorded stay in the ledger for the next run to pick up as already-open.
+
+    Goal Review Council is platform.admin-only, regardless of goal membership.
+    """
     created_by = user.get("uid") or user.get("id")
-    result = await enqueue_run(pid, created_by=created_by)
+    result = await (force_run(pid, created_by=created_by) if force
+                    else enqueue_run(pid, created_by=created_by))
     if result.get("created"):
         council_dispatcher.trigger()
         return JSONResponse({"ok": True, "run_id": result["run_id"], "status": "queued"})

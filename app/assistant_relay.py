@@ -103,14 +103,10 @@ async def post_card_to_assistant_thread(
             task.get("id", "?"), msg_id[:8], exc,
         )
 
-    # Mirror to Slack story channel as Block Kit card (if mapped)
-    try:
-        from app.channels.slack.outbound import relay_card
-        await relay_card(task.get("goal_id", ""), source_thread_id, card, content_markdown)
-    except ImportError:
-        pass
-    except Exception as exc:
-        logger.warning("Slack card relay failed for task %s: %s", task["id"], exc)
+    # Slack is reached by notify_new_message, which mirrors every
+    # card-bearing message. This used to be one of only three places that
+    # relayed a card, which is why the other twenty-four kinds never
+    # appeared in Slack at all.
 
     # Mirror plain text to Notion assistant subpage (if mapped). Slack is excluded
     # here because it already received a Block Kit card above.

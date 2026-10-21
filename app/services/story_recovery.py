@@ -161,12 +161,10 @@ async def post_recovery_card(goal_id: str, story_id: str, dag_task_id: str,
         await notify_new_message(thread_id, msg_id)
     except Exception:
         _log.exception("post_recovery_card: fan-out notify failed (story=%s)", story_id)
-    # Slack relay — Block Kit with Replan/Retry/Abandon buttons (falls back to text).
-    try:
-        from app.channels.slack.outbound import relay_card as _slack_relay_card
-        await _slack_relay_card(goal_id, thread_id, card, body)
-    except Exception:
-        _log.exception("post_recovery_card: Slack relay failed (story=%s)", story_id)
+    # The Slack relay used to be a second call here. notify_new_message
+    # above now mirrors every card-bearing message, so relaying again
+    # would post the card twice.
+
 
 
 async def mark_recovery_cards_decided(dag_task_id: str, action: str) -> None:

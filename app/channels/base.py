@@ -131,6 +131,32 @@ async def is_duplicate(platform: str, external_event_id: str) -> bool:
     return False
 
 
+async def forget_event(platform: str, external_event_id: str) -> None:
+    """Release a dedup claim so a redelivery can be processed.
+
+    `is_duplicate` claims the event BEFORE the handler runs, which is the
+    only way to make the claim atomic -- but it means a handler that
+    throws has consumed the event. The router has already answered 200 by
+    then, so nothing retries it and the message is gone, with one warning
+    to show for it.
+
+    Claim-then-release is the standard shape, and the failure mode it
+    trades into is a duplicate delivery rather than a silent loss. A
+    duplicate is visible and the handlers are idempotent; a loss is
+    neither.
+    """
+    try:
+        await get_pool().execute(
+            "DELETE FROM platform_processed_events "
+            " WHERE platform = $1 AND external_event_id = $2",
+            platform, external_event_id)
+        _log.info("Released dedup claim after a failed handle: %s/%s",
+                  platform, external_event_id)
+    except Exception as exc:                                    # noqa: BLE001
+        _log.warning("Could not release dedup claim %s/%s: %s",
+                     platform, external_event_id, exc)
+
+
 async def resolve_actor(
     platform: str,
     external_user_id: str,
@@ -439,7 +465,8 @@ async def route_to_session(
             await session._broadcast(thread_id, broadcast_payload)
             try:
                 from app.routers.goal_thread import _broadcast_to_goal_thread
-                await _broadcast_to_goal_thread(goal_id, broadcast_payload)
+                await _broadcast_to_goal_thread(goal_id, broadcast_payload,
+                                                thread_id)
             except Exception as exc:
                 _log.debug("Goal thread UI broadcast failed goal=%s: %s", goal_id, exc)
         else:
@@ -583,7 +610,7 @@ async def get_binding_by_thread(platform: str, thread_id: str, goal_id: Optional
     if goal_id:
         row = await get_pool().fetchrow(
             """
-            SELECT pcb.goal_id, pcb.integration_id, pcb.actor_id,
+            SELECT pcb.id, pcb.goal_id, pcb.integration_id, pcb.actor_id,
                    pcb.external_channel_id, pcb.resource_kind, pcb.agent_id
             FROM platform_channel_bindings  pcb
             JOIN platform_integrations      pi  ON pi.id             = pcb.integration_id
@@ -601,7 +628,7 @@ async def get_binding_by_thread(platform: str, thread_id: str, goal_id: Optional
     else:
         row = await get_pool().fetchrow(
             """
-            SELECT pcb.goal_id, pcb.integration_id, pcb.actor_id,
+            SELECT pcb.id, pcb.goal_id, pcb.integration_id, pcb.actor_id,
                    pcb.external_channel_id, pcb.resource_kind, pcb.agent_id
             FROM platform_channel_bindings  pcb
             JOIN platform_integrations      pi  ON pi.id             = pcb.integration_id

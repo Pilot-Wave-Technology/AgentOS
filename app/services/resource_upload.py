@@ -159,6 +159,11 @@ async def upload_and_register_resource(
                     UPDATE goal_resources
                        SET status = 'active',
                            file_size_bytes = $1,
+                           -- BOTH, for the reason the insert above
+                           -- gives: `uri` is what the kernel reads, and
+                           -- a revived row that keeps its old `uri`
+                           -- points at an object that is gone.
+                           uri = $2,
                            gcs_uri = $2,
                            summary_stale = true,
                            updated_at = now()
@@ -242,12 +247,25 @@ async def upload_and_register_resource(
                     context_goal_id=goal_id,
                 )
                 await conn.execute("""
+                    -- `uri` IS THE LOCATOR, and writing only `gcs_uri`
+                    -- makes the resource INVISIBLE TO THE KERNEL: no
+                    -- mount, no egress host, and nothing raises.
+                    -- `test_resource_uri_is_one_column` names this
+                    -- exact failure as the one thing its removal of
+                    -- `gcs_uri` from kernel/ depends on -- "every
+                    -- writer populates `uri`" -- and this writer did
+                    -- not. GOAL1 story 4bb5e544: three documents
+                    -- uploaded from the resources page, an empty
+                    -- `/workspace/docs/`, and a WORKSPACE.md telling
+                    -- the executor to read them.
                     INSERT INTO goal_resources
-                        (id, goal_id, kind, name, created_by, human_context,
-                         file_type, file_size_bytes, gcs_uri, summary_stale)
-                    VALUES ($1, $2, 'document', $3, $4, $5, $6, $7, $8, true)
-                """, resource_id, goal_id, name, uploader_uid, human_context,
-                    ext, len(file_bytes), gcs_uri)
+                        (id, goal_id, kind, name, uri, created_by,
+                         human_context, file_type, file_size_bytes,
+                         gcs_uri, summary_stale)
+                    VALUES ($1, $2, 'document', $3, $4, $5, $6, $7, $8, $9,
+                            true)
+                """, resource_id, goal_id, name, gcs_uri, uploader_uid,
+                    human_context, ext, len(file_bytes), gcs_uri)
                 # resource_attachments.filename keeps the ORIGINAL (pre-
                 # sanitisation) name so the audit trail shows what the
                 # human actually uploaded. The canonical safe name lives

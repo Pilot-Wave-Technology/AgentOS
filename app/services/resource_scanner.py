@@ -33,8 +33,42 @@ REPO_KEY_FILES = [
     "ARCHITECTURE.md", "CONTRIBUTING.md",
 ]
 
-# Max file size to read via API (prevent huge files)
-MAX_FILE_READ_BYTES = 100_000  # 100KB
+# Raw-endpoint fetch cap — a download safety net so one pathological file can't
+# be held in memory in full. Reads are ALSO windowed by line count
+# (DEFAULT_MAX_LINES), which is what actually bounds the tokens returned to an
+# agent, so this only guards against enormous blobs — not normal source files.
+MAX_FILE_READ_BYTES = 5_000_000  # 5MB
+# Default line window returned per read call. Files longer than this are paged
+# via `offset`; the read result carries `next_offset` so the caller can continue.
+DEFAULT_MAX_LINES = 1500
+
+
+def window_lines(text: str, offset: int, max_lines: int) -> dict:
+    """Return a line window [offset : offset+max_lines] over `text`, plus paging
+    metadata. When more lines remain, appends a human-readable 'call again with
+    offset=N' notice and sets `next_offset` so an agent can page through the rest
+    of a large file instead of being silently cut off.
+    """
+    lines = text.split("\n")
+    total = len(lines)
+    offset = max(0, offset)
+    win = lines[offset:offset + max_lines]
+    out = {
+        "content": "\n".join(win),
+        "offset": offset,
+        "lines_returned": len(win),
+        "total_lines": total,
+        "truncated": (offset + max_lines < total) or offset > 0,
+    }
+    if offset + max_lines < total:
+        shown = offset + max_lines
+        out["next_offset"] = shown
+        out["content"] += (
+            f"\n\n... {total - shown} more line(s) not shown (this file has {total} lines "
+            f"total). Read on with offset={shown} for the next window, or pass lines={total} "
+            f"to read the whole file in one call."
+        )
+    return out
 
 
 # ── Repo scanning ───────────────────────────────────────────────────────────
@@ -106,16 +140,23 @@ async def scan_repo_full(
         f"File contents:\n{content[:500_000]}"  # Limit to ~125K tokens
     )
 
-    summary = await _summarize_with_gemini(
-        f"Analyze this GitHub repository codebase and provide a comprehensive summary:\n"
-        f"- What does it do (purpose and functionality)\n"
-        f"- Tech stack, languages, and frameworks used\n"
-        f"- Architecture — key modules/directories and what they contain\n"
-        f"- Dependencies and infrastructure (Docker, CI/CD, etc.)\n"
-        f"- Code quality observations\n"
-        f"- Current state and any notable patterns\n\n"
-        f"{analysis_text}"
-    )
+    try:
+        summary = await _summarize_with_gemini(
+            f"Analyze this GitHub repository codebase and provide a comprehensive summary:\n"
+            f"- What does it do (purpose and functionality)\n"
+            f"- Tech stack, languages, and frameworks used\n"
+            f"- Architecture — key modules/directories and what they contain\n"
+            f"- Dependencies and infrastructure (Docker, CI/CD, etc.)\n"
+            f"- Code quality observations\n"
+            f"- Current state and any notable patterns\n\n"
+            f"{analysis_text}"
+        )
+    except SummarizationFailed as exc:
+        return _summarization_failure_result(
+            resource_id=resource_id, kind="repo/full", exc=exc,
+            start_time=start_time,
+            metadata={"file_count": file_count, "scan_method": "gitingest"},
+        )
 
     duration_ms = int((time.monotonic() - start_time) * 1000)
 
@@ -191,7 +232,10 @@ async def scan_repo_incremental(
         compare_data = compare_resp.json()
         changed_files = compare_data.get("files", [])
         new_commits = compare_data.get("commits", [])
-        head_sha = compare_data.get("ahead_by", 0)
+        # BUG FIXED (G4): this assigned `ahead_by` -- a COUNT -- to a
+        # variable named head_sha. The real head is fetched below; this
+        # line now records what it always meant to.
+        ahead_by = compare_data.get("ahead_by", 0)
 
         # Get current head SHA
         head_resp = await client.get(f"{base_url}/commits/{branch}", headers=headers)
@@ -232,10 +276,19 @@ async def scan_repo_incremental(
         f"\n\nCommits:\n" + "\n".join(commits_text)
     )
 
-    summary = await _summarize_with_gemini(
-        f"Update this repository summary based on the changes below. "
-        f"Focus on what's new or different.\n\n{analysis}"
-    )
+    try:
+        summary = await _summarize_with_gemini(
+            f"Update this repository summary based on the changes below. "
+            f"Focus on what's new or different.\n\n{analysis}"
+        )
+    except SummarizationFailed as exc:
+        # Note this also leaves head_sha unadvanced (it is set in the same
+        # UPDATE below), so the next incremental scan re-examines the same
+        # commits rather than skipping them as already-summarized.
+        return _summarization_failure_result(
+            resource_id=resource_id, kind="repo/incremental", exc=exc,
+            start_time=start_time,
+        )
 
     duration_ms = int((time.monotonic() - start_time) * 1000)
 
@@ -272,43 +325,48 @@ async def read_repo_file(
     file_path: str,
     branch: str = "main",
     github_token: str = "",
-    max_lines: int = 500,
+    max_lines: int = DEFAULT_MAX_LINES,
+    offset: int = 0,
 ) -> dict:
-    """Read a specific file from a GitHub repo via API."""
+    """Read a file from a GitHub repo via the RAW endpoint.
+
+    Uses raw.githubusercontent.com (NOT the Contents API), so there is no 1 MB
+    base64 content ceiling and no per-file byte error for ordinary source files.
+    The returned content is a line window [offset : offset+max_lines]; a long
+    file is paged via `offset` (see `next_offset` in the result) instead of
+    failing with "File too large" or being silently cut at a fixed line.
+    """
     import httpx
 
-    headers = {"Accept": "application/vnd.github.v3+json"}
+    headers = {"Accept": "application/vnd.github.raw+json"}
     if github_token:
         headers["Authorization"] = f"token {github_token}"
 
-    url = f"https://api.github.com/repos/{repo_owner}/{repo_name}/contents/{file_path}?ref={branch}"
+    url = f"https://raw.githubusercontent.com/{repo_owner}/{repo_name}/{branch}/{file_path}"
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            resp = await client.get(url, headers=headers)
+    except Exception as exc:
+        return {"error": f"Failed to fetch {file_path}: {exc}"}
 
-    async with httpx.AsyncClient(timeout=15) as client:
-        resp = await client.get(url, headers=headers)
-
+    if resp.status_code == 404:
+        return {"error": f"File not found: {file_path}", "status": 404}
     if resp.status_code != 200:
-        return {"error": f"File not found: {file_path}", "status": resp.status_code}
+        return {
+            "error": f"GitHub returned {resp.status_code} for {file_path}",
+            "status": resp.status_code,
+        }
 
-    data = resp.json()
-    if data.get("size", 0) > MAX_FILE_READ_BYTES:
-        return {"error": f"File too large: {data['size']} bytes (max {MAX_FILE_READ_BYTES})"}
+    text = resp.text
+    # Download safety net only — the returned content is bounded by the line
+    # window, so a normal file is never rejected; this just caps a huge blob.
+    if len(text) > MAX_FILE_READ_BYTES:
+        text = text[:MAX_FILE_READ_BYTES]
 
-    import base64
-    content = base64.b64decode(data.get("content", "")).decode("utf-8", errors="replace")
-
-    # Trim to max_lines
-    lines = content.split("\n")
-    truncated = len(lines) > max_lines
-    if truncated:
-        content = "\n".join(lines[:max_lines]) + f"\n\n... truncated ({len(lines)} total lines)"
-
-    return {
-        "path": file_path,
-        "content": content,
-        "size": data.get("size", 0),
-        "truncated": truncated,
-        "total_lines": len(lines),
-    }
+    result = window_lines(text, offset, max_lines)
+    result["path"] = file_path
+    result["size"] = len(text)
+    return result
 
 
 # ── Document scanning ───────────────────────────────────────────────────────
@@ -351,12 +409,18 @@ async def scan_document(
     text = extracted.get("text", "")[:50000]  # Limit input
     doc_metadata = extracted.get("metadata", {})
 
-    summary = await _summarize_with_gemini(
-        f"Summarize this {file_type.upper()} document.\n"
-        f"Filename: {filename}\n"
-        f"Metadata: {json.dumps(doc_metadata)}\n\n"
-        f"Content:\n{text}"
-    )
+    try:
+        summary = await _summarize_with_gemini(
+            f"Summarize this {file_type.upper()} document.\n"
+            f"Filename: {filename}\n"
+            f"Metadata: {json.dumps(doc_metadata)}\n\n"
+            f"Content:\n{text}"
+        )
+    except SummarizationFailed as exc:
+        return _summarization_failure_result(
+            resource_id=resource_id, kind="document", exc=exc,
+            start_time=start_time, metadata=doc_metadata,
+        )
 
     duration_ms = int((time.monotonic() - start_time) * 1000)
 
@@ -567,24 +631,60 @@ def _render_tree(node: dict, lines: list, prefix: str):
             _render_tree(node[name], lines, prefix + extension)
 
 
+class SummarizationFailed(Exception):
+    """The utility model could not summarize this resource.
+
+    Raised rather than returned so a failure cannot be mistaken for a
+    summary. It previously returned the string ``f"Summarization failed:
+    {exc}"``, which callers stored verbatim as the resource's summary AND
+    stamped ``last_scanned_at = now(), summary_stale = false`` alongside —
+    two separate problems:
+
+      * the resource was marked freshly scanned, so it was never retried;
+      * ``get_resource_summary`` served that error text to GO as the
+        repository's description.
+
+    A scan that failed should look like it hasn't happened, which is what
+    the sibling gitingest failure path already does by returning before
+    the stamping UPDATE.
+    """
+
+
 async def _summarize_with_gemini(prompt: str) -> str:
-    """Call Gemini Flash for summarization."""
-    settings = get_settings()
-    if not settings.gemini_api_key:
-        _log.warning("GEMINI_API_KEY not configured — returning raw text")
-        return prompt[:2000]
+    """Call the configured utility model (resource_scan_summary purpose) for
+    summarization. Raises `SummarizationFailed` — never returns error text."""
+    from app.services.utility_llm import UtilityLLMError, generate_utility_text
 
     try:
-        from google import genai
-        client = genai.Client(api_key=settings.gemini_api_key)
-        response = await client.aio.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=prompt[:100000],  # Limit prompt size
-        )
-        return response.text.strip()
-    except Exception as exc:
-        _log.warning("Gemini summarization failed: %s", exc)
-        return f"Summarization failed: {exc}"
+        return await generate_utility_text("resource_scan_summary", prompt[:100000])
+    except UtilityLLMError as exc:
+        raise SummarizationFailed(str(exc)) from exc
+
+
+def _summarization_failure_result(
+    *, resource_id: str, kind: str, exc: Exception, start_time: float,
+    metadata: dict | None = None,
+) -> dict:
+    """Uniform result for a scan whose summarization failed.
+
+    Deliberately does NOT call `_store_summary` and the caller must return
+    this BEFORE its `UPDATE goal_resources ... summary_stale = false`, so the
+    resource stays stale and is picked up by the next scan. Writing nothing is
+    the point: a stored failure is both a lie to `get_resource_summary` and a
+    reason never to retry.
+    """
+    duration_ms = int((time.monotonic() - start_time) * 1000)
+    _log.warning(
+        "Resource scan (%s) for resource_id=%s produced no summary — %s. "
+        "Leaving the resource stale so the next scan retries; nothing stored.",
+        kind, resource_id, exc,
+    )
+    return {
+        "summary": "",
+        "error": f"Summarization failed: {exc}",
+        "metadata": metadata or {},
+        "duration_ms": duration_ms,
+    }
 
 
 async def _store_summary(
@@ -610,6 +710,56 @@ async def _store_summary(
 
 # ── Get summary for GO tools ────────────────────────────────────────────────
 
+async def declared_trunks(goal_id: str, repo_name: str,
+                          repo_owner: str = "") -> list:
+    """The branches this goal has designated as trunks for this repo.
+
+    A goal declares them by ADDING them -- `kind='branch'` with
+    `role='trunk'` -- and there can be several: one repository can carry
+    a backend lane and a frontend lane in the same goal, each its own
+    merge target. `repo_identity.resolve_ws_trunk` already works this
+    way; the lane a story lands on is the trunk resource it was
+    GRANTED, not a property of the repository.
+    """
+    if not (goal_id and repo_name):
+        return []
+    rows = await get_pool().fetch(
+        "SELECT branch_name FROM goal_resources "
+        "WHERE goal_id = $1 AND kind = 'branch' AND role = 'trunk' "
+        "  AND repo_name = $2 "
+        # OWNER TOO, or two same-named repositories from different
+        # owners in one goal suppress each other's summaries -- and the
+        # symptom is a card that is simply never built.
+        "  AND lower(coalesce(repo_owner, '')) = lower(coalesce($3, '')) "
+        "  AND coalesce(branch_name, '') <> '' "
+        "  AND coalesce(status, 'active') = 'active'",
+        goal_id, repo_name, repo_owner)
+    return [r["branch_name"] for r in rows]
+
+
+async def trunk_branch_for(resource: dict) -> str:
+    """The branch a REPO row is summarised from, when one is at all.
+
+    ONLY REACHED WHEN THE GOAL HAS DECLARED NO TRUNKS. If it has, the
+    repo row is not summarised -- see `scan_resource` -- because work
+    happens at BRANCH level and each declared trunk is its own resource
+    with its own summary. A repo-level card that picks one of them is an
+    overview that can contradict the cards beneath it.
+
+    NO SECOND RESOLVER. An earlier version of this resolved the trunk
+    here, with its own precedence and its own ordering, and that was the
+    real defect: `resolve_repo_trunk` already answers it for the engine,
+    and mine took the NEWEST declared trunk where it takes the OLDEST,
+    so on a two-trunk goal the engine would have cut from one branch
+    while the summary described the other.
+
+    With no declared trunk there is nothing to disagree about: the
+    repository's own default branch is what the engine falls back to,
+    and it is what this uses.
+    """
+    return resource.get("default_branch") or "main"
+
+
 async def scan_resource(goal_id: str, resource_id: str) -> dict:
     """Trigger a fresh scan for any supported resource kind.
 
@@ -633,19 +783,53 @@ async def scan_resource(goal_id: str, resource_id: str) -> dict:
     _log.info("scan_resource: goal=%s resource=%s kind=%s", goal_id, resource_id, kind)
 
     if kind == "repo":
+        # THE BRANCH CARDS ARE THE ANSWER, so the repo card does not
+        # compete with them.
+        #
+        # Work happens at BRANCH level: a goal declares the branches it
+        # works on as resources, one repository can carry several trunk
+        # lanes in one goal, and which lane a story lands on is decided
+        # by the trunk resource it was granted
+        # (`repo_identity.resolve_ws_trunk`). Nothing in the engine asks
+        # "what is THE repo's branch".
+        #
+        # A summary is a scan of ONE branch's tree, so a repo card can
+        # only ever show one of those lanes -- an overview that silently
+        # equals one of the cards beneath it, and contradicts the rest.
+        # Observed on NCAL2: two declared trunks, `cal_backend` and
+        # `cal_frontend`, each correctly summarised, and a repo card
+        # describing a third branch entirely.
+        #
+        # A goal that has declared NOTHING still gets a repo summary --
+        # it is the only thing there is to describe, and with no lanes
+        # there is nothing for it to contradict.
+        trunks = await declared_trunks(goal_id,
+                                       resource.get("repo_name", ""),
+                                       resource.get("repo_owner", ""))
+        if trunks:
+            _log.info(
+                "resource %s: repo-level summary skipped; this goal works "
+                "on %d declared trunk branch(es) (%s), each summarised "
+                "from its own branch",
+                resource_id, len(trunks), ", ".join(sorted(trunks)))
+            return {"skipped": "repo-level summary not built",
+                    "reason": "this goal declares trunk branches; each is "
+                              "summarised from its own branch",
+                    "trunks": sorted(trunks)}
+
         github_token = await _github_token_for_goal(goal_id, resource.get("repo_name", ""))
         previous_sha = resource.get("head_sha", "")
         if previous_sha:
             return await scan_repo_incremental(
                 resource_id, goal_id,
                 resource["repo_owner"], resource["repo_name"],
-                resource.get("default_branch", "main"),
+                await trunk_branch_for(dict(resource)),
                 previous_sha, github_token,
             )
         return await scan_repo_full(
             resource_id, goal_id,
             resource["repo_owner"], resource["repo_name"],
-            resource.get("default_branch", "main"),
+            await trunk_branch_for(dict(resource)),
             github_token,
         )
 
@@ -662,10 +846,15 @@ async def scan_resource(goal_id: str, resource_id: str) -> dict:
         if not repo_owner or not repo_name:
             raise ValueError("Cannot determine repo for this branch resource")
         github_token = await _github_token_for_goal(goal_id, repo_name)
+        # A BRANCH RESOURCE IS ABOUT ITS OWN BRANCH, so `branch_name`
+        # stands. Only the FALLBACK changes: a branch row with no name
+        # is a bug, and scanning the trunk says something true about the
+        # repository rather than something false about `main`.
         return await scan_repo_full(
             resource_id, goal_id,
             repo_owner, repo_name,
-            resource.get("branch_name", "main"),
+            resource.get("branch_name")
+            or await trunk_branch_for(dict(resource)),
             github_token,
         )
 

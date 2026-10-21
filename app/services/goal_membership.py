@@ -279,7 +279,8 @@ async def remove_goal_member(
     # Started-story check — same rule as tasks: no mid-flight reassignment.
     started_stories = await pool.fetch(
         """SELECT id, title FROM stories
-            WHERE goal_id = $1 AND assigned_to = $2 AND state IN ('in_progress', 'blocked')
+            WHERE goal_id = $1 AND assigned_to = $2
+              AND state IN ('in_progress', 'blocked', 'awaiting_merge')
             ORDER BY created_at""",
         goal_id, target_uid,
     )

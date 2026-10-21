@@ -1,0 +1,38 @@
+{# Single GO-thread message row.
+   Shared by the full page render (goal_thread/index.html) and the
+   "load earlier" partial (goal_thread/_earlier_messages.html) so both paths
+   produce byte-identical markup. If you change the row, change it here only —
+   a divergence shows up as older messages that look different from newer ones.
+
+   Contract: `msg` must carry id / role / sender / sender_name / content /
+   created_at. `.rendered-md` holds RAW markdown text; the client converts it
+   via safeMarkdown() (see index.html) — do not pre-render HTML here. #}
+<div class="{% if msg.role == 'agent' %}go-msg{% else %}member-msg{% endif %} pl-4 py-2 rounded-r-lg" data-msg-id="{{ msg.id }}">
+  <div class="flex items-center gap-2 mb-1">
+    <span class="text-xs font-semibold {% if msg.sender_name == 'Goal Review Council' %}text-amber-300{% elif msg.sender_name == 'Security Council' %}text-rose-300{% elif msg.role == 'agent' %}text-emerald-400{% else %}text-indigo-400{% endif %}">
+      {{ msg.sender_name if msg.sender_name else msg.sender }}
+      {# Role clarifier for the GO only: council messages already name themselves. #}
+      {% if msg.role == 'agent' and msg.sender_name not in ('Goal Review Council', 'Security Council') %}<span class="text-slate-500 font-normal">(Goal Orchestrator)</span>{% endif %}
+    </span>
+    {# Where it was said -- see chat/_message.html for why this matters. #}
+    {% if msg.platform %}<span class="text-xs text-slate-600" title="Sent from {{ msg.platform }}">· {{ msg.platform }}</span>{% endif %}
+    <span class="text-xs text-slate-500" data-utc="{{ msg.created_at.isoformat() if msg.created_at else '' }}">
+      {{ msg.created_at.strftime('%b %d, %H:%M') if msg.created_at else '' }} UTC
+    </span>
+  </div>
+  <div class="text-sm text-slate-200 agent-prose">
+    <div class="rendered-md">{{ msg.content }}</div>
+  </div>
+  {# I5f — the errand proposal, rendered server-side. #}
+  {% if msg.proposal %}{% include "goal_thread/_errand_proposal.html" %}{% endif %}
+  {# AND A PARKED EXECUTOR'S CARD, hydrated by the same renderer the
+     assistant's thread uses (/static/js/kernel_park_card.js). It used
+     to arrive here as prose with no buttons, so an approved errand's
+     plan could be read and not approved. `msg.kernel_card` is "" for
+     every other message, so nothing that rendered before changes. #}
+  {% if msg.kernel_card %}
+  <div class="card-container mt-2">
+    <script class="card-json" type="application/json">{{ msg.kernel_card | safe }}</script>
+  </div>
+  {% endif %}
+</div>

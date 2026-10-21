@@ -333,6 +333,22 @@ async def _resolve_dependents(story_id: str) -> None:
         pass
 
 
+async def _promote_local_plan_executed(pool, story_id: str) -> None:
+    """C3: on a clean LOCAL DAG completion, promote the story's current plan_version
+    'approved'->'executed' so the local plan gate refuses a re-approval of the identical
+    plan (an edited plan has a new content_hash and still runs). One statement: the inline
+    execution_mode check makes it a no-op for gateway stories; WHERE status='approved' makes
+    it idempotent. Keys off current_plan_id — the plan gate keeps exactly one DAG in flight
+    per story (submit's already_executing guard), so it's the plan that spawned THIS DAG."""
+    await pool.execute(
+        "UPDATE plan_versions SET status = 'executed' "
+        "WHERE id = (SELECT current_plan_id FROM stories WHERE id = $1) "
+        "AND status = 'approved' "
+        "AND (SELECT execution_mode FROM stories WHERE id = $1) = 'local'",
+        story_id,
+    )
+
+
 async def _on_dag_tasks_complete(
     goal_id: str, story_id: str, dag_task_id: Optional[str],
 ) -> None:
@@ -402,6 +418,7 @@ async def _on_dag_tasks_complete(
             "UPDATE stories SET current_phase = 'awaiting_next', updated_at = NOW() WHERE id = $1",
             story_id,
         )
+        await _promote_local_plan_executed(pool, story_id)  # C3 (no-op unless local)
         await _emit_ledger(
             goal_id, "dag.complete",
             {"dag_task_id": dag_task_id, "story_id": story_id,
@@ -435,12 +452,26 @@ async def _on_dag_tasks_complete(
              "subtask_count": len(states)},
             actor_id=sh_actor, actor_type=sh_type,
         )
-        # Capture diff + write diff-review card.
-        try:
-            from app.services.diff_review import begin_diff_review
-            await begin_diff_review(goal_id, story_id, dag_task_id)
-        except Exception:
-            _log.exception("diff_review trigger failed for DAG %s", dag_task_id)
+        # Capture diff + write diff-review card. A LOCAL story submits its own
+        # diff via /internal/local/diff-submit (the CP can't gitDiff a clone that
+        # lives on the user's machine), so skip the gateway capture — the parent is
+        # already awaiting_approval + current_phase='awaiting_review', which IS the
+        # "waiting for diff-submit" state (§14.2 / M5).
+        exec_mode = await pool.fetchval(
+            "SELECT execution_mode FROM stories WHERE id = $1", story_id,
+        )
+        if exec_mode == "local":
+            await _promote_local_plan_executed(pool, story_id)  # C3
+            _log.info(
+                "sentinel_parser: DAG %s complete on a LOCAL story — plan marked executed, "
+                "awaiting diff-submit", dag_task_id,
+            )
+        else:
+            try:
+                from app.services.diff_review import begin_diff_review
+                await begin_diff_review(goal_id, story_id, dag_task_id)
+            except Exception:
+                _log.exception("diff_review trigger failed for DAG %s", dag_task_id)
 
 
 async def _fail_dag_parent(

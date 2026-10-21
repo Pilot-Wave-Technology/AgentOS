@@ -4,10 +4,15 @@
 {% block content %}
 <script src="https://cdn.jsdelivr.net/npm/marked@15/marked.min.js"></script>
 <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11/build/highlight.min.js"></script>
-<script src="/static/js/markdown_renderer.js"></script>
+<script src="/static/js/markdown_renderer.js?v={{ request.state.asset_v('js/markdown_renderer.js') }}"></script>
 <!-- XSS: DOMPurify sanitizes rendered markdown before innerHTML (see safe_markdown.js) -->
 <script src="https://cdn.jsdelivr.net/npm/dompurify@3/dist/purify.min.js"></script>
-<script src="/static/js/safe_markdown.js"></script>
+<script src="/static/js/safe_markdown.js?v={{ request.state.asset_v('js/safe_markdown.js') }}"></script>
+<script src="/static/js/kernel_park_card.js?v={{ request.state.asset_v('js/kernel_park_card.js') }}"></script>
+<!-- `defer`, so it runs after the inline script has defined
+     RUN_THREAD_ID and RUN_BASE. -->
+<script src="/static/js/run_controls.js?v={{ request.state.asset_v('js/run_controls.js') }}" defer></script>
+<script src="/static/js/workspace_panel.js?v={{ request.state.asset_v('js/workspace_panel.js') }}" defer></script>
 
 <style>
   .agent-prose h1, .agent-prose h2, .agent-prose h3,
@@ -46,7 +51,12 @@
   .system-msg { border-left: 3px solid #64748b; }
 </style>
 
-<div class="flex flex-col h-screen">
+{# A ROW, so the workspace rail can sit beside the conversation.
+   The conversation keeps `flex-col h-screen`; `min-w-0` is what
+   stops a long unbroken line in a message pushing the rail off
+   the screen. #}
+<div class="flex h-screen">
+<div class="flex flex-col flex-1 min-w-0">
   <!-- Header -->
   <div id="goal-thread-header" class="flex items-center justify-between px-6 py-3 border-b border-slate-700 bg-slate-800/50">
     <div class="flex items-center gap-3">
@@ -87,6 +97,15 @@
                   class="text-emerald-400 transition-all duration-300"/>
         </svg>
       </div>
+      {% if thread_id %}
+      <!-- View the current compaction summary (what GO retained after context compaction). -->
+      <button id="btn-compaction-summary" type="button" title="View compaction summary"
+        class="w-7 h-7 flex items-center justify-center rounded-md text-gray-600 hover:text-brand-light hover:bg-surface-hover transition-colors">
+        <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h4m3 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/>
+        </svg>
+      </button>
+      {% endif %}
       {% if goal.id == '__platform__' %}
       <!-- Platform Research Council v2: run a research sweep (model + tool research → independent review) -->
       <button id="prc-run-btn" type="button" onclick="platformResearchRun('{{ goal.id }}')"
@@ -216,7 +235,66 @@
   setInterval(() => {
     if (document.visibilityState === 'visible') refreshUsageRing();
   }, 8000);
+
+  // ── Compaction summary modal (on-demand) ────────────────────────────────
+  // Shows what GO retained after context compaction, via the CP's
+  // /api/memory/compaction-summary endpoint (existing sessions.get RPC — no
+  // gateway change). Button only exists when a thread is bound.
+  (function initCompactionSummary() {
+    const btn = document.getElementById('btn-compaction-summary');
+    if (!btn) return;
+    const cGoalId = '{{ goal.id }}';
+    const cAgentId = '{{ (goal.go_agent_id or ("go-" + goal.id)).lower() }}';
+    const cThreadId = '{{ thread_id or "" }}';
+    const modal = document.createElement('div');
+    modal.id = 'compaction-modal';
+    modal.className = 'hidden fixed inset-0 z-50 items-center justify-center bg-black/60 p-4';
+    modal.innerHTML =
+      '<div class="bg-surface border border-border rounded-lg max-w-2xl w-full max-h-[80vh] flex flex-col shadow-xl">'
+      + '<div class="flex items-center justify-between px-4 py-3 border-b border-border">'
+      + '<div class="text-sm font-semibold">Compaction summary '
+      + '<span id="compaction-count" class="text-2xs text-gray-500 font-normal"></span></div>'
+      + '<button id="compaction-close" type="button" class="text-gray-500 hover:text-gray-300 text-xl leading-none px-1">&times;</button>'
+      + '</div>'
+      + '<div id="compaction-body" class="px-4 py-3 overflow-y-auto text-sm text-gray-300 leading-relaxed"></div>'
+      + '</div>';
+    document.body.appendChild(modal);
+    const body = modal.querySelector('#compaction-body');
+    const countEl = modal.querySelector('#compaction-count');
+    const hide = () => { modal.classList.add('hidden'); modal.classList.remove('flex'); };
+    const show = () => { modal.classList.remove('hidden'); modal.classList.add('flex'); };
+    modal.addEventListener('click', (e) => { if (e.target === modal) hide(); });
+    modal.querySelector('#compaction-close').addEventListener('click', hide);
+    document.addEventListener('keydown', (e) => { if (e.key === 'Escape') hide(); });
+    btn.addEventListener('click', async () => {
+      body.innerHTML = '<div class="text-gray-500">Loading…</div>';
+      countEl.textContent = '';
+      show();
+      try {
+        const qs = new URLSearchParams({goal_id: cGoalId, agent_id: cAgentId, thread_id: cThreadId});
+        const resp = await fetch(`/api/memory/compaction-summary?${qs}`);
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok) { body.innerHTML = '<div class="text-red-400">Couldn\'t load the compaction summary.</div>'; return; }
+        countEl.textContent = `· ${(data && data.compaction_count) || 0} compaction(s)`;
+        if (data && data.has_summary && data.summary) {
+          const html = safeMarkdown(data.summary);
+          body.innerHTML = (typeof html === 'string') ? html : '';
+        } else {
+          body.innerHTML = '<div class="text-gray-500">No compaction summary yet — this session hasn\'t been compacted.</div>';
+        }
+      } catch (e) {
+        body.innerHTML = '<div class="text-red-400">Couldn\'t load the compaction summary.</div>';
+      }
+    });
+  })();
   </script>
+
+  {# The executor's run controls, for an errand thread. Shared with the
+     assistant's thread: same bar, same endpoints, same buttons. On the
+     goal's MAIN thread there is no story behind it, so /controls says
+     there is nothing in flight and the bar stays hidden. #}
+  {% include "_shared/machine_row.html" %}
+  {% include "_shared/run_controls.html" %}
 
   <!-- Messages area -->
   <div id="messages" class="flex-1 overflow-y-auto px-6 py-4 space-y-3">
@@ -227,23 +305,11 @@
     </div>
     {% endif %}
 
-    {% for msg in messages %}
-    <div class="{% if msg.role == 'agent' %}go-msg{% else %}member-msg{% endif %} pl-4 py-2 rounded-r-lg" data-msg-id="{{ msg.id }}">
-      <div class="flex items-center gap-2 mb-1">
-        <span class="text-xs font-semibold {% if msg.sender_name == 'Goal Review Council' %}text-amber-300{% elif msg.sender_name == 'Security Council' %}text-rose-300{% elif msg.role == 'agent' %}text-emerald-400{% else %}text-indigo-400{% endif %}">
-          {{ msg.sender_name if msg.sender_name else msg.sender }}
-          {# Role clarifier for the GO only: council messages already name themselves. #}
-          {% if msg.role == 'agent' and msg.sender_name not in ('Goal Review Council', 'Security Council') %}<span class="text-slate-500 font-normal">(Goal Orchestrator)</span>{% endif %}
-        </span>
-        <span class="text-xs text-slate-500" data-utc="{{ msg.created_at.isoformat() if msg.created_at else '' }}">
-          {{ msg.created_at.strftime('%b %d, %H:%M') if msg.created_at else '' }} UTC
-        </span>
-      </div>
-      <div class="text-sm text-slate-200 agent-prose">
-        <div class="rendered-md">{{ msg.content }}</div>
-      </div>
-    </div>
-    {% endfor %}
+    {# Only the newest INITIAL_MESSAGE_LIMIT messages are rendered; this button
+       pages backwards through the rest. See goal_thread/README.md. #}
+    {% if has_older %}{% with before_id = oldest_message_id %}{% include "_shared/load_earlier.html" %}{% endwith %}{% endif %}
+
+    {% for msg in messages %}{% include "goal_thread/_message.html" %}{% endfor %}
 
     <!-- Compaction indicator: shows when the gateway is compacting context.
          Can take several minutes for large sessions; this prevents the UI
@@ -280,8 +346,19 @@
     </div>
   </div>
 
+  {% include "_shared/run_ticker.html" %}
+
   <!-- Input area -->
-  <div class="px-6 py-3 border-t border-slate-700 bg-slate-800/50">
+  <div class="relative px-6 py-3 border-t border-slate-700 bg-slate-800/50">
+    <!-- New-message pill. Auto-scroll is suppressed while the reader has
+         scrolled up (see thread_scroll.js), so without this affordance an
+         incoming GO reply would land silently off-screen. Anchored to the input
+         bar rather than inside #messages so it does not scroll away. -->
+    <button type="button" id="new-messages-pill"
+      class="hidden absolute -top-10 left-1/2 -translate-x-1/2 z-10 px-3 py-1.5 rounded-full
+             bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-medium shadow-lg">
+      ↓ New messages
+    </button>
     <div id="upload-status" class="hidden mb-2 px-3 py-1.5 text-xs rounded-lg"></div>
     <div class="flex gap-3 items-end">
       <input id="file-input" type="file" class="hidden" multiple
@@ -311,9 +388,41 @@
     </div>
   </div>
 </div>
+{% include "_shared/workspace_panel.html" %}
+</div>
 
+<script src="/static/js/thread_scroll.js?v={{ request.state.asset_v('js/thread_scroll.js') }}"></script>
 <script>
 const pid = "{{ pid }}";
+// The thread the SERVER resolved for this page: an errand's own when
+// one was named, the goal's main GO thread otherwise. Not the raw query
+// parameter -- `go_thread_pick` refuses a thread that is not this
+// goal's, not the GO's, or is one of the three fixed channels, and the
+// page must not then talk to it anyway.
+const THREAD_ID = "{{ thread_id }}";
+// MODULE SCOPE, not inside connect(). It was declared there and used by
+// catchUpMissedMessages() too, which is a ReferenceError on every
+// reconnect -- the one path that only fires when the socket has already
+// dropped, so nothing would have caught it in normal use.
+const THREAD_Q = "&thread_id=" + encodeURIComponent(THREAD_ID);
+// What /static/js/kernel_park_card.js expects. It was lifted out of the
+// assistant's page, which had these under different names; naming them
+// here rather than editing the renderer keeps one copy of the card.
+const PID = pid;
+// The run this thread's story is on. Same two consts the assistant's
+// page defines, same endpoint -- it is thread-scoped and does not know
+// which agent owns the thread. "" on a thread with no story, which
+// leaves the bar hidden.
+const RUN_THREAD_ID = THREAD_ID;
+const RUN_BASE = `/goals/${pid}/threads/${RUN_THREAD_ID}/run`;
+// The story this thread is about, for the workspace rail. "" on the
+// goal's main thread, which is every thread that existed before errands
+// moved here -- and the rail renders nothing without it.
+const CURRENT_STORY_ID = {% if current_story %}"{{ current_story.id }}"{% else %}""{% endif %};
+function renderMd(text) {
+  try { return safeMarkdown(text || "") || ""; }   // XSS: sanitized
+  catch (e) { return escapeHtml(text || ""); }
+}
 const threadId = "{{ thread_id }}";
 const currentUid = "{{ user.uid }}";
 const currentName = "{{ user.display_name or user.email }}";
@@ -329,6 +438,10 @@ let lastMsgId = '';
 // with chat/orchestrator/council_thread/security_thread) ──────────────────────
 
 // Render existing agent messages
+// The data-md-done marker matters: messages loaded later by "Load earlier" are
+// converted by the same pass in htmx:afterSwap, which must skip anything
+// already turned into HTML (re-running safeMarkdown over rendered HTML mangles
+// it).
 document.querySelectorAll('.rendered-md').forEach(el => {
   try {
     const html = safeMarkdown(el.textContent);  // XSS: sanitized before innerHTML
@@ -336,21 +449,94 @@ document.querySelectorAll('.rendered-md').forEach(el => {
   } catch (e) {
     console.warn('safeMarkdown failed for element:', e);
   }
+  el.setAttribute('data-md-done', '1');
 });
 
 // Seed lastMsgId from the last server-rendered message so reconnect catch-up
 // only fetches messages that arrived after the page load.
 {% if messages %}lastMsgId = "{{ messages[-1].id }}";{% endif %}
 
-// Auto-scroll to bottom
+// ── Scroll management ────────────────────────────────────────────────────────
+// Shared with the read-only channels — see /static/js/thread_scroll.js for why
+// appends are conditional and why prepends need anchoring.
 const messagesDiv = document.getElementById('messages');
-messagesDiv.scrollTop = messagesDiv.scrollHeight;
+
+const threadScroll = initThreadScroll({
+  container: messagesDiv,
+  pill: document.getElementById('new-messages-pill'),
+  // Older rows arrive as raw markdown in .rendered-md (same contract as the
+  // server-rendered page); convert the newly inserted ones. data-md-done keeps
+  // the pass off already-rendered HTML, which re-rendering would mangle.
+  onInserted: (container) => {
+    container.querySelectorAll('.rendered-md:not([data-md-done])').forEach(el => {
+      try {
+        const html = safeMarkdown(el.textContent);  // XSS: sanitized before innerHTML
+        if (typeof html === 'string' && html.trim()) el.innerHTML = html;
+      } catch (e) {
+        console.warn('safeMarkdown failed for loaded-earlier element:', e);
+      }
+      el.setAttribute('data-md-done', '1');
+    });
+    // AND THEIR CARDS. Older messages carry `.card-container` holders
+    // exactly like the first page, and this pass converted only the
+    // markdown -- so a card far enough back to need "Load earlier" was
+    // never drawn at all, however long you scrolled.
+    //
+    // `hydrateParkCards` skips a container whose <script> is already
+    // gone, so running it over rows that include hydrated ones is free.
+    // The assistant's page does the same on its own swap.
+    try { hydrateParkCards(container); }
+    catch (e) { console.warn('card hydration failed for loaded-earlier:', e); }
+  },
+});
+
+function jumpToLatest() { threadScroll.jumpToLatest(); }
 
 // ── Missed-message catch-up (called on WS reconnect) ──
+// A card that arrived while the socket was closed, rendered into the
+// bubble `appendMessage` just made.
+//
+// THROUGH THE SAME TWO BUILDERS the live and reload paths use --
+// `buildProposalCard` for the errand proposal, `hydrateParkCards` for
+// everything else -- rather than a third rendering of the same data.
+// The buttons carry ids that `decideProposal` and the kernel card
+// handlers look up, so a hand-rolled copy that drifts renders controls
+// that do nothing, which is worse than none.
+function appendCatchUpCard(msg) {
+  if (!msg || (!msg.proposal && !msg.kernel_card)) return;
+  const bubble = document.querySelector(`[data-msg-id="${msg.id}"]`);
+  if (!bubble) return;
+  try {
+    if (msg.proposal) {
+      const el = buildProposalCard(
+        Object.assign({}, msg.proposal,
+                      {proposal_id: msg.proposal.proposal_id}));
+      if (el) bubble.appendChild(el);
+      return;
+    }
+    // `kernel_card` is the same JSON string the page render puts in a
+    // <script class="card-json">, so the same hydrator reads it.
+    const box = document.createElement('div');
+    box.className = 'card-container mt-2';
+    const holder = document.createElement('script');
+    holder.className = 'card-json';
+    holder.type = 'application/json';
+    holder.textContent = msg.kernel_card;
+    box.appendChild(holder);
+    bubble.appendChild(box);
+    hydrateParkCards(bubble);
+  } catch (e) {
+    // The message text is already on the page; a card that fails to
+    // draw must not take the catch-up loop down with it and lose every
+    // message after it.
+    if (window.console) console.error('catch-up card failed', msg.id, e);
+  }
+}
+
 async function catchUpMissedMessages() {
   if (!lastMsgId) return;
   try {
-    const resp = await fetch(`/goals/${pid}/thread/messages?after=${encodeURIComponent(lastMsgId)}`, {
+    const resp = await fetch(`/goals/${pid}/thread/messages?after=${encodeURIComponent(lastMsgId)}${THREAD_Q}`, {
       headers: { 'Authorization': `Bearer ${firebaseToken}` },
     });
     if (!resp.ok) return;
@@ -361,6 +547,12 @@ async function catchUpMissedMessages() {
       if (document.querySelector(`[data-msg-id="${msg.id}"]`)) continue;
       const _label = msg.sender_name || (msg.origin === 'slack' ? 'Slack' : msg.sender);
       appendMessage(_label, msg.content, msg.role || 'human', msg.sender === currentUid, msg.id);
+      // AND ITS CARD, IF IT HAD ONE. Without this a card missed while
+      // the socket was down came back as its own prose with no buttons
+      // -- readable, unapprovable, and indistinguishable from "the card
+      // never arrived", which is what "the approval only shows after a
+      // refresh" actually was.
+      appendCatchUpCard(msg);
     }
     hideThinking();
   } catch (e) {
@@ -371,7 +563,13 @@ async function catchUpMissedMessages() {
 // ── WebSocket ──
 let _wsConnectCount = 0;
 function connect() {
-  const wsUrl = `${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/goals/${pid}/thread/ws?token=${firebaseToken}`;
+  // WHICH THREAD THIS PAGE IS. The server resolved it (an errand names
+  // its own; everything else is the goal's main one) and every call the
+  // page makes has to carry it. Four of them did not, so this page
+  // RENDERED an errand's history and then sent and received on the main
+  // conversation -- the page looked right, which is why it took a live
+  // errand to notice.
+  const wsUrl = `${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/goals/${pid}/thread/ws?token=${firebaseToken}${THREAD_Q}`;
   ws = new WebSocket(wsUrl);
   const connectIndex = ++_wsConnectCount;
 
@@ -409,6 +607,46 @@ function connect() {
 }
 
 function handleMessage(msg) {
+  // ONCE PER FRAME, WHATEVER ITS TYPE AND WHICHEVER REGISTRY SENT IT.
+  //
+  // `_deliver` posts every frame to BOTH subscriber registries --
+  // `session_manager` and `goal_thread_subs` -- because deciding which
+  // one owns a thread is a decision that is wrong the first time a
+  // thread is opened somewhere nobody anticipated. A viewer sitting in
+  // both therefore receives everything twice.
+  //
+  // AT THE TOP, NOT PER BRANCH. The first attempt guarded only the
+  // `agent_card` branch, so cards stopped doubling and MESSAGES kept
+  // doubling; the second added branches for the other two types and put
+  // them AFTER the existing handlers for those types, where they were
+  // dead code. One guard before the chain cannot be half-applied.
+  //
+  // A frame with no id is always shown -- dropping those would be a
+  // worse bug than showing one twice -- and streaming token frames
+  // carry none, so they are unaffected.
+  //
+  // `msg.id` IS THE THIRD SPELLING AND THE ONE MESSAGES USE. The guard
+  // read `msg_id || message_id`, which cards carry and a `message`
+  // frame does not -- the very next line hands `msg.id` to
+  // `appendMessage`. So cards stopped doubling and every human message
+  // kept doubling, which is exactly what was reported: send once, see
+  // it twice, refresh and it is there once. One row, two frames, a
+  // guard looking at a field neither of them sets.
+  //
+  // THE BARE ROW ID, AND NOT NAMESPACED BY TYPE. Namespacing was
+  // tried and is exactly what broke this: ONE row reaches the page as
+  // two frames with DIFFERENT types -- `human_message` from the
+  // cross-instance broadcaster and the chat socket's own echo -- so
+  // `human_message:<id>` and `message:<id>` read as two frames and
+  // both rendered. Reported as "now I see my messages appear twice",
+  // immediately after the fan-out was repaired so that both
+  // registries deliver for the first time.
+  //
+  // The collision the namespace defended against cannot happen:
+  // `msg_id`, `message_id` and `id` are all `messages.id`, one table,
+  // UUIDs. There is no second numbering to collide with.
+  const __fid = msg.msg_id || msg.message_id || msg.id || '';
+  if (__alreadySeen(__fid)) return;
   if (msg.type === 'message') {
     // Human message from another member (or echo of own), OR an agent message
     // delivered as a plain message (e.g. council review, cross-instance fanout).
@@ -446,6 +684,42 @@ function handleMessage(msg) {
     // GO finished responding (agent event)
     finalizeStreaming();
     if (typeof refreshUsageRing === 'function') refreshUsageRing();
+  } else if (msg.type === 'agent_card' || msg.type === 'diff_review'
+             || msg.type === 'dag_recovery') {
+    // A CARD, LIVE. `_chat_broadcaster` pushes these to the session's
+    // subscribers and the goal thread relays them through; before this
+    // the frame arrived and was dropped, so a parked executor's card
+    // sat correctly in the database and appeared only on a refresh.
+    //
+    // THE SAME BUILDER THE ASSISTANT'S THREAD USES -- an approval
+    // button rendered two ways is one that comes to be wrong in one of
+    // them. See /static/js/kernel_park_card.js.
+    // ONCE PER CARD, WHATEVER ROUTE IT TOOK. There are two subscriber
+    // registries -- `session_manager` and `goal_thread_subs` -- and the
+    // fan-out delivers to BOTH, because deciding which one owns a thread
+    // is a decision that is wrong the first time a thread is opened
+    // somewhere nobody anticipated. A viewer registered in both
+    // therefore receives every card twice, which is exactly what
+    // happened the first time this shipped: every errand card in the GO
+    // chat appeared as a pair.
+    //
+    // The frame carries `msg_id`, so the browser can simply refuse the
+    // second one. That is the right place for it -- the delivery side
+    // cannot know how many registries a given viewer sits in.
+    //
+    // Keyed on msg_id ONLY when present: a frame without one has no
+    // identity to dedupe on, and dropping every such card would be a
+    // worse bug than showing one twice.
+    try {
+      hideThinking();
+      const el = (msg.card_type === 'errand_proposal' && msg.proposal_id)
+        ? buildProposalCard(msg)
+        : buildCardElement(msg);
+      const box = document.getElementById('messages');
+      if (box) { box.appendChild(el); threadScroll.onAppend(true); }
+    } catch (e) {
+      console.error('card render failed', e);
+    }
   } else if (msg.type === 'tool_start') {
     // GO is using a tool: replace "is thinking" with "is using <tool>"
     showThinking();
@@ -517,7 +791,7 @@ function appendMessage(sender, content, role, isOwn, msgId) {
   const container = document.getElementById('messages');
   const thinkingEl = document.getElementById('go-thinking');
   container.insertBefore(div, thinkingEl);
-  container.scrollTop = container.scrollHeight;
+  threadScroll.onAppend(true);  // real content — announce via pill if suppressed
 }
 
 function appendSystemMessage(text, opts = {}) {
@@ -531,13 +805,13 @@ function appendSystemMessage(text, opts = {}) {
   div.textContent = (warn ? '⏸ ' : '') + text;
   const container = document.getElementById('messages');
   container.insertBefore(div, document.getElementById('go-thinking'));
-  container.scrollTop = container.scrollHeight;
+  threadScroll.onAppend(true);  // system notices (e.g. kill-switch pause) are content
 }
 
 function showThinking() {
   goIsThinking = true;
   document.getElementById('go-thinking').classList.remove('hidden');
-  messagesDiv.scrollTop = messagesDiv.scrollHeight;
+  threadScroll.onAppend(false);  // transient indicator — never raise the pill
 }
 
 function hideThinking() {
@@ -554,7 +828,10 @@ function showStreaming(text) {
   const content = document.getElementById('go-streaming-content');
   el.classList.remove('hidden');
   try { content.innerHTML = safeMarkdown(text) || escapeHtml(text); } catch(e) { content.textContent = text; }  // XSS: sanitized
-  messagesDiv.scrollTop = messagesDiv.scrollHeight;
+  // Fires once per streamed token. Unconditional scrolling here is what made
+  // reading history impossible mid-response; finalizeStreaming() routes the
+  // completed text through appendMessage(), which raises the pill instead.
+  threadScroll.onAppend(false);
 }
 
 function finalizeStreaming() {
@@ -577,7 +854,45 @@ function sendMessage() {
   ws.send(JSON.stringify({type: 'message', content: text}));
   input.value = '';
   input.style.height = 'auto';
+  // Sending is explicit intent to rejoin the live conversation: re-pin to the
+  // bottom even if the user had scrolled up to read history first.
+  jumpToLatest();
   // "GO is thinking" is broadcast from server to all members
+}
+
+// A parked executor's card, with its buttons. Rendered by the SAME
+// module the assistant's thread uses rather than a copy, because two
+// copies of an approval button is how one comes to be wrong. Before
+// this the card arrived here as prose: readable, correct, unapprovable.
+// CALLED DIRECTLY, NOT ON `DOMContentLoaded`, and that was the bug.
+//
+// The messages are server-rendered ABOVE this script, so by the time it
+// runs the `.card-container` holders are already in the DOM and there
+// is nothing to wait for. Waiting made it depend on an event that does
+// not always come: `DOMContentLoaded` fires once per HARD load, so any
+// path where this script runs after parsing -- an htmx-boosted
+// navigation, a swap, a bfcache restore -- registers a listener for an
+// event that has already passed.
+//
+// WHAT THAT LOOKED LIKE. A persisted card stayed an invisible
+// `<script class="card-json">` tag: correct in the database, correct in
+// the HTML, drawn as nothing. Cards still ARRIVED live, because the
+// socket path builds its own element and never touches the hydrator --
+// so the symptom was "the card is there until I refresh, then it is
+// gone", which reads like the card was never saved.
+//
+// `chat/index.html` has called `hydrateChatCards()` directly all along,
+// which is why the assistant's thread never had this.
+//
+// The readyState guard keeps the one case where waiting IS right: if
+// this ever moves above the message list, the holders would not exist
+// yet.
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', function () {
+    hydrateParkCards();
+  });
+} else {
+  hydrateParkCards();
 }
 
 function escapeHtml(str) {
@@ -677,7 +992,7 @@ connect();
 // label) from chat_run_state so reloads don't lose the indicator.
 (async function restoreGoRunState() {
   try {
-    const resp = await fetch(`/goals/${pid}/thread/run-state`);
+    const resp = await fetch(`/goals/${pid}/thread/run-state?thread_id=${encodeURIComponent(THREAD_ID)}`);
     if (!resp.ok) return;
     const r = await resp.json();
     if (r.status === 'using_tool' && r.tool) {
@@ -690,6 +1005,109 @@ connect();
     }
   } catch (e) { /* idle / ignore */ }
 })();
+
+// ── I5f · approving an errand GO proposed ───────────────────
+//
+// ANY MEMBER MAY, and the endpoint enforces membership in THIS goal --
+// wider than the rest of the kernel's approvals, and narrower than what
+// the park endpoints shipped with, which was anybody signed in at all.
+//
+// The uid is never sent. The server takes it from the session, because
+// whoever approves owns every run of the errand -- their thread, their
+// ledger principal, their cost -- and ownership read off a request body
+// is a claim rather than a fact.
+// Has this exact frame already been rendered on this page?
+//
+// ONE PLACE, because the delivery side cannot know how many subscriber
+// registries a given viewer sits in -- it delivers to both on purpose
+// -- so every frame type that carries an id has to ask this. A frame
+// with NO id is always shown: dropping those would be a worse bug than
+// showing one twice.
+function __alreadySeen(id) {
+  if (!id) return false;
+  const seen = (window.__seenFrames = window.__seenFrames || new Set());
+  if (seen.has(id)) return true;
+  seen.add(id);
+  return false;
+}
+
+// GO's errand proposal, rendered LIVE, with the buttons.
+//
+// WHY THIS IS HERE AND NOT IN kernel_park_card.js. `_errand_proposal.html`
+// says it in its own comment: this is the only card THIS thread renders.
+// The shared card library serves the assistant's page too and has no
+// business knowing about a goal-thread-only card type -- so its generic
+// branch rendered the title and body and no buttons at all, which is
+// why the card arrived live and could not be approved without a reload.
+//
+// THE IDS ARE THE CONTRACT. `decideProposal` reads
+// `proposal-actions-<id>` and `proposal-note-<id>` by id, so the markup
+// built here has to match the Jinja partial exactly or the buttons
+// render and do nothing -- which is worse than no buttons.
+function buildProposalCard(msg) {
+  const id = msg.proposal_id;
+  const el = document.createElement('div');
+  el.className = 'mt-2 rounded-lg border border-amber-500/40 '
+    + 'bg-amber-500/5 p-3';
+  el.setAttribute('data-proposal', String(id));
+  const title = msg.title || 'An errand that would run without you';
+  const body = typeof renderMd === 'function'
+    ? renderMd(msg.body || '')
+    : escapeHtml(msg.body || '');
+  el.innerHTML =
+    '<div class="text-xs font-semibold text-amber-300 mb-2">🤖 '
+      + escapeHtml(title) + '</div>'
+    + '<div class="agent-prose text-sm mb-2">' + body + '</div>'
+    + '<div class="flex flex-wrap gap-2 items-center" '
+      + 'id="proposal-actions-' + id + '">'
+      + '<button type="button" class="px-2 py-1 rounded text-xs '
+        + 'font-medium bg-emerald-600 hover:bg-emerald-500 text-white" '
+        + 'onclick="decideProposal(' + id + ", 'approve')\">"
+        + "✓ Approve — I'll own these runs</button>"
+      + '<button type="button" class="px-2 py-1 rounded text-xs '
+        + 'font-medium bg-rose-700 hover:bg-rose-600 text-white" '
+        + 'onclick="decideProposal(' + id + ", 'decline')\">"
+        + '✕ Decline</button>'
+      + '<input type="text" id="proposal-note-' + id + '" '
+        + 'class="flex-1 min-w-[12rem] px-2 py-1 rounded text-xs '
+        + 'bg-slate-800 border border-slate-700 text-slate-200" '
+        + 'placeholder="Why not? (required to decline)">'
+    + '</div>';
+  return el;
+}
+
+async function decideProposal(id, verdict) {
+  const noteEl = document.getElementById(`proposal-note-${id}`);
+  const note = (noteEl || {}).value || '';
+  if (verdict === 'decline' && !note.trim()) {
+    alert('Say why — a proposal that vanishes with no reason gets re-proposed next week.');
+    return;
+  }
+  if (verdict === 'approve' && !confirm(
+      'You will own every run of this errand: it runs in your thread, the ledger '
+      + 'records you as the principal, and the cost is yours. Approve?')) {
+    return;
+  }
+  const box = document.getElementById(`proposal-actions-${id}`);
+  if (box) box.innerHTML = '<span class="text-xs text-slate-400 italic">Sending…</span>';
+  try {
+    const resp = await fetch(`/goals/${pid}/kernel/errand-proposals/${id}/decide`, {
+      method: 'POST', credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ verdict, reason: note }),
+    });
+    if (!resp.ok) {
+      const j = await resp.json().catch(() => ({}));
+      throw new Error(j.detail || `${resp.status} ${resp.statusText}`);
+    }
+    const out = await resp.json();
+    if (box) box.outerHTML = verdict === 'approve'
+      ? `<div class="text-xs text-emerald-400">✓ Approved — the first run parks for your plan approval. Story ${out.story || ''}</div>`
+      : '<div class="text-xs text-slate-400">✕ Declined</div>';
+  } catch (e) {
+    if (box) box.innerHTML = `<span class="text-xs text-rose-400">${e.message}</span>`;
+  }
+}
 </script>
 {% endblock %}
 

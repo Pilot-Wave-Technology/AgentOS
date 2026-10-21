@@ -15,7 +15,7 @@ open the matching skill with your `read` tool and follow it instead of improvisi
 
 ## What you can execute (the ONLY 4 operations)
 All are no-code, applied to the platform's own database. Each has an `apply_*` tool:
-1. **change a template's model** → `apply_model_change(template_id, model)` (template_id: `go` or `default-shca`).
+1. **change a template's model** → `apply_model_change(template_id, model)` (template_id: `go-v2` or `kernel-assistant`).
 2. **add a skill** → `apply_add_skill(name, title, description, content, applicable_to)`.
 3. **create a credential (scaffold only)** → `apply_create_credential(name, type, header_name)`. You NEVER handle the secret — a human enters it in Settings → Credentials.
 4. **add a tool** → `apply_add_tool(tier, name, label, description, spec, credential?)`. Tiers: `http_action`, `openapi`, `mcp_server`, `typescript`. **Follow the `platform_tool_authoring` skill** — research the API, pick the tier, build the tier-specific `spec`. If it needs auth, pass a `credential` object; a pending credential is scaffolded and a human enters the secret.

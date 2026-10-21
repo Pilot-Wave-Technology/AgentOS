@@ -63,6 +63,8 @@ import httpx
 import websockets
 from websockets.exceptions import ConnectionClosed
 
+from app import local_dev
+from app.chat_module.compaction_gate import CompactionGate
 from app.config import get_settings
 
 
@@ -466,6 +468,32 @@ class GatewayAdmin:
                     return seg
         return "orphans"
 
+    async def wait_for_run(self, run_id: str, timeout_s: float = 120.0) -> str:
+        """Block until a dispatched run reaches a terminal state.
+
+        The `agent` RPC ACKS — it responds with a runId as soon as the turn is
+        accepted, not when it finishes (`respond(true, accepted, …)` in the
+        gateway's agent.ts). Anything that needs the turn's SIDE EFFECTS to
+        have landed before it does something else — a memory flush holding the
+        home lock, for instance — has to wait here as well.
+
+        Returns the terminal status, or "" if it could not be established.
+        Never raises: a wait that fails must not fail the thing it was
+        protecting.
+        """
+        if not run_id:
+            return ""
+        try:
+            result = await self.call(
+                "agent.wait",
+                {"runId": run_id, "timeoutMs": int(timeout_s * 1000)},
+                timeout=timeout_s + 15,
+            )
+        except Exception as exc:
+            logger.warning("wait_for_run: %s did not resolve: %s", run_id[:12], exc)
+            return ""
+        return str((result or {}).get("status") or "") if isinstance(result, dict) else ""
+
     async def list_agent_files(self, agent_id: str) -> dict:
         return await self.call("agents.files.list", {"agentId": agent_id})
 
@@ -785,13 +813,15 @@ class _AgentSession:
         # run_id -> latest cumulative text from delta events (replaced on each delta)
         self._buffers: dict[str, str] = {}
 
-        # Compaction tracking — populated from `stream: "compaction"` agent_events
+        # Compaction tracking — fed from `stream: "compaction"` agent_events
         # (both pi's sync auto_compaction and our async-compaction-manager).
-        # While a thread_id is in this set, the chat_module dispatcher defers
-        # dispatch for that thread until the matching `phase: "end"` event
-        # arrives (which triggers a chat_dispatch NOTIFY to wake the queue).
-        # Keyed by thread_id because pi sessions are per-(agent, thread).
-        self._compacting_threads: set[str] = set()
+        # While a thread is held, the chat_module dispatcher defers dispatch for
+        # it. The gate BOUNDS that hold: the `end` event is a best-effort
+        # broadcast, and treating it as the only release path silenced a prod
+        # agent for 53h on 2026-08-08. See chat_module/compaction_gate.py for
+        # the full contract. Keyed by thread_id because pi sessions are
+        # per-(agent, thread).
+        self._compaction_gate = CompactionGate()
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -805,12 +835,103 @@ class _AgentSession:
         return unsubscribe
 
     def is_compacting(self, thread_id: str) -> bool:
-        """Return True if the gateway is currently compacting this thread's
-        pi session — observed via `stream: "compaction"` agent_events. Used
-        by the chat_module dispatcher to defer dispatch until the matching
-        compaction-end event arrives.
+        """Raw compaction-hold presence, ignoring expiry.
+
+        DIAGNOSTICS ONLY. Dispatch decisions must call `should_defer_for_compaction`
+        instead — this method reports the latch, not the gate, so using it to gate
+        dispatch reintroduces the unbounded hold it replaced (2026-08-08).
         """
-        return thread_id in self._compacting_threads
+        return self._compaction_gate.is_held(thread_id)
+
+    async def should_defer_for_compaction(self, thread_id: str) -> bool:
+        """Should the dispatcher hold this thread for an in-flight compaction?
+
+        Delegates to the gate, which bounds the hold and can positively confirm
+        completion via the gateway's `compactionCount` when the end-event never
+        arrived. Never raises — a gate that errors must not become one that sticks.
+        """
+        try:
+            return await self._compaction_gate.should_defer(
+                thread_id, fetch_count=self._fetch_compaction_count,
+            )
+        except Exception:
+            logger.warning(
+                "compaction gate check failed agent=%s thread=%s — allowing dispatch",
+                self.agent_id, thread_id, exc_info=True,
+            )
+            return False
+
+    async def _release_compaction_holds_on_disconnect(self) -> None:
+        """Drop every compaction hold when the gateway WS dies, and wake the
+        dispatcher for each freed thread.
+
+        The end-event can only arrive on the connection that is now gone, so
+        holding past a disconnect is a guaranteed stall rather than a cautious
+        wait. Best-effort throughout: this runs on the teardown path, where
+        raising would abort the reconnect loop.
+        """
+        try:
+            freed = self._compaction_gate.clear_all()
+        except Exception:
+            logger.warning("failed to clear compaction holds on disconnect",
+                           exc_info=True)
+            return
+        if not freed:
+            return
+        logger.warning(
+            "Gateway WS dropped while compacting agent=%s — released %d hold(s), "
+            "waking the dispatcher for: %s", self.agent_id, len(freed), freed,
+        )
+        for thread_id in freed:
+            try:
+                from app.chat_module.repository import notify_dispatch
+                await notify_dispatch(thread_id)
+            except Exception:
+                logger.debug(
+                    "chat_module: notify_dispatch after disconnect failed for "
+                    "thread=%s — poll loop will catch up", thread_id, exc_info=True,
+                )
+
+    async def _capture_compaction_baseline(self, thread_id: str) -> None:
+        """Record `compactionCount` just after a compaction starts.
+
+        Runs as a detached task off the event handler, so it must swallow
+        everything: a failure here only costs the gate its status-based release
+        (it still expires on the timer), and an unhandled exception in a
+        fire-and-forget task is far more damaging than a missing baseline.
+        """
+        try:
+            self._compaction_gate.set_baseline(
+                thread_id, await self._fetch_compaction_count(thread_id),
+            )
+        except Exception:
+            logger.debug(
+                "compaction baseline capture failed agent=%s thread=%s — "
+                "gate falls back to its timer", self.agent_id, thread_id, exc_info=True,
+            )
+
+    async def _fetch_compaction_count(self, thread_id: str) -> int | None:
+        """Read the gateway's `compactionCount` for this thread's session.
+
+        Reuses the existing `sessions.status` RPC (same call `memory_v2.auto_flush`
+        makes) rather than adding gateway surface — the count only advances after
+        a splice commits, which is what makes it usable as proof of completion.
+        Returns None whenever the answer isn't trustworthy, so the caller falls
+        back to the timer.
+        """
+        gw_agent = getattr(self, "_gateway_agent_id", None) or self.agent_id
+        session_key = make_goal_session_key(gw_agent, self.pid, thread_id)
+        try:
+            status = await gateway_admin.call(
+                "sessions.status", {"key": session_key}, timeout=10,
+            )
+        except Exception:
+            logger.debug("sessions.status failed for %s", session_key, exc_info=True)
+            return None
+        if not status or not status.get("ok"):
+            return None
+        count = status.get("compactionCount")
+        return int(count) if isinstance(count, (int, float)) else None
 
     def _thread_id_from_session_key(self, session_key: str) -> str | None:
         """Extract thread_id from a gateway sessionKey of the form
@@ -1452,6 +1573,41 @@ class _AgentSession:
     async def _connect(self):
         gw_url = _ws_url()  # Single endpoint, no path
 
+        # The teardown below MUST run on every exit path, not just a clean one.
+        # A real gateway death raises ConnectionClosedError out of the `async for`
+        # and is caught by _connect_loop's `except` — so any cleanup written
+        # after the `async with` is silently skipped exactly when it matters
+        # most. Verified locally 2026-08-10: killing the gateway mid-compaction
+        # produced "no close frame received or sent" and left the hold in place.
+        # Hence try/finally rather than trailing statements.
+        try:
+            await self._connect_inner(gw_url)
+        finally:
+            self._gw_ws = None
+            self._gw_ready.clear()
+            await self._release_compaction_holds_on_disconnect()
+            self._notify_stale_runs_on_disconnect()
+
+    def _notify_stale_runs_on_disconnect(self) -> None:
+        """Tell browsers their in-flight runs are dead so they stop spinning."""
+        if not self._runs:
+            return
+        stale_threads = set(self._runs.values())
+        logger.warning(
+            "Gateway WS dropped with %d in-flight runs across threads: %s",
+            len(self._runs), stale_threads,
+        )
+        for thread_id in stale_threads:
+            asyncio.create_task(self._broadcast(thread_id, json.dumps({
+                "type": "error",
+                "code": "WS_RECONNECTING",
+                "message": "Connection to agent lost — reconnecting. Response may arrive via polling.",
+                "retryable": True,
+            })))
+        self._runs.clear()
+        self._buffers.clear()
+
+    async def _connect_inner(self, gw_url: str):
         async with websockets.connect(gw_url, max_size=_WS_MAX_SIZE) as ws:
             # DO NOT set self._gw_ws until handshake completes — otherwise
             # send_to_gateway() can fire on an unauthenticated connection
@@ -1496,26 +1652,9 @@ class _AgentSession:
             # Step 4: Receive frames
             async for raw in ws:
                 await self._dispatch(raw)
-
-        # Connection closed — block new sends until reconnect.
-        # Notify browsers about stale in-flight runs so they stop spinning.
-        self._gw_ws = None
-        self._gw_ready.clear()
-        if self._runs:
-            stale_threads = set(self._runs.values())
-            logger.warning(
-                "Gateway WS dropped with %d in-flight runs across threads: %s",
-                len(self._runs), stale_threads,
-            )
-            for thread_id in stale_threads:
-                await self._broadcast(thread_id, json.dumps({
-                    "type": "error",
-                    "code": "WS_RECONNECTING",
-                    "message": "Connection to agent lost — reconnecting. Response may arrive via polling.",
-                    "retryable": True,
-                }))
-            self._runs.clear()
-            self._buffers.clear()
+        # NOTE: no teardown here on purpose — see the try/finally in _connect().
+        # A real gateway death exits this coroutine by RAISING, so anything
+        # written after the `async with` runs only on a clean close.
 
     async def _dispatch(self, raw: str):
         """Route gateway frames to browser subscribers and persist to DB.
@@ -1611,11 +1750,17 @@ class _AgentSession:
                     return
                 phase = data.get("phase", "")
                 if phase == "start":
-                    self._compacting_threads.add(comp_thread_id)
+                    self._compaction_gate.mark_start(comp_thread_id)
                     logger.info(
                         "compaction START: agent=%s thread=%s source=%s — chat_module will defer dispatch",
                         self.agent_id, comp_thread_id, data.get("source", "sync"),
                     )
+                    # Record the pre-round compactionCount out-of-band: it is the
+                    # baseline that later proves the splice committed if the end
+                    # event never arrives. Fire-and-forget so a slow/absent
+                    # status RPC never delays event processing — a missing
+                    # baseline just degrades the gate to its timer.
+                    asyncio.create_task(self._capture_compaction_baseline(comp_thread_id))
                 elif phase == "end":
                     will_retry = bool(data.get("willRetry", False))
                     if will_retry:
@@ -1624,7 +1769,7 @@ class _AgentSession:
                             self.agent_id, comp_thread_id,
                         )
                         return
-                    self._compacting_threads.discard(comp_thread_id)
+                    self._compaction_gate.mark_end(comp_thread_id)
                     logger.info(
                         "compaction END: agent=%s thread=%s ok=%s reason=%s — releasing dispatch hold",
                         self.agent_id, comp_thread_id,
@@ -2052,7 +2197,8 @@ async def _build_identity_md(pool, goal_id: str, thread_id: str) -> str:
     story = await pool.fetchrow(
         """SELECT * FROM stories
             WHERE active_thread_id = $1
-              AND state IN ('accepted', 'in_progress', 'blocked')
+              AND state IN ('accepted', 'in_progress', 'blocked',
+                            'awaiting_merge')
             ORDER BY updated_at DESC NULLS LAST
             LIMIT 1""",
         thread_id,
@@ -2210,8 +2356,37 @@ async def _build_identity_md(pool, goal_id: str, thread_id: str) -> str:
             parts.append(f"- {d['decision']}{rationale} [{date}]")
         parts.append("")
 
-    # Instructions — division of labor
-    parts.append("""## How To Work On This Story
+    # Instructions — division of labor. MUST branch on execution_mode: an
+    # operator-mode story gives THIS SHCA direct repo/ access (see
+    # RESOURCES.md's "Workspace layout" section) and there are no coding
+    # agents to delegate to — telling it to create_task instead of writing
+    # code directly contradicts RESOURCES.md and stalls the story.
+    if (story.get("execution_mode") or "ia_dispatch") == "operator":
+        parts.append("""## How To Work On This Story
+
+### Your role
+You are working DIRECTLY on this story's code, in your own workspace. The
+repo is already checked out at `repo/` under your cwd (the story workspace
+root) — see RESOURCES.md for the exact layout, branch, and git credentials.
+
+### Do the work yourself — do NOT create tasks
+Write, edit, test, and commit code directly inside `repo/`. There are no
+coding agents to delegate to in operator mode — `create_task` is not the
+right tool here. Commit frequently with clear messages (RESOURCES.md has the
+git setup). Only work inside `repo/`; anything outside it is invisible to the
+diff/review gate.
+
+### For research/planning: DO IT YOURSELF
+Use web_search, resource_read, etc. to research approaches, understand the
+codebase, and plan before you start editing.
+
+### Communication
+- Use `message_go` to communicate with the Goal Orchestrator (questions, updates, requests)
+- Use `story_update` to post progress updates
+- Use `register_resource` to register new resources you create
+- When done, send a completion report via `message_go(type='update')`""")
+    else:
+        parts.append("""## How To Work On This Story
 
 ### Your role
 You are the human's advisor and coordinator. You help them:
@@ -2332,7 +2507,7 @@ class SessionManager:
     async def send_silent_flush(
         self, *, goal_id: str, agent_id: str, thread_id: str,
         user_message: str, system_prompt: str, idempotency_key: str,
-    ) -> bool:
+    ) -> str:
         """Dispatch a silent flush turn via gateway admin RPC.
 
         Routes through `gateway_admin.call("agent", ...)` — the always-on
@@ -2368,7 +2543,7 @@ class SessionManager:
                 "agent=%s goal=%s thread=%s — flush dropped",
                 agent_id, goal_id, thread_id,
             )
-            return False
+            return ""
 
         # Build the session key the same way the chat/task paths do so
         # the gateway routes this turn to the same pi session as
@@ -2407,13 +2582,18 @@ class SessionManager:
                 gateway_agent_id, thread_id,
                 run_id[:12] if run_id else "?",
             )
-            return True
+            # The run id, not just True. The RPC above ACKS — the turn has been
+            # accepted, not run — so a caller that needs the memory writes to
+            # have LANDED (one holding the home lock across several stories
+            # finishing at once) has to wait on this id. `""` stays falsy for
+            # the callers that only check whether dispatch succeeded.
+            return run_id or "dispatched"
         except Exception:
             logger.exception(
                 "send_silent_flush: admin RPC failed for goal=%s gateway_agent=%s thread=%s",
                 goal_id, gateway_agent_id, thread_id,
             )
-            return False
+            return ""
 
     async def _resolve_gateway_agent_id_for_flush(
         self, *, agent_id: str, thread_id: str,
@@ -2763,10 +2943,14 @@ class SessionManager:
 
         Returns the gateway agent ID for the new instance.
         """
-        # Instance ID: {template}-{goal_id}-{thread_id} (full UUIDs for traceability)
-        instance_id = f"{agent_id}-{goal_id}-{thread_id}"
-        workspace = f"~/.openclaw/workspace-{instance_id}"
-        model = agent_row.get("model", "google/gemini-2.5-flash")
+        # Instance ID: {template}-{goal_id}-{thread_id}, or {template}-{goal_id}
+        # for an assistant that shares one home across its threads — see
+        # app/services/assistant_instance.py. The workspace follows the id, which
+        # is exactly why the fold is there: one id, one MEMORY.md.
+        from app.services.assistant_instance import resolve as _resolve_instance_id
+        instance_id = await _resolve_instance_id(pool, agent_id, goal_id, thread_id)
+        workspace = local_dev.agent_workspace_path(instance_id)
+        model = agent_row.get("model", "google/gemini-3.8-flash")
 
         # Create gateway agent with dispatchMode flag for ACP tool detection.
         # If the agent already exists on the gateway (resume after CP-side
@@ -2931,10 +3115,14 @@ class SessionManager:
         # push. user_uid comes from the agent row (owner_actor_id). Non-fatal.
         try:
             from app.memory_v2 import provisioning as _mv2_provisioning
+            from app.memory_v2.snapshot import memory_key as _memory_key
             owner_uid = agent_row.get("owner_actor_id")
             owner_uid_str = str(owner_uid) if owner_uid else None
+            # db_key = the canonical {agent}-{goal} memory key so restore reads the
+            # shared store (incl. local writes). agent_id is the abstract assistant id.
             await _mv2_provisioning.setup_memory_v2_for_agent(
                 agent_id=instance_id, agent_type="SHCA", user_uid=owner_uid_str,
+                db_key=_memory_key(agent_id, goal_id),
             )
         except Exception:
             logger.exception(
@@ -3001,16 +3189,32 @@ class SessionManager:
         # Push every applicable skill into <workspace>/skills/<name>/SKILL.md.
         # Mirrors what go_agent.py does for GO. Required so SHCA can invoke
         # the shca_* operator skills (registered in migration 040).
+        #
+        # NOT FOR THE KERNEL ASSISTANT, which has zero skills by design --
+        # not few. Its whole surface is twelve tools and two prompt files,
+        # and a skills/ directory it never reads is not merely clutter:
+        # the control panel's story kickoff used to route it into
+        # `skills/assistant_discovery/SKILL.md`, so the model announced a
+        # phase and waited for a state machine that does not exist here.
+        _kernel_assistant = await pool.fetchval(
+            "SELECT 1 FROM agents WHERE id = $1 "
+            "AND template_id IN ('kernel-assistant', 'go-v2')", instance_id)
         try:
-            skill_rows = await pool.fetch(
-                """
-                SELECT name, content
-                  FROM skills
-                 WHERE status = 'active'
-                   AND 'SHCA' = ANY(applicable_to)
-                ORDER BY name
-                """,
-            )
+            if _kernel_assistant:
+                logger.info(
+                    "skill push skipped for %s: kernel-template agents carry "
+                    "no skills", instance_id)
+                skill_rows = []
+            else:
+                skill_rows = await pool.fetch(
+                    """
+                    SELECT name, content
+                      FROM skills
+                     WHERE status = 'active'
+                       AND 'SHCA' = ANY(applicable_to)
+                    ORDER BY name
+                    """,
+                )
             pushed = 0
             for sk in skill_rows:
                 try:
@@ -3104,8 +3308,8 @@ class SessionManager:
         try:
             await gateway_admin.call("agents.create", {
                 "name": gw_id,
-                "workspace": f"~/.openclaw/workspace-{gw_id}",
-                "model": agent_row.get("model", "google/gemini-2.5-flash"),
+                "workspace": local_dev.agent_workspace_path(gw_id),
+                "model": agent_row.get("model", "google/gemini-3.8-flash"),
             })
             created = True
             logger.info("Created gateway agent %s", gw_id)

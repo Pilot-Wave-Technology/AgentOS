@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from typing import Optional
 
 import yaml  # noqa: F401  (validated as runtime dep in requirements.txt)
 
@@ -53,6 +54,10 @@ tasks:
       Concrete, scoped, executable in one Claude turn.
     acceptance: "One-line acceptance criterion (string, not list)."
     depends_on: []
+    # `repo` is OPTIONAL for a single-repo story and REQUIRED for every task
+    # when the story spans multiple repositories (there is no default then).
+    # Use the repo directory name shown in your workspace docs.
+    repo: repos/acme__web
 
   - id: T2
     phase: unit-tester
@@ -74,6 +79,8 @@ Hard rules (the parser will reject otherwise):
 - depends_on entries must reference existing task ids in the same DAG
 - No self-reference, no cycles
 - Flat list only — no nested subtasks
+- `repo` is required on EVERY task when the story spans multiple repositories;
+  omit it only when the story has exactly one repo
 """
 
 
@@ -85,6 +92,12 @@ class DagTask:
     description: str
     acceptance: str
     depends_on: list[str] = field(default_factory=list)
+    # Which repo this task works in (multi-repo plan M4.3). Empty ⇒ the story's sole
+    # write repo, which is the only unambiguous default; a multi-write story MUST set
+    # it per task (validated in parse_dag_from_markdown when allowed_repos is given).
+    # Matches a story_workspace_nodes subdir or a repo name — resolution is the
+    # caller's job, since the parser is deliberately DB-free.
+    repo: str = ""
 
 
 @dataclass
@@ -124,7 +137,10 @@ def _strip_inline_backticks(yaml_body: str) -> str:
     return _BACKTICKED_VALUE_RE.sub(_sub, yaml_body)
 
 
-def parse_dag_from_markdown(plan_md: str, *, allowed_phases: set[str]) -> ParsedDag:
+def parse_dag_from_markdown(
+    plan_md: str, *, allowed_phases: set[str],
+    repo_aliases: Optional[dict] = None,
+) -> ParsedDag:
     """Parse the Task DAG section out of a plan markdown file.
 
     Returns a ParsedDag with validated tasks. Raises DagParseError on:
@@ -135,6 +151,25 @@ def parse_dag_from_markdown(plan_md: str, *, allowed_phases: set[str]) -> Parsed
       * A task references a phase not in `allowed_phases`
       * `depends_on` references a task id that doesn't exist
       * Topological cycle in the dependency graph
+      * `repo` names a repo the story wasn't granted, or is MISSING on a
+        multi-repo story (see below)
+
+    `repo_aliases` (multi-repo plan M4.3) maps every identifier this story's plan may
+    use for a repo → that repo's canonical workspace subdir. Several aliases resolve to
+    the same repo on purpose (the directory `repos/acme__web`, the bare name `web`, and
+    `acme/web`), because the planner sees more than one form in its workspace docs.
+
+    It is a MAPPING, not a set, specifically so the alias count can never be mistaken
+    for the repo count: passing a set of aliases made a one-repo story look like a
+    three-repo story and demanded `repo:` on every task, rejecting every plan. The repo
+    count is therefore always derived here, from the distinct subdirs.
+
+      * None / empty  — single-repo story (or an un-migrated caller). `repo:` is
+        ignored entirely and the DAG parses exactly as it always did.
+      * one repo      — `repo:` is optional; that repo is the unambiguous default.
+      * several repos — `repo:` is REQUIRED on every task. There is no sensible default
+        when a story writes to several repos, and silently guessing would run a task
+        against the wrong checkout (plan finding R9).
     """
     # Null bytes (\x00) can appear when the gateway's readFile RPC reads a
     # plan file that has binary-padding artifacts from the filesystem/CLI.
@@ -214,6 +249,31 @@ def parse_dag_from_markdown(plan_md: str, *, allowed_phases: set[str]) -> Parsed
                     f"tasks[{idx}] ({tid}) depends_on entry {d!r} must match T<number>"
                 )
 
+        # `repo` (multi-repo M4.3). Validated only when the caller told us which repos
+        # exist — the parser never touches the DB, so with no allowed_repos it cannot
+        # distinguish a typo from a legitimate name and stays out of the way.
+        repo = str(raw.get("repo") or "").strip()
+        if repo_aliases:
+            # Distinct SUBDIRS = repositories. Never len(repo_aliases), which counts
+            # aliases (3 per repo) and would treat every single-repo story as multi-repo.
+            distinct_repos = sorted(set(repo_aliases.values()))
+            if repo and repo not in repo_aliases:
+                raise DagParseError(
+                    f"tasks[{idx}] ({tid}) repo {repo!r} is not one of this story's "
+                    f"repos: {distinct_repos}"
+                )
+            if not repo and len(distinct_repos) > 1:
+                raise DagParseError(
+                    f"tasks[{idx}] ({tid}) is missing required field `repo`. This "
+                    f"story spans multiple repositories ({distinct_repos}), so every "
+                    f"task must name the repo it works in — there is no default."
+                )
+            # Deliberately NOT auto-filled for the single-repo case. An empty `repo`
+            # already means "the story's sole write repo" (see DagTask.repo), and
+            # filling it in made tasks.repo_subdir non-NULL for ordinary single-repo
+            # stories — which changed every dispatch prompt with the feature flag off
+            # and contradicted what tasks_repo_subdir.sql documents.
+
         tasks.append(DagTask(
             id=tid,
             phase=phase,
@@ -221,6 +281,7 @@ def parse_dag_from_markdown(plan_md: str, *, allowed_phases: set[str]) -> Parsed
             description=str(raw["description"]).rstrip(),
             acceptance=str(raw["acceptance"]).strip(),
             depends_on=deps,
+            repo=repo,
         ))
 
     # Validate dependency references AFTER all tasks are seen so forward

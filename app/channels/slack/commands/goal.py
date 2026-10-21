@@ -5,8 +5,6 @@
   /goal members                   list goal members and their roles
   /goal invite <email> [role]     add an existing control-panel user to this goal
   /goal remove <email>            remove a member from this goal
-  /goal pause [reason]            pause task dispatch for this goal (platform admin/editor only)
-  /goal resume                    resume a paused goal (platform admin/editor only)
   /goal refresh                   reset the gateway session for this channel
 
 Creating a NEW goal is intentionally web-only — use the web UI.
@@ -46,14 +44,13 @@ async def handle(
         from app.channels.slack.commands.status import handle as _h
         return await _h(rest, channel_id, team_id, slack_user_id=slack_user_id, command=cmd)
 
-    if sub == "pause":
-        from app.channels.slack.commands.pause import handle as _h
-        return await _h(rest, slack_user_id, channel_id, team_id, command=cmd)
-
-    if sub == "resume":
-        from app.channels.slack.commands.resume import handle as _h
-        return await _h(slack_user_id, channel_id, team_id, command=cmd)
-
+    # PAUSE AND RESUME MOVED TO `/run`, and the level is the point.
+    # These stopped dispatch for the WHOLE GOAL -- every story in it --
+    # which is a blunt instrument nobody reached for, and it sat beside
+    # per-story controls in the panel that are what people actually
+    # want. `/run pause` and `/run resume` act on the one run the
+    # channel is about, and take their text the way the panel dialog
+    # does.
     if sub == "refresh":
         from app.channels.slack.commands.refresh import handle as _h
         return await _h(slack_user_id, channel_id, team_id, response_url, command=cmd)

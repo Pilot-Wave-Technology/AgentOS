@@ -108,6 +108,17 @@
           </div>
           {% endif %}
 
+          <!-- Waiting on a merge: shown in the in-progress column, because it
+               is still in progress, but the card has to say WHY nothing is
+               happening. Without it the story reads as stalled work rather
+               than as a pull request somebody needs to merge. -->
+          {% if story.state == 'awaiting_merge' %}
+          <div class="text-2xs text-violet-400 mb-2" title="The work is pushed and its pull request is open — merge it on GitHub.">
+            <span class="lg:hidden">⇡ merge</span>
+            <span class="hidden lg:inline">Waiting on its pull request — merge it on GitHub</span>
+          </div>
+          {% endif %}
+
           {% if story.blocked_reason and state == 'blocked' %}
           <div class="text-2xs text-orange-400 mb-2 lg:line-clamp-2" title="{{ story.blocked_reason }}">
             <span class="lg:hidden">⚠ blocked</span>
@@ -146,6 +157,48 @@
               <span class="hidden lg:inline">Managed by the Git Engine: approve or cancel in the Git Engine view</span>
             </span>
             {% else %}
+            {# CANCEL, on every card, with the SAME disabled-with-reason
+               idiom as "Start (blocked)" above. Enabled only before the
+               branch is cut: past `accepted` the story has commits, and
+               cancelling would strand them and risk merging work
+               somebody stopped. That is the server's invariant too --
+               `_cancel_story` returns 409 with this same sentence -- so
+               the button and the endpoint refuse for one reason, in one
+               wording, and a person is told it here rather than
+               discovering it in a failed request. #}
+            {# An ERRAND has no branch, so "the branch is cut" never
+               applies to one and it stays cancellable at any point --
+               matching the server guard, which exempts it for the same
+               reason. Without this an errand had no clean stop: it is
+               `accepted` for seconds and `in_progress` from then on. #}
+            {# A VS CODE STORY WAITING FOR ITS MERGE can be cancelled too: its
+               work is pushed, and cancelling retires its branch (the PR goes
+               with it) and frees the checkout. Local stories only -- the cloud
+               lane is unchanged. #}
+            {# AND A STORY ALREADY IN FLIGHT. The three arms above grew one
+               at a time around a rule that a started story could not be
+               cancelled at all; that rule is gone, so the condition is
+               now "not already finished" rather than a list of the cases
+               somebody remembered. Work that has MERGED stays merged --
+               `tear_down_nodes` leaves a landed node alone -- so what is
+               cancelled is the work still to come. #}
+            {% if state not in ('done', 'reviewed', 'cancelled', 'rejected') %}
+              <form action="/goals/{{ pid }}/stories/{{ story.id }}/cancel"
+                    method="post" data-toast-submit
+                    data-confirm="Cancel &quot;{{ story.title }}&quot;? Its dependents are re-linked onto its own dependencies, and any branch still open for it is retired. Work already merged stays merged. This cannot be undone."
+                    data-success="Story cancelled."
+                    data-fail="Failed to cancel story.">
+                {# A FIELD SO THE FORM IS NOT EMPTY. `new FormData()` on
+                   a form with no named inputs sends only the closing
+                   boundary, which the multipart parser rejects -- the
+                   request 500s before the server sees it. It also gives
+                   the ledger something better than a default. #}
+                <input type="hidden" name="reason"
+                       value="Cancelled from the board">
+                <button type="submit"
+                        class="btn btn-secondary btn-xs w-full text-rose-300 hover:text-rose-200">Cancel</button>
+              </form>
+            {% endif %}
             {% if state == 'proposed' %}
               {% if not story.assigned_to or story.assigned_to == user.uid %}
               {% if story.needs_resource %}

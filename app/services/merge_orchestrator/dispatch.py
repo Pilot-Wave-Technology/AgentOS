@@ -56,6 +56,9 @@ async def find_next_dispatchable_gate() -> dict | None:
            )
            AND t.story_id NOT IN (SELECT story_id FROM busy_stories)
            AND s.execution_paused = FALSE
+           -- Local Execution Mode (M0): never dispatch a checked-out / local story.
+           AND s.checked_out_to_uid IS NULL
+           AND s.execution_mode <> 'local'
            AND NOT EXISTS (
                SELECT 1 FROM execution_pauses ep
                 WHERE ep.scope = 'goal' AND ep.scope_id = t.goal_id

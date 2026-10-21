@@ -19,11 +19,145 @@ validation failures and never return HTTP objects.
 import logging
 from typing import Optional
 
+from app.config import get_settings
 from app.database import get_pool, resolve_goal_id
+from app.services.git_graph.repo_identity import canonical_repo_id, is_write_relation
+from app.services.story_repo_scope import count_story_repos, has_live_local_checkout
 
 _log = logging.getLogger(__name__)
 
 _VALID_RELATIONS = ("needs", "produces", "modifies")
+
+
+async def _check_no_new_write_repo_after_kickoff(
+    pool, story_id: str, resource_id: str, res_row, relation: str,
+) -> tuple[bool, str]:
+    """Multi-repo fix, piece 2 (`research/MULTI_REPO_STORIES_PLAN.md` §12.5): refuse a
+    NEW write repo once the story's kickoff has been sent.
+
+    Makes the dangerous re-provisioning case structurally unreachable rather than
+    merely unlikely: `provision_story_workspace`'s clone step is destructive on every
+    call (the gateway nukes and re-clones every repo subdir to stay idempotent), which
+    is only safe before any real work exists. Refusing the grant here means the
+    "repo-set incomplete" case `dispatch_story_kickoff_to_assistant` may later redo
+    (piece 1) can only ever be reached pre-kickoff, where redoing is provably safe.
+
+    Only a genuinely NEW repo is refused — re-granting a repo the story already holds
+    (a second `goal_resources` row for the SAME owner/name, e.g. adding the engine-cut
+    branch alongside the bare repo grant) adds no new clone, so it is not the case this
+    guards against and must stay allowed.
+
+    Read-only ('needs') grants never provision a clone and are always allowed here —
+    `_check_one_write_branch_per_repo` below has the same exemption for the same reason.
+    """
+    if not is_write_relation(relation):
+        return True, ""
+
+    this_repo = f"{(res_row['repo_owner'] or '').lower()}/{(res_row['repo_name'] or '').lower()}"
+    already_granted = await pool.fetchval(
+        """SELECT 1 FROM story_resources sr
+             JOIN goal_resources gr ON gr.id = sr.resource_id
+            WHERE sr.story_id = $1 AND sr.resource_id <> $2
+              AND gr.status = 'active'
+              AND gr.kind IN ('repo', 'branch')
+              AND lower(coalesce(gr.repo_owner, '') || '/' || coalesce(gr.repo_name, '')) = $3
+            LIMIT 1""",
+        story_id, resource_id, this_repo,
+    )
+    if already_granted:
+        return True, ""  # re-grant of a repo the story already holds — not new
+
+    story = await pool.fetchrow(
+        "SELECT execution_mode, active_thread_id FROM stories WHERE id = $1", story_id,
+    )
+    if not story or (story["execution_mode"] or "") != "operator":
+        return True, ""  # not an operator-mode story — this fix's clone path doesn't apply
+
+    from app.services.story_kickoff_state import story_has_had_kickoff  # noqa: PLC0415
+    if await story_has_had_kickoff(pool, story_id, story["active_thread_id"] or ""):
+        _log.warning(
+            "resource_allocation: refusing NEW write repo %s to story=%s — kickoff "
+            "already sent, re-provisioning now would risk the destructive clone step "
+            "touching real work", resource_id, story_id,
+        )
+        return False, (
+            f"This story's kickoff has already been sent, so it may already hold real, "
+            f"uncommitted work. Adding repo '{res_row['repo_name']}' now would require "
+            f"re-provisioning the workspace, which re-clones every repo in it — including "
+            f"the one already in progress. Split this into a follow-up story instead."
+        )
+    return True, ""
+
+
+async def _check_one_write_branch_per_repo(
+    pool, story_id: str, resource_id: str, res_row, relation: str,
+) -> tuple[bool, str]:
+    """Multi-repo guard (plan decision #2): a story may hold N repos, but at most ONE
+    WRITE branch per repo.
+
+    Why the narrower rule: a node is a (repo, branch) pair, and the DAG has no
+    per-phase target-branch dimension — two write branches in one repo would give the
+    story two nodes in the same repo with no way for a task to say which one it targets.
+    Cross-branch work in a single repo stays "split into sibling stories".
+
+    Read-only context grants ('needs') are always allowed: they are cloned for
+    reference and never get a branch, node, or PR.
+    """
+    if not is_write_relation(relation):
+        _log.debug(
+            "grant_resource: story=%s resource=%s relation=%s is read-only context — "
+            "multi-repo write check skipped", story_id[:8], resource_id[:8], relation,
+        )
+        return True, ""
+
+    this_repo_id = canonical_repo_id(res_row["repo_owner"], res_row["repo_name"])
+    existing = await pool.fetch(
+        """
+        SELECT gr.id, gr.kind, gr.role, gr.name, gr.branch_name,
+               gr.repo_owner, gr.repo_name, sr.relation
+          FROM story_resources sr
+          JOIN goal_resources gr ON gr.id = sr.resource_id
+         WHERE sr.story_id = $1
+           AND sr.resource_id <> $2
+           AND gr.status = 'active'
+           AND gr.kind IN ('repo', 'branch')
+           AND gr.repo_name IS NOT NULL AND gr.repo_name <> ''
+           AND NOT (gr.kind = 'branch' AND gr.role = 'trunk')
+        """,
+        story_id, resource_id,
+    )
+    for row in existing:
+        if canonical_repo_id(row["repo_owner"], row["repo_name"]) != this_repo_id:
+            continue  # a DIFFERENT repo — allowed under multi-repo
+        if not is_write_relation(row["relation"]):
+            continue  # same repo, but held read-only — not a competing write branch
+        # Same repo, both write. Only a genuine SECOND BRANCH is a conflict; the common
+        # "bare repo grant + engine-cut feature branch for that same repo" pair is one
+        # logical write target and must stay legal (the engine creates it itself).
+        both_branches = (
+            (row["kind"] or "").lower() == "branch"
+            and (res_row["kind"] or "").lower() == "branch"
+            and (row["branch_name"] or "") != (res_row["branch_name"] or "")
+        )
+        if both_branches:
+            _log.info(
+                "grant_resource: rejecting story=%s second WRITE branch '%s' in repo %s "
+                "(already writes '%s')", story_id[:8], res_row["branch_name"],
+                res_row["repo_name"], row["branch_name"],
+            )
+            return False, (
+                f"This story already writes to branch '{row['branch_name']}' in repo "
+                f"'{row['repo_name']}'. A story maps to at most ONE write branch per "
+                f"repo (one git node per repo) — a second write branch in the same repo "
+                f"would have no way for a task to say which branch it targets. Grant it "
+                f"read-only ('needs') instead, or split the second branch's work into a "
+                f"sibling story with a dependency."
+            )
+    _log.debug(
+        "grant_resource: story=%s write grant for repo %s/%s accepted (multi-repo on)",
+        story_id[:8], res_row["repo_owner"], res_row["repo_name"],
+    )
+    return True, ""
 
 
 def _validate_subject(subject_type: str, subject_id: str) -> Optional[str]:
@@ -77,20 +211,40 @@ async def grant_resource(
     if not res_row:
         return False, "resource_id not found in this goal"
 
-    # NEVER grant the repo's TRUNK designation (a kind='branch' role='trunk' resource,
-    # e.g. `dev`) to a story/task. It exists only so the engine knows the trunk
-    # (resolve_repo_trunk); granting it makes the trunk a WRITABLE working ref, and the
-    # story's workspace then clones the trunk and the assistant commits straight to it —
-    # bypassing the branch/PR/merge model entirely. The GO grants the kind='repo'
-    # resource; the Git Engine cuts + links the feature branch ('produces').
-    if (res_row["kind"] or "").lower() == "branch" and (res_row["role"] or "").lower() == "trunk":
-        return False, (
-            f"Refusing to grant the TRUNK branch '{res_row['name']}' to {subject_type} "
-            f"'{subject_id[:8]}'. The trunk is the engine's merge target, not a working "
-            "ref — granting it would make the assistant commit straight to trunk. Grant "
-            "the repo (kind='repo') instead; the Git Engine cuts and links the feature "
-            "branch automatically."
-        )
+    # A TRUNK LANE IS GRANTABLE, AND GRANTING IT IS HOW A STORY SAYS WHERE IT LANDS.
+    #
+    # This refused it, and told the caller to "Grant the repo (kind='repo') instead".
+    # The fear was real -- granting a trunk as a working ref would have the assistant
+    # commit straight to it, bypassing branch/PR/merge -- and the conclusion has been
+    # overtaken by the lane model:
+    #
+    #   `resolve_ws_trunk` (git_graph/repo_identity.py) reads the lane OFF
+    #   `story_resources`: the trunk a workstream lands on is the trunk-lane resource
+    #   its stories were granted. One repo can carry several lanes in one goal.
+    #
+    #   `kernel/workspace/mounts.py` is built around `relation IN ('produces',
+    #   'modifies')` on a role='trunk' row -- "where the story has an explicit
+    #   trunk-lane WRITE grant for a repo, the lane rows own that repo's checkouts
+    #   outright". The engine still cuts a FEATURE branch from the lane; the grant
+    #   names the target, it is not a checkout of trunk.
+    #
+    #   `kernel/go/AGENTS.md` instructs the GO in as many words: "Grant the trunk-lane
+    #   branch resource with the correct relation -- the lane you grant is the lane
+    #   the story lands on."
+    #
+    # So the kernel's granter (kernel/go/tools.py) has never refused this, and this one
+    # did -- two granters disagreeing, with the legacy one served verbatim to agents
+    # through the orchestrator and Slack. An agent obeying it grants the bare repo, the
+    # story carries NO lane, and `resolve_ws_trunk` falls back to the oldest lane: work
+    # lands on a branch nobody chose, silently, on exactly the multi-lane goals the
+    # model exists for.
+    #
+    # NO REPLACEMENT GUARD IS ADDED HERE, deliberately. The checks that
+    # survive are the ones below -- one write branch per repo per story,
+    # and the multi-repo interlock -- and between them they already stop
+    # a story acquiring two lanes of one repository, which is the case
+    # the DAG cannot express. Refusing the lane grant on top of those
+    # refused the only thing that tells the engine where to land.
 
     # Repos ARE grantable to a story under the Git Engine model. Granting a repo DECLARES
     # which repo the story works in (its target) — the signal the engine uses to know
@@ -98,12 +252,53 @@ async def grant_resource(
     # the workstream branch from the repo's trunk and the provisioner collapses the bare
     # repo block into the cut branch, so the agent only sees/commits its feature branch.
     #
-    # ONE REPO PER STORY: the engine maps a story to a SINGLE repo (one git_node / one
-    # workstream branch). A second, DIFFERENT repo would be SILENTLY DROPPED by plan
-    # derivation (StoryInput.repo_id is scalar; resolve_story_repo LIMIT 1), so reject it
-    # here rather than let work vanish. Cross-repo work = separate stories with a
-    # dependency. (Re-granting the SAME repo, or the engine's same-repo branch, is fine.)
-    if subject_type == "story" and (res_row["kind"] or "").lower() in ("repo", "branch") \
+    # ONE REPO PER STORY (legacy rule, active while multi_repo_enabled is false): the
+    # engine maps a story to a SINGLE repo (one git_node / one workstream branch). A
+    # second, DIFFERENT repo would be SILENTLY DROPPED by plan derivation
+    # (StoryInput.repo_id is scalar; resolve_story_repo LIMIT 1), so reject it here
+    # rather than let work vanish. Cross-repo work = separate stories with a dependency.
+    # (Re-granting the SAME repo, or the engine's same-repo branch, is fine.)
+    #
+    # MULTI-REPO (research/MULTI_REPO_STORIES_PLAN.md M1.3): with the flag on, N distinct
+    # repos per story are allowed — each WRITE grant becomes its own node/branch/PR. The
+    # rule that survives is decision #2: at most ONE WRITE BRANCH PER REPO, because the
+    # DAG has no per-phase target-branch dimension. That narrower check lives below.
+    if subject_type == "story" and get_settings().multi_repo_enabled \
+            and (res_row["kind"] or "").lower() in ("repo", "branch") \
+            and (res_row["repo_name"] or ""):
+        # MULTI-REPO × LOCAL-EXECUTION INTERLOCK (audit decision D3). The flag-off
+        # branch below cannot produce a multi-repo story at all, so this is the only
+        # place the unsafe pairing can be created from the grant side. A story being
+        # worked in someone's editor must not silently become multi-repo underneath
+        # them: local execution resolves ONE repo for the clone and (independently)
+        # one for the push token, and its landing path reports success without a
+        # per-repo check. Checked BEFORE the write-branch rule because it is the
+        # broader refusal — the pairing is unsafe regardless of branch topology.
+        if await has_live_local_checkout(pool, subject_id):
+            existing_repos = await count_story_repos(pool, subject_id)
+            _log.warning(
+                "resource_allocation: refusing repo grant %s to story=%s — story is "
+                "checked out locally and already targets %d repo(s)",
+                resource_id, subject_id, existing_repos,
+            )
+            return False, (
+                "This story is currently checked out in a local editor, and local "
+                "execution works one repository at a time. Granting it another "
+                "repository would leave work in that repo unpushed while the story "
+                "reported as landed. Release the local checkout first, or split the "
+                "cross-repo work into a separate story."
+            )
+        ok, reason = await _check_no_new_write_repo_after_kickoff(
+            pool, subject_id, resource_id, res_row, relation,
+        )
+        if not ok:
+            return False, reason
+        ok, reason = await _check_one_write_branch_per_repo(
+            pool, subject_id, resource_id, res_row, relation,
+        )
+        if not ok:
+            return False, reason
+    elif subject_type == "story" and (res_row["kind"] or "").lower() in ("repo", "branch") \
             and (res_row["repo_name"] or ""):
         this_repo = f"{(res_row['repo_owner'] or '').lower()}/{(res_row['repo_name'] or '').lower()}"
         other = await pool.fetchrow(

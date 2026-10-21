@@ -15,10 +15,12 @@
     <p class="text-xs text-gray-500 mb-4">
       <span class="text-gray-300">platform.editor</span> has the same Settings page access as
       <span class="text-gray-300">platform.member</span>: only My Agents, Help &amp; Explainability,
-      and Model Pricing (read-only). Users, Signup Requests, the Agent/Skill/Tool Registry, Memory
-      Prompts, Claude Phases, Integrations, Kill Switch, Dashboard, and Council Runs are all
-      <span class="text-gray-300">platform.admin</span>-only. Editor's one distinguishing capability
-      is goal creation (a general goal-lifecycle action, not a Settings page).
+      Model Pricing, and Model Registry (both read-only for members/editors). Users, Signup
+      Requests, the Agent/Skill/Tool Registry, Memory Prompts, Claude Phases, Integrations, Kill
+      Switch, Dashboard, and Council Runs are all
+      <span class="text-gray-300">platform.admin</span>-only, as is Model Registry editing. Editor's
+      one distinguishing capability is goal creation (a general goal-lifecycle action, not a
+      Settings page).
     </p>
 
     <div class="overflow-x-auto">
@@ -35,6 +37,7 @@
           {% set rows = [
             ("View My Agents, Help & Explainability", true, true, true),
             ("View Model Pricing", true, true, true),
+            ("View Model Registry (read-only)", true, true, true),
             ("Create goals", false, true, true),
             ("View Users, Signup Requests, Skill/Tool/Agent Registry, Templates, Claude Phases, Integrations, Memory Prompts", false, false, true),
             ("View Kill Switch (goal pause/resume state, system state)", false, false, true),
@@ -46,6 +49,7 @@
             ("Manage users: change roles", false, false, true),
             ("Review and approve signup requests", false, false, true),
             ("Edit Memory Prompts, Integrations, Model Pricing", false, false, true),
+            ("Edit Model Registry: create, update, enable, disable models and providers", false, false, true),
             ("Run/watch Security Council, Goal Review Council, Platform Research Council (env-gated - dormant unless enabled on this deployment)", false, false, true),
           ] %}
           {% for label, member_ok, editor_ok, admin_ok in rows %}

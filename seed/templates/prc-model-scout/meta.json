@@ -3,7 +3,7 @@
   "type": "PlatformResearch",
   "name": "Research: Models & Pricing",
   "description": "Researches best LLM per agent role (cost/reasoning/latency/context).",
-  "model": "google-flash-500k/gemini-2.5-flash-500k",
+  "model": "google-flash38-500k/gemini-3.8-flash-500k",
   "emoji": "🔬",
   "tools_allow": [
     "read",

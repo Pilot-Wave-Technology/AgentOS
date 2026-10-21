@@ -1,0 +1,85 @@
+# Coding story executor.
+#
+# Edit this file to change what a coding executor can do. Edit prompt.md to
+# change who it is. Add a directory under skills/ to give it a new skill.
+# None of the three needs a code change.
+
+kind   = "story"
+domain = "coding"
+
+# The tool surface. Chain stage 2 is fail-closed on exactly this list, so a
+# tool absent here is refused by name — it is not merely undocumented.
+# Base gives read/glob/grep/skill/ask_human. These are what a CODING
+# executor adds on top. Effective surface: ./run.sh profiles
+tools_add = [
+  # L — what this goal already settled. Read it BEFORE choosing a
+  # framework or a pattern: a plan that re-opens a decision a person
+  # already approved costs a whole review cycle to discover.
+  "goal_knowledge",
+  "write",
+  "edit",
+  "bash",
+  # LONG WORK, AND THE FIVE THAT MAKE IT ONE STEP RATHER THAN EIGHT.
+  # `bash_wait` is the one to reach for: it blocks until the job is done
+  # however long that takes and costs ONE step, where polling
+  # `bash_output` in a loop costs a step per poll and ends the leg as
+  # `stalled` on the eighth identical one -- which is how a leg died on
+  # the eighth poll of a twelve-minute build.
+  "bash_background",      # start a long command; optional `timeout`
+  "bash_wait",            # ONE step, however long the job runs
+  "bash_output",          # what is new since a cursor, without waiting
+  "bash_jobs",            # what is running, after a context compaction
+  "bash_kill",            # stop one
+  # Run a check YOUR PLAN declared, under the budget the plan gave it --
+  # the only way to run a suite slower than `bash`'s 120s ceiling as a
+  # check. If that command already ran over this exact tree you get that
+  # run's result instead of a second forty minutes.
+  "run_check",
+  "story_commit",         # commit to the git workspace
+  # Fetch + merge the trunk into this branch. A TOOL and not a command
+  # because fetching needs the git credential, which the sandbox
+  # deliberately does not hold -- same reason story_commit is here.
+  "sync_trunk",
+  "propose_completion",
+  "register_plan",        # E6h - plan, then approval, then work   # present here, absent from the errand (Eb3)
+  "subagent",             # E7b/E7c - investigate | build
+  # WHAT SURVIVES THAT IS NOT THE TREE. `register_plan` offers
+  # `{expect: "artifact", ...}` to every profile and `artifact_kind`
+  # answers it from `artifact_manifest`, which ONLY `emit_artifact`
+  # writes -- so a coding story could register an artifact check and
+  # then never satisfy it, refusing its own claim on every attempt.
+  # A coding story's deliverable is usually the tree, but "usually" is
+  # not "always": a benchmark, a migration note, an analysis is a real
+  # output with nowhere to go without this.
+  "emit_artifact",
+  "artifact_read",
+  "publish_artifact",  # G6: durable new version of a granted document/dataset        # read stored outputs by id (E7)
+  "web_fetch",            # egress: guarded against SSRF, see tools_web
+  # The environment's two doors. `env_setup` applies the tree's own
+  # committed definition (manifest or .agentos/setup.sh) — the Verifier
+  # rebuilds from the same files, so this is the one that cannot drift.
+  # `env_install` is the recorded ad-hoc fallback for a workspace with
+  # no manifest. Neither was listed here before, which meant the model
+  # had ONLY the shell — every install was invisible to the Verifier
+  # and the first live story failed verification on ModuleNotFoundError.
+  "env_setup",
+  "env_install",
+  # Pending, and deliberately NOT listed until built — a surface that
+  # names a tool the harness lacks is worse than one that omits it:
+  #   "subagent"      E7b
+  #   "register_plan" E6h
+  #   "web_fetch" / "web_search"  egress policy
+]
+
+# E7d. "git" | "copyin" | "none".
+workspace_driver = "git"
+
+# Read from the WORKSPACE (not this directory) on every leg and appended to
+# prompt.md. prompt.md says what a coding executor is; these say what THIS
+# project's conventions are and what character the operator gave the agent.
+prompt_files = ["AGENTS.md", "SOUL.md"]
+
+allows_completion  = true
+requires_plan      = true
+has_verifier       = true
+max_subagent_depth = 1

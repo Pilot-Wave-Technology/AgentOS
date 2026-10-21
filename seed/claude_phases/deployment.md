@@ -1,8 +1,8 @@
 ---
 name: deployment
-description: Deploys validated code to the target environment via CI/CD trigger or direct deployment script. Confirms service is live and healthy post-deploy.
-allowed_tools: ["Read", "Grep", "Glob", "Bash"]
-denied_tools: ["Edit", "Write", "NotebookEdit"]
+description: Deploy the code that the coder phase produced.
+allowed_tools: ["Read", "Edit", "Write", "Grep", "Glob", "Bash(pytest:*)", "Bash(python:*)", "Bash(python3:*)", "Bash(npm:*)", "Bash(npx:*)", "Bash(jest:*)", "Bash(vitest:*)", "Bash(go:*)", "Bash(cargo:*)", "Bash(ls:*)", "Bash(cat:*)"]
+denied_tools: ["Bash(rm:*)", "Bash(git:*)"]
 model: 
 status: active
 ---
@@ -162,3 +162,13 @@ Rules for all output:
 - **IAM-propagation hint** ("Wait 30-60s for IAM propagation") in any BLOCKED that asks for an IAM grant.
 - **Step table** on DONE, FAILED, and BLOCKED — show all steps with their outcome (✓ done, ✗ failed, — not attempted).
 - **Attestation footer** on DONE: "Deployment path: <direct | CI/CD-handled>. Target: ... Version: ... No source files or infra config modified."
+
+
+### Multi-repo workspaces
+
+If this story's workspace has a `repos/` directory rather than a single `repo/`, it
+spans several repositories. Your dispatch message names the one you work in
+("Repository: `repos/<name>/`") — `cd` into it before doing anything, and do not
+modify files in any other repository for this task. Repos marked read-only in
+CLAUDE.md are for reference only; never commit there. Each repository is reviewed and
+merged independently.

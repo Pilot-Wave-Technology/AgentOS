@@ -178,6 +178,48 @@
     <div class="text-xs text-indigo-300">
       <span class="font-medium">Operator mode</span>: this story is running via a Claude Code subprocess.
     </div>
+
+<!-- Executor model. The VERIFIER is deliberately absent: which model
+     judges is a goal-level standard, and a story that could pick its own
+     judge could pick a lenient one. -->
+<div class="card p-3 mb-4">
+  <div class="flex items-start justify-between gap-3">
+    <div>
+      <div class="text-xs font-medium text-gray-200">Executor model</div>
+      <div class="text-2xs text-gray-500 mt-0.5">
+        {% if executor_model %}
+          This story runs on <span class="text-gray-300">{{ executor_model }}</span>.
+        {% else %}
+          Inheriting the goal&#39;s choice.
+        {% endif %}
+      </div>
+    </div>
+    {% if model_locked %}
+    <div class="text-2xs text-gray-600 flex-shrink-0 text-right">
+      Locked &mdash; this run keeps the model it<br>started with.
+    </div>
+    {% else %}
+    <form action="/goals/{{ pid }}/stories/{{ story.id }}/executor-model"
+          method="post" class="flex items-center gap-2 flex-shrink-0"
+          data-toast-submit data-fail="Failed to set the model.">
+      <select name="executor_model" class="input input-sm">
+        <option value="" {% if not executor_model %}selected{% endif %}>
+          Inherit from goal
+        </option>
+        {% for group in kernel_models %}
+        <optgroup label="{{ group.provider }}">
+          {% for m in group.models %}
+          <option value="{{ m }}" {% if executor_model == m %}selected{% endif %}>{{ m }}</option>
+          {% endfor %}
+        </optgroup>
+        {% endfor %}
+      </select>
+      <button class="btn btn-secondary text-xs">Set</button>
+    </form>
+    {% endif %}
+  </div>
+</div>
+
   </div>
   {% endif %}
 

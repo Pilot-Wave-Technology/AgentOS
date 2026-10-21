@@ -44,6 +44,13 @@ VALID_TRANSITIONS: dict[str, list[str]] = {
 }
 
 # Story state machine (simpler than task)
+#
+# DEAD COPY, AND SAYING SO IS THE POINT. Nothing imports either name from
+# this module -- `story_transitions.py` takes the real table from
+# `app/models/story.py`, which has `awaiting_merge` and this does not.
+# Left in place rather than deleted because removing a public name is a
+# bigger change than labelling it, but anyone editing THIS table to change
+# behaviour is editing the wrong file.
 STORY_STATES = ["proposed", "accepted", "in_progress", "blocked", "done", "rejected"]
 
 STORY_VALID_TRANSITIONS: dict[str, list[str]] = {

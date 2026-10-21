@@ -16,7 +16,7 @@ AgentOS is two branches of one repository, and they deploy in a fixed order:
    shared infrastructure the control plane reuses — the VPC and the archive
    bucket (the gateway + LLM secrets are created earlier by `prerequisites.sh`).
 2. **Stage ② — the control plane (`agent_os_platform`, this branch).** Deploy
-   this **second**. It manages goals, stories, tasks, memory, approvals, and
+   this **second**. It manages goals, stories, executions, memory, approvals, and
    platform integrations, and it connects to the gateway over a VPC-internal
    WebSocket.
 
@@ -44,20 +44,18 @@ connector, Cloud Run, and Cloud SQL must all share it.
 
 ---
 
-## Deployment profiles: split vs. single
+## Control-plane services
 
-The control plane ships as one container image and can run in two shapes. Choose
-in `terraform.tfvars`:
+The control plane ships as one container image, deployed as five Cloud Run
+services: the public web app (`app.main`) plus four background workers — the
+councils and the research dispatcher (`app.council_worker`), the git
+dependency-graph engine (`app.git_engine_worker`), the settings/admin backends
+(`app.management_worker`), and the scheduler (`app.scheduler_worker`), which
+runs the background loops behind one leader. The web app runs with
+`AGENTOS_SCHEDULER_LOOPS=0`, so it leaves those loops to the scheduler.
 
-- **Split (default).** Four independently scalable Cloud Run services from the
-  one image — the public web app plus three background workers (councils and the
-  research dispatcher, the git dependency-graph engine, and the settings/admin
-  backends). Best for isolation and scaling each concern separately.
-- **Single.** Set `service_profile = "single"` and everything runs in **one**
-  Cloud Run service with the worker loops in-process — one always-on instance
-  instead of four. Best for a smaller, cheaper footprint.
-
-Both profiles are first-class; the `deploy/` guide covers each.
+Story work does not run on Cloud Run: every executor runs in a pod on the GKE
+cluster Terraform creates (the execution plane), which Cloud Build deploys.
 
 ---
 
@@ -81,9 +79,10 @@ procedure — gather prerequisites, run the one-time setup, deploy the gateway
   checklist of every tool, account, and value to have on hand first.
 
 The end-to-end order the `deploy/` guide follows is: **`prerequisites.sh`
-(service accounts + all secrets + Cloud SQL) → Stage ① gateway Terraform →
-Stage ② platform Terraform → the 7.0 gateway-ready gate → Cloud Build
-(build / migrate / deploy) → first login.**
+(service accounts + non-DB secrets) → Stage ① gateway Terraform → Stage ②
+platform Terraform (Cloud SQL, DSN secrets, GKE) → readiness gate → Cloud Build
+(build / test / migrate / deploy / execution plane) → `publish-extension.sh` →
+first login.**
 
 > This page is a duplicate map for orientation. The **canonical** deployment map
 > is the repo's main-branch `DEPLOYMENT.md`; if the two ever differ, that one wins.

@@ -1,8 +1,8 @@
 ---
 name: integration-tester
-description: Validates built deliverables by running them directly and observing real behavior against acceptance criteria. Does not inspect or run unit test files.
-allowed_tools: ["Read", "Grep", "Glob", "Bash"]
-denied_tools: ["Edit", "Write", "NotebookEdit"]
+description: Runs the code and tests that the coder phase produced working solution based on acceptance criteria.
+allowed_tools: ["Read", "Edit", "Write", "Grep", "Glob", "Bash(pytest:*)", "Bash(python:*)", "Bash(python3:*)", "Bash(npm:*)", "Bash(npx:*)", "Bash(jest:*)", "Bash(vitest:*)", "Bash(go:*)", "Bash(cargo:*)", "Bash(ls:*)", "Bash(cat:*)"]
+denied_tools: ["Bash(rm:*)", "Bash(git:*)"]
 model: 
 status: active
 ---
@@ -153,3 +153,13 @@ PHASE_TASK_BLOCKED T<id> — <specific thing that needs to be fixed>
 ```
 
 List each acceptance criterion with ✓ or ✗ and one line of evidence (the actual observed result) per criterion before emitting the final sentinel.
+
+
+### Multi-repo workspaces
+
+If this story's workspace has a `repos/` directory rather than a single `repo/`, it
+spans several repositories. Your dispatch message names the one you work in
+("Repository: `repos/<name>/`") — `cd` into it before doing anything, and do not
+modify files in any other repository for this task. Repos marked read-only in
+CLAUDE.md are for reference only; never commit there. Each repository is reviewed and
+merged independently.

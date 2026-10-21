@@ -256,7 +256,7 @@ DEFAULT_MEMORY_FILE_TARGET_CHARS = 24000
 # Compaction summarizer model. Gemini Flash by default — cheap (~$0.20
 # per compaction vs $1-2 for Pro) and plenty good for narrative summary.
 # Per-agent override allowed via the same admin path.
-DEFAULT_SUMMARIZER_MODEL = "google/gemini-2.5-flash"
+DEFAULT_SUMMARIZER_MODEL = "google/gemini-3.8-flash"
 # Activate upstream LLM-based safeguard pathway when Pi auto-compacts.
 # "default" leaves Pi's built-in truncation in place; "safeguard" engages
 # the openclaw fork's compaction-safeguard extension which runs an LLM

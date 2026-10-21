@@ -52,9 +52,15 @@
           <select name="model" required
                   class="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm font-mono focus:outline-none focus:border-indigo-500">
             {% for m in models %}
-            <option value="{{ m }}" {% if m == template.model %}selected{% endif %}>{{ m }}</option>
+            <option value="{{ m.id }}" {% if m.id == template.model %}selected{% endif %}>{{ m.label }} — {{ m.id }}</option>
             {% endfor %}
           </select>
+          {% if models_empty %}
+          <p class="text-xs text-gray-500 mt-1">
+            No models are registered in the Model Registry.
+            <a href="/settings/model-registry" class="text-indigo-400 hover:text-indigo-300">Open Model Registry →</a>
+          </p>
+          {% endif %}
         </div>
         <div>
           <label class="block text-sm text-gray-400 mb-1.5">Emoji</label>
@@ -64,6 +70,7 @@
       </div>
       <div>
         <label class="block text-sm text-gray-400 mb-1.5">Notes</label>
+        <p class="text-xs text-gray-600 mb-1.5">Free-text annotation for other admins — e.g. why this template exists, or that it's deprecated. Purely informational: it is never read by the agent or the gateway and has no effect on behavior.</p>
         <textarea name="notes" rows="2"
                   class="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm focus:outline-none focus:border-indigo-500">{{ template.notes }}</textarea>
       </div>
@@ -330,7 +337,15 @@
   {# ── Info tab ── #}
   <div id="tab-info" class="tab-panel hidden">
 
-    <h3 class="text-base font-semibold mb-3">Live instances</h3>
+    <h3 class="text-base font-semibold mb-3 flex items-center justify-between">
+      <span>Live instances</span>
+      {% if can_edit and instances %}
+      <button type="button" class="btn btn-secondary btn-sm" onclick="applyModelToInstances()">
+        Apply model to all existing instances
+      </button>
+      <form id="apply-model-form" method="post" action="/templates/{{ template.id }}/apply-model-to-instances" class="hidden"></form>
+      {% endif %}
+    </h3>
     {% if instances %}
     <table class="w-full text-sm mb-10">
       <thead class="text-xs text-gray-500 uppercase border-b border-gray-800">
@@ -457,6 +472,16 @@ function filterToolCheckboxes(query) {
       group.style.display = visible === 0 ? "none" : "";
     });
   });
+}
+
+async function applyModelToInstances() {
+  const result = await window.confirmAction({
+    title: 'Apply model to all instances?',
+    body: 'This sets every live instance below to this template\'s current model ({{ template.model }}), not just new ones created from here on. Already-open chats will be reset so they pick it up immediately.',
+    danger: false,
+  });
+  if (!result || !result.confirmed) return;
+  document.getElementById('apply-model-form').submit();
 }
 
 // Activate tab from URL hash on load.

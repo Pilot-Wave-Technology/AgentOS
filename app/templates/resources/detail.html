@@ -114,6 +114,39 @@
       {% endif %}
     </div>
 
+    {# WHERE THIS GOAL'S WORK LANDS. Work goes somewhere whether or not a
+       lane is declared, and nothing used to say where: an operator who
+       removes the last trunk lane sees an empty list and concludes the
+       branch is out of use, while the engine goes on merging into it.
+       That is the same shape as the bug this page's orphan badge exists
+       for -- the system quietly using a branch no resource names. #}
+    {% if lane_summary %}
+    <div class="py-2 mb-3 border-t border-gray-800">
+      <p class="text-2xs text-gray-500 mb-1">Trunk lanes</p>
+      {% if lane_summary.declared %}
+      <div class="flex flex-wrap items-center gap-1.5">
+        {% for lane in lane_summary.lanes %}
+        <span class="text-xs font-mono px-1.5 py-0.5 rounded bg-slate-800 text-gray-300 border border-slate-700">{{ lane }}</span>
+        {% endfor %}
+      </div>
+      <p class="text-2xs text-gray-500 mt-1.5">
+        Each story lands on the lane it is granted. Work granted no lane falls
+        back to <span class="font-mono text-gray-400">{{ lane_summary.effective }}</span>.
+      </p>
+      {% else %}
+      <p class="text-xs text-amber-300">
+        None declared — work on this repository still merges into
+        <span class="font-mono">{{ lane_summary.effective }}</span>
+        (the repository default).
+      </p>
+      <p class="text-2xs text-gray-500 mt-1">
+        Add a branch with role <span class="font-mono">trunk</span> to declare
+        a lane that stories can be granted.
+      </p>
+      {% endif %}
+    </div>
+    {% endif %}
+
     {% if github_live %}
     <!-- Live GitHub stats bar -->
     <div class="flex flex-wrap gap-4 text-sm border-t border-gray-800 pt-3 mt-1">
@@ -842,11 +875,44 @@
         <input type="hidden" name="parent_repo_id" value="{{ resource.id }}">
         <div>
           <label class="block text-sm text-gray-400 mb-1.5">Branch Name</label>
-          <input name="branch_name" required class="input" placeholder="e.g., feat/auth, fix/login-bug" />
+          <input name="branch_name" required class="input" placeholder="e.g., main, develop, release/2.0" />
         </div>
         <div>
           <label class="block text-sm text-gray-400 mb-1.5">Base Branch</label>
           <input name="base_branch" class="input" value="{{ resource.default_branch or github_live.default_branch if github_live else resource.default_branch or 'main' }}" />
+        </div>
+        {# WHAT KIND OF BRANCH THIS IS, which the form never asked.
+           `add_resource` has always read and validated `role`, but no field
+           sent it, so every branch added here came out 'feature' and a
+           trunk lane could be declared ONLY by registering a repo with the
+           is-trunk checkbox. That is why an operator told to move a goal's
+           trunk re-registered the repository -- it was the only door --
+           and deleted the old row on the way out (goal GOAL1, 2026-10-05).
+
+           TRUNK IS THE DEFAULT, on the evidence. Across every goal: 142
+           feature branch resources, ALL created by the engine, and 112
+           trunk lanes, ALL created by people. Not one human has ever
+           wanted a feature branch resource -- the engine cuts those itself
+           (branches.ensure_branch_resource). This form produced nothing
+           but feature branches and has correspondingly never been used.
+
+           The wrong choice is also asymmetric. Feature-when-you-meant-trunk
+           is Afsheen's bug exactly: resolve_ws_trunk cannot see the lane,
+           the goal declares none, and work falls back to 'main' in silence.
+           Trunk-when-you-meant-feature shows up on the repo card and can be
+           archived. So the default is the one that fails loudly. #}
+        <div>
+          <label class="label">Branch role</label>
+          <select name="role" class="input">
+            <option value="trunk" selected>Trunk lane — stories are granted it and merge into it</option>
+            <option value="feature">Feature — work happens on it, cut from a trunk lane</option>
+            <option value="release">Release</option>
+          </select>
+          <p class="text-2xs text-gray-500 mt-1">
+            A trunk lane is a merge target, never checked out directly. One repo
+            can carry several; each story lands on the lane it is granted.
+            The engine creates feature branches itself — you rarely need to.
+          </p>
         </div>
         <div>
           <label class="block text-sm text-gray-400 mb-1.5">Context for GO</label>

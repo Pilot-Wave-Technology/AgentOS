@@ -4,7 +4,7 @@ title: Story Planning Protocol
 description: Use this when the team asks you to plan, propose, or revise stories. Walks through the 6-phase protocol from understanding the objective to writing acceptance criteria.
 applicable_to: GO
 status: active
-version: 5
+version: 11
 ---
 # Story Planning Protocol
 
@@ -29,7 +29,7 @@ version: 5
 
 ## Phase 3: GATHER
 - **Confirm the repo(s) are registered as goal resources.** The Git Engine can only place a story that resolves to a registered repo (`kind: repo` in `resource_list`). You **cannot** add a repo yourself — if one the work needs is missing, ask the team to (1) install the GitHub App on it, then (2) add it via the goal's Resources panel, and **wait**. Don't plan coding stories against a repo that isn't registered.
-- **Multiple repos:** if the goal spans more than one repo, make sure every repo a story will touch is registered. **Most stories work in a single repo** — when you write a story, decide which repo(s) it genuinely needs rather than assuming it needs all of them. Each story works in exactly ONE repo. Split cross-repo work into separate per-repo stories with a dependency between them.
+- **Multiple repos:** if the goal spans more than one repo, make sure every repo a story will touch is registered. **Most stories work in a single repo** — when you write a story, decide which repo(s) it genuinely needs rather than assuming it needs all of them. A story may work in two or more repos when it genuinely spans them. Prefer one repo when the work fits in one; use several when the change is inherently cross-repo.
 - If other resources are missing (docs, designs, datasets), ask the team to add them.
 - Wait for resources before planning — don't speculate.
 
@@ -60,7 +60,11 @@ Only after **explicit approval** from the team:
   4. **Accurate `depends_on`** — the stories whose output this one needs. This is how you shape the git flow (see "Dependencies & the Git Engine" below), so get it right.
   5. **Repo allocation — MANDATORY for every coding story.** Immediately after creating a coding story, grant it the repo(s) it works in:
      `grant_resource(subject_type="story", subject_id=<story-id>, resource_id=<repo-id>, relation="produces", notes=...)`.
-     This is **required** — it's how the Git Engine knows which repo to cut the story's branch from, and **a coding story with no repo grant cannot be accepted.** Grant exactly **ONE** repo per coding story — a story maps to a single workstream branch, so a second/different repo grant is REJECTED. To work across repos, split into separate stories linked by a dependency. **Never grant a branch** — the engine cuts and links the branch itself. (Granting the repo does not expose the trunk; the assistant only ever sees its engine-cut feature branch.) See the `resource_management` skill.
+     **If the repo has SEVERAL trunks, name one.** Call `resource_describe(resource_id)` first. When it reports `trunk_choice_required: true`, pass `trunk_branch=...` — and ask the human which trunk before you do; the grant is REFUSED without it. When creating SEVERAL stories at once, propose a trunk per story from what the conversation implies, list them for the human, and wait for explicit confirmation — they may answer in bulk ("all use `agentos_platform`", or "first three on A, the rest on B"). Never assume, and never carry a previous story's answer forward.
+
+      This is **required** — it's how the Git Engine knows which repo to cut the story's branch from, and **a coding story with no repo grant cannot be accepted.** Grant **one** repo for the common single-repo story; grant **two or more** when the story genuinely spans repos. Each write repo gets its own engine-cut branch and its own pull request. Only a second write branch in the SAME repo is rejected. **Never grant a branch** — the engine cuts and links the branch itself. (Granting the repo does not expose the trunk; the assistant only ever sees its engine-cut feature branch.) See the `resource_management` skill.
+
+     **Decide `produces` vs `needs` from what the story will actually DO in each repo — never default.** Read your OWN story description before granting: if it says a repo will get new files, edits, fixes, or a report committed to it, that repo is `produces`, even when a later human request ("assign repos", "grant the repos", "add resources as well") doesn't spell out read vs write per repo — `grant_resource`'s relation defaults to `needs` (read-only), and using that default across the board silently strands a story that was always meant to commit to all of them. **If it's genuinely unclear** which repos should be editable — the description doesn't say, or the request spans several repos with mixed intent — **ask the human directly** (e.g. "Which of these should be write access — the story will commit to them — versus read-only for context?") before granting anything. Don't guess and don't silently default every repo to read-only just because the request didn't spell it out. **This applies every time you grant or change a repo's access, not only right after `create_story`** — the exact same reasoning (and the same "ask if unclear" rule) applies when `update_story` changes a story's scope to touch a new repo, or when a follow-up `grant_resource` call adds/adjusts a repo mid-story.
   6. **Other resource allocations** — grant any documents, datasets, or specs the story needs via `grant_resource(subject_type="story", ..., relation="needs")`.
   7. An `assigned_to` that you confirmed against the live `## Team` block this turn.
 - Record key decisions with `record_decision`.
@@ -100,3 +104,37 @@ Cancelling marks a story as effectively deleted:
 - It disappears from the Story Board.
 - It no longer blocks any downstream story — dependents become unblocked automatically.
 - Its resources (docs, datasets) stay registered at the goal level but are no longer locked to it. (The Git Engine reclaims any branch it had cut for the cancelled work.)
+
+
+## Multi-repo stories
+
+> **Check this applies first.** Multi-repo stories are a per-deployment
+> capability. If granting a second repo to a story is REJECTED ("a story maps
+> to exactly ONE repo"), this deployment has multi-repo turned OFF — that
+> rejection is expected, not a bug. Keep to one repo per story and split
+> cross-repo work into sibling stories with a dependency, as before. You can
+> also tell from a story workspace: multi-repo is active when it contains a
+> `repos/` directory instead of a single `repo/`.
+
+A coding story MAY work in more than one repository. Grant each repo the story needs.
+
+- **Write repos** — grant with `relation="produces"`. Each one gets its own
+  engine-cut branch, its own pull request, and its own merge.
+- **Read-only repos** — grant with `relation="needs"` when the story only needs to
+  READ another repo's code for context. These are cloned but never branched or
+  committed to. Prefer this whenever the story does not actually change that repo.
+- **One write branch per repo.** A story may write to many repos, but only ONE branch
+  in each. If work genuinely needs two branches of the same repo, split it into
+  sibling stories with a dependency.
+- **Every task must name its repo.** When a story spans repositories, each task in the
+  `## Task DAG` block MUST carry a `repo:` field naming the repo directory it works in
+  (e.g. `repo: repos/acme__web`). There is no default with several repos, and a task
+  without one is rejected. Omit `repo:` only when the story has exactly one repo.
+- **Repos merge independently.** One human approval commits and pushes every write
+  repo and opens a pull request for each, but those pull requests are merged
+  separately by humans on GitHub. The story completes only once ALL of them land.
+  Plan each repo's changes so they are self-consistent — never assume the repos land
+  at the same instant.
+
+Prefer a single-repo story when the work genuinely fits in one repo: it is simpler to
+review and lands in one step.

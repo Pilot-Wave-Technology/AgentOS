@@ -6,6 +6,9 @@ For each active lease holder (its (repo,trunk) slot), live-read the trunk and
 `compare`:
   * behind_by > 0  → ensure a DIFF story exists (a normal `code` story, created_by
     ='engine', in the node's merge group): "sync trunk into the branch + resolve".
+    NOT when the node's own story is still alive and holding its pod for the merge
+    -- that story integrates trunk itself (app/services/trunk_integration.py), and
+    cutting a diff story as well gives one behind branch two integrations.
   * behind_by == 0 → the branch is current; it's ready for the merge story to open
     the PR (build §7 opens it; this step just reports "ready").
 
@@ -32,6 +35,12 @@ import logging
 
 from app.database import get_pool
 from app.ledger.journal import append_event
+from app.services.operator_provisioning import repo_clone_subdir
+from app.services.trunk_integration import (
+    node_is_errand,
+    node_self_integrates,
+    record_caught_up,
+)
 
 from . import github_ops as gh
 from .dispatch import notify_story_branch_ready
@@ -55,6 +64,13 @@ _GRIND_PERMS = {"contents": "read", "metadata": "read", "checks": "read",
 _PR_OPEN_PERMS = {"contents": "read", "metadata": "read", "pull_requests": "write"}
 # Distinct fix attempts (per head sha) before a perpetually-red PR is escalated.
 _MAX_FIX_ATTEMPTS = 5
+
+# The `mergeStateStatus` values that mean THIS BRANCH'S STALENESS is what
+# stops the merge, and therefore the only ones worth an integrate story once
+# a PR is open. Everything else -- CLEAN, UNSTABLE, BLOCKED, DRAFT,
+# HAS_HOOKS, UNKNOWN -- is waiting on review, on checks, or on nothing.
+# See the long note at the call site in `_grind_one`.
+_STALENESS_BLOCKS_MERGE = ("DIRTY", "BEHIND")
 
 
 def _diff_story_id(node_id: str, trunk_sha: str) -> str:
@@ -160,6 +176,18 @@ async def _grind_one(h: dict, out: dict) -> None:
     ):
         return
 
+    # LEVEL WITH TRUNK, SO SAY SO. GitHub's own compare is the evidence,
+    # and it is the only evidence anybody should accept: the pod that
+    # ran the merge used to write this column itself and was refused by
+    # Postgres on every attempt (`agentos_leg_dev` has no write on the
+    # git graph) -- correctly, because an executor able to declare
+    # itself caught up could land work that never took trunk in.
+    #
+    # Written before the branches below, so it covers the branch that
+    # is ready for its PR AND the one already contained in trunk.
+    if cmp["behind_by"] == 0:
+        await record_caught_up(get_pool(), h["node_id"], trunk_branch, trunk_sha)
+
     if cmp["behind_by"] > 0 and cmp["ahead_by"] > 0:
         # Trunk has MOVED under this branch AND the branch still has its own un-merged
         # work → hand integration to the assistant via a diff story — never an engine-
@@ -201,15 +229,122 @@ async def _grind_one(h: dict, out: dict) -> None:
             if ms.get("review_decision") == "APPROVED" or ms.get("in_merge_queue"):
                 out["ready"] += 1
                 return
+            # AN OPEN PR IS INTEGRATED ONLY WHEN STALENESS IS WHAT BLOCKS IT.
+            #
+            # `behind_by > 0 and ahead_by > 0` is true of EVERY open PR the
+            # moment anyone else lands on trunk, so on an actively-developed
+            # trunk this spawned one integrate story per upstream commit, for
+            # as long as the PR stayed open. Measured on GOAL1/next: PR #82
+            # against `develop` produced runs 416, 418, 419, 421
+            # and 424 over thirteen hours, each one landing within the hour of
+            # a push to dev, each one completing, each one obsoleted by the
+            # next push. The cost is linear in how long a human takes to
+            # review.
+            #
+            # `mergeStateStatus` is GitHub's own answer to "can this merge",
+            # and it already arrives in `ms` -- no extra call. Only two of its
+            # values mean the branch's own staleness is the obstacle:
+            #
+            #   DIRTY   a real conflict with trunk -- a person must resolve it
+            #   BEHIND  the base requires up-to-date and this is not
+            #
+            # CLEAN, UNSTABLE, BLOCKED and DRAFT all mean the merge is not
+            # waiting on staleness: it is waiting on review, on checks, or on
+            # nothing. Integrating those produces a merge commit nobody needed
+            # and a story nobody asked for.
+            #
+            # UNKNOWN is GitHub still computing, and it skips too: acting on it
+            # is how the churn gets reintroduced by a transient read. The next
+            # tick asks again.
+            #
+            # AN EMPTY `ms` FALLS THROUGH DELIBERATELY. That is the shape of a
+            # FAILED `get_merge_state_status` (it is wrapped in try/except
+            # above), and a GitHub outage must not silently stop integration
+            # for every story -- it falls back to the behind/ahead judgement
+            # that was the whole rule until now.
+            state = (ms.get("merge_state_status") or "").upper()
+            if state and state not in _STALENESS_BLOCKS_MERGE:
+                out["ready"] += 1
+                return
+        # THE STORY DOES ITS OWN INTEGRATION NOW, when it is still alive to do it.
+        # A coding story holds its pod from push until its PR merges, so the branch
+        # that is behind belongs to a run that is parked on the merge card right
+        # now -- `trunk_integration.sweep` offers that run an integration plan, a
+        # person approves it, and the same executor that wrote the branch brings
+        # trunk in. Cutting a diff story as well gives one behind branch two
+        # integrations and a stray assistant thread nobody asked for.
+        if await node_self_integrates(get_pool(), h["node_id"]):
+            _log.info("git-engine: node %s is behind but its own story integrates "
+                      "it -- no diff story", h["node_id"])
+            return
+        # AND NEVER FOR AN ERRAND: see `trunk_integration.node_is_errand`.
+        if await node_is_errand(get_pool(), h["node_id"]):
+            _log.info("git-engine: node %s is behind but belongs to an errand "
+                      "-- no diff story", h["node_id"])
+            return
         if await _ensure_diff_story(h, trunk_sha):   # assistant integrates + reconciles + tests
             out["diffs_spawned"] += 1
         return
     # Branch carries nothing trunk lacks (ahead_by == 0) — either an empty branch, or
     # one that's already FULLY MERGED into trunk (behind only by its own merge commit
-    # after a human merged the PR). Either way there's nothing to land or integrate →
-    # no-op finalize (mark MERGED, advance trunk, merge story done). Reuses the
-    # detection sink; idempotent if detection's own finalize also fires for the merge.
+    # after a human merged the PR). THOSE ARE NOT THE SAME THING, and treating them
+    # the same is how the first kernel story "landed" without a byte reaching GitHub:
+    # its seven commits sat unpushed in the sandbox, the remote branch still equalled
+    # the engine's cut point, ahead_by read 0, and this path marked the node MERGED
+    # and told the GO the work was on trunk.
+    #
+    # The discriminator is the branch tip itself: a branch that was merged MOVED
+    # (its tip is not the cut point); a branch that never received a push did not.
+    # Never-moved + a rider claiming completed work = the work is stranded somewhere
+    # else — ESCALATE with the reason instead of certifying a landing.
     if cmp["ahead_by"] == 0:
+        never_moved = False
+        try:
+            tip = await gh.get_ref_sha(token, owner, name, branch)
+            base = await get_pool().fetchval(
+                "SELECT base_sha FROM git_nodes WHERE id = $1", h["node_id"])
+            never_moved = bool(tip and base and tip == base)
+        except Exception:
+            never_moved = False  # can't prove it; the old behaviour stands
+        if never_moved:
+            # A BRANCH THAT NEVER MOVED IS NOT A LANDING, and what it IS
+            # depends entirely on whether its work is finished.
+            #
+            # STILL IN FLIGHT: the executor simply has not pushed yet --
+            # the ordinary state of every story between the cut and the
+            # first push. Finalising here marks the node MERGED while
+            # the work is being written, so the eventual push has no
+            # live node, opens no PR, and lands nowhere. Seen live on a
+            # two-lane story: both branches "merged" minutes after being
+            # cut, with the run still RUNNING.
+            live_rider = await get_pool().fetchval(
+                "SELECT s.id FROM git_node_stories gns "
+                "JOIN stories s ON s.id = gns.story_id "
+                "WHERE gns.git_node_id = $1 "
+                "AND s.state IN ('proposed', 'accepted', 'in_progress', "
+                "                'blocked') LIMIT 1",
+                h["node_id"])
+            if live_rider:
+                out["awaiting_push"] = out.get("awaiting_push", 0) + 1
+                return
+            done_rider = await get_pool().fetchval(
+                "SELECT s.id FROM git_node_stories gns "
+                "JOIN stories s ON s.id = gns.story_id "
+                "WHERE gns.git_node_id = $1 "
+                "AND s.state IN ('done', 'reviewed', 'awaiting_merge') LIMIT 1",
+                h["node_id"])
+            if done_rider:
+                pool = get_pool()
+                await pool.execute(
+                    "UPDATE git_nodes SET state = 'ESCALATED', "
+                    "last_error = $2, updated_at = now() WHERE id = $1 "
+                    "AND state NOT IN ('MERGED', 'ABANDONED')",
+                    h["node_id"],
+                    f"story {done_rider} is done but branch {branch} has "
+                    f"no commits — the work was never pushed. Nothing was "
+                    f"merged; nothing will be reported as landed.")
+                out["escalated"] = out.get("escalated", 0) + 1
+                return
         await _finalize_merged(h["git_repo_id"], h["node_id"], trunk_sha,
                                token, owner, name, trunk_branch)
         out["noop_merged"] += 1
@@ -283,8 +418,20 @@ async def _spawn_engine_code_story(
         async with conn.transaction():
             if await conn.fetchval("SELECT 1 FROM stories WHERE id = $1", sid):
                 return False  # this exact (node, sha, kind) story already exists
+            # Deterministic group choice. Reconcile prunes superseded memberships, so a
+            # node should be in exactly one group — but a diff/fix story must not bind
+            # to a stale group in the window before that prune runs. Prefer a group
+            # whose merge story is still live, then order by id so the pick can never
+            # vary between two otherwise-identical passes.
             grp = await conn.fetchrow(
-                "SELECT merge_group_id FROM git_merge_group_nodes WHERE git_node_id = $1 LIMIT 1",
+                "SELECT gmn.merge_group_id FROM git_merge_group_nodes gmn "
+                "  LEFT JOIN stories s ON s.merge_group_id = gmn.merge_group_id "
+                "                     AND s.story_kind = 'merge' "
+                " WHERE gmn.git_node_id = $1 "
+                " ORDER BY (s.id IS NOT NULL "
+                "           AND s.state NOT IN ('cancelled', 'rejected', 'done')) DESC, "
+                "          gmn.merge_group_id ASC "
+                " LIMIT 1",
                 node_id,
             )
             if grp is None:
@@ -313,27 +460,64 @@ async def _spawn_engine_code_story(
                 # operator-only poll backstop.
                 "INSERT INTO stories (id, goal_id, title, description, assigned_to, "
                 "  state, depends_on, thread_id, created_by, story_kind, merge_group_id, "
-                "  execution_mode) "
+                "  execution_mode, git_node_id) "
                 "VALUES ($1, $2, $3, $4, $5, 'proposed', $6, $7, 'engine', 'code', $8, "
-                "  'operator') "
+                "  'operator', $9) "
                 "ON CONFLICT (id) DO NOTHING",
                 sid, goal_id, title, brief, assignee, depends, thread_id, merge_group_id,
+                # git_node_id (R3): the group is no longer a proxy for the node once a
+                # group can hold one node per repo — record the node itself.
+                node_id,
             )
             await conn.execute(
                 "INSERT INTO threads (id, goal_id, created_by, title) "
                 "VALUES ($1, $2, 'engine', $3) ON CONFLICT (id) DO NOTHING",
                 thread_id, goal_id, thread_label,
             )
-            # One engine story in flight per node: supersede prior non-terminal engine
-            # code stories on this group. Runs AFTER the INSERT so `id <> $2` excludes
+            # One engine story in flight per NODE: supersede prior non-terminal engine
+            # code stories for THIS node. Runs AFTER the INSERT so `id <> $2` excludes
             # the story we just created.
-            await conn.execute(
-                "UPDATE stories SET state = 'cancelled', updated_at = now() "
-                "WHERE created_by = 'engine' AND story_kind = 'code' "
-                "  AND merge_group_id = $1 AND id <> $2 "
-                "  AND state NOT IN ('done', 'reviewed', 'cancelled', 'rejected')",
-                merge_group_id, sid,
-            )
+            #
+            # Scoped by node, not by group (R3/2.4): with a multi-write story the group
+            # holds one node per repo, so the old group-wide cancel would kill repo B's
+            # in-flight diff story every time repo A spawned one. The merge_group_id
+            # clause is retained ONLY for legacy rows written before git_node_id
+            # existed — those have a NULL node and would otherwise never be superseded.
+            from app.services.story_state_ledger import record_states_where
+            _superseded_where = (
+                "created_by = 'engine' AND story_kind = 'code' "
+                "AND id <> $3 AND state NOT IN "
+                "('done', 'reviewed', 'cancelled', 'rejected') "
+                "AND (git_node_id = $2 OR (git_node_id IS NULL "
+                "AND merge_group_id = $1))")
+            # THE IDS, READ BEFORE THE CANCEL, because the predicate stops
+            # matching the moment they move to `cancelled` and the run still
+            # has to be stopped. `record_states_where` returns a count.
+            _superseded = [r["id"] for r in await conn.fetch(
+                f"SELECT id FROM stories WHERE {_superseded_where}",
+                merge_group_id, node_id, sid)]
+            await record_states_where(
+                conn, "cancelled",
+                where=_superseded_where,
+                params=(merge_group_id, node_id, sid),
+                action="superseded_by_newer_diff")
+            # AND STOP THE RUN, which cancelling the story never did.
+            #
+            # A superseded story left its execution exactly where it was.
+            # Caught on GOAL1/next: run 419 sat `PARKED_COLD` with one
+            # unanswered question for nine hours while runs 421 and 424
+            # superseded it — the story was cancelled, the run was not, and a
+            # parked run holds its question, its workspace and its admission
+            # slot until something sweeps it. The open question is the worst
+            # part: it is addressed to a person, about work that five commits
+            # have since made irrelevant.
+            #
+            # `stop_the_run` goes through the mailbox on its own kernel
+            # connection and never raises, so a run that cannot be reached
+            # does not undo the supersede.
+            from app.services.story_cancellation import stop_the_run
+            for _sid in _superseded:
+                await stop_the_run(conn, _sid, actor_uid="system")
             # The merge story waits on this story (edge SEQUENCES dispatch; the live
             # behind_by==0 + checks-green gate is the real merge authorization — §0).
             if merge:
@@ -354,6 +538,67 @@ async def _spawn_engine_code_story(
                     "VALUES ($1, $2, 'produces') ON CONFLICT DO NOTHING",
                     sid, br["id"],
                 )
+
+            # Ripple-check (research/MULTI_REPO_STORIES_PLAN.md §15.3): grant this SAME
+            # story write access to every SIBLING repo's branch in the multi-write story's
+            # merge group too, not just its own. This reuses provision_story_workspace's
+            # EXISTING multi-repo clone path (resolve_repos_for_story -> _clone_descriptors)
+            # with zero new provisioning code — it already clones every write repo a story
+            # is granted, multi-write or not. Safe from a two-writer race because every
+            # story in this merge group shares the SAME assignee (below), so the
+            # assistant-busy/single-active-thread rule already guarantees only one of
+            # them is ever actively dispatched at a time — nothing else can be
+            # concurrently touching a sibling's branch while this session is.
+            # 2026-08-20: exclude a sibling whose OWN node already reached a terminal
+            # state (MERGED/ABANDONED) — confirmed live (goal VKSDN, story b20bb3f9):
+            # a sync story granted write access to a sibling that had ALREADY merged
+            # by the time the grant was read. The engine's own detection (detect.py's
+            # _POLL_SKIP_STATES) stops watching a MERGED/ABANDONED node entirely, so a
+            # new commit pushed to that branch is invisible to it — no PR-open
+            # detection, no finalize, and the branch itself may already be deleted
+            # (many repos auto-delete on merge). Granting write access to a dead
+            # workstream just hands the assistant a blind spot; there is nothing left
+            # there for it to safely touch.
+            #
+            # ESCALATED excluded too: it means a human closed the sibling's PR
+            # unmerged (detect.py's _cancel_node), a persistent GitHub 401/403/404
+            # (node_errors.py — revoked App permission, deleted ref/PR), or another
+            # grind-loop condition that can't self-heal (grind._escalate_node). Its
+            # queue slot is already released and — if it was the group's last live
+            # node — the merge story itself is rejected. Unlike MERGED/ABANDONED an
+            # ESCALATED node COULD still recover (the poller keeps checking it), but
+            # right now it needs a human "Retry", not a new commit from this session.
+            siblings = await conn.fetch(
+                "SELECT r.owner, r.name, n.branch_name FROM git_merge_group_nodes gmn "
+                "JOIN git_nodes n ON n.id = gmn.git_node_id "
+                "JOIN git_repos r ON r.id = n.git_repo_id "
+                "WHERE gmn.merge_group_id = $1 AND gmn.git_node_id <> $2 "
+                "  AND n.state NOT IN ('MERGED', 'ABANDONED', 'ESCALATED')",
+                merge_group_id, node_id,
+            )
+            for sib in siblings:
+                sib_br = await conn.fetchrow(
+                    "SELECT id FROM goal_resources WHERE goal_id = $1 AND kind = 'branch' "
+                    "  AND repo_name = $2 AND branch_name = $3 AND status = 'active' LIMIT 1",
+                    goal_id, sib["name"], sib["branch_name"],
+                )
+                if sib_br:
+                    # relation='modifies', NOT 'produces': this grant and the own-repo
+                    # grant above are inserted in the SAME transaction, so they tie
+                    # exactly on created_at (Postgres now() resolves to transaction
+                    # start for every statement in one transaction — the same class of
+                    # bug fixed for story_workspace_nodes.is_primary, see
+                    # story_workspace_layout.py). 'modifies' is still a full write
+                    # relation (repo_identity.WRITE_RELATIONS) so this repo is still
+                    # cloned writable — it just no longer ties with the story's own
+                    # repo for "which one is primary" in _resolve_repo_for_story /
+                    # resolve_repos_for_story, which now rank 'produces' strictly above
+                    # 'modifies'.
+                    await conn.execute(
+                        "INSERT INTO story_resources (story_id, resource_id, relation) "
+                        "VALUES ($1, $2, 'modifies') ON CONFLICT DO NOTHING",
+                        sid, sib_br["id"],
+                    )
             await append_event(
                 conn,
                 actor_id=_SYSTEM_ACTOR_ID, actor_type="system",
@@ -391,6 +636,37 @@ async def _ensure_diff_story(h: dict, trunk_sha: str) -> bool:
         h["node_id"],
     )
     work = "; ".join(m["title"] for m in members if m["title"]) or "this branch's work"
+
+    # Ripple-check (research/MULTI_REPO_STORIES_PLAN.md §15.3): when this branch is
+    # part of a multi-write story, this same clone ALSO carries a write-enabled copy
+    # of every sibling repo in the change (granted alongside this story's own branch —
+    # see _spawn_engine_code_story). Tell the assistant so it actually looks, rather
+    # than assuming its own repo is the whole change.
+    # Same terminal-sibling exclusion as _spawn_engine_code_story's grant query
+    # (2026-08-20) — telling the assistant to go check a sibling that already
+    # merged would send it looking at a workstream the engine no longer watches.
+    siblings = await pool.fetch(
+        "SELECT r.owner, r.name FROM git_merge_group_nodes gmn "
+        "JOIN git_nodes n ON n.id = gmn.git_node_id "
+        "JOIN git_repos r ON r.id = n.git_repo_id "
+        "WHERE gmn.merge_group_id = ( "
+        "  SELECT merge_group_id FROM git_merge_group_nodes WHERE git_node_id = $1 LIMIT 1) "
+        "  AND gmn.git_node_id <> $1 "
+        "  AND n.state NOT IN ('MERGED', 'ABANDONED', 'ESCALATED')",
+        h["node_id"],
+    )
+    ripple_note = ""
+    if siblings:
+        sib_dirs = ", ".join(f"`{repo_clone_subdir(s['owner'], s['name'])}`" for s in siblings)
+        ripple_note = (
+            f"\nThis is part of a MULTI-REPO change: {sib_dirs} are the sibling repo(s) in "
+            f"the same change, cloned writable alongside yours in this same workspace. "
+            f"Before you finish: check whether integrating `{trunk}` here requires a "
+            f"matching change in any of them (a renamed function, a changed contract, a "
+            f"shared type) — if so, make that change directly in that sibling's clone and "
+            f"commit + push it too, in this SAME session. Do not open a separate story or "
+            f"assume someone else will notice.\n"
+        )
     title = f"Integrate {trunk} into {branch}"
     brief = (
         f"Your branch `{branch}` holds the work for: {work}. That work is finished and "
@@ -401,13 +677,20 @@ async def _ensure_diff_story(h: dict, trunk_sha: str) -> bool:
         f"Your job: bring those newer trunk changes into your branch and make sure your "
         f"work still integrates with them. Stay ON `{branch}` — merging trunk INTO your "
         f"branch does NOT count as switching branches and is exactly what you should do "
-        f"here (do not create or check out a different branch). Your git credentials are "
-        f"already configured.\n"
-        f"1. Pull trunk into your branch. Your clone is single-branch, so fetch the trunk "
-        f"ref BY NAME (a bare `git fetch` / `origin/{trunk}` won't have it):\n"
-        f"     git pull origin {trunk}\n"
-        f"   (equivalently: `git fetch origin {trunk}` then `git merge FETCH_HEAD`). This "
-        f"merges `{trunk}` into `{branch}`; you stay on `{branch}`.\n"
+        f"here (do not create or check out a different branch).\n"
+        f"1. Bring trunk in with the **`sync_trunk` tool**. It takes no arguments: "
+        f"it resolves the lane from the record, fetches `{trunk}` by name and "
+        f"merges it into `{branch}`, worker-side. Call it once and read what it "
+        f"reports.\n"
+        f"   Do NOT use `git pull` / `git fetch` / `git merge` by hand. This brief "
+        f"used to spell out `git pull origin {trunk}`, and the result was that every "
+        f"diff story did the merge with raw git while `sync_trunk` went uncalled -- "
+        f"the outcome looked right and nothing recorded that the platform own tool "
+        f"had not done it.\n"
+        f"   A CONFLICT from `sync_trunk` is not a failure: the merge ran and found "
+        f"two real answers, the markers are in your files, and resolving them is "
+        f"step 2. An ERROR is a platform fault -- say so and stop rather than "
+        f"working around it with git.\n"
         f"2. Resolve any merge conflicts.\n"
         f"3. RECONCILE your work with what others changed on `{trunk}` — EVEN IF the merge "
         f"was clean. Their changes may have moved/renamed files, changed an API/signature/"
@@ -415,9 +698,13 @@ async def _ensure_diff_story(h: dict, trunk_sha: str) -> bool:
         f"the incoming `{trunk}` changes and adapt your work so it still builds and behaves "
         f"correctly against them.\n"
         f"4. Run the build/tests and repair anything the integration broke.\n"
-        f"5. Commit and push: `git push origin {branch}`.\n"
+        f"5. Commit with **`story_commit`**, then **`propose_completion`**. Do NOT "
+        f"run `git push`: publishing is the platform, exactly as for an ordinary "
+        f"story, and it happens once your claim is settled. A diff story finishes "
+        f"the same way every other story does.\n"
         f"Do NOT open a pull request — the engine opens/updates the merge PR once your "
         f"branch is current with trunk and green."
+        f"{ripple_note}"
     )
     return await _spawn_engine_code_story(
         h, sid, title, brief, f"Sync: {branch[:60]}", "diff")

@@ -1,0 +1,84 @@
+# Tests the PUBLISHED suite does not run, by exact id.
+#
+# Each one asserts how an INTERNAL file is written or organised -- a
+# migration's SQL style or its name in SEQUENCE, our per-environment build
+# files, the E0 laptop sandbox under infra/e0/ -- and this distribution
+# deliberately ships none of those files (its migrations are squashed into
+# 0001-0006). No product fact is lost: every test that checks a product
+# fact through such a file was rewritten to check the same fact against
+# what ships (see app/services/tests/shipped_tree.py), and the internal
+# repository still runs every test listed here.
+#
+# Loaded by release_deselect.py (pytest.ini). One id per line.
+
+# migrations/model_aliases_seed.sql, models_seed.sql -- frozen migrations; the
+# distribution seeds its registry from seed/models.json and ships no aliases.
+tests/test_model_registry_migration.py::test_alias_resolves_to_expected_wire_id[sonnet]
+tests/test_model_registry_migration.py::test_alias_resolves_to_expected_wire_id[haiku]
+tests/test_model_registry_migration.py::test_alias_resolves_to_expected_wire_id[gemini-2.5-flash]
+tests/test_model_registry_migration.py::test_alias_resolves_to_expected_wire_id[gemini-2.5-pro]
+tests/test_model_registry_migration.py::test_alias_resolves_to_expected_wire_id[claude-haiku-4-5]
+tests/test_model_registry_migration.py::test_alias_resolves_to_expected_wire_id[claude-sonnet-4-5]
+tests/test_model_registry_migration.py::test_alias_resolves_to_expected_wire_id[claude-opus-4-7]
+tests/test_model_registry_migration.py::test_alias_resolves_to_expected_wire_id[sonnet-4]
+tests/test_model_registry_migration.py::test_alias_seed_covers_every_expected_raw_string
+tests/test_model_registry_migration.py::test_alias_seed_has_no_unexpected_entries
+tests/test_model_registry_migration.py::test_expected_aliases_are_documented_in_recon_report
+tests/test_model_registry_migration.py::test_every_alias_target_is_a_seeded_wire_id
+tests/test_model_registry_migration.py::test_backfill_is_idempotent_on_reapply
+tests/test_model_registry_migration.py::test_every_seed_provider_id_matches_supported_models
+tests/test_model_registry_migration.py::test_every_seed_row_is_covered_by_supported_models
+tests/test_model_registry_migration.py::test_every_supported_model_is_seeded
+
+# migrations/models_hierarchy_backfill.sql -- how that migration is written.
+app/services/model_registry/tests/test_backfill_projection.py::test_backfill_uses_on_conflict_do_nothing_twice
+app/services/model_registry/tests/test_backfill_projection.py::test_backfill_update_is_guarded_by_null_empty_predicate
+app/services/model_registry/tests/test_backfill_projection.py::test_backfill_has_no_delete_drop_alter
+
+# A migration's NAME in SEQUENCE / its SQL style. The grant, column or tool it
+# delivers is checked against what ships by the rewritten test beside it.
+app/services/tests/test_accept_errand_is_a_real_tool.py::test_the_migration_is_idempotent
+app/services/tests/test_accept_errand_is_a_real_tool.py::test_the_migration_is_in_the_sequence
+app/services/tests/test_a_two_lane_story_can_be_reviewed.py::test_it_is_in_the_sequence
+app/services/tests/test_no_dead_trunk_map.py::test_the_migration_is_in_sequence
+app/services/tests/test_the_leg_presents_the_token_it_holds.py::test_the_migration_is_a_new_name_and_not_an_edited_one
+app/services/tests/test_expand_contract_guard.py::test_every_acknowledged_migration_still_exists
+tests/test_table_lists_do_not_drift.py::test_every_seeded_table_is_classified
+
+# migrations/uploaded_documents_carry_a_uri.sql -- a one-off backfill of rows
+# that exist only in our databases; a fresh install has none.
+app/services/tests/test_uploaded_documents_reach_the_executor.py::test_the_backfill_exists_and_only_fills_gaps
+
+# cloudbuild-dev.yaml, cloudbuild-feature.yaml, cloudbuild-next.yaml -- our
+# per-environment build files. The distribution's own pipeline is checked
+# by the rewritten tests that read cloudbuild.yaml.
+app/services/tests/test_the_pool_scope_defaults_to_blank.py::test_dev_declares_its_scope
+app/services/tests/test_the_pool_scope_defaults_to_blank.py::test_feature_declares_its_scope
+app/services/tests/test_the_pool_scope_defaults_to_blank.py::test_feature_runs_the_same_steps_as_dev
+app/services/tests/test_the_background_loops_have_one_home.py::test_a_loop_only_service_gets_cpu_between_requests[deploy-scheduler]
+app/services/tests/test_the_background_loops_have_one_home.py::test_a_loop_only_service_gets_cpu_between_requests[deploy-git-engine]
+app/services/tests/test_the_background_loops_have_one_home.py::test_the_scheduler_is_a_singleton
+app/services/tests/test_the_background_loops_have_one_home.py::test_the_web_tier_hands_its_loops_over_and_is_capped
+
+# infra/e0/ and local-development/ -- the E0 laptop sandbox and launchers.
+app/services/tests/test_artifact_store_is_shared.py::test_the_store_is_a_bind_mount_not_a_named_volume
+app/services/tests/test_artifact_store_is_shared.py::test_the_control_panel_is_pointed_at_the_same_tree
+app/services/tests/test_artifact_store_is_shared.py::test_no_control_characters_in_the_compose_or_launcher
+app/services/tests/test_credential_outstanding.py::test_the_metadata_guard_fails_closed_when_it_cannot_probe
+app/services/tests/test_credential_outstanding.py::test_the_guard_separates_blocked_from_routable_but_closed
+app/services/tests/test_credential_outstanding.py::test_the_guard_blocks_one_address_for_every_cloud
+app/services/tests/test_local_only_configuration.py::test_the_scan_still_finds_something
+app/services/tests/test_local_only_configuration.py::test_nothing_new_depends_on_the_developer_machine
+app/services/tests/test_local_only_configuration.py::test_the_reasons_are_still_true
+app/services/tests/test_errand_surfaces_reachable.py::test_the_prompt_gate_is_not_pinned_to_a_container_path
+app/services/tests/test_worker_service_extracted.py::test_something_actually_starts_it
+app/services/tests/test_the_sandbox_image_carries_what_it_claims.py::test_preflight_offers_a_deliberate_rebuild
+# Our own environments' names (dev/feature/next) and the multi-environment
+# build guard. The release renames our environment names to neutral ones,
+# which these tests pin exactly; a single install has neither.
+app/services/tests/test_infra_names_are_stable.py::test_our_environments_are_named_exactly_as_they_are_today[dev]
+app/services/tests/test_infra_names_are_stable.py::test_our_environments_are_named_exactly_as_they_are_today[feature]
+app/services/tests/test_infra_names_are_stable.py::test_our_environments_are_named_exactly_as_they_are_today[next]
+app/services/tests/test_infra_scope_guard.py::test_the_real_target_set_passes
+app/services/tests/test_infra_scope_guard.py::test_a_dev_build_may_not_touch_next
+app/services/tests/test_infra_scope_guard.py::test_substring_matches_do_not_count_as_scope

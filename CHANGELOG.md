@@ -12,6 +12,65 @@ changes at any `0.MINOR` boundary until `1.0.0` is cut.
 
 Nothing yet. Changes land here before a version is cut.
 
+## [0.2.0] - 2026-10-21
+
+**The execution model changed.** The 0.1.0 notes below describe
+`goal -> story -> task`, dispatched to a per-task Independent Agent and
+reviewed by a Reviewer Agent. That is no longer how AgentOS works, and those
+notes are kept because a changelog records what was true at the time, not
+because they describe the system you are running.
+
+### Changed
+
+- **`goal -> story -> execution -> leg`.** A story is the unit a person
+  accepts; an *execution* is one attempt at running it; a *leg* is one
+  conversation with a model, starting from an empty context and leaving a brief
+  for the next. See `HOW_A_STORY_EXECUTES.md`.
+- **Work runs in its own pod**, not in the control plane: two containers
+  running as different users, a default-deny network, an egress proxy, and no
+  cloud credential inside. The execution plane is required: every executor
+  runs on it, and one `terraform apply` creates it with the database.
+- **A kernel plane** (`kernel/`) decides *when* work runs: admission ceilings,
+  dispatch, leases, reconciliation, and a verifier that re-runs a completion
+  claim's checks in a clean container. It contains no model call.
+- **Executor profiles** replace per-task agent types. A profile is data — a
+  TOML file, a prompt, optional skills — and its tool surface is fail-closed.
+- **IA is vestigial; RA was repurposed.** The standard-IA list was emptied in
+  earlier versions and nothing dispatches one. `RA` is now the type the review
+  councils provision their reviewers as.
+- **The model set** is Claude Opus 5.5, Claude Sonnet 5.5 and Gemini 3.8 Flash,
+  each registered at 100K, 200K, 500K and 1M context windows (migration
+  `0007_model_windows_tags_and_defaults`).
+- **Legacy templates retired.** Migration `0009_retire_legacy_templates`
+  removes the `go`, `default-shca` and IA templates (and `task-reviewer-ia`)
+  where no live agent still uses them. The current templates are `go-v2` for
+  the orchestrator and `kernel-assistant` for the assistant.
+
+### Added
+
+- **A fifth Cloud Run service, `<prefix>-scheduler`** (`app.scheduler_worker`).
+  The background loops run there, one instance behind one leader; the web
+  service runs with `AGENTOS_SCHEDULER_LOOPS=0`.
+- **Per-goal executor settings** on the goal's Model Configuration page:
+  executor model, verifier model, machine size (`small` / `medium` / `large`),
+  tokens per leg and max legs. They are frozen onto the run at dispatch
+  (`executions.leg_budget`, migration `0008_goal_leg_budget`) and govern the
+  work phase, not the review.
+- **The gateway's compaction summarizer** is chosen on the Model Registry page,
+  under Utility Models.
+- `preflight.sh` — checks that an installation is actually provisioned, and
+  treats "could not determine" as a failure rather than a pass.
+- `execution-plane.sh` — stands up the cluster, identities, pools and
+  conductor for a single-environment install.
+- A documentation set written from the source: `HOW_A_STORY_EXECUTES.md`, a
+  rewritten `ARCHITECTURE.md`, and a README in every published folder.
+
+### Removed
+
+- The single-service deployment profile. It existed only in the published
+  overlay, so no test could import it, and it had drifted into importing a
+  router that no longer exists.
+
 ## [0.1.0] - 2026-07-19
 
 Initial public release. This section documents the state of AgentOS at the
@@ -63,9 +122,8 @@ agent gateway.
   first-admin bootstrap bypass.
 - **In-app notifications** — durable per-user notifications with unread state
   and read markers.
-- **Split and single deployment profiles** — the control plane runs either as
-  four independently scalable Cloud Run services (web, council, git engine,
-  management) or as a single always-on service, selected by configuration.
+- **Four-service control plane** — web, council, git engine and management run
+  as independently scalable Cloud Run services off one image.
 - **Multi-council architecture** — Goal Review, Security, and Platform Research
   councils run as separate workers off the same image.
 - **Git dependency-graph engine** — an optional worker that manages per-repo

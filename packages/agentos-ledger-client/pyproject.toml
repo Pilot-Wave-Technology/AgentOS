@@ -1,0 +1,66 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agentos-ledger-client"
+# THE VERSION LIVES IN `__init__.py`, and is read from there.
+#
+# It was declared in both places. Two declarations of one fact drift,
+# and the one that drifts here is invisible: a wheel built from a
+# pyproject saying 0.1.0 while the module says 0.1.7 installs as
+# 0.1.0 and reports 0.1.7 when asked. Nothing errors.
+#
+# CI rewrites the single line in `__init__.py` before building --
+# `0.1.<commits touching this package>` -- so the published version,
+# the installed version and `agentos_ledger_client.__version__` are
+# necessarily the same string.
+dynamic = ["version"]
+description = "Canonical AgentOS State Ledger client and content-addressed blob storage"
+readme = "README.md"
+# 3.12, NOT ">=3.10", WHICH WE NEVER TESTED. Nothing that uses this
+# package runs below 3.12: the app image, the sandbox image and
+# multi-agent-RL are all 3.12, and the only 3.11 image in the
+# repository (the task runner) does not import it. The old floor was
+# an untested compatibility claim on a package whose whole purpose is
+# being depended on -- the wrong place for optimism, as the Linux
+# bootstrap and the actor_type CHECK both demonstrated.
+#
+# It also makes the test extra below honest: `pgserver` publishes
+# cp312 wheels and no sdist, so on 3.10 or 3.11 the embedded database
+# is simply unavailable and the conformance suite could not run.
+requires-python = ">=3.12"
+dependencies = [
+    "asyncpg>=0.29.0",
+]
+
+[project.optional-dependencies]
+gcs = [
+    "google-cloud-storage>=2.0.0",
+]
+# `pip install "agentos-ledger-client[test]"` must yield a RUNNABLE
+# suite. It used to give pytest and no database, so every test that
+# matters -- the ones that put the schema on a real Postgres and append
+# a chained event -- skipped, and the install looked fine.
+test = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    # An actual PostgreSQL, shipped as a wheel: no Docker, no system
+    # install, no port to remember. This is what makes
+    # `pytest --pyargs agentos_ledger_client` work on a consumer's
+    # machine with nothing set up.
+    "pgserver>=0.1.4",
+]
+
+[tool.setuptools.dynamic]
+version = {attr = "agentos_ledger_client.__version__"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+agentos_ledger_client = ["py.typed", "schema.sql"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "strict"
+testpaths = ["src/agentos_ledger_client/tests", "tests"]

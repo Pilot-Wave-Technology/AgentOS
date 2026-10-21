@@ -96,7 +96,13 @@ class NotionInboundAdapter:
             return RedirectResponse(url="/settings/integrations?error=token_exchange_failed", status_code=303)
 
         if not token_data.get("access_token"):
-            _log.error("Notion OAuth response missing access_token: %s", token_data)
+            # The KEYS, never the dict. On the path where `access_token`
+            # is missing the rest of the payload can still carry a
+            # refresh token or a bot secret, and this ran at ERROR --
+            # the level nobody excludes.
+            _log.error("Notion OAuth response missing access_token; keys=%s",
+                       sorted(token_data) if isinstance(token_data, dict)
+                       else type(token_data).__name__)
             return RedirectResponse(url="/settings/integrations?error=missing_token", status_code=303)
 
         try:

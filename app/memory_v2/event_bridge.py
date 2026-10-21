@@ -64,7 +64,12 @@ _EVENT_WHITELIST: dict[str, dict[str, bool]] = {
 
 # Story phases worth surfacing in memory (skip discovery→planning noise).
 _INTERESTING_PHASES = frozenset({
-    "executing", "awaiting_review", "awaiting_next", "done",
+    # `submitting` and `awaiting_merge` are the local lane's replacements
+    # for `awaiting_review`/`awaiting_next`, which are retired. The old
+    # names stay listed so a story mid-flight across the change, and the
+    # gateway lane's own use of them, keep surfacing.
+    "executing", "submitting", "awaiting_merge", "awaiting_closeout",
+    "awaiting_review", "awaiting_next", "done",
 })
 
 # Story states worth surfacing (terminal only — in-flight transitions are noise).
@@ -75,6 +80,25 @@ _INTERESTING_TERMINAL_STATES = frozenset({"done", "cancelled", "rejected"})
 
 def is_enabled() -> bool:
     return bool(getattr(get_settings(), "memory_v2_bridge_enabled", False))
+
+
+
+async def _local_consolidation_stamp(story_id: str):
+    """When a local session last said it consolidated this story's memory.
+
+    None means it did not, or could not say -- and both answers point the
+    same way: run the fallback.
+    """
+    from app.database import get_pool
+    try:
+        return await get_pool().fetchval(
+            "SELECT local_memory_consolidated_at FROM stories WHERE id = $1",
+            story_id)
+    except Exception:                                       # noqa: BLE001
+        _log.exception(
+            "event_bridge: could not read the consolidation stamp for %s — "
+            "treating it as absent, so the gateway flush runs", story_id)
+        return None
 
 
 async def maybe_handle_ledger_event(event: dict[str, Any]) -> None:
@@ -170,12 +194,50 @@ async def _maybe_trigger_story_complete_flush(
 
     pool = get_pool()
     story = await pool.fetchrow(
-        "SELECT title, active_thread_id FROM stories WHERE id = $1",
+        "SELECT title, active_thread_id, execution_mode, checked_out_to_uid "
+        "FROM stories WHERE id = $1",
         story_id,
     )
     if not story:
         return
     story_title = story["title"] or ""
+
+    # A local story that is CHECKED OUT is being completed by the human's own Claude Code
+    # session via the extension, which authors its own story-complete flush (consolidates
+    # .agentos-memory/MEMORY.md → the shared {agent}-{goal} key BEFORE it flips the story
+    # to done). A gateway SHCA flush here would be redundant and could clobber that
+    # curated write with a thread distillation — so suppress it. GO flush still fires
+    # (separate store). If the story is NOT checked out (e.g. marked done from the web UI
+    # after release, or never taken locally), no extension flush will run, so we DON'T
+    # suppress — the gateway SHCA flush is the fallback that captures the memory.
+    # ON PROOF, NOT ON THE CHECKOUT. The reasoning above is right and its
+    # premise was never checked: the extension's flush is BEST-EFFORT. The
+    # human can cancel it, the model can fail to emit the sentinel, and the
+    # 180s timeout is indistinguishable from either -- the flow continues
+    # regardless. A skipped local flush met a suppressed gateway flush and
+    # the story reached done with NO assistant checkpoint in either lane.
+    # Not a degradation: a hole, and a silent one, because each half looks
+    # correct on its own.
+    #
+    # `local_memory_consolidated_at` is set by a write-back that carried
+    # `consolidated: true`, so suppression now happens exactly when the
+    # thing being suppressed was actually done by somebody else.
+    if (story["execution_mode"] or "") == "local" and story["checked_out_to_uid"]:
+        consolidated_at = await _local_consolidation_stamp(story_id)
+        if consolidated_at and shca_targets:
+            _log.info(
+                "event_bridge: story=%s consolidated locally at %s — skipping "
+                "SHCA story_complete flush; GO unaffected.",
+                story_id, consolidated_at,
+            )
+            shca_targets = []
+        elif not consolidated_at and shca_targets:
+            _log.warning(
+                "event_bridge: story=%s is local + checked out but reported no "
+                "consolidation — running the SHCA story_complete flush as the "
+                "fallback rather than leaving no checkpoint at all.",
+                story_id,
+            )
 
     # Build the list of flushes to fire — SHCA(s) + GO. Each entry is
     # a coroutine awaiting its own gateway admin RPC. Fire them
@@ -189,6 +251,16 @@ async def _maybe_trigger_story_complete_flush(
     # The CP-side gateway_admin RPC accepts template id; we resolve in
     # send_silent_flush. (Bug observed 2026-05-25 on SUM02 where passing
     # gateway instance id missed the session_manager._sessions key.)
+    #
+    # The thread comes from the STORY, not from the agent. This used to look up
+    # "a thread belonging to this gateway agent, LIMIT 1", which was unambiguous
+    # only while an assistant had exactly one. It no longer does: several threads
+    # share one gateway agent id now (Stage K), so LIMIT 1 would pick an
+    # arbitrary one and deliver story A's completion checkpoint into story B's
+    # conversation — writing A's decisions under B's heading, in the one turn
+    # whose entire job is to record what happened. `stories.active_thread_id` is
+    # the story's own thread and answers it exactly.
+    story_thread = (story["active_thread_id"] or "").strip()
     for gw_agent_id in shca_targets:
         row = await pool.fetchrow(
             """SELECT t.id AS thread_id, ai.template_id
@@ -196,8 +268,9 @@ async def _maybe_trigger_story_complete_flush(
                 JOIN agent_instances ai ON ai.thread_id = t.id
                                        AND ai.gateway_agent_id = $1
                                        AND ai.status = 'active'
+                ORDER BY (t.id = $2) DESC, t.created_at DESC
                 LIMIT 1""",
-            gw_agent_id,
+            gw_agent_id, story_thread,
         )
         if not row or not row["thread_id"] or not row["template_id"]:
             continue

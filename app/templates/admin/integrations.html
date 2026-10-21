@@ -166,10 +166,26 @@
       <p class="text-sm text-gray-500 mb-3">No Slack workspaces connected.</p>
       {% endif %}
       {% if can_edit %}
+      {# IT SAID "Add workspace", WHICH IS NOT WHAT IT DOES HERE.
+         `upsert_workspace` conflicts on `platform` alone and the table
+         holds one Slack row per database, so for a deployment that
+         already has a workspace this REPLACES it -- which is exactly
+         what you want when reinstalling after a scope change, and is
+         the only way to do it, since Slack's own "Reinstall to
+         Workspace" button never reaches our callback and so never
+         updates the token. Labelled for what it does. #}
       <a href="/channels/slack/oauth/install"
          class="btn btn-secondary btn-sm {% if not slack_app or not slack_app.client_id %}opacity-50 pointer-events-none{% endif %}">
-        {% if slack_workspaces %}Add workspace{% else %}Connect Slack{% endif %}
+        {% if slack_workspaces %}Reinstall / reconnect{% else %}Connect Slack{% endif %}
       </a>
+      {% if slack_workspaces %}
+      <p class="text-xs text-gray-500 mt-2">
+        Re-runs the install and replaces this deployment's bot token — do
+        this after changing the app manifest, because scopes only change on
+        reinstall. Starting it from Slack's own "Reinstall to Workspace"
+        button does <em>not</em> update the token here.
+      </p>
+      {% endif %}
       {% if not slack_app or not slack_app.client_id %}
       <p class="text-xs text-gray-500 mt-2">Save app credentials first to enable this button.</p>
       {% endif %}

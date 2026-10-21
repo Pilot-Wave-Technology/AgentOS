@@ -28,12 +28,30 @@ async def handle(
         return f"Usage: /{command} work <story title or short id>"
 
     pool = get_pool()
-    config = await resolve_goal_config(channel_id, team_id, pool)
-    if not config:
+    # RESOLVED FROM THE BINDING, like /run, /park and /errand.
+    # `resolve_goal_config` requires `pcb.actor_id IS NULL`, which is true
+    # of a goal channel and of a GO story channel and NOT of an
+    # assistant's own story channel -- so starting a story from the place
+    # you are most likely to be standing answered "I couldn't figure out
+    # which goal this channel is linked to", and told you to go somewhere
+    # else. The binding knows, in every one of those channels.
+    from app.channels.slack.commands._context import resolve as _resolve_ctx
+    ctx = await _resolve_ctx(channel_id, team_id, pool)
+    if not ctx.ok:
         return (
-            "I couldn't figure out which goal this channel is linked to. "
-            f"Please run /{command} work from the goal channel."
+            "I couldn't work out which goal this channel belongs to. "
+            f"Try /{command} start from the goal's channel."
         )
+    config = await resolve_goal_config(channel_id, team_id, pool) or {}
+    config = {
+        "goal_id": ctx.goal_id,
+        "bot_token": ctx.bot_token or config.get("bot_token", ""),
+        "bot_user_id": config.get("bot_user_id", ""),
+        "workspace_id": config.get("workspace_id", team_id),
+        # The goal channel is where the work-on-story flow posts its
+        # progress; a story channel does not have one of its own.
+        "goal_channel_id": config.get("goal_channel_id", ""),
+    }
 
     user_uid = await resolve_user(slack_user_id, config["bot_token"], pool)
     if not user_uid:
@@ -45,6 +63,28 @@ async def handle(
     from app.auth import get_goal_role
     if await get_goal_role(user_uid, config["goal_id"]) is None:
         return "You're not a member of this goal."
+
+    # CHECK ENTITLEMENT HERE, synchronously, so the refusal is the slash
+    # command's own answer.
+    #
+    # The flow already refuses a story held by somebody else -- but it
+    # does it deep inside the backgrounded part, as an ephemeral posted
+    # into the GOAL channel. Run from a story channel, the person saw
+    # "Working on it…" here and the refusal somewhere they were not
+    # looking, so the story simply never started and nothing said why.
+    story = await pool.fetchrow(
+        """SELECT id, title, assigned_to FROM stories
+            WHERE goal_id = $1
+              AND state NOT IN ('done', 'reviewed', 'cancelled', 'rejected')
+              AND (id = $2 OR id LIKE $3 OR lower(title) LIKE $4)
+            ORDER BY (id = $2) DESC, created_at DESC LIMIT 1""",
+        config["goal_id"], args.strip(), f"{args.strip()[:8]}%",
+        f"%{args.strip().lower()}%")
+    if story:
+        from app.channels.slack.commands._entitled import may_start
+        ok, why = await may_start(pool, user_uid, dict(story))
+        if not ok:
+            return why
 
     asyncio.create_task(_run_async(
         team_id=team_id, config=config,

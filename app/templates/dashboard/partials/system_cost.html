@@ -233,3 +233,10 @@
   {% endif %}
   {% endif %}
 </div>
+
+{# Attribution sits BELOW the totals card and only on the Cost tab. The
+   Overview tile is four numbers at a glance; this is the detail you open
+   when one of them surprises you. #}
+{% if not _summary %}
+  {% include "dashboard/partials/system_cost_attribution.html" %}
+{% endif %}

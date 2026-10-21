@@ -9,7 +9,6 @@ Structurally a clone of `app/routers/orchestrator.py`'s channel skeleton
 (subscriber registry + page + websocket), scoped to `security_thread_id`
 instead of `orchestrator_thread_id`.
 """
-import json
 import logging
 
 from fastapi import APIRouter, Depends, HTTPException, Request, WebSocket, WebSocketDisconnect
@@ -18,11 +17,16 @@ from fastapi.templating import Jinja2Templates
 
 from app.auth import get_current_user, get_goal_role, verify_firebase_token
 from app.database import get_pool
+from app.routers.thread_paging import fetch_channel_page, register_channel_earlier_route
 
 _log = logging.getLogger(__name__)
 
 router = APIRouter()
 templates = Jinja2Templates(directory="app/templates")
+
+# Visual identity for this channel's message rows, passed to the shared
+# channels/_message.html partial.
+_ACCENT = "rose"
 
 # ── Security Council channel subscriber registry ─────────────────────────────
 _security_subscribers: dict[str, set] = {}
@@ -72,26 +76,13 @@ async def security_thread_page(
     if not security_thread_id:
         raise HTTPException(status_code=404, detail="Security Council channel not found")
 
-    msg_rows = await pool.fetch(
-        """SELECT m.id, m.sender, m.role, m.content, m.created_at, m.card_data
-           FROM messages m
-           WHERE m.thread_id = $1
-             AND m.kind <> 'system_inject'
-             AND NOT (m.kind = 'system_wake' AND m.sender = 'system' AND m.card_data IS NULL)
-           ORDER BY m.created_at""",
-        security_thread_id,
+    # Only the newest window is rendered; older history is paged in on demand.
+    # See app/routers/thread_paging.py for why this is keyset-based.
+    messages, has_older = await fetch_channel_page(pool, security_thread_id)
+    _log.info(
+        "security-channel: rendering goal=%s messages=%d has_older=%s",
+        pid, len(messages), has_older,
     )
-    messages = []
-    for r in msg_rows:
-        m = dict(r)
-        # card_data is JSONB — asyncpg returns it as a JSON string; parse so the
-        # template can read card fields directly (review cards).
-        if isinstance(m.get("card_data"), str) and m["card_data"]:
-            try:
-                m["card_data"] = json.loads(m["card_data"])
-            except Exception:
-                m["card_data"] = None
-        messages.append(m)
 
     firebase_token = request.cookies.get("firebase_token", "")
 
@@ -105,8 +96,22 @@ async def security_thread_page(
             "thread_id": security_thread_id, "messages": messages,
             "firebase_token": firebase_token,
             "auto_fire_tour": auto_fire_tour,
+            "has_older": has_older,
+            "oldest_message_id": messages[0]["id"] if messages else "",
+            "accent": _ACCENT,
+            "label_mode": "sender",
+            "load_earlier_url": f"/goals/{pid}/security/messages/earlier",
         },
     )
+
+
+register_channel_earlier_route(
+    router,
+    channel_slug="security",
+    thread_id_column="security_thread_id",
+    accent=_ACCENT,
+    label_mode="sender",
+)
 
 
 # ── WebSocket (read-only broadcast to human observers) ────────────────────────

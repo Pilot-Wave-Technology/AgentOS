@@ -177,6 +177,82 @@ async def trigger_pre_reap_flush(
 
 # ── Internal ────────────────────────────────────────────────────────────────
 
+async def _home_key(agent_id: str, thread_id: str) -> str:
+    """The workspace this flush will write to, as a lock key.
+
+    The gateway agent id IS the home: the workspace path is derived from it.
+    An agent with a gateway id per thread therefore gets a key nobody else
+    contends for, which is why this needs no "does this agent share a home?"
+    branch — the shared case is the only one where two callers collide.
+
+    Falls back to the thread, which is the pre-Stage-K identity and is at
+    worst as good as no lock at all.
+    """
+    from app.openclaw import session_manager
+    try:
+        resolved = await session_manager._resolve_gateway_agent_id_for_flush(
+            agent_id=agent_id, thread_id=thread_id)
+    except Exception:
+        resolved = None
+    return resolved or f"{agent_id}:{thread_id}"
+
+
+async def _dispatch_direct_serialized(
+    *, session_manager, agent_id: str, agent_type: str,
+    goal_id: Optional[str], story_id: Optional[str], thread_id: str,
+    flush_type: str, user_prompt: str, system_prompt: str,
+    idempotency_key: str,
+) -> bool:
+    """Dispatch a flush over the admin RPC, one per home at a time.
+
+    Two things have to be true together and neither is enough alone:
+
+      * the home lock is held, so a second memory turn in the same workspace
+        waits rather than interleaving its read-modify-write of `MEMORY.md`;
+      * the turn is WAITED FOR inside that lock. The `agent` RPC acks — it
+        returns a runId when the turn is accepted, not when it has run — so
+        holding a lock across the dispatch alone would serialize the sending
+        and nothing else.
+    """
+    from app.memory_v2 import home_lock  # noqa: PLC0415
+    from app.openclaw import gateway_admin  # noqa: PLC0415
+
+    home = await _home_key(agent_id, thread_id)
+    async with home_lock.held(home) as serialized:
+        if not serialized:
+            # Another memory turn in this home outlasted the wait. Skip rather
+            # than write over it: the story's own narrative file
+            # (`memory/<story_id>.md`) has no other writer, so what is at risk
+            # here is the distilled line, not the record of what happened.
+            _log.warning(
+                "flush SKIPPED — home %s busy with another memory turn: "
+                "type=%s thread=%s story=%s",
+                home, flush_type, thread_id, story_id,
+            )
+            await _emit_flush_ledger_event(
+                agent_id=agent_id, agent_type=agent_type,
+                goal_id=goal_id, story_id=story_id,
+                flush_type=f"{flush_type}_skipped_home_busy",
+            )
+            return False
+
+        run_id = await session_manager.send_silent_flush(
+            goal_id=goal_id or "",
+            agent_id=agent_id,
+            thread_id=thread_id,
+            user_message=user_prompt,
+            system_prompt=system_prompt,
+            idempotency_key=idempotency_key,
+        )
+        if not run_id:
+            return False
+        if run_id != "dispatched":
+            status = await gateway_admin.wait_for_run(run_id, timeout_s=90.0)
+            _log.info("flush %s: run %s finished status=%s",
+                      flush_type, run_id[:12], status or "<unknown>")
+        return True
+
+
 async def _send_flush_turn(
     *, agent_id: str, agent_type: str, thread_id: str,
     goal_id: Optional[str], story_id: Optional[str],
@@ -206,16 +282,28 @@ async def _send_flush_turn(
     # — same path task_controller uses to dispatch IA tasks. Does NOT
     # require a CP-side _AgentSession or any browser tab to be open. The
     # agent writes to memory files as side effects of tool calls during
-    # the turn; we don't wait for the turn to complete (besides the
-    # pre_reap caller's outer wait_for).
+    # the turn.
+    #
+    # ONE MEMORY TURN AT A TIME PER HOME. Every flush type writes the same
+    # `MEMORY.md`, and the model writes it by reading the file and writing the
+    # whole thing back. That was safe while an agent had one conversation;
+    # since Stage K an assistant's threads share a workspace, so two flushes
+    # overlapping lose one of them, silently. Serializing here — rather than
+    # per caller — covers all four flush types and both dispatch paths, which
+    # is the only version of this that stays true when a fifth is added.
+    #
+    # See app/memory_v2/home_lock.py for why the file is shared rather than
+    # split per thread: `MEMORY.md` is a bootstrap file and a per-thread one
+    # would never be injected.
     try:
         from app.openclaw import session_manager
         idempotency_key = f"flush-{flush_type}-{agent_id}-{uuid.uuid4().hex[:8]}"
         # Prefer the durable queue: the flush becomes a SYSTEM_WAKE turn that
-        # always runs (reaper-retried, never dropped) and serializes with the
-        # dispatcher's per-thread lock so it never overlaps a user turn. Falls
-        # back to the direct admin RPC when the queue is off or routing can't be
-        # resolved.
+        # always runs (reaper-retried, never dropped) and is serialized by the
+        # dispatcher — per thread against a user turn, and PER HOME against
+        # another memory turn (chat_module/dispatcher.py). Nothing to lock
+        # here on that path: this call only enqueues, and locking an enqueue
+        # serializes nothing.
         sent = await session_manager.enqueue_silent_flush(
             goal_id=goal_id or "",
             agent_id=agent_id,
@@ -225,11 +313,16 @@ async def _send_flush_turn(
             system_prompt=system_prompt,
         )
         if not sent:
-            sent = await session_manager.send_silent_flush(
-                goal_id=goal_id or "",
-                agent_id=agent_id,
-                thread_id=thread_id,
-                user_message=user_prompt,
+            # The direct path has no dispatcher in front of it, so the home
+            # lock is taken HERE instead — and held across the turn itself,
+            # not just the dispatch. This is the path E0 uses today
+            # (CHAT_QUEUE_ENABLED defaults off), so it is the one that has to
+            # be right for the live test to mean anything.
+            sent = await _dispatch_direct_serialized(
+                session_manager=session_manager,
+                agent_id=agent_id, agent_type=agent_type,
+                goal_id=goal_id, story_id=story_id, thread_id=thread_id,
+                flush_type=flush_type, user_prompt=user_prompt,
                 system_prompt=system_prompt,
                 idempotency_key=idempotency_key,
             )

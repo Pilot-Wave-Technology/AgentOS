@@ -114,6 +114,18 @@ async def monitor_dashboard(
     shown_tokens = sum(a["tokens"] for a in agents)
     historical_tokens = max(0, total_tokens - shown_tokens)
 
+    # Local-execution stories are a SECOND, larger gap in Tokens Used, and unlike the
+    # historical-agent gap above it can never be reconciled: a local story's coding
+    # phases run as Claude Code in the user's own editor on their own subscription, so
+    # the control panel never sees those token calls and writes no `token_calls` row.
+    # Count them so the number reads as "spend we cannot observe" rather than "no work
+    # happened" — same reasoning as the historical-tokens line, applied to a gap that
+    # is structural rather than temporal. Cheap COUNT on an indexed goal_id.
+    local_story_count = await pool.fetchval(
+        "SELECT count(*) FROM stories WHERE goal_id = $1 AND execution_mode = 'local'",
+        pid,
+    ) or 0
+
     agents_etag = _compute_agents_etag(agents)
 
     return templates.TemplateResponse(
@@ -138,6 +150,7 @@ async def monitor_dashboard(
             "total_tokens": total_tokens,
             "shown_tokens": shown_tokens,
             "historical_tokens": historical_tokens,
+            "local_story_count": local_story_count,
         },
     )
 

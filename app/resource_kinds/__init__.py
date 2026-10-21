@@ -27,7 +27,7 @@ from typing import Optional
 
 # Format constants — kept here so brokers and the registry share them.
 GCP_PROJECT_RE = r"^[a-z][a-z0-9\-]{4,28}[a-z0-9]$"
-GCP_REGION_RE = r"^[a-z]+-[a-z]+\d+$"  # e.g. ${GCP_REGION}, europe-west2
+GCP_REGION_RE = r"^[a-z]+-[a-z]+\d+$"  # e.g. us-central1, europe-west2
 SA_EMAIL_RE = (
     r"^[a-zA-Z][a-zA-Z0-9\-]+@[a-zA-Z0-9\-]+\.iam\.gserviceaccount\.com$"
 )
@@ -131,7 +131,7 @@ RESOURCE_KINDS: dict[str, ResourceKindSpec] = {
             ),
             FieldSpec(
                 "target_region",
-                "GCP region for the deliverable (e.g. ${GCP_REGION})",
+                "GCP region for the deliverable (e.g. us-central1)",
                 regex=GCP_REGION_RE,
             ),
         ),

@@ -12,7 +12,7 @@ Agent type selection (IA / RA) drives archetype selection automatically:
   RA → code-reviewer archetype
 
 Registered BEFORE proxy_routes in main.py so these /settings/* paths are
-served by the main service (gateway_admin dependency).
+served by the main service.
 """
 import json
 import logging
@@ -23,10 +23,12 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
 from app.auth import require_admin
-from app.config import get_settings
 from app.database import get_pool
-from app.openclaw import gateway_admin
 from app.routers.templates import _record_history
+from app.services.model_registry.dropdowns import (
+    is_dropdown_empty,
+    list_model_ids_for_dropdown_v2,
+)
 from app.services.template_authoring import (
     ARCHETYPES,
     WizardInputs,
@@ -58,18 +60,6 @@ _TOOLS_MD_STUB = (
 _SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 
 
-async def _model_options() -> list[str]:
-    """Available model ids — gateway list with settings fallback."""
-    try:
-        gw = await gateway_admin.list_models()
-        models = [m["id"] for m in gw.get("models", [])]
-        if models:
-            return models
-    except Exception:
-        logger.debug("template_authoring: gateway model list unavailable, using settings")
-    return list(get_settings().available_models)
-
-
 def _inputs_from_form(form) -> WizardInputs:
     """Build WizardInputs from a posted form, normalising blanks.
 
@@ -84,7 +74,7 @@ def _inputs_from_form(form) -> WizardInputs:
         template_id=(form.get("template_id") or "").strip().lower(),
         name=(form.get("name") or "").strip(),
         emoji=(form.get("emoji") or "").strip(),
-        model=(form.get("model") or "google/gemini-2.5-flash").strip(),
+        model=(form.get("model") or "google/gemini-3.8-flash").strip(),
         description=(form.get("description") or "").strip(),
         agent_type=agent_type,
         archetype=archetype,
@@ -105,13 +95,15 @@ def _inputs_from_form(form) -> WizardInputs:
 async def template_new(request: Request, user: dict = Depends(require_admin)):
     """Admin-only: platform.editor has read-only access to the Agent Registry."""
     logger.debug("template_authoring: wizard opened by %s", user.get("email"))
+    models = await list_model_ids_for_dropdown_v2(get_pool())
     return templates.TemplateResponse(
         "authoring/wizard.html",
         {
             "request": request,
             "user": user,
             "archetypes": ARCHETYPES,
-            "models": await _model_options(),
+            "models": models,
+            "models_empty": is_dropdown_empty(models),
         },
     )
 

@@ -1,0 +1,18 @@
+# Line endings are not a preference here — they are correctness.
+#
+# 23 of 68 shell scripts were checked out with CRLF on a Windows working
+# copy, and every one of them fails inside a Linux container on
+# `set -euo pipefail\r: invalid option name`. It went unnoticed for a
+# whole stage because the suites were being run as `python3 ci/x.py`
+# directly; the `.sh` wrappers and therefore `./run.sh` itself had never
+# been exercised.
+#
+# Everything the containers execute is LF, whatever the checkout host is.
+* text=auto eol=lf
+
+# Binary, and must not be touched.
+*.png binary
+*.jpg binary
+*.gz  binary
+*.tar binary
+*.pyc binary

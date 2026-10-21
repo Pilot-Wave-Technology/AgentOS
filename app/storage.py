@@ -39,7 +39,6 @@ async def upload_workspace_file(pid: str, agent_id: str, filename: str, data: by
 async def list_workspace_files(pid: str, agent_id: str) -> list[dict]:
     client = get_gcs_client()
     bucket_name = workspace_bucket_name(pid)
-    bucket = client.bucket(bucket_name)
     prefix = f"{agent_id}/"
     blobs = client.list_blobs(bucket_name, prefix=prefix)
     return [
@@ -75,6 +74,40 @@ async def upload_resource_file(resource_id: str, filename: str, data: bytes, con
     blob = bucket.blob(blob_path)
     blob.upload_from_string(data, content_type=content_type or "application/octet-stream")
     return f"gs://{bucket_name}/{blob_path}"
+
+
+def download_resource_uri(uri: str) -> bytes:
+    """Read a `gs://bucket/path` or `artifact://<sha256>` object. SYNCHRONOUS.
+
+    For the workspace drivers, which are synchronous by design -- the
+    worker calls `acquire()` off the event loop -- so an async fetcher
+    would have to be bridged at exactly the wrong layer.
+
+    Takes a URI rather than (resource_id, filename) because that is what
+    a mount carries: `goal_resources.uri` is the full gs:// path and the
+    mount is derived from it. Splitting it back into two halves here
+    would invent a parsing rule that the writer never agreed to.
+    """
+    # `artifact://<sha256>` IS A RESOURCE URI NOW. D2 made every emitted
+    # report, dataset and method a grantable resource with that scheme,
+    # and a story granted one mounts it `copyin` at docs/<name>, which
+    # lands here for the bytes. Without this branch the whole
+    # errand-report-then-story chain refused at its last link, with a
+    # message about a URI scheme rather than about a missing report.
+    #
+    # No download: the content store is a shared tree this process can
+    # open, so resolving is finding the file.
+    from kernel.artifacts.uri import is_artifact_uri, read_artifact_uri
+
+    if is_artifact_uri(uri):
+        return read_artifact_uri(uri)
+    if not (uri or "").startswith("gs://"):
+        raise ValueError(f"not a gs:// or artifact:// uri: {uri!r}")
+    bucket_name, _, blob_path = uri[len("gs://"):].partition("/")
+    if not blob_path:
+        raise ValueError(f"uri names a bucket but no object: {uri!r}")
+    client = get_gcs_client()
+    return client.bucket(bucket_name).blob(blob_path).download_as_bytes()
 
 
 async def download_resource_file(resource_id: str, filename: str) -> bytes:

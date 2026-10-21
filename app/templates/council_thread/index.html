@@ -5,7 +5,7 @@
 <!-- Markdown rendering: marked.js + highlight.js, same pattern as chat/index.html -->
 <script src="https://cdn.jsdelivr.net/npm/marked@15/marked.min.js"></script>
 <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11/build/highlight.min.js"></script>
-<script src="/static/js/markdown_renderer.js"></script>
+<script src="/static/js/markdown_renderer.js?v={{ request.state.asset_v('js/markdown_renderer.js') }}"></script>
 <style>
   .agent-prose h1, .agent-prose h2, .agent-prose h3,
   .agent-prose h4, .agent-prose h5, .agent-prose h6 {
@@ -64,31 +64,11 @@
 
   <!-- Messages -->
   <div id="messages" class="flex-1 overflow-y-auto px-6 py-4 space-y-3">
-    {% for msg in messages %}
-    {% if msg.card_data and msg.card_data.type == 'review' %}
-    <div class="rounded-lg border border-amber-500/30 bg-amber-500/5 px-4 py-3">
-      <div class="flex items-center gap-2 mb-2">
-        <span class="pill pill-neutral text-2xs uppercase tracking-wide">
-          {{ msg.card_data.subtype }} review
-        </span>
-        <span class="text-2xs font-medium text-amber-300">{{ msg.card_data.title }}</span>
-        <span class="text-2xs text-gray-700 ml-auto" data-utc="{{ msg.created_at.isoformat() if msg.created_at else '' }}">{{ msg.created_at.strftime('%b %d, %H:%M') if msg.created_at else '' }} UTC</span>
-      </div>
-      {% if msg.card_data.producer %}
-      <div class="text-2xs text-gray-500 mb-1">by {{ msg.card_data.producer }}</div>
-      {% endif %}
-      <div class="agent-prose text-sm text-gray-300" data-md="{{ msg.card_data.body | e }}">{{ msg.card_data.body }}</div>
-    </div>
-    {% else %}
-    <div class="rounded-lg px-4 py-2.5">
-      <div class="flex items-center gap-2 mb-1">
-        <span class="text-2xs font-medium text-amber-300">{{ msg.sender }}</span>
-        <span class="text-2xs text-gray-700" data-utc="{{ msg.created_at.isoformat() if msg.created_at else '' }}">{{ msg.created_at.strftime('%b %d, %H:%M') if msg.created_at else '' }} UTC</span>
-      </div>
-      <div class="message-body" data-md="{{ msg.content | e }}">{{ msg.content }}</div>
-    </div>
-    {% endif %}
-    {% endfor %}
+    {# Only the newest window of messages is rendered; this button pages
+       backwards through the rest. See app/templates/channels/README.md. #}
+    {% if has_older %}{% with before_id = oldest_message_id %}{% include "_shared/load_earlier.html" %}{% endwith %}{% endif %}
+
+    {% for msg in messages %}{% include "channels/_message.html" %}{% endfor %}
 
     {% if not messages %}
     <div class="text-center py-12">
@@ -98,14 +78,25 @@
     {% endif %}
   </div>
 
-  <!-- Read-only notice (no input box) -->
-  <div class="px-6 py-3 border-t border-border">
+  <!-- Read-only notice (no input box). `relative` anchors the new-message pill. -->
+  <div class="relative px-6 py-3 border-t border-border">
+    <!-- Auto-scroll is suppressed while the reader has scrolled up (see
+         thread_scroll.js), so without this affordance an incoming message would
+         land silently off-screen. Anchored to this bar rather than inside
+         #messages so it does not scroll away. -->
+    <button type="button" id="new-messages-pill"
+      class="hidden absolute -top-10 left-1/2 -translate-x-1/2 z-10 px-3 py-1.5 rounded-full
+             bg-indigo-600 hover:bg-indigo-500 text-white text-2xs font-medium shadow-lg">
+      ↓ New messages
+    </button>
     <p class="text-2xs text-gray-600 text-center">
       This is a read-only channel. The Goal Review Council posts here automatically.
     </p>
   </div>
 </div>
 
+<script src="/static/js/channel_message_renderer.js?v={{ request.state.asset_v('js/channel_message_renderer.js') }}"></script>
+<script src="/static/js/thread_scroll.js?v={{ request.state.asset_v('js/thread_scroll.js') }}"></script>
 <script>
 // ── Markdown renderer config lives in /static/js/markdown_renderer.js (shared
 // with chat/orchestrator/security_thread/goal_thread) ─────────────────────────
@@ -128,68 +119,21 @@ function escapeHtml(s) {
   return (s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
-// Many plain (non-card) messages here start with a bracketed header line —
-// e.g. "[Prateek Upadhyay's Assistant · Story: ... · request]\nbody text" or
-// "[GO → Story: ...]\nbody text" (see app/routers/orchestrator.py's
-// internal_orchestrator_message/internal_orchestrator_reply formatting).
-// Render that header as compact segments instead of dumping the brackets
-// into the body text. Falls back to plain renderMd() untouched — including
-// on any parse error — if the content doesn't match this shape.
-function renderMessageBody(raw, accent) {
-  accent = accent || 'amber';
-  const plainFallback = () => {
-    const rendered = renderMd(raw);
-    return rendered && rendered.trim()
-      ? `<div class="agent-prose text-sm text-gray-300">${rendered}</div>`
-      : `<div class="text-sm text-gray-300 whitespace-pre-wrap">${escapeHtml(raw)}</div>`;
-  };
-  if (!raw) return '';
-  try {
-    const m = /^\[([^\]]+)\]\s*([\s\S]*)$/.exec(raw.trim());
-    if (!m) return plainFallback();
-    const header = m[1];
-    const body = m[2].trim();
-    const headerHtml = header.split('·').map((part, i) => {
-      const trimmed = part.trim();
-      if (!trimmed) return '';
-      // First segment is the "who" attribution — give it more visual weight
-      // than the metadata segments that follow (Story:, request, etc.).
-      const weight = i === 0 ? 'font-semibold' : 'font-medium';
-      return `<span class="header-pill header-pill-${accent} ${weight}">${marked.parseInline(trimmed)}</span>`;
-    }).join('');
-    if (!headerHtml.trim()) return plainFallback();
-    const renderedBody = body ? renderMd(body) : '';
-    const bodyHtml = renderedBody && renderedBody.trim()
-      ? `<div class="agent-prose text-sm text-gray-300">${renderedBody}</div>`
-      : (body ? `<div class="text-sm text-gray-300 whitespace-pre-wrap">${escapeHtml(body)}</div>` : '');
-    return `<div class="flex flex-wrap items-center gap-1.5 mb-2 text-2xs">${headerHtml}</div>${bodyHtml}`;
-  } catch (e) {
-    console.warn('renderMessageBody: bracket-header parse failed, falling back to plain text:', e);
-    return plainFallback();
-  }
-}
+// renderMessageBody() and the hydration pass now live in
+// /static/js/channel_message_renderer.js, shared by all three read-only
+// channels. Scroll management lives in /static/js/thread_scroll.js.
+const CHANNEL_ACCENT = 'amber';
 
-// Render stored messages on page load (Jinja escapes content; data-md holds raw text).
-// Only overwrite innerHTML if renderMd produced something, else keep the
-// server-rendered fallback so a marked.parse failure never blanks a bubble.
-document.querySelectorAll('.agent-prose[data-md]').forEach(el => {
-  const rendered = renderMd(el.dataset.md);
-  if (rendered && rendered.trim()) {
-    el.innerHTML = rendered;
-  } else if (el.dataset.md) {
-    el.style.whiteSpace = 'pre-wrap';
-    el.textContent = el.dataset.md;
-  }
-});
-
-// Plain (non-card) message bodies — bracket-header aware, see renderMessageBody().
-document.querySelectorAll('.message-body[data-md]').forEach(el => {
-  el.innerHTML = renderMessageBody(el.dataset.md, 'amber');
-});
-
-// Scroll the messages area to the bottom so the latest message is visible
 const _msgEl = document.getElementById('messages');
-if (_msgEl) _msgEl.scrollTop = _msgEl.scrollHeight;
+hydrateChannelMessages(document, CHANNEL_ACCENT);
+
+// Also scrolls to the bottom on load, and preserves the reader's position when
+// "Load earlier" prepends older rows.
+const threadScroll = initThreadScroll({
+  container: _msgEl,
+  pill: document.getElementById('new-messages-pill'),
+  onInserted: (container) => hydrateChannelMessages(container, CHANNEL_ACCENT),
+});
 
 // WebSocket for real-time updates
 const token = '{{ firebase_token }}';
@@ -240,7 +184,7 @@ function connectWs() {
             ${renderMessageBody(msg.content, 'amber')}
           `;
         }
-        if (_msgEl) { _msgEl.appendChild(div); _msgEl.scrollTop = _msgEl.scrollHeight; }
+        if (_msgEl) { _msgEl.appendChild(div); threadScroll.onAppend(true); }
       }
     } catch (err) {
       console.error('WS parse error:', err);

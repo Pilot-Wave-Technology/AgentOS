@@ -1,0 +1,26 @@
+# Base tool surface for a LOCAL executor — every local profile gets these.
+#
+# This is a SEPARATE TREE from `profiles/`, deliberately. See
+# `kernel/profiles/local_registry.py` for why: the pod profiles describe a
+# sandbox, and a local run has no sandbox, no legs and no step budget. The two
+# are edited independently and neither constrains the other.
+#
+# THE VOCABULARY IS STILL THE KERNEL'S. A tool is named the same here as in a
+# pod profile even though the thing serving it is different, so that
+# `app/services/local_tool_surface.py` can keep mapping names to the bridge and
+# keep FAILING CLOSED on one it does not recognise. A typo should refuse the
+# import, not silently grant nothing.
+#
+# WHAT A LOCAL BASE DOES NOT NEED: `ask_human` and `reply_to_human`. In a pod
+# they park the run and wait for a card. Here the person is in the room — Claude
+# Code and Codex already stop and ask, and the answer is them typing it. The
+# conversation is still recorded into the story thread; recording is not a
+# channel.
+
+tools = [
+  "read",       # read one file
+  "glob",       # find files by pattern
+  "grep",       # search file contents
+  "list_dir",   # list a directory
+  "skill",      # load one skill's instructions on demand
+]

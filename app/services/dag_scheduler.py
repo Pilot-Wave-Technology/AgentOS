@@ -127,6 +127,9 @@ _CLAIM_READY_PHASE_SQL = """
                         WHERE g.id = t.goal_id AND g.status = 'active')
            AND t.story_id NOT IN (SELECT story_id FROM busy_stories)
            AND s.execution_paused = FALSE
+           -- Local Execution Mode (M0): never claim a checked-out / local story.
+           AND s.checked_out_to_uid IS NULL
+           AND s.execution_mode <> 'local'
            AND NOT EXISTS (SELECT 1 FROM execution_pauses ep
                             WHERE ep.scope = 'goal' AND ep.scope_id = t.goal_id)
          ORDER BY t.created_at ASC

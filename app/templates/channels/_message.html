@@ -1,0 +1,66 @@
+{# One message row for the read-only agent channels: council_thread,
+   security_thread, orchestrator.
+
+   These three pages previously each carried their own copy of this markup,
+   identical apart from the accent colour and how the plain row is labelled.
+   This is now the single source of truth for all three — change it here and
+   all three follow.
+
+   The GO thread deliberately does NOT use this partial. It has no card_data,
+   labels by resolved sender_name, and hydrates via safeMarkdown() over
+   `.rendered-md` instead of renderMessageBody() over `data-md`. Two different
+   data contracts and two different client renderers; merging them would be a
+   fake abstraction. See app/templates/goal_thread/README.md.
+
+   Context:
+     msg        — message row (id, sender, role, content, created_at, card_data)
+     accent     — 'amber' | 'rose' | 'emerald' … drives card chrome + header pills
+     label_mode — 'sender' : show msg.sender verbatim (council, security)
+                  'role'   : derive GO / System / Assistant (orchestrator)
+
+   `data-md` carries the RAW markdown; the element's text content is an escaped
+   fallback so a marked.parse failure never blanks a bubble. See
+   static/js/channel_message_renderer.js. #}
+<div data-msg-id="{{ msg.id }}">
+{% if msg.card_data and msg.card_data.type == 'review' %}
+  <div class="rounded-lg border border-{{ accent }}-500/30 bg-{{ accent }}-500/5 px-4 py-3">
+    <div class="flex items-center gap-2 mb-2">
+      <span class="pill pill-neutral text-2xs uppercase tracking-wide">{{ msg.card_data.subtype }} review</span>
+      <span class="text-2xs font-medium text-{{ accent }}-300">{{ msg.card_data.title }}</span>
+      <span class="text-2xs text-gray-700 ml-auto" data-utc="{{ msg.created_at.isoformat() if msg.created_at else '' }}">{{ msg.created_at.strftime('%b %d, %H:%M') if msg.created_at else '' }} UTC</span>
+    </div>
+    {% if msg.card_data.producer %}
+    <div class="text-2xs text-gray-500 mb-1">by {{ msg.card_data.producer }}</div>
+    {% endif %}
+    <div class="agent-prose text-sm text-gray-300" data-md="{{ msg.card_data.body | e }}">{{ msg.card_data.body }}</div>
+  </div>
+{% elif label_mode == 'role' %}
+  {# Orchestrator: the channel carries both sides of an internal exchange, so
+     the row is labelled by role rather than by raw sender id. #}
+  <div class="{% if msg.role == 'agent' %}bg-surface-hover{% endif %} rounded-lg px-4 py-2.5">
+    <div class="flex items-center gap-2 mb-1">
+      <span class="text-2xs font-medium
+        {% if msg.role == 'agent' %}text-emerald-400
+        {% elif msg.sender == 'system' %}text-gray-500
+        {% else %}text-indigo-400{% endif %}">
+        {% if msg.role == 'agent' %}GO
+        {% elif msg.sender == 'system' %}System
+        {% else %}Assistant{% endif %}
+      </span>
+      <span class="text-2xs text-gray-700" data-utc="{{ msg.created_at.isoformat() if msg.created_at else '' }}">{{ msg.created_at.strftime('%b %d, %H:%M') if msg.created_at else '' }} UTC</span>
+    </div>
+    <div class="message-body"
+         data-md="{{ msg.content | e }}"
+         data-accent="{% if msg.role == 'agent' %}emerald{% elif msg.sender == 'system' %}gray{% else %}indigo{% endif %}">{{ msg.content }}</div>
+  </div>
+{% else %}
+  {# Council / Security: a single agent posts here, so its name is the label. #}
+  <div class="rounded-lg px-4 py-2.5">
+    <div class="flex items-center gap-2 mb-1">
+      <span class="text-2xs font-medium text-{{ accent }}-300">{{ msg.sender }}</span>
+      <span class="text-2xs text-gray-700" data-utc="{{ msg.created_at.isoformat() if msg.created_at else '' }}">{{ msg.created_at.strftime('%b %d, %H:%M') if msg.created_at else '' }} UTC</span>
+    </div>
+    <div class="message-body" data-md="{{ msg.content | e }}" data-accent="{{ accent }}">{{ msg.content }}</div>
+  </div>
+{% endif %}
+</div>

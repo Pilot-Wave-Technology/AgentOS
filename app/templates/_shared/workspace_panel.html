@@ -1,0 +1,58 @@
+{# The story's workspace, as a right rail.
+   SHARED by the assistant's thread and the GO's. An approved autonomous
+   errand's conversation lives on the GO's thread, and its workspace was
+   provisioned exactly as before -- `stories.workspace_path` is set and
+   the tree endpoints work -- but the only thing that rendered it was
+   this markup, inside the assistant's page.
+
+   The including page must define `current_story` (id, title,
+   workspace_state) and load /static/js/workspace_panel.js.
+   Self-gating: nothing renders unless the workspace is `ready`. #}
+  {% if current_story and current_story.workspace_state == 'ready' %}
+  <!-- Horizontal resizer between chat and workspace panel -->
+  <div id="ws-resize-handle-x"
+       class="w-1 flex-shrink-0 bg-border hover:bg-indigo-500/60 cursor-col-resize transition-colors"
+       title="Drag to resize"></div>
+  <!-- Right rail: workspace file viewer (Stage 1 of plan-approval flow) -->
+  <aside id="workspace-panel"
+         class="flex-shrink-0 border-l border-border bg-surface/30 flex flex-col"
+         style="width: 24rem;"
+         data-story-id="{{ current_story.id }}">
+    <div class="px-4 py-2.5 border-b border-border flex items-center gap-2">
+      <svg class="w-4 h-4 text-indigo-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+              d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z"/>
+      </svg>
+      <div class="min-w-0 flex-1">
+        <div class="text-xs font-semibold text-gray-200 truncate">Workspace</div>
+        <div class="text-2xs text-gray-500 truncate" title="{{ current_story.title }}">{{ current_story.title }}</div>
+      </div>
+      <button id="ws-refresh-btn" class="text-2xs text-gray-500 hover:text-gray-300 px-2 py-1 rounded hover:bg-surface" title="Refresh tree">
+        ↻
+      </button>
+    </div>
+    <div id="ws-panel-body" class="flex-1 min-h-0 flex flex-col">
+      <!-- File tree -->
+      <div id="ws-tree" class="overflow-y-auto px-2 py-2 text-xs font-mono"
+           style="flex: 1 1 auto; min-height: 4rem;">
+        <div class="text-gray-500 text-2xs italic px-2 py-1">Loading…</div>
+      </div>
+      <!-- Vertical resizer between tree and content pane (only shown when content is open) -->
+      <div id="ws-resize-handle-y"
+           class="hidden h-1 flex-shrink-0 bg-border hover:bg-indigo-500/60 cursor-row-resize transition-colors"
+           title="Drag to resize"></div>
+      <!-- File content (collapsible) -->
+      <div id="ws-content-pane" class="hidden flex-col border-t border-border"
+           style="flex: 1 1 50%; min-height: 6rem;">
+        <div class="px-3 py-1.5 border-b border-border bg-surface/40 flex items-center gap-2 text-2xs">
+          <span id="ws-content-path" class="font-mono text-gray-300 truncate flex-1"></span>
+          <span id="ws-content-meta" class="text-gray-600"></span>
+          <button onclick="closeWsContent()" class="text-gray-500 hover:text-gray-300 px-1.5">✕</button>
+        </div>
+        <div id="ws-content-body" class="flex-1 min-h-0 overflow-y-auto px-3 py-2 text-xs">
+          <!-- markdown renders into .agent-prose; code into <pre><code> -->
+        </div>
+      </div>
+    </div>
+  </aside>
+  {% endif %}

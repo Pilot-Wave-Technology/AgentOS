@@ -43,6 +43,88 @@ async def _guard_thread_in_goal(pool, thread_id: str, pid: str) -> None:
         raise HTTPException(status_code=404, detail="thread not found")
 
 
+# ── Assistant/IA chat message pagination ─────────────────────────────────────
+#
+# A long-lived assistant thread accumulates thousands of messages; rendering
+# them all produced a multi-MB page that hung the browser. The page now renders
+# only the newest window and pages backwards on demand — the same keyset design
+# the read-only channels use (app/routers/thread_paging.py), but with the chat's
+# own richer row shape (sender_name join, state-context stripping, card_data).
+# The `messages` id is TEXT and created_at TIMESTAMPTZ, so the cursor is the
+# tuple (created_at, id) — created_at alone is not unique and would skip/dup a
+# row across a page boundary.
+
+_CHAT_MSG_SELECT = """
+    SELECT m.*,
+           COALESCE(u.display_name, ag.name, m.sender) AS sender_name
+      FROM messages m
+      LEFT JOIN users  u  ON u.uid = m.sender
+      LEFT JOIN agents ag ON ag.id = m.sender
+     WHERE m.thread_id = $1
+       AND m.kind <> 'system_inject'
+       AND NOT (m.kind = 'system_wake' AND m.sender = 'system' AND m.card_data IS NULL)
+"""
+
+
+def _process_chat_rows(rows) -> list[dict]:
+    """Strip the appended state-context block from human messages (it's for the
+    LLM only) and parse card_data JSONB (asyncpg hands it back as a str) so the
+    template's `is mapping` branches match. A malformed card degrades to a plain
+    row rather than breaking the whole render."""
+    from app.services.story_state import strip_state_context
+    messages = []
+    for row in rows:
+        m = dict(row)
+        if m.get("role") == "human":
+            m["content"] = strip_state_context(m.get("content") or "")
+        cd = m.get("card_data")
+        if isinstance(cd, str) and cd:
+            try:
+                m["card_data"] = json.loads(cd)
+            except Exception:
+                pass
+        messages.append(m)
+    return messages
+
+
+async def _fetch_chat_page(pool, thread_id: str, before_id: str = "") -> tuple[list[dict], bool]:
+    """Return (messages ascending, has_older) for a chat thread.
+
+    `before_id` empty → the newest window; otherwise the page immediately older
+    than that message. Each query fetches `limit + 1` rows so the extra oldest
+    "probe" row proves whether more history exists without a COUNT(*). An unknown
+    `before_id` (stale tab / deleted message) yields an empty terminal page."""
+    from app.routers.thread_paging import (
+        INITIAL_MESSAGE_LIMIT, EARLIER_PAGE_SIZE, split_probe_row,
+    )
+    if before_id:
+        anchor = await pool.fetchrow(
+            "SELECT created_at, id FROM messages WHERE id = $1 AND thread_id = $2",
+            before_id, thread_id,
+        )
+        if anchor is None:
+            return [], False
+        rows = await pool.fetch(
+            f"""SELECT * FROM ({_CHAT_MSG_SELECT}
+                   AND (m.created_at, m.id) < ($2, $3)
+                   ORDER BY m.created_at DESC, m.id DESC
+                   LIMIT $4
+               ) sub ORDER BY created_at ASC, id ASC""",
+            thread_id, anchor["created_at"], anchor["id"], EARLIER_PAGE_SIZE + 1,
+        )
+        page, has_older = split_probe_row(rows, EARLIER_PAGE_SIZE)
+    else:
+        rows = await pool.fetch(
+            f"""SELECT * FROM ({_CHAT_MSG_SELECT}
+                   ORDER BY m.created_at DESC, m.id DESC
+                   LIMIT $2
+               ) sub ORDER BY created_at ASC, id ASC""",
+            thread_id, INITIAL_MESSAGE_LIMIT + 1,
+        )
+        page, has_older = split_probe_row(rows, INITIAL_MESSAGE_LIMIT)
+    return _process_chat_rows(page), has_older
+
+
 async def _maybe_generate_thread_title(pool, thread_id: str, pid: str, agent_id: str):
     """Auto-generate a thread title after 6 messages if still 'New conversation'."""
     try:
@@ -105,7 +187,7 @@ async def _get_goal_context(pool, pid: str, agent_id: str) -> dict:
         "goal_id": pid,
         "agent_type": agent.get("type", "IA"),
         "scope": agent.get("scope", "task"),
-        "model": agent.get("model", "google/gemini-2.5-flash"),
+        "model": agent.get("model", "google/gemini-3.8-flash"),
         "additional_instructions": ctx.get("additional_instructions", ""),
         "tools_allow": agent.get("tools_allow", []),
         "tools_deny": agent.get("tools_deny", []),
@@ -202,6 +284,18 @@ def _make_callbacks(pool, pid: str, agent_id: str):
                 # Last event in this thread → causation for the agent reply
                 last_event_id = await _last_thread_event_id(conn, thread_id)
 
+                # WHO THE ASSISTANT IS ACTING FOR. An assistant message
+                # attributed only to the assistant is attributable to a robot
+                # and to nobody — the same dead end `system` attribution was.
+                # An SHCA is per-(goal, user) by construction, so this is a
+                # fact about the instance rather than a guess from who last
+                # spoke. Returns None when the thread has no human owner
+                # (`engine` and `go-*` own threads too), and None is left
+                # unset rather than filled with an invented principal.
+                from app.ledger.actors import human_principal_for_thread
+
+                acting_for = await human_principal_for_thread(conn, thread_id)
+
                 await append_event(
                     conn,
                     event_type=MESSAGE_POSTED,
@@ -214,6 +308,7 @@ def _make_callbacks(pool, pid: str, agent_id: str):
                     },
                     actor_id=agent_actor_id,
                     actor_type="shca",
+                    on_behalf_of=acting_for,
                     correlation_id=thread_corr_id,
                     causation_ids=[last_event_id] if last_event_id else None,
                     context_goal_id=pid,
@@ -354,62 +449,65 @@ async def chat_page(
 
     # If no thread_id, check for existing threads instead of auto-creating
     if not thread_id:
+        # The GENERAL thread first — the one with no story on it. Story threads
+        # have their own rows in the sidebar and their own links; landing on
+        # whichever happens to be newest means "# assistant" opens a different
+        # story from one visit to the next, which is the one thing a fixed link
+        # must not do.
         existing = await pool.fetchval(
             """SELECT id FROM threads
                WHERE goal_id = $1 AND agent_id = $2 AND task_id IS NULL
-               ORDER BY created_at DESC LIMIT 1""",
+               ORDER BY (story_id IS NULL OR story_id = '') DESC,
+                        created_at DESC
+               LIMIT 1""",
             pid, agent_id,
         )
+        if not existing:
+            # F7 — CREATE ONE. Asked for directly: "the user should be
+            # allowed to open an assistant session even without a story
+            # or errand."
+            #
+            # This branch used to fall through and render the page with
+            # NO thread, so the client connected to the empty string and
+            # sat on "connecting" for ever. An assistant thread was only
+            # ever created as a side effect of a STORY, so when the story
+            # ended you were left with an assistant you could not reach
+            # and no way to make one.
+            #
+            # The capability was always meant to exist -- CLAUDE.md
+            # describes a "general-mode conversation" with no story
+            # linked -- and the code to create it existed too, in the
+            # SLACK path (app/routers/assistant.py). So a Slack user got
+            # a general conversation and a web user did not.
+            #
+            # The same columns that creator writes, so this is the row
+            # the product would have made.
+            agent_name = await pool.fetchval(
+                "SELECT name FROM agents WHERE id = $1", agent_id) or agent_id
+            existing = str(uuid.uuid4())
+            await pool.execute(
+                "INSERT INTO threads (id, goal_id, agent_id, created_by, "
+                "title, correlation_id) VALUES ($1,$2,$3,$4,$5,$6)",
+                existing, pid, agent_id, user["uid"], agent_name,
+                str(uuid.uuid4()))
+            logger.info("goal %s: opened a general assistant thread %s for %s",
+                      pid, existing, user["uid"])
         if existing:
             return RedirectResponse(
                 url=f"/goals/{pid}/chat/{agent_id}?thread_id={existing}",
                 status_code=303,
             )
 
-    # Load existing messages (empty if no thread_id -- empty state).
-    # Cap the initial render to the most recent INITIAL_MESSAGE_LIMIT messages:
-    # a long-lived thread (e.g. a persistent SHCA assistant) accumulates
-    # thousands of messages, and rendering them all server-side produced a
-    # multi-MB page that hung the browser ("stuck loading"). New messages still
-    # arrive over the WS; older history is a follow-up "load earlier" feature.
-    INITIAL_MESSAGE_LIMIT = 150
-    messages = []
+    # Load the newest window of messages (empty if no thread_id -- empty state).
+    # A long-lived thread accumulates thousands of messages; rendering them all
+    # server-side produced a multi-MB page that hung the browser. We render only
+    # the newest THREAD_INITIAL_MESSAGE_LIMIT and page backwards on demand via
+    # the "Load earlier" sentinel (see _fetch_chat_page + messages_earlier).
+    messages: list[dict] = []
+    has_older = False
     if thread_id:
-        msg_rows = await pool.fetch(
-            """SELECT * FROM (
-                   SELECT m.*,
-                          COALESCE(u.display_name, ag.name, m.sender) AS sender_name
-                   FROM messages m
-                   LEFT JOIN users u  ON u.uid  = m.sender
-                   LEFT JOIN agents ag ON ag.id = m.sender
-                   WHERE m.thread_id = $1
-                     AND m.kind <> 'system_inject'
-                     AND NOT (m.kind = 'system_wake' AND m.sender = 'system')
-                   ORDER BY m.created_at DESC
-                   LIMIT $2
-               ) sub
-               ORDER BY created_at""",
-            thread_id, INITIAL_MESSAGE_LIMIT,
-        )
-        messages = [dict(r) for r in msg_rows]
-        # Phase 4 Stage 4: strip the appended state-context block from
-        # human messages before rendering. The block is for SHCA's LLM
-        # only — the human sees their original text in the chat UI.
-        # Also: asyncpg returns JSONB as str — parse card_data into a
-        # dict so Jinja's `is mapping` checks match the typed-card
-        # branches (otherwise every card falls through to the JS-rendered
-        # catch-all and renders with an empty title/body).
-        from app.services.story_state import strip_state_context
-        import json as _json
-        for _m in messages:
-            if _m.get("role") == "human":
-                _m["content"] = strip_state_context(_m.get("content") or "")
-            _cd = _m.get("card_data")
-            if isinstance(_cd, str) and _cd:
-                try:
-                    _m["card_data"] = _json.loads(_cd)
-                except Exception:
-                    pass
+        messages, has_older = await _fetch_chat_page(pool, thread_id)
+    oldest_message_id = str(messages[0]["id"]) if messages else ""
 
     # Sidebar threads -- exclude task threads
     thread_rows = await pool.fetch(
@@ -441,9 +539,17 @@ async def chat_page(
         # (non-reviewed) first, then newest; a reviewed story still wins if it's
         # the only non-terminal one on the thread.
         story_row = await pool.fetchrow(
+            # `sandbox_size` IS READ BY THE MACHINE ROW, and leaving it out
+            # of this SELECT is why changing the machine here looked like it
+            # did nothing. The POST saved correctly every time; the page then
+            # re-rendered from this row, found no `sandbox_size` attribute,
+            # and selected "default for this work" -- so the control reset
+            # itself on every reload and reported the opposite of the truth.
+            # A control that lies about the stored value is worse than one
+            # that refuses, because the second attempt looks identical.
             """SELECT id, title, execution_mode, current_phase, workspace_state,
                       workspace_path, shca_instance_id, execution_paused,
-                      current_plan_path, current_plan_id
+                      current_plan_path, current_plan_id, sandbox_size
                  FROM stories
                 WHERE goal_id = $1 AND active_thread_id = $2
                   AND state NOT IN ('done', 'cancelled', 'rejected')
@@ -451,8 +557,28 @@ async def chat_page(
                 LIMIT 1""",
             pid, thread_id,
         )
+        from app.services.machine_lock import locked_reason
         if story_row:
             current_story = dict(story_row)
+            # 2026-08-20: `workspace_state == 'ready'` is a legitimate, common
+            # outcome of a PARTIAL multi-repo provision — see
+            # `is_write_repo_set_incomplete`'s docstring. Without this flag the
+            # workspace panel below renders as if every granted repo is present,
+            # with no indication a repo is still landing (or, if the branch-ready
+            # catch-up has exhausted its retries, silently missing). Cheap here:
+            # exactly one story per page load, not a list view.
+            current_story["workspace_repos_incomplete"] = False
+            if current_story.get("workspace_state") == "ready":
+                from app.services.operator_provisioning import is_write_repo_set_incomplete
+                try:
+                    current_story["workspace_repos_incomplete"] = (
+                        await is_write_repo_set_incomplete(pool, pid, current_story["id"])
+                    )
+                except Exception:
+                    logger.warning(
+                        "chat: is_write_repo_set_incomplete check failed for story=%s "
+                        "(non-fatal)", current_story["id"],
+                    )
 
     firebase_token = request.cookies.get("firebase_token", "")
 
@@ -481,11 +607,59 @@ async def chat_page(
             "agent": agent,
             "thread_id": thread_id or "",
             "messages": messages,
+            "has_older": has_older,
+            "oldest_message_id": oldest_message_id,
+            "load_earlier_url": (
+                f"/goals/{pid}/chat/{agent_id}/thread/{thread_id}/messages/earlier"
+                if thread_id else ""
+            ),
             "threads": threads,
             "current_story": current_story,
+            # Whether the machine can still be changed, or why not. The
+            # same helper guards the endpoint; this only decides whether
+            # the control is greyed out.
+            "machine_locked": (
+                await locked_reason(pool, current_story["id"])
+                if current_story else None),
             "firebase_token": firebase_token,
             "is_read_only": is_read_only,
             "auto_fire_tour": auto_fire_tour,
+        },
+    )
+
+
+# -- Load earlier messages (backwards pagination) ------------------------------
+
+@router.get(
+    "/goals/{pid}/chat/{agent_id}/thread/{tid}/messages/earlier",
+    response_class=HTMLResponse,
+)
+async def messages_earlier(
+    pid: str, agent_id: str, tid: str,
+    request: Request,
+    before_id: str = "",
+    user: dict = Depends(get_current_user),
+):
+    """Return the page of messages older than `before_id` as an HTML fragment
+    (next sentinel + rows), reusing chat/_message.html so paged-in rows are
+    byte-identical to the full render. HTML, not JSON — a JSON endpoint would
+    need a second client-side copy of the bubble markup that would diverge."""
+    role = await get_goal_role(user["uid"], pid)
+    if role is None:  # Must be a goal member
+        raise HTTPException(status_code=403)
+    pool = get_pool()
+    await _guard_thread_in_goal(pool, tid, pid)  # cross-tenant IDOR guard
+
+    messages, has_older = await _fetch_chat_page(pool, tid, before_id)
+    return templates.TemplateResponse(
+        "chat/_earlier_messages.html",
+        {
+            "request": request,
+            "messages": messages,
+            "has_older": has_older,
+            # Next cursor: the oldest row in THIS page.
+            "oldest_message_id": str(messages[0]["id"]) if messages else "",
+            "load_earlier_url": f"/goals/{pid}/chat/{agent_id}/thread/{tid}/messages/earlier",
         },
     )
 
@@ -539,6 +713,16 @@ async def add_thread_participant(
 
     logger.info("Added participant %s to thread %s in goal %s", participant_uid, tid, pid)
 
+    # Mirror it into Slack now rather than waiting up to 15 minutes for the
+    # reconcile pass. kick=False: this path knows somebody was ADDED, and
+    # walking the channel to remove strangers is the reconciler's job.
+    try:
+        from app.channels.slack.membership import sync_channel_members
+        await sync_channel_members(pool, tid, kick=False)
+    except Exception as _slack_exc:
+        logger.warning("Slack membership sync for thread %s failed: %s",
+                       tid, _slack_exc)
+
     return RedirectResponse(
         url=f"/goals/{pid}/chat/{agent_id}?thread_id={tid}",
         status_code=303,
@@ -581,17 +765,36 @@ async def chat_upload_file(
     if len(data) > MAX_UPLOAD_SIZE:
         raise HTTPException(status_code=400, detail=f"File too large (max {MAX_UPLOAD_SIZE // 1024 // 1024} MB)")
 
-    resource_id = str(uuid.uuid4())[:12]
     content_hash = hashlib.sha256(data).hexdigest()
     resource_name = file.filename
 
+    # ── A NAME THAT ALREADY EXISTS IS A REVISION, NOT AN ERROR ────────
+    #
+    # `uq_goal_resource_kind_name UNIQUE (goal_id, kind, name)` made the
+    # plain INSERT below raise, uncaught, and a person re-uploading a
+    # revised price list got an internal error with no message. Reusing
+    # the existing id keeps the blob path, the grants and every story
+    # link intact, so the revision reaches everyone already holding the
+    # document with nothing to re-grant. See services/resource_upsert.
+    from app.services.resource_upsert import (existing_document,
+                                              record_replacement,
+                                              replace_document)
+
+    pool = get_pool()
+    prior = await existing_document(pool, pid, resource_name)
+    resource_id = prior["id"] if prior else str(uuid.uuid4())[:12]
+
     logger.info(
-        "chat_upload_file: goal=%s user=%s sender_agent=%s file=%s ext=%s size=%d",
+        "chat_upload_file: goal=%s user=%s sender_agent=%s file=%s ext=%s "
+        "size=%d %s",
         pid, user.get("email", user["uid"]), sender_agent or "-",
         file.filename, ext, len(data),
+        f"REPLACING {resource_id} (was {prior['file_size_bytes']} bytes)"
+        if prior else f"new resource {resource_id}",
     )
 
-    # Upload to GCS
+    # Upload to GCS. Same object path when replacing, so the bytes behind
+    # the resource change and nothing that points at it has to move.
     from app.storage import upload_resource_file
     gcs_uri = await upload_resource_file(
         resource_id, file.filename, data,
@@ -599,27 +802,34 @@ async def chat_upload_file(
     )
 
     # Register as goal resource (read-only, no story link → goal-wide)
-    pool = get_pool()
+    via = f"chat:{sender_agent or 'unknown'}"
     async with pool.acquire() as conn:
         async with conn.transaction():
             await append_event(
-                conn, event_type="GOAL_RESOURCE_REGISTERED",
+                conn,
+                event_type=("GOAL_RESOURCE_UPDATED" if prior
+                            else "GOAL_RESOURCE_REGISTERED"),
                 payload={
                     "resource_id": resource_id, "kind": "document",
                     "name": resource_name, "file_type": ext,
                     "file_size": len(data),
-                    "uploaded_via": f"chat:{sender_agent or 'unknown'}",
+                    "replaced_in_place": bool(prior),
+                    "uploaded_via": via,
                 },
                 actor_id=user["actor_id"], context_goal_id=pid,
             )
-            await conn.execute("""
-                INSERT INTO goal_resources
-                    (id, goal_id, kind, name, uri, created_by, human_context,
-                     file_type, file_size_bytes, gcs_uri, summary_stale)
-                VALUES ($1, $2, 'document', $3, $4, $5, $6, $7, $8, $9, true)
-            """, resource_id, pid, resource_name, gcs_uri, user["uid"],
-                f"Uploaded by {user.get('email', user['uid'])} via chat",
-                ext, len(data), gcs_uri)
+            if prior:
+                await replace_document(conn, resource_id, pid, resource_name,
+                                       gcs_uri, ext, len(data))
+            else:
+                await conn.execute("""
+                    INSERT INTO goal_resources
+                        (id, goal_id, kind, name, uri, created_by, human_context,
+                         file_type, file_size_bytes, gcs_uri, summary_stale)
+                    VALUES ($1, $2, 'document', $3, $4, $5, $6, $7, $8, $9, true)
+                """, resource_id, pid, resource_name, gcs_uri, user["uid"],
+                    f"Uploaded by {user.get('email', user['uid'])} via chat",
+                    ext, len(data), gcs_uri)
             try:
                 await conn.execute("""
                     INSERT INTO resource_attachments
@@ -630,14 +840,19 @@ async def chat_upload_file(
                     gcs_uri, user["uid"], content_hash)
             except Exception as exc:
                 logger.warning("Failed to insert resource_attachments row: %s", exc)
-            await conn.execute("""
-                INSERT INTO resource_events (resource_id, goal_id, event_type, actor, details)
-                VALUES ($1, $2, 'created', $3, $4)
-            """, resource_id, pid, user["uid"],
-                json.dumps({
-                    "filename": file.filename, "type": ext, "size": len(data),
-                    "uploaded_via": f"chat:{sender_agent or 'unknown'}",
-                }))
+            if prior:
+                await record_replacement(
+                    conn, resource_id, pid, user["uid"], file.filename, ext,
+                    len(data), prior["file_size_bytes"], via)
+            else:
+                await conn.execute("""
+                    INSERT INTO resource_events (resource_id, goal_id, event_type, actor, details)
+                    VALUES ($1, $2, 'created', $3, $4)
+                """, resource_id, pid, user["uid"],
+                    json.dumps({
+                        "filename": file.filename, "type": ext,
+                        "size": len(data), "uploaded_via": via,
+                    }))
 
     # Refresh every active session in the goal so they all see the new doc
     refresh_summary = {"go": False, "shcas": 0, "ia_workers": 0}
@@ -659,7 +874,18 @@ async def chat_upload_file(
                 "go": "while chatting with the GO",
                 "shca": "while chatting with their assistant",
             }.get(sender_agent, "from the chat page")
+            # A REPLACEMENT IS NOT AN UPLOAD, and the channel is where a
+            # team finds out the contract moved under them. "Uploaded
+            # PRICE_LIST.xlsx" reads as a new document; what actually
+            # happened is that every story holding the old one is now
+            # holding a different file.
             notify_msg = (
+                f"[System] **{uploader}** replaced **{resource_name}** "
+                f"({ext.upper()}, {len(data) // 1024} KB, was "
+                f"{(prior['file_size_bytes'] or 0) // 1024} KB) "
+                f"{sender_label}. Same resource, new contents — every "
+                f"story already holding it now reads the new version."
+                if prior else
                 f"[System] **{uploader}** uploaded **{resource_name}** "
                 f"({ext.upper()}, {len(data) // 1024} KB) {sender_label}. "
                 f"Now available to all agents as a read-only goal resource."
@@ -798,7 +1024,7 @@ async def tasks_for_import(
         FROM stories s
         WHERE s.goal_id = $1
           AND s.assigned_to = $2
-          AND s.state IN ('accepted', 'in_progress')
+          AND s.state IN ('accepted', 'in_progress', 'awaiting_merge')
         ORDER BY
             CASE state WHEN 'in_progress' THEN 1 ELSE 2 END,
             s.created_at DESC
@@ -995,6 +1221,14 @@ async def import_task_to_chat(
     if is_story:
         story_row = await pool.fetchrow("SELECT * FROM stories WHERE id = $1", task_id)
         if story_row and story_row.get("state") == "accepted":
+            # Concurrency guard — the same one the board, the assistant import
+            # and the local checkout use. A fourth entry point with its own copy
+            # of the rule is a fourth place to forget to change it; this one was
+            # found by the Stage K gate, not by anyone reading the code.
+            from app.services.thread_ceiling import refusal_for
+            refusal = await refusal_for(pool, pid, user["uid"], task_id)
+            if refusal:
+                raise HTTPException(status_code=409, detail=refusal)
             await pool.execute(
                 "UPDATE stories SET state = 'in_progress', started_at = now(), updated_at = now() WHERE id = $1",
                 task_id,
@@ -1254,6 +1488,35 @@ async def chat_ws(
         logger.info("chat_ws: goal %s deleted — refusing session for %s", pid, agent_id)
         await websocket.send_text(json.dumps(
             {"type": "error", "message": "This goal has been deleted."}))
+        await websocket.close()
+        return
+
+    # CLOSED THREAD → readable, never writable.
+    #
+    # The git engine retires a story's thread once every branch it holds has
+    # landed on trunk (git_graph/story_threads.close_threads_for_landed). That
+    # sets `left_goal_at`, which takes the row out of the sidebar and out of
+    # find-or-create — but a hidden row is still reachable by anyone holding
+    # its URL or sitting on a stale tab, and a session opened there would spawn
+    # a gateway agent for work that is finished and merged.
+    #
+    # Refused at the SOCKET rather than per message: the socket is what creates
+    # the session, and a connection that can never usefully send is better
+    # closed with a reason than left open to fail silently on first use. The
+    # transcript stays readable over HTTP — this closes the conversation, it
+    # does not hide the record.
+    _closed = await pool.fetchrow(
+        "SELECT left_goal_at, story_id FROM threads WHERE id = $1", thread_id)
+    if _closed is not None and _closed["left_goal_at"] is not None:
+        logger.info(
+            "chat_ws: thread %s is closed (story %s landed) — refusing session",
+            thread_id[:12], _closed["story_id"] or "-")
+        await websocket.send_text(json.dumps({
+            "type": "error",
+            "message": ("This story's work has landed on trunk and its "
+                        "conversation is closed. Open a current story to "
+                        "keep working."),
+        }))
         await websocket.close()
         return
 
@@ -1968,6 +2231,35 @@ async def delete_thread(
             # below raises a ForeignKeyViolationError.
             await conn.execute("DELETE FROM thread_participants WHERE thread_id = $1", thread_id)
             await conn.execute("UPDATE tasks SET thread_id = NULL WHERE thread_id = $1", thread_id)
+            # F6 — THE REVERSE POINTER, which nothing cleared.
+            #
+            # The binding between an assistant and its conversation is
+            # one fact in two columns: `threads.instance_id` and
+            # `agent_instances.thread_id`. Deleting the thread left the
+            # second pointing at a row that no longer exists, and the
+            # instance stayed `status='active'` -- so every listing read
+            # as healthy while the goal had no assistant anybody could
+            # open, and nothing said why.
+            #
+            # Cleared rather than destroyed: destroying goes through the
+            # gateway and takes the workspace with it, including the
+            # accumulated MEMORY.md. That is why the cleanup watchdog is
+            # disabled (see app/main.py). An unbound instance is
+            # re-bindable; a destroyed one has lost its memory.
+            await conn.execute(
+                "UPDATE agent_instances SET thread_id = NULL "
+                "WHERE thread_id = $1", thread_id)
+            # The channel goes with the thread. Slack cannot delete a
+            # channel outside Enterprise Grid, so this archives it -- and
+            # an archived name stays reserved, which is why channel names
+            # carry the thread id rather than the story id.
+            try:
+                from app.channels.slack.thread_channels import (
+                    archive_channel_for_thread)
+                await archive_channel_for_thread(pool, thread_id)
+            except Exception as _slack_exc:
+                logger.warning("Slack channel for deleted thread %s not archived: %s",
+                             thread_id, _slack_exc)
             await conn.execute("DELETE FROM threads WHERE id = $1", thread_id)
 
     # 3. Evict only this thread — other threads on the same agent stay alive

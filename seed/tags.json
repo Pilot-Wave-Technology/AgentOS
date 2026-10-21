@@ -1,0 +1,14 @@
+[
+  {
+    "name": "go-selectable",
+    "description": "Offered in the goal-setup model picker. Says where a model is OFFERED, not who may run it -- an untagged model stays active and assignable everywhere else."
+  },
+  {
+    "name": "reasoning",
+    "description": "Model supports extended/deliberate reasoning mode. Wire-meaningful: sets contract field reasoning=true."
+  },
+  {
+    "name": "vision",
+    "description": "Model accepts image input. Wire-meaningful: adds \"image\" to contract field input (text is always included)."
+  }
+]

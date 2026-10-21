@@ -29,9 +29,15 @@ async def _wipe(dsn: str) -> None:
             "WHERE datname = $1 AND pid <> pg_backend_pid()",
             db,
         )
+        # BOTH schemas. 0001 creates `kernel`; leaving it behind makes the
+        # re-apply fail on "schema already exists".
+        await conn.execute("DROP SCHEMA IF EXISTS kernel CASCADE;")
         await conn.execute("DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public;")
-        await conn.execute("GRANT ALL ON SCHEMA public TO public;")
-        print(f"[reset_db] wiped schema 'public' in database '{db}'")
+        # USAGE, not ALL: what a fresh database gives PUBLIC. ALL would let
+        # any login on the instance create objects here. Roles are
+        # cluster-wide and survive, so the pods' login and its password do.
+        await conn.execute("GRANT USAGE ON SCHEMA public TO PUBLIC;")
+        print(f"[reset_db] wiped schemas 'kernel' and 'public' in database '{db}'")
     finally:
         await conn.close()
 

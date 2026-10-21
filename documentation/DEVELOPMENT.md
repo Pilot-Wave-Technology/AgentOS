@@ -129,7 +129,7 @@ docker run --name agentos-pg \
   -e POSTGRES_PASSWORD=agentos \
   -e POSTGRES_DB=agentos \
   -p 5432:5432 \
-  -d postgres:16
+  -d postgres:17
 ```
 
 Then set the DSN in `.env`:
@@ -167,27 +167,29 @@ python migrations/reset_db.py "$DATABASE_URL"   # DESTRUCTIVE — dev/test only
 
 ## Run it
 
-The all-in-one entrypoint runs the web app **and** the background worker loops
-in a single process — the best choice for local development:
+`app.main` runs the web app **and**, unless you turn them off, the background
+loops in the same process — which is what you want locally:
 
 ```bash
-uvicorn app.single:app --reload --port 8000
+uvicorn app.main:app --reload --port 8000
 ```
 
 Then open `http://localhost:8000` and sign in with the Firebase account whose
 email matches `BOOTSTRAP_ADMIN_EMAIL`. That account is auto-created as admin on
 first login; any other account lands on `/signup` and waits for admin approval.
 
-If you only need the web surface (no in-process workers), run the web
-entrypoint instead:
+If you want the web surface alone, with no loops running under it:
 
 ```bash
-uvicorn app.main:app --reload --port 8000
+AGENTOS_SCHEDULER_LOOPS=0 uvicorn app.main:app --reload --port 8000
 ```
 
-`app.main:app` serves the web UI, chat, and agent callbacks; `app.single:app`
-additionally runs the council, git-engine, and management worker loops
-in-process. For how these map onto a deployed footprint, see the deploy guide
+That switch is the same one the deployed split uses: in Cloud Run the web
+service sets it to `0`, and a dedicated scheduler service
+(`app.scheduler_worker`, one instance) runs the background loops behind one
+leader. The council, git-engine and management services each run their own
+workers. For how those map onto a deployed
+footprint, see the deploy guide
 ([../deploy/README.md](../deploy/README.md)).
 
 Verbose logs: set `LOG_LEVEL=DEBUG` (respected by `app/config.py`), which also
@@ -196,7 +198,7 @@ JSON object per line; for readable local output, pipe through
 [`jq`](https://jqlang.github.io/jq/):
 
 ```bash
-LOG_LEVEL=DEBUG uvicorn app.single:app --reload --port 8000 2>&1 | jq -R 'fromjson? // .'
+LOG_LEVEL=DEBUG uvicorn app.main:app --reload --port 8000 2>&1 | jq -R 'fromjson? // .'
 ```
 
 ---
@@ -222,16 +224,22 @@ gateway from the `agent_os_openclaw` branch and point `OPENCLAW_WS_URL` at it.
 
 ## Tests and checks
 
-Install and run the test suite with [pytest](https://docs.pytest.org/) inside
-your virtualenv:
+The suite runs with [pytest](https://docs.pytest.org/) against a real
+PostgreSQL database built from `SEQUENCE`. Run it the way Cloud Build does, from
+the repo root:
 
 ```bash
-pip install pytest
-pytest
+INTERLOCK_TEST_DSN=postgresql://agentos:agentos@localhost:5432/agentos_test \
+  scripts/ci/run_suite.sh
 ```
 
-The primary automated gate is **migration consistency**: every `.sql` file in
-`migrations/` must appear in `SEQUENCE` exactly once and vice-versa, and the
+The script is more than a pytest call: database-backed tests skip when no
+database is reachable, so it fails the run if too many tests skip, rather than
+going green on a fraction of the suite. Cloud Build runs it inside the image's
+`test` stage, so the packages under test are the packages the app runs with.
+
+The other automated gate is **migration consistency**: every `.sql` and `.py`
+migration in `migrations/` must appear in `SEQUENCE` exactly once and vice-versa, and the
 sequence must apply cleanly against a fresh database. Before opening a pull
 request that touches `migrations/`, apply the full sequence against a throwaway
 database (`python migrations/reset_db.py "$DATABASE_URL"`) to confirm it builds
@@ -257,11 +265,13 @@ Rules (never break these):
 
 To add a migration:
 
-1. Create `migrations/<descriptive_name>.sql` following the rules above.
-2. Append `<descriptive_name>` (without `.sql`) to `migrations/SEQUENCE` at the
-   correct position — after anything it depends on, otherwise at the end.
+1. Create `migrations/<descriptive_name>.sql` following the rules above (or a
+   `.py` migration, for a change that is easier to express in code — a `.py`
+   file goes in `SEQUENCE` exactly like a `.sql` one).
+2. Append `<descriptive_name>` (without the extension) to `migrations/SEQUENCE`
+   at the correct position — after anything it depends on, otherwise at the end.
 3. Apply it locally: `python migrations/apply.py "$DATABASE_URL"`.
-4. Commit the `.sql` file and the updated `SEQUENCE` **together**.
+4. Commit the migration file and the updated `SEQUENCE` **together**.
 
 When merging another branch, insert its new `SEQUENCE` entries at the correct
 position (a migration must come after whatever creates the tables/columns it
@@ -271,7 +281,7 @@ uses), then re-apply against a fresh database to confirm the order is valid.
 
 ## Troubleshooting
 
-**`uvicorn app.single:app` fails with `ModuleNotFoundError`.** The virtualenv
+**`uvicorn app.main:app` fails with `ModuleNotFoundError`.** The virtualenv
 is not active, or `pip install -r requirements.txt` did not finish. Reactivate
 and re-run pip.
 
@@ -288,7 +298,7 @@ Confirm `OPENCLAW_WS_URL` is reachable from the process and `OPENCLAW_AUTH_TOKEN
 matches the gateway's token.
 
 **`apply.py` reports a migration missing from `SEQUENCE` (or vice-versa).**
-A `.sql` file and `SEQUENCE` are out of sync — usually after a merge. Add the
+A `.sql` or `.py` migration and `SEQUENCE` are out of sync — usually after a merge. Add the
 missing `SEQUENCE` entry at the correct position.
 
 **`.env` values are not picked up.** `pydantic-settings` loads `.env` from the

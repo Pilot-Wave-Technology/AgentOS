@@ -1,0 +1,24 @@
+{# "Load earlier messages" pagination sentinel — shared by ALL message threads
+   (goal_thread, council_thread, security_thread, orchestrator).
+
+   Context:
+     load_earlier_url — endpoint returning the next older page as HTML.
+                        Must accept ?before_id= and re-emit this sentinel.
+     before_id        — id of the OLDEST message currently in the DOM.
+
+   hx-swap="outerHTML" replaces this element with [next sentinel + older
+   messages], landing exactly where the sentinel was — i.e. above everything
+   already rendered, and below any header/objective banner.
+
+   Scroll position across the swap is preserved by thread_scroll.js, which keys
+   off the id="load-earlier" below. Keep that id in sync if it ever changes. #}
+<div id="load-earlier" class="flex justify-center py-2" data-before-id="{{ before_id }}">
+  <button type="button"
+          hx-get="{{ load_earlier_url }}?before_id={{ before_id }}"
+          hx-target="#load-earlier"
+          hx-swap="outerHTML"
+          class="px-3 py-1.5 text-2xs font-medium text-gray-300 bg-surface-hover hover:bg-surface
+                 border border-border rounded-full transition-colors">
+    ↑ Load earlier messages
+  </button>
+</div>

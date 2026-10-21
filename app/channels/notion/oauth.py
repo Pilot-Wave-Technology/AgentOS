@@ -109,7 +109,12 @@ async def exchange_code(code: str) -> dict:
             auth=(client_id, client_secret),
             headers={"Notion-Version": "2022-06-28"},
         )
-        _log.info("Notion token exchange: status=%s body=%s", resp.status_code, resp.text[:500])
+        # STATUS ONLY. The body of a successful exchange IS the access
+        # token, and this line put it in Cloud Logging in the clear at
+        # INFO -- durable, searchable, and outliving every rotation. The
+        # failure case is the one worth seeing, and `raise_for_status`
+        # below already carries the status into the caller's handler.
+        _log.info("Notion token exchange: status=%s", resp.status_code)
         resp.raise_for_status()
         return resp.json()
 

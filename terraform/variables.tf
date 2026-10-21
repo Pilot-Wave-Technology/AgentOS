@@ -58,8 +58,7 @@ variable "bootstrap_admin_email" {
 
 variable "github_org" {
   type        = string
-  description = "GitHub org/owner where AGENTS create + work on goal repos (via the GitHub App). This is NOT the AgentOS fork — that's `repo_url`."
-  default     = ""
+  description = "GitHub org/owner where AGENTS create + work on goal repos (via the GitHub App). This is NOT the AgentOS fork — that's `repo_url`. REQUIRED: no default, because an empty value builds API paths like `https://api.github.com/repos//name` that 404 at the moment an agent first tries to deliver work, hours into a run."
 }
 
 variable "repo_url" {
@@ -137,19 +136,47 @@ variable "available_models" {
   type        = list(string)
   description = "Models shown in the UI dropdowns. Keep in sync with the gateway's configured models."
   default = [
-    "google/gemini-2.5-flash",
-    "google/gemini-2.5-pro",
-    "anthropic/claude-sonnet-4-5",
+    # KEEP IN SYNC WITH `app/config.py::available_models`, which is the
+    # documented source of truth. This default used to name
+    # `google/gemini-2.5-flash` and `-pro`, so a terraform apply pushed
+    # the UI dropdown back to models the catalogue had already retired
+    # -- picking one gave an agent that looked configured and failed on
+    # its first turn.
+    "google/gemini-3.8-flash",
+    "anthropic/claude-opus-5-5",
+    "anthropic/claude-sonnet-5-5",
     "anthropic/claude-haiku-4-5",
-    "anthropic/claude-opus-4-7",
+    "claude-cli/opus",
+    "claude-cli/sonnet",
   ]
 }
 
 # ─── 4. Database (Cloud SQL) ───────────────────────────────────────────────
-# The Cloud SQL instance + control_panel db + app_user/migrate_user + DB DSN
-# secrets are created by prerequisites.sh (its [db] step). Terraform only reads
-# the instance. Change tier/disk via DB_TIER / DB_DISK_GB env vars to
-# prerequisites.sh, not here.
+# Terraform creates the instance, the control_panel database, app_user +
+# migrate_user and their DSN secrets (modules/database).
+variable "db_tier" {
+  type        = string
+  description = "Cloud SQL machine tier (ENTERPRISE edition)."
+  default     = "db-custom-2-8192"
+}
+
+variable "db_version" {
+  type        = string
+  description = "Postgres major version. Changing it on a live instance is an upgrade, not an edit."
+  default     = "POSTGRES_17"
+}
+
+variable "db_disk_gb" {
+  type        = number
+  description = "Starting disk size. Autoresize grows it; terraform never shrinks it."
+  default     = 250
+}
+
+variable "db_deletion_protection" {
+  type        = bool
+  description = "Refuse `terraform destroy` on the instance. Set false only on a throwaway project you mean to tear down."
+  default     = true
+}
 
 # ─── 5. Networking ─────────────────────────────────────────────────────────
 variable "create_network" {
@@ -201,21 +228,11 @@ variable "archive_bucket" {
 # put its internal WebSocket URL here so the control plane can reach it.
 variable "openclaw_ws_url" {
   type        = string
-  description = "OpenClaw gateway WebSocket URL, e.g. ws://<vm-internal-ip>:18789."
-  default     = "ws://REPLACE_WITH_GATEWAY_VM_IP:18789"
+  description = "Override only. Empty (the default) derives ws://<ip>:18789 from the gateway stack's reserved address, <name_prefix>-gateway-ip -- so each deployment uses its own gateway and nothing is copied by hand."
+  default     = ""
 }
 
-# ─── 8. Cloud Run sizing + service profile ─────────────────────────────────
-variable "service_profile" {
-  type        = string
-  description = "\"split\" (default) = separate web / council-worker / git-engine / management Cloud Run services (better isolation + independent scaling). \"single\" = one service runs everything in-process (cheaper: 1 always-on instance vs 4)."
-  default     = "split"
-  validation {
-    condition     = contains(["single", "split"], var.service_profile)
-    error_message = "service_profile must be \"single\" or \"split\"."
-  }
-}
-
+# ─── 8. Cloud Run sizing ────────────────────────────────────────────────────
 variable "service_cpu" {
   type        = string
   description = "CPU for the main service."
@@ -275,19 +292,19 @@ variable "flags" {
     # memory v2
     memory_v2_bridge_enabled      = optional(bool, true)
     memory_v2_flush_enabled       = optional(bool, true)
-    memory_v2_snapshot_enabled    = optional(bool, false)
+    memory_v2_snapshot_enabled    = optional(bool, true)
     memory_v2_user_memory_enabled = optional(bool, false)
     # goal review council
     council_dispatcher_enabled = optional(bool, true)
     council_schedule_enabled   = optional(bool, true)
     # security council
-    security_dispatcher_enabled = optional(bool, true)
-    security_ui_enabled         = optional(bool, true)
-    security_schedule_enabled   = optional(bool, true)
+    security_dispatcher_enabled = optional(bool, false)
+    security_ui_enabled         = optional(bool, false)
+    security_schedule_enabled   = optional(bool, false)
     security_schedule_hours     = optional(number, 12)
     # platform research council
-    platform_council_enabled             = optional(bool, true)
-    platform_research_dispatcher_enabled = optional(bool, true)
+    platform_council_enabled             = optional(bool, false)
+    platform_research_dispatcher_enabled = optional(bool, false)
     platform_agents_recreate_on_build    = optional(bool, true)
     # goal progress summaries
     goal_summary_enabled = optional(bool, true)
@@ -301,4 +318,17 @@ variable "flags" {
     log_level          = optional(string, "INFO")
   })
   default = {}
+}
+
+# ─── 10. Execution plane ────────────────────────────────────────────────────
+variable "execution_node_disk_gb" {
+  type        = number
+  description = "Boot disk per execution node. The sandbox image is ~900MB and a brownfield checkout plus its toolchain is the rest."
+  default     = 100
+}
+
+variable "execution_small_min_nodes" {
+  type        = number
+  description = "Warm nodes held in the `small` pool. 0 costs nothing and makes the first story of the day wait for a node; 1 keeps one warm."
+  default     = 0
 }

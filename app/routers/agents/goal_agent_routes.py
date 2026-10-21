@@ -79,6 +79,8 @@ async def list_goal_agents(
         f"""SELECT a.id AS agent_id, a.name AS display_name, a.type
              FROM agents a
              JOIN users u ON u.actor_id = a.owner_actor_id
+             -- sql: safe -- a pure mapping of the module constant
+             -- _ASSISTANT_TYPE; no caller input reaches it.
             WHERE u.uid = $1 AND a.type = '{to_db_agent_type(_ASSISTANT_TYPE)}' AND a.status = 'active'
             ORDER BY a.name""",
         user["uid"],

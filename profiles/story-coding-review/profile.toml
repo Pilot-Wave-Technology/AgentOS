@@ -1,0 +1,132 @@
+# Coding story REVIEWER.
+#
+# The same execution, the same pod, the same workspace — a later phase
+# of it. The executor finished, a person accepted, and this reads what
+# was actually written before the story leaves `done`.
+#
+# Edit this file to change what a reviewer can do. Edit prompt.md to
+# change how it reviews. Neither needs a code change.
+
+kind   = "story"
+domain = "coding"
+phase  = "review"
+
+# THE SURFACE IS THE GUARANTEE. Base gives read/glob/grep/list_dir/
+# skill/ask_human and NOTHING that writes — base.toml says so itself:
+# "`write` is the example: an errand has no business editing the
+# workspace, so it is not here." A reviewer has less business still.
+#
+# Chain stage 2 is fail-closed on the effective list, so every tool the
+# executor had and this does not — write, edit, bash, the background-job
+# set (bash_background, bash_wait, bash_output, bash_jobs, bash_kill),
+# run_check, story_commit, sync_trunk, propose_completion, register_plan,
+# subagent, emit_artifact, publish_artifact, web_fetch, env_setup,
+# env_install — is refused BY NAME. The reviewer cannot change the thing
+# it is judging because it holds no tool that could.
+#
+# THE BACKGROUND SET IS NOT AN EXCEPTION, and it would be an easy one to
+# make: those tools only watch and stop work, which sounds harmless. But
+# `bash_background` starts a command, and a reviewer that can run one can
+# run the suite it is judging and report its own measurement as a finding
+# about somebody else's work. The five travel together, so all five stay
+# out. `run_check` likewise runs a command.
+tools_add = [
+  # NO DIFF TOOL, DELIBERATELY. The workspace holds the whole tree and
+  # `read`/`glob`/`grep` answer "is this correct?" better than a patch
+  # does. The one thing they cannot answer -- WHAT MOVED, which is how
+  # you check a claim that nothing else was modified -- is computed once
+  # and handed over in the brief, by code that reads the trunk from
+  # `git_nodes` instead of guessing it.
+  #
+  # It WAS a tool. Execution 246 called it nineteen times across three
+  # legs, most of them `show`, using a diff tool as a file reader
+  # because its base detection was wrong. A fact in the brief cannot be
+  # browsed with and cannot guess.
+  # What the goal already settled. Correctness is not only "does this
+  # code work": a story that rebuilds what a sibling delivered, or
+  # contradicts a decision a person approved, was not done correctly,
+  # and no amount of diff-reading finds that.
+  "goal_knowledge",
+  # The story's own outputs, by id, when the claim cites one.
+  "artifact_read",
+  # The only way out. Writes the review, moves the story to `reviewed`,
+  # ends the execution.
+  "submit_story_review",
+]
+
+# NOBODY TO ASK. `ask_human` parks the run waiting for an answer, and
+# there is no answer coming: the person already accepted this story and
+# has moved on. A reviewer that parks holds the pod, the admission slot
+# and the node until a deadline reaps it, and produces nothing. Where
+# something is genuinely unclear, the honest move is a finding that says
+# so — which is why the prompt says exactly that.
+#
+# `reply_to_human` IS NOT DENIED, and the asymmetry is the point. That
+# one answers a question a person asked; it parks nothing, waits for
+# nothing and holds no slot. A review is exactly the moment somebody
+# asks "what are you finding?", and the argument above is about waiting
+# for an answer, not about giving one.
+tools_deny = ["ask_human"]
+
+# The workspace is already composed; `prepare_workspace` is idempotent
+# and adopts it. Declared `git` rather than `none` so the mounts the
+# reviewer reads are the mounts the executor wrote.
+workspace_driver = "git"
+
+# The project's conventions, and NOT the executor's SOUL.md. AGENTS.md
+# says how this repository does things, which is context a reviewer
+# needs. SOUL.md is the character the operator gave the AGENT THAT DID
+# THE WORK, and a reviewer wearing the author's personality is not an
+# independent read.
+prompt_files = ["AGENTS.md"]
+
+# It does not claim the story — it reports on one. The claim was made
+# and measured before this phase began.
+allows_completion = false
+
+# No plan. There is nothing to approve: the work is finished, the shape
+# of a review is fixed, and parking to have it approved would be one
+# more way for a phase that must deliver to stall.
+requires_plan = false
+
+# A Verifier rebuilds a committed tree to judge code that will merge.
+# This IS the judgement.
+has_verifier = false
+
+# No delegation. A child would outlive the leg budget that bounds this.
+max_subagent_depth = 0
+
+# THE MODEL, NAMED RATHER THAN INHERITED. It happens to be the harness
+# default today (`choice.FALLBACK`), so this changes nothing right now --
+# but a reviewer's model is a property of the agent type, and inheriting
+# it means a deployment retuning AGENTOS_ASSIST_MODEL for executors
+# silently retunes the thing that checks them.
+model = "gemini-3.8-flash"
+
+# THREE LEGS, AND THE THIRD SAYS SO.
+#
+# One leg should be enough: a large window holds the brief, every diff
+# and a good number of whole files. Two and three are headroom, not the
+# plan, and the brief counts them down — the final leg's header tells
+# the reviewer to submit now with `partial` rather than read on.
+#
+# Counted from `phase_generation`, so a review gets three legs whatever
+# the executor spent. And exhaustion here does NOT fail the story the
+# way it does for work: `loop.py` records `not_produced` and ends the
+# execution DONE, because `done -> reviewed` is gated on a review
+# existing and a story stranded at `done` holds its thread, its
+# workspace and its node for ever.
+max_legs = 3
+
+# 600K OF A 1,048,576 WINDOW, against the registry's own 200K for this
+# model. Raised deliberately and stated as a deliberate override: a
+# reviewer's whole job is to hold the brief, several diffs and a handful
+# of whole files at once, and 200K is sized for an executor that reads a
+# little and writes a lot. 448K of headroom is left for the reply and
+# for the fact that context accounting is an estimate.
+#
+# IF REVIEWS COME BACK `incomplete`, this is the first number to look at
+# -- and the second is whether the diffs are simply too large, which
+# `story_diff`'s own cut messages will say.
+leg_tokens = 600000
+leg_steps  = 60

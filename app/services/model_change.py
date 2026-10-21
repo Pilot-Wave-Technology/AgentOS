@@ -24,6 +24,7 @@ from app.database import get_pool
 from app.ledger.journal import append_event
 from app.ledger.schema import AGENT_UPDATED
 from app.llm_models import is_supported, label_for
+from app.services.model_registry.dropdowns import is_model_registered_v2
 
 _log = logging.getLogger(__name__)
 
@@ -55,8 +56,16 @@ async def change_agent_model(
     """
     pool = get_pool()
 
-    # 1. Validate the requested model.
-    if not is_supported(new_model):
+    # 1. Validate the requested model. Accept ids present in the v2
+    # Model Registry as well as the legacy `SUPPORTED_MODELS` allowlist
+    # so a newly-registered DB model works end-to-end (story 5dafee43
+    # AC-4). The DB check is skipped implicitly on pool exceptions —
+    # `is_model_registered_v2` logs at WARNING and returns False,
+    # leaving `is_supported` as the last line of defence.
+    if (
+        not is_supported(new_model)
+        and not await is_model_registered_v2(pool, new_model)
+    ):
         return ModelChangeResult(
             ok=False, error=f"Model '{new_model}' is not in the supported list",
         )
@@ -166,37 +175,20 @@ async def change_agent_model(
                 gw_id, old_model, new_model, exc,
             )
 
-    # 6. Evict any in-memory _AgentSession objects so the next message
-    # rebuilds them with the new model. (The session caches model-
-    # specific state at construction.)
+    # 6. Reset every live session for this agent — both this process's
+    # local _AgentSession cache AND the gateway's own SessionEntry cache
+    # (agents.update above only rewrote the gateway's persisted config,
+    # neither cache re-reads it on its own). See gateway_sessions.py.
     try:
-        from app.openclaw import session_manager
-        # Collect (goal_id, agent_id, thread_id) keys to evict.
-        keys_to_evict = [
-            key for key in list(session_manager._sessions.keys())
-            if isinstance(key, tuple)
-            and (
-                # SHCA: key is (goal_id, template_agent_id, thread_id)
-                (len(key) == 3 and key[1] == agent_id)
-                # GO: key is (goal_id, agent_id) — 2-tuple
-                or (len(key) == 2 and key[1] == agent_id)
-            )
-        ]
-        for key in keys_to_evict:
-            session = session_manager._sessions.pop(key, None)
-            if session:
-                try:
-                    await session.stop()
-                except Exception:
-                    pass
-        if keys_to_evict:
-            _log.info(
-                "Evicted %d in-memory session(s) for agent=%s after model change",
-                len(keys_to_evict), agent_id,
-            )
+        from app.services.gateway_sessions import reset_agent_sessions
+        reset_count = await reset_agent_sessions(agent_id)
+        _log.info(
+            "Gateway session reset after model change: agent=%s reset_count=%d",
+            agent_id, reset_count,
+        )
     except Exception as exc:
         _log.warning(
-            "Session evict failed for agent=%s after model change: %s",
+            "Gateway session reset failed for agent=%s after model change: %s",
             agent_id, exc,
         )
 

@@ -257,8 +257,30 @@ async def actor_is_registered(conn, actor_id) -> bool:
     key = str(actor_id)
     if key in _known_actor_ids:
         return True
+    # INSIDE A SAVEPOINT, and the `except` below is why it has to be.
+    #
+    # This runs within the CALLER'S transaction, from `append_event`'s
+    # provenance audit. A statement that errors there poisons the whole
+    # transaction before control ever reaches an `except` -- so catching
+    # the exception here returned True, looked handled, and the caller's
+    # next INSERT still died with `InFailedSQLTransactionError` naming
+    # neither this query nor this table. `journal.py` describes that
+    # exact failure; it is the reason the audit stopped being an import
+    # and became a host callable, and the callable kept the bug.
+    #
+    # The one database where `actors` does not exist is the one this
+    # bites on: a consumer holding only the ledger tables, which is what
+    # the ledger client's own tests create. Observed when a test module
+    # that imports `app.ledger` is collected alongside them -- the audit
+    # is installed process-wide at import, and then fires against a
+    # schema that never had an `actors` table.
+    #
+    # A nested `conn.transaction()` is a SAVEPOINT: the failure rolls
+    # back to it and the caller's transaction survives intact.
     try:
-        exists = await conn.fetchval("SELECT 1 FROM actors WHERE id = $1", actor_id)
+        async with conn.transaction():
+            exists = await conn.fetchval(
+                "SELECT 1 FROM actors WHERE id = $1", actor_id)
     except Exception:
         return True  # don't false-alarm on a lookup error
     if exists:
@@ -288,3 +310,76 @@ async def _ensure_instance_actor(pool, instance_id: uuid.UUID) -> None:
         _registered_instances.add(key)
     except Exception:
         _log.warning("_ensure_instance_actor failed for %s", instance_id, exc_info=True)
+
+
+async def human_principal_for_thread(conn, thread_id) -> Optional[uuid.UUID]:
+    """The PERSON an agent on this thread is acting for, or None.
+
+    WHY AN AGENT EVENT NEEDS ONE. An assistant message attributed only to the
+    assistant is attributable to a robot and to nobody — the same dead end
+    that `system` attribution was. The assistant exists for exactly one
+    person, so naming them costs a join and makes 219 messages traceable.
+
+    STRUCTURAL, NOT GUESSED, and the distinction decided how this is written.
+    `agent_instances.owner_actor_id` is the binding created when the instance
+    was provisioned: an SHCA is per-(goal, user) by construction, so its owner
+    is a fact about the instance rather than an inference from who happens to
+    have spoken. All 33 instances here carry one and all 33 point at a `user`.
+
+    `threads.created_by` is the fallback and it is NOT trusted blindly: that
+    column also holds 'engine', 'go-KER15' and 'system', so it is joined
+    through `actors` with `type = 'user'` and yields NULL for all of them.
+    Returning None is the correct answer for a thread nobody owns; inventing
+    a principal would put a false name in an append-only record.
+
+    DELIBERATELY NOT USED FOR THE GO. The orchestrator is goal-level and
+    serves every member, so there is no one person it acts for. Attributing
+    its messages to whoever created the thread would read as fact and be a
+    guess — `context_goal_id` already says which goal, which is the true
+    scope of what it did.
+    """
+    if not thread_id:
+        return None
+    try:
+        return await conn.fetchval(
+            """SELECT COALESCE(owner.id, creator.id)
+                 FROM threads t
+                 LEFT JOIN agent_instances ai
+                        ON ai.gateway_agent_id = t.instance_id
+                 LEFT JOIN actors owner
+                        ON owner.id = ai.owner_actor_id AND owner.type = 'user'
+                 LEFT JOIN actors creator
+                        ON creator.uid = t.created_by AND creator.type = 'user'
+                WHERE t.id = $1
+                  AND COALESCE(owner.id, creator.id) IS NOT NULL
+                LIMIT 1""",
+            str(thread_id))
+    except Exception:                                       # noqa: BLE001
+        # Attribution is an enrichment; a message must still be recorded
+        # when it cannot be resolved.
+        _log.warning("could not resolve thread principal for %s", thread_id,
+                     exc_info=True)
+        return None
+
+
+async def human_principal_for_uid(conn, uid) -> Optional[uuid.UUID]:
+    """A person's actor id, or None. STRICT — never falls back.
+
+    Deliberately not `human_actor`, which returns the SYSTEM actor when a uid
+    does not resolve. That fallback is right for `actor_id`, where something
+    must be named, and wrong for `on_behalf_of`, where it would assert an
+    agent acted "on behalf of the system" — a sentence with no meaning, and
+    precisely the `system` over-attribution this work exists to remove.
+
+    None means "no principal can be named", which is a legitimate and
+    countable state (`has_principal` on the resolved view), not an error.
+    """
+    if not uid:
+        return None
+    try:
+        return await conn.fetchval(
+            "SELECT id FROM actors WHERE type = 'user' AND uid = $1 LIMIT 1",
+            str(uid))
+    except Exception:                                       # noqa: BLE001
+        _log.warning("human_principal_for_uid failed for %s", uid, exc_info=True)
+        return None

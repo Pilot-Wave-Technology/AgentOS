@@ -97,12 +97,22 @@ class AgentCreateRequest(BaseModel):
     name: str
     type: Literal["SHCA", "IA", "GO", "RA"] = "SHCA"
     scope: Literal["goal", "task"] = "task"
-    model: str = "google/gemini-2.5-flash"
+    model: str = "google/gemini-3.8-flash"
     emoji: str = ""
     base_system_prompt: str = ""
     soul: str = ""
     tools_allow: list[str] = []
     tools_deny: list[str] = []
+    # PENDING (both fields below): stored and API-editable, but neither is
+    # actually enforced. chat.py forwards both into the goal_context dict
+    # passed to session_manager, but _AgentSession never reads them back
+    # out (only agent_type is), so neither reaches a gateway session-create
+    # call. memory_enabled is also misleading as written — real memory
+    # enablement is decided independently by memory_v2/provisioning.py
+    # (agent_type == "SHCA" AND the global memory_v2_user_memory_enabled
+    # setting), not by this column. Both are hidden from instance_detail.html's
+    # edit form until a real enforcement path exists for each — don't wire a
+    # new UI control to either without first closing that gap.
     memory_enabled: bool = False
     max_tokens: Optional[int] = None
     notes: str = ""
@@ -134,12 +144,15 @@ class AgentCreate(BaseModel):
     name: str
     type: Literal["SHCA", "IA", "GO", "RA"] = "SHCA"
     scope: Literal["goal", "task"] = "task"
-    model: str = "google/gemini-2.5-flash"
+    model: str = "google/gemini-3.8-flash"
     emoji: str = ""
     base_system_prompt: str = ""     # Written to AGENTS.md on creation
     soul: str = ""                   # Written to SOUL.md on creation
     tools_allow: list[str] = []
     tools_deny: list[str] = []
+    # PENDING (both fields below) — see the matching note on
+    # AgentCreateRequest above: neither reaches gateway enforcement, and
+    # memory_enabled is superseded by memory_v2's own type/settings gate.
     memory_enabled: bool = False
     max_tokens: Optional[int] = None
     notes: str = ""

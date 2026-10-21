@@ -409,3 +409,73 @@ document.addEventListener('htmx:beforeRequest', () => {
 document.addEventListener('htmx:afterRequest', () => {
   document.body.style.cursor = '';
 });
+
+// ── Sidebar resize ──────────────────────────────────────────────────────────
+// 240px truncated long goal names, and thread rows now carry six-word story
+// titles rather than ids, so the default cuts more than it used to. Drag the
+// trailing edge; the width persists per browser.
+//
+// WIDTH LIVES IN A CSS VARIABLE, not on `style.width`. `.sidebar-collapsed`
+// sets a fixed 68px, and an inline width would beat it — so collapsing a
+// widened sidebar would leave a 400px rail of icons. Setting `--sidebar-user-width`
+// means only `.sidebar-expanded` reads it, collapse ignores it, and expanding
+// restores whatever the person chose.
+(function () {
+  const MIN = 180, MAX = 560, KEY = 'agentos.sidebarWidth';
+
+  function apply(px) {
+    const nav = document.getElementById('sidebar');
+    if (nav) nav.style.setProperty('--sidebar-user-width', px + 'px');
+  }
+
+  function clamp(px) { return Math.min(MAX, Math.max(MIN, Math.round(px))); }
+
+  // Restore before first paint where possible, so a widened sidebar does not
+  // visibly snap from 240px on every page load.
+  try {
+    const saved = parseInt(localStorage.getItem(KEY) || '', 10);
+    if (Number.isFinite(saved)) apply(clamp(saved));
+  } catch { /* private window, or site data blocked — 240px is fine */ }
+
+  function start(e) {
+    const nav = document.getElementById('sidebar');
+    const handle = document.getElementById('sidebar-resizer');
+    if (!nav || nav.classList.contains('sidebar-collapsed')) return;
+    e.preventDefault();
+    handle?.classList.add('is-dragging');
+    document.body.classList.add('is-resizing-sidebar');
+
+    const startX = e.clientX;
+    const startW = nav.getBoundingClientRect().width;
+
+    function move(ev) { apply(clamp(startW + (ev.clientX - startX))); }
+
+    function stop() {
+      document.removeEventListener('pointermove', move);
+      document.removeEventListener('pointerup', stop);
+      handle?.classList.remove('is-dragging');
+      document.body.classList.remove('is-resizing-sidebar');
+      try {
+        localStorage.setItem(
+          KEY, String(Math.round(nav.getBoundingClientRect().width)));
+      } catch { /* not persisting is survivable; a broken drag is not */ }
+    }
+
+    document.addEventListener('pointermove', move);
+    document.addEventListener('pointerup', stop);
+  }
+
+  // Delegated, because base.html renders the handle on every page and this
+  // script runs once — binding directly would miss htmx-swapped chrome.
+  document.addEventListener('pointerdown', (e) => {
+    if (e.target && e.target.id === 'sidebar-resizer') start(e);
+  });
+
+  // Double-click resets, which is the discoverable way out of a width
+  // somebody dragged to 180px and cannot read.
+  document.addEventListener('dblclick', (e) => {
+    if (!e.target || e.target.id !== 'sidebar-resizer') return;
+    apply(240);
+    try { localStorage.removeItem(KEY); } catch { /* see above */ }
+  });
+})();

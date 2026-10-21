@@ -1,0 +1,1290 @@
+{% extends "base.html" %}
+{% from "partials/_info_popover.html" import info_popover %}
+{% block title %}Model Registry: Admin{% endblock %}
+
+{% block content %}
+<div class="max-w-6xl mx-auto py-8 px-4 space-y-6">
+
+  {# ── Page header ─────────────────────────────────────────────────────── #}
+  <div>
+    <a href="/settings" class="inline-flex items-center gap-1 text-xs text-gray-500 hover:text-gray-300 transition-colors mb-5">
+      <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"/></svg>
+      Settings
+    </a>
+    <div class="flex items-center justify-between mt-2">
+      <h1 class="text-xl font-semibold">Model Registry</h1>
+      <div class="flex items-center gap-3">
+        {# Server-side ?view= tabs — same pattern as agent_registry/index.html's
+           Templates/Instances toggle, not a client-side JS swap. #}
+        <div class="flex items-center bg-surface border border-border rounded-lg p-0.5">
+          <a href="/settings/model-registry?view=registry"
+             class="px-3 py-1.5 rounded-md text-sm font-medium transition-colors {% if view == 'registry' %}bg-brand text-white{% else %}text-gray-400 hover:text-gray-200{% endif %}">
+            Registry
+          </a>
+          <a href="/settings/model-registry?view=pricing"
+             class="px-3 py-1.5 rounded-md text-sm font-medium transition-colors {% if view == 'pricing' %}bg-brand text-white{% else %}text-gray-400 hover:text-gray-200{% endif %}">
+            Pricing{% if pricing_linked or pricing_unlinked %} <span class="{% if view == 'pricing' %}text-indigo-200{% else %}text-gray-600{% endif %} text-xs">{{ pricing_linked | length + pricing_unlinked | length }}</span>{% endif %}
+          </a>
+          <a href="/settings/model-registry?view=misc"
+             class="px-3 py-1.5 rounded-md text-sm font-medium transition-colors {% if view == 'misc' %}bg-brand text-white{% else %}text-gray-400 hover:text-gray-200{% endif %}">
+            Utility Models
+          </a>
+        </div>
+      </div>
+    </div>
+    <p class="text-xs text-gray-500 mt-3">
+      {% if view == 'pricing' %}
+      Token cost rates for every priced model, keyed to its Registry entry. Rates are
+      append-only — adding a new one never edits history, it just takes effect from
+      its own effective-from timestamp onward.
+      {% elif view == 'misc' %}
+      A separate, Gemini-only config for AgentOS's own internal-purpose model calls
+      (summarization, template generation, memory compaction, …) — not agents deployed
+      via the Registry tab above. Each purpose keeps its own hardcoded fallback, so
+      clearing an override here never breaks the feature. Runs on whatever credential
+      the call site already uses (ADC / <code class="font-mono">GEMINI_API_KEY</code>),
+      never a Registry-managed credential.
+      {% else %}
+      This admin registry manages the app&#39;s own model bookkeeping (identity,
+      providers, and — in future cycles — API keys and tags). The gateway model
+      catalog is fed from a separate source and is not modified by edits here.
+      Providers marked <em class="not-italic bg-amber-900/40 text-amber-400 rounded px-1">not_provisioned</em>
+      are registered as inventory but have no runnable infra yet.
+      {% endif %}
+    </p>
+  </div>
+
+  {# ── Error toast ──────────────────────────────────────────────────────────
+     Every mutating POST handler re-renders this page with `error=str(exc)`
+     on a ManagementError (see _render_page_v2 in the router) instead of
+     redirecting, so the operator's in-progress edits/scroll position stay
+     put. Surfaced via the shared toast system (base.html's showToast) per
+     project convention — never window.alert/confirm. #}
+  {% if error %}
+  <script>
+    document.addEventListener('DOMContentLoaded', function () {
+      showToast({{ error | tojson }}, 'error');
+    });
+  </script>
+  {% endif %}
+
+  {% if view == 'registry' %}
+  {% if can_edit %}
+  <div class="flex justify-end">
+    <button onclick="document.getElementById('add-provider-modal').classList.remove('hidden')"
+            class="btn btn-primary btn-sm">+ Add provider</button>
+  </div>
+  {% endif %}
+
+  {# ── Provider accordions ─────────────────────────────────────────────── #}
+  {% if not providers %}
+  <div class="bg-gray-900 border border-gray-800 rounded-xl px-4 py-6 text-center text-gray-500 text-sm">
+    No providers registered yet.{% if can_edit %} Click <span class="text-gray-300">+ Add provider</span> to seed one.{% endif %}
+  </div>
+  {% endif %}
+
+  {% for provider in providers %}
+  {# No `overflow-hidden` here (on purpose): the provider row's "⋮" dropdown
+     is a position:absolute popover living inside <summary>. `overflow-hidden`
+     on this <details> would clip it to the CLOSED box height (summary-bar
+     only) the instant it tries to open, since a closed <details>'s box is
+     exactly its summary's height. rounded-xl still rounds the visible
+     border/background; nothing here needs child-clipping. #}
+  <details class="provider-accordion bg-gray-900 border border-gray-800 rounded-xl" open>
+    <summary class="px-4 py-3 border-b border-gray-800 flex items-center gap-3 cursor-pointer hover:bg-gray-800/40 list-none">
+      <span class="font-medium text-sm">{{ provider.label }}</span>
+      <code class="text-xs text-gray-500">{{ provider.id }}</code>
+
+      {# Runtime pill — inventory bookkeeping, does NOT gate execution.
+         Kept as its own pill (not folded into the precedence badge
+         below) since it's a genuinely independent fact: a provider can
+         be not_provisioned while still status=active, meaning "intended
+         for use, infra just isn't wired up yet" — a different thing
+         from being disabled. #}
+      {% if provider.runtime_status == 'provisioned' %}
+        <span class="text-2xs uppercase tracking-wide rounded px-2 py-0.5 bg-emerald-900/40 text-emerald-400">provisioned</span>
+      {% else %}
+        <span class="text-2xs uppercase tracking-wide rounded px-2 py-0.5 bg-amber-900/40 text-amber-400">not_provisioned</span>
+      {% endif %}
+
+      <span class="text-2xs text-gray-500 rounded px-2 py-0.5 bg-gray-800">
+        {{ provider.models | length }} model{{ 's' if provider.models | length != 1 else '' }}
+      </span>
+
+      {# Single precedence-ordered status badge (availability.effective_provider_status)
+         — covers status=disabled AND credential_status (healthy/unhealthy/revoked)
+         in one place, so this row never shows e.g. "Active" next to a
+         revoked credential. See that function's docstring for the
+         precedence order. #}
+      {% if provider.effective_status == 'not_provisioned' %}
+        {# Nothing else to show — the runtime pill above already says
+           everything relevant; status/credential facts still exist in
+           storage but aren't meaningful to display until infra is up. #}
+      {% elif provider.effective_status == 'disabled' %}
+        <span class="text-2xs text-red-400 rounded px-2 py-0.5 bg-red-900/20">disabled</span>
+      {% elif provider.effective_status == 'revoked' %}
+        <span class="text-2xs text-red-400 rounded px-2 py-0.5 bg-red-900/20">credential revoked</span>
+      {% elif provider.effective_status == 'unhealthy' %}
+        <span class="text-2xs text-red-400 rounded px-2 py-0.5 bg-red-900/20">credential unhealthy</span>
+      {% else %}
+        <span class="text-2xs text-emerald-400 rounded px-2 py-0.5 bg-emerald-900/20">active</span>
+      {% endif %}
+
+      <span class="flex-1"></span>
+
+      {% if can_edit %}
+      {# ── Single actions menu, replacing the old row-of-buttons. Every
+         action a provider row can take (edit, enable/disable, + add
+         model — moved up here from the bottom of the model list) lives
+         in one dropdown so the row doesn't grow a button per feature.
+         Toggle/close-on-outside-click via the shared
+         `toggleActionsMenu`/document-click handler at the bottom of this
+         file. Credential management (Provide/Rotate/Clear key) was
+         dropped — it only ever stored an encrypted value nothing read
+         back; the gateway resolves real keys via "API key source" (the
+         env var name) instead, see Edit provider. #}
+      <div class="relative" onclick="event.stopPropagation();">
+        <button type="button" onclick="toggleActionsMenu(event)"
+                class="btn btn-secondary btn-sm px-2" title="Provider actions">&#8942;</button>
+        <div class="dropdown-menu hidden absolute right-0 mt-1 w-56 bg-gray-800 border border-gray-700 rounded-lg shadow-2xl z-20 py-1">
+          <button type="button"
+                  onclick="document.getElementById('add-model-{{ provider.id }}').classList.remove('hidden'); closeActionsMenus();"
+                  class="w-full text-left px-3 py-1.5 text-xs text-gray-200 hover:bg-gray-700">+ Add model</button>
+          <button type="button"
+                  onclick="document.getElementById('edit-provider-{{ provider.id }}').classList.remove('hidden'); closeActionsMenus();"
+                  class="w-full text-left px-3 py-1.5 text-xs text-gray-200 hover:bg-gray-700">Edit</button>
+          {% if provider.status == 'active' %}
+          <form method="post" action="/settings/model-registry/providers/{{ provider.id }}/disable" onclick="event.stopPropagation();">
+            <button type="submit" class="w-full text-left px-3 py-1.5 text-xs text-red-400 hover:bg-gray-700">Disable</button>
+          </form>
+          {% else %}
+          <form method="post" action="/settings/model-registry/providers/{{ provider.id }}/enable" onclick="event.stopPropagation();">
+            <button type="submit" class="w-full text-left px-3 py-1.5 text-xs text-emerald-400 hover:bg-gray-700">Enable</button>
+          </form>
+          {% endif %}
+        </div>
+      </div>
+      {% endif %}
+    </summary>
+
+    <div class="p-4 space-y-3">
+      {% if not provider.models %}
+      <div class="text-xs text-gray-600 italic">
+        No models registered under this provider yet.{% if can_edit %} Use the <span class="text-gray-300">&#8942;</span> menu above to add one.{% endif %}
+      </div>
+      {% endif %}
+
+      {% for model in provider.models %}
+      <div class="model-card bg-gray-900/50 border border-gray-800 rounded-lg p-3">
+        <div class="flex items-center gap-3 flex-wrap">
+          {% if model.gateway_reachable is not none %}
+          <span class="w-2 h-2 rounded-full inline-block {{ 'bg-green-500' if model.gateway_reachable else 'bg-red-500' }}"
+                title="{{ 'Reachable' if model.gateway_reachable else 'Not reachable' }} from the gateway{% if model.gateway_checked_at %} — last checked {{ model.gateway_checked_at.strftime('%Y-%m-%d %H:%M') }} UTC{% endif %}"></span>
+          {% endif %}
+          <code class="text-xs font-mono text-gray-300">{{ model.id }}</code>
+          <span class="text-sm">{{ model.label }}</span>
+          <span class="text-2xs rounded px-2 py-0.5 bg-gray-800 text-gray-400">tier: {{ model.tier }}</span>
+          {% if model.provider_shorthand %}
+          <span class="text-2xs rounded px-2 py-0.5 bg-indigo-900/40 text-indigo-300 font-mono"
+                title="Short name used to build this model's context-window variant ids, e.g. {{ model.provider_id }}-{{ model.provider_shorthand }}-200k">{{ model.provider_shorthand }}</span>
+          {% endif %}
+          <span class="text-2xs text-gray-500">ctx: {{ "{:,}".format(model.context_window) }}</span>
+
+          {% if model.status == 'active' %}
+            <span class="text-2xs text-emerald-400 rounded px-2 py-0.5 bg-emerald-900/20">active</span>
+          {% else %}
+            <span class="text-2xs text-red-400 rounded px-2 py-0.5 bg-red-900/20">disabled</span>
+          {% endif %}
+
+          {% if model.id in unpriced_model_ids %}
+          {# Soft hint only — never blocks adding/using a model. For an
+             admin, clicking jumps straight to that model's "Add price"
+             modal (rendered further down the page regardless of active
+             tab — see the Pricing tab's "Not yet priced" modals); the
+             modal doesn't exist in the DOM for a read-only viewer, so
+             their version is a plain non-interactive badge. #}
+          {% if can_edit %}
+          <button type="button"
+                  onclick="document.getElementById('add-price-new-{{ model.id | replace('/', '__') }}').classList.remove('hidden')"
+                  title="No pricing configured for this model yet — click to add one"
+                  class="text-2xs rounded px-2 py-0.5 bg-amber-900/30 text-amber-400 hover:bg-amber-900/50">
+            no pricing
+          </button>
+          {% else %}
+          <span class="text-2xs rounded px-2 py-0.5 bg-amber-900/30 text-amber-400" title="No pricing configured for this model yet">
+            no pricing
+          </span>
+          {% endif %}
+          {% endif %}
+
+          <span class="flex-1"></span>
+
+          {% if can_edit %}
+          {# Single actions menu — Edit/Enable-Disable, plus "+ context
+             window" moved up here from the bottom of the variants row
+             below, so it's not the last thing after however many chips
+             a model happens to have. #}
+          <div class="relative" onclick="event.stopPropagation();">
+            <button type="button" onclick="toggleActionsMenu(event)"
+                    class="btn btn-secondary btn-sm px-2" title="Model actions">&#8942;</button>
+            <div class="dropdown-menu hidden absolute right-0 mt-1 w-48 bg-gray-800 border border-gray-700 rounded-lg shadow-2xl z-20 py-1">
+              <button type="button"
+                      onclick="document.getElementById('add-cw-{{ model.id | replace('/', '__') }}').classList.remove('hidden'); closeActionsMenus();"
+                      class="w-full text-left px-3 py-1.5 text-xs text-gray-200 hover:bg-gray-700">+ Context window</button>
+              <button type="button"
+                      onclick="document.getElementById('edit-model-{{ model.id | replace('/', '__') }}').classList.remove('hidden'); closeActionsMenus();"
+                      class="w-full text-left px-3 py-1.5 text-xs text-gray-200 hover:bg-gray-700">Edit</button>
+              {% if model.status == 'active' %}
+              <form method="post" action="/settings/model-registry/models/{{ model.id }}/disable" onclick="event.stopPropagation();">
+                <button type="submit" class="w-full text-left px-3 py-1.5 text-xs text-red-400 hover:bg-gray-700">Disable</button>
+              </form>
+              {% else %}
+              <form method="post" action="/settings/model-registry/models/{{ model.id }}/enable" onclick="event.stopPropagation();">
+                <button type="submit" class="w-full text-left px-3 py-1.5 text-xs text-emerald-400 hover:bg-gray-700">Enable</button>
+              </form>
+              {% endif %}
+            </div>
+          </div>
+          {% endif %}
+        </div>
+
+        {# Variants row — inline chips per context window, or a
+           native-only pill if the model has no synthetic variants. #}
+        <div class="mt-2 flex items-center gap-2 flex-wrap">
+          {% if model.synthesized_variants %}
+            {% for v in model.synthesized_variants %}
+            {# Removal disabled for now (admin ask) — variant chips are
+               display-only until this is revisited. Backend route
+               (/context-windows/{tokens}/remove) is untouched. #}
+            <div class="inline-flex items-center gap-1 rounded-full bg-gray-800 text-gray-200 text-xs px-2 py-0.5"
+                 title="{{ v.variant_id }} — {{ v.label }}">
+              <span class="font-mono">{{ "{:,}".format(v.context_window) }}</span>
+            </div>
+            {% endfor %}
+          {% else %}
+            <span class="text-2xs rounded-full px-2 py-0.5 bg-gray-800 text-gray-500">native-only (no synthetic variants)</span>
+          {% endif %}
+        </div>
+      </div>
+      {% endfor %}
+    </div>
+  </details>
+  {% endfor %}
+  {% endif %}
+
+  {% if view == 'pricing' %}
+  {# ── Model Pricing ─────────────────────────────────────────────────────
+     One row per model with linked pricing (models.id != null) — current
+     rate only; click a row to expand its full rate-history underneath
+     (append-only versions, newest first). `provider`/`model` are never
+     free-typed here — every "Add rate" form is pre-scoped to a specific
+     model_id and the router resolves the real (provider, model) text
+     server-side, closing the drift that produced the old unlinked rows.
+     Rows with no model_id (legacy pricing whose (provider, model) text
+     never matched a real model) get their own read-only section below —
+     see PricingValidationError / list_pricing_grouped's docstring. #}
+  {% if can_edit and unpriced_models %}
+  {# ── Not yet priced ────────────────────────────────────────────────────
+     A model with zero pricing rows never appears in `pricing_linked` (it's
+     built from existing model_pricing rows), so without this there'd be no
+     way to give it a FIRST rate — only ever "+ Add rate" a new version on
+     top of one that already exists. One modal per unpriced model, same
+     pattern as every other per-entity modal in this file. #}
+  <div class="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden">
+    <div class="px-4 py-3 border-b border-gray-800">
+      <h2 class="text-sm font-semibold text-gray-400">Not yet priced</h2>
+    </div>
+    <div class="p-3 flex flex-wrap gap-2">
+      {% for m in unpriced_models %}
+      <button type="button"
+              onclick="document.getElementById('add-price-new-{{ m.id | replace('/', '__') }}').classList.remove('hidden')"
+              class="btn btn-secondary btn-sm">
+        + Add price for <code class="font-mono">{{ m.id }}</code>
+      </button>
+      {% endfor %}
+    </div>
+  </div>
+  {% endif %}
+
+  <div class="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden">
+    <div class="px-4 py-3 border-b border-gray-800 flex items-center justify-between">
+      <h2 class="text-sm font-semibold">Model Pricing</h2>
+      <span class="text-xs text-gray-500">Click a row to see its rate history</span>
+    </div>
+    {% if not pricing_linked %}
+    <div class="px-4 py-6 text-center text-gray-500 text-sm">No priced models yet.</div>
+    {% else %}
+    <table class="w-full text-sm">
+      <thead>
+        <tr class="text-left text-xs text-gray-500 border-b border-gray-800">
+          <th class="px-4 py-2 font-normal">Model</th>
+          <th class="px-2 py-2 font-normal">Provider</th>
+          <th class="px-2 py-2 font-normal text-right">Input</th>
+          <th class="px-2 py-2 font-normal text-right">Output</th>
+          <th class="px-2 py-2 font-normal text-right">Cache read</th>
+          <th class="px-2 py-2 font-normal text-right">Cache write</th>
+          <th class="px-2 py-2 font-normal text-right">Thinking</th>
+          <th class="px-2 py-2 font-normal">Effective from</th>
+          <th class="px-4 py-2 font-normal"></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for entry in pricing_linked %}
+        {% set row_key = entry.model_id | replace('/', '__') %}
+        <tr class="border-b border-gray-800/60 hover:bg-gray-800/30 cursor-pointer"
+            onclick="document.getElementById('price-history-{{ row_key }}').classList.toggle('hidden')">
+          <td class="px-4 py-2">
+            <code class="text-xs text-gray-300">{{ entry.model_id }}</code>
+          </td>
+          <td class="px-2 py-2 text-xs text-gray-400">{{ entry.provider }}</td>
+          <td class="px-2 py-2 text-right font-mono text-xs">{{ "%.6f"|format(entry.current.input_rate) }}</td>
+          <td class="px-2 py-2 text-right font-mono text-xs">{{ "%.6f"|format(entry.current.output_rate) }}</td>
+          <td class="px-2 py-2 text-right font-mono text-xs">{{ "%.6f"|format(entry.current.cache_read_rate) }}</td>
+          <td class="px-2 py-2 text-right font-mono text-xs">{{ "%.6f"|format(entry.current.cache_write_rate) }}</td>
+          <td class="px-2 py-2 text-right font-mono text-xs">{{ "%.6f"|format(entry.current.thinking_rate) if entry.current.thinking_rate is not none else "—" }}</td>
+          <td class="px-2 py-2 text-xs text-gray-500" data-utc="{{ entry.current.effective_from.isoformat() }}">{{ entry.current.effective_from.strftime('%Y-%m-%d %H:%M') }} UTC</td>
+          <td class="px-4 py-2 text-right">
+            {% if can_edit %}
+            <button type="button"
+                    onclick="event.stopPropagation(); document.getElementById('add-price-{{ row_key }}').classList.remove('hidden')"
+                    class="btn btn-secondary btn-sm">+ Add rate</button>
+            {% endif %}
+          </td>
+        </tr>
+        <tr id="price-history-{{ row_key }}" class="hidden bg-gray-950/60">
+          <td colspan="9" class="px-4 py-3">
+            {% if not entry.history %}
+            <div class="text-xs text-gray-500">No earlier versions — this is the only rate on record.</div>
+            {% else %}
+            <table class="w-full text-xs">
+              <thead>
+                <tr class="text-left text-gray-500">
+                  <th class="py-1 font-normal">Effective from</th>
+                  <th class="py-1 font-normal text-right">Input</th>
+                  <th class="py-1 font-normal text-right">Output</th>
+                  <th class="py-1 font-normal text-right">Cache read</th>
+                  <th class="py-1 font-normal text-right">Cache write</th>
+                  <th class="py-1 font-normal text-right">Thinking</th>
+                  <th class="py-1 font-normal">Notes</th>
+                </tr>
+              </thead>
+              <tbody>
+                {% for h in entry.history %}
+                <tr class="border-t border-gray-800/60">
+                  <td class="py-1 text-gray-500" data-utc="{{ h.effective_from.isoformat() }}">{{ h.effective_from.strftime('%Y-%m-%d %H:%M') }} UTC</td>
+                  <td class="py-1 text-right font-mono">{{ "%.6f"|format(h.input_rate) }}</td>
+                  <td class="py-1 text-right font-mono">{{ "%.6f"|format(h.output_rate) }}</td>
+                  <td class="py-1 text-right font-mono">{{ "%.6f"|format(h.cache_read_rate) }}</td>
+                  <td class="py-1 text-right font-mono">{{ "%.6f"|format(h.cache_write_rate) }}</td>
+                  <td class="py-1 text-right font-mono">{{ "%.6f"|format(h.thinking_rate) if h.thinking_rate is not none else "—" }}</td>
+                  <td class="py-1 text-gray-500">{{ h.notes or "" }}</td>
+                </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+            {% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% endif %}
+  </div>
+
+  {% if pricing_unlinked %}
+  {# ── Unlinked pricing ────────────────────────────────────────────────────
+     Legacy rows whose (provider, model) text never resolved to a real
+     models row (directly or via model_aliases) — read-only, no "Add rate"
+     here since there's no model to scope a new version to. #}
+  <div class="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden">
+    <div class="px-4 py-3 border-b border-gray-800">
+      <h2 class="text-sm font-semibold text-gray-400">Unlinked pricing</h2>
+      <p class="text-xs text-gray-500 mt-1">
+        These rows' provider/model text doesn't match any registered model —
+        kept read-only so existing cost history stays intact.
+      </p>
+    </div>
+    <table class="w-full text-sm">
+      <thead>
+        <tr class="text-left text-xs text-gray-500 border-b border-gray-800">
+          <th class="px-4 py-2 font-normal">Provider</th>
+          <th class="px-2 py-2 font-normal">Model</th>
+          <th class="px-2 py-2 font-normal text-right">Input</th>
+          <th class="px-2 py-2 font-normal text-right">Output</th>
+          <th class="px-2 py-2 font-normal">Effective from</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for entry in pricing_unlinked %}
+        <tr class="border-b border-gray-800/60">
+          <td class="px-4 py-2 text-xs text-gray-400">{{ entry.provider }}</td>
+          <td class="px-2 py-2 text-xs text-gray-400">{{ entry.model }}</td>
+          <td class="px-2 py-2 text-right font-mono text-xs">{{ "%.6f"|format(entry.current.input_rate) }}</td>
+          <td class="px-2 py-2 text-right font-mono text-xs">{{ "%.6f"|format(entry.current.output_rate) }}</td>
+          <td class="px-2 py-2 text-xs text-gray-500" data-utc="{{ entry.current.effective_from.isoformat() }}">{{ entry.current.effective_from.strftime('%Y-%m-%d %H:%M') }} UTC</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endif %}
+  {% endif %}
+
+  {# ── Add-provider modal ──────────────────────────────────────────────── #}
+  {% if can_edit %}
+  <div id="add-provider-modal"
+       class="hidden fixed inset-0 z-50 flex items-center justify-center bg-black/60">
+    <div class="bg-gray-900 border border-gray-700 rounded-xl p-6 w-full max-w-2xl shadow-2xl">
+      <div class="flex items-center justify-between mb-4">
+        <h2 class="text-base font-semibold">Add provider</h2>
+        <button type="button" onclick="document.getElementById('add-provider-modal').classList.add('hidden')"
+                class="text-gray-500 hover:text-gray-300 text-xl leading-none">&times;</button>
+      </div>
+      <p class="text-xs text-gray-500 mb-5 flex items-center gap-1.5">
+        One row per real upstream provider (native APIs + CLI backends).
+        {{ info_popover(
+          "Id may contain letters, digits, dots, underscores, or hyphens, and must "
+          "start with a letter or digit. Mark a provider not_provisioned if its "
+          "runtime infra (VM binary install, gateway config) is not yet wired up — "
+          "bookkeeping only, does not gate execution."
+        ) }}
+      </p>
+
+      <form method="post" action="/settings/model-registry/providers" class="space-y-4">
+        <div class="grid grid-cols-2 gap-4">
+          <div>
+            <label class="block text-xs text-gray-400 mb-1">Id</label>
+            <input type="text" name="id" required placeholder="anthropic"
+              class="w-full bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm text-gray-200 focus:border-indigo-500 focus:outline-none">
+          </div>
+          <div>
+            <label class="block text-xs text-gray-400 mb-1">Label</label>
+            <input type="text" name="label" required placeholder="Anthropic"
+              class="w-full bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm text-gray-200 focus:border-indigo-500 focus:outline-none">
+          </div>
+        </div>
+
+        <div>
+          <label class="block text-xs text-gray-400 mb-1">Runtime status</label>
+          <select name="runtime_status"
+            class="w-full bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm text-gray-200 focus:border-indigo-500 focus:outline-none">
+            <option value="provisioned" selected>provisioned</option>
+            <option value="not_provisioned">not_provisioned</option>
+          </select>
+        </div>
+
+        <div class="space-y-4">
+          <div>
+            <label class="block text-xs text-gray-400 mb-1">Base URL <span class="text-gray-600">(optional; NULL for CLI kinds)</span></label>
+            <input type="text" name="base_url" placeholder="https://api.anthropic.com/v1"
+              class="w-full bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm text-gray-200 focus:border-indigo-500 focus:outline-none">
+          </div>
+
+          <div>
+            <label class="block text-xs text-gray-400 mb-1 flex items-center gap-1.5">
+              API type <span class="text-gray-600">(optional)</span>
+              {{ info_popover(
+                "Every option except cli is a real, already-working adapter in the "
+                "gateway's model library (pi-ai) — pick whichever matches this "
+                "upstream's actual API shape, even for a vendor we don't have a "
+                "provider row for yet (e.g. Mistral, Bedrock, Vertex all already "
+                "work if you fill in the right base URL/key). cli is different — "
+                "it's this project's own concept for a provider that shells out to "
+                "a CLI tool instead of calling an HTTP API (no base URL / API key "
+                "needed). No custom/other option here — a genuinely unsupported "
+                "API shape needs matching gateway-side code before it could ever "
+                "work, so there's nothing useful to type by hand yet."
+              ) }}
+            </label>
+            <select name="api_type"
+              class="w-full bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm text-gray-200 focus:border-indigo-500 focus:outline-none">
+              {# Only values the gateway's ModelApiSchema accepts, plus `cli`.
+                 This list used to offer azure-openai-responses, google-gemini-cli,
+                 google-vertex and mistral-conversations — none of which the gateway
+                 recognises. Picking one saved fine and then failed validation for the
+                 WHOLE config document on the next sync (one write covers every
+                 provider), silently stopping provider sync platform-wide. Removed
+                 2026-08-09; server-side `_validate_api_type` now rejects them too.
+                 Keep in step with `emitter._GATEWAY_ACCEPTED_API_TYPES`. #}
+              <option value="">— none —</option>
+              <optgroup label="Anthropic">
+                <option value="anthropic-messages">anthropic-messages</option>
+              </optgroup>
+              <optgroup label="OpenAI">
+                <option value="openai-completions">openai-completions</option>
+                <option value="openai-responses">openai-responses</option>
+                <option value="openai-codex-responses">openai-codex-responses</option>
+              </optgroup>
+              <optgroup label="Google">
+                <option value="google-generative-ai">google-generative-ai</option>
+              </optgroup>
+              <optgroup label="Amazon">
+                <option value="bedrock-converse-stream">bedrock-converse-stream</option>
+              </optgroup>
+              <optgroup label="Other">
+                <option value="github-copilot">github-copilot</option>
+                <option value="ollama">ollama</option>
+              </optgroup>
+              <optgroup label="CLI-backed (not sent to the gateway)">
+                <option value="cli">cli</option>
+              </optgroup>
+            </select>
+          </div>
+        </div>
+
+        <div class="pt-2 border-t border-gray-800">
+          <label class="block text-xs text-gray-400 mb-1 flex items-center gap-1.5">
+            Secret Manager name <span class="text-gray-600">(the real credential source)</span>
+            {{ info_popover(
+              "Just the secret's short id (e.g. anthropic-api-key) — not the full resource path. "
+              "The gateway resolves it against its own GCP project (the project the VM is deployed "
+              "in — you don't type that here) and always reads the latest version, never a pinned "
+              "one. The secret must already exist there and the gateway's service account must "
+              "already have Secret Manager Secret Accessor on it; creating the secret and granting "
+              "access happens outside this UI. The key value itself never passes through this "
+              "control panel — only this name does."
+            ) }}
+          </label>
+          <input type="text" name="secret_id" placeholder="anthropic-api-key"
+            class="w-full bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm text-gray-200 focus:border-indigo-500 focus:outline-none">
+        </div>
+
+        <div class="flex justify-end gap-3 pt-2">
+          <button type="button" onclick="document.getElementById('add-provider-modal').classList.add('hidden')"
+                  class="btn btn-secondary btn-sm">Cancel</button>
+          <button type="submit"
+                  class="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white text-sm rounded font-medium">
+            Add provider
+          </button>
+        </div>
+      </form>
+    </div>
+  </div>
+  {% endif %}
+
+  {# ── Edit-provider modals (one per provider row) ─────────────────────── #}
+  {% if can_edit %}
+    {% for provider in providers %}
+    <div id="edit-provider-{{ provider.id }}"
+         class="hidden fixed inset-0 z-50 flex items-center justify-center bg-black/60">
+      <div class="bg-gray-900 border border-gray-700 rounded-xl p-6 w-full max-w-2xl shadow-2xl">
+        <div class="flex items-center justify-between mb-4">
+          <h2 class="text-base font-semibold">Edit provider <span class="font-mono text-sm text-gray-400">{{ provider.id }}</span></h2>
+          <button type="button" onclick="document.getElementById('edit-provider-{{ provider.id }}').classList.add('hidden')"
+                  class="text-gray-500 hover:text-gray-300 text-xl leading-none">&times;</button>
+        </div>
+        <p class="text-xs text-gray-500 mb-5">
+          Leave any field blank to keep its current value. Provider id is immutable;
+          use Disable / Enable on the header to toggle visibility.
+        </p>
+
+        <form method="post" action="/settings/model-registry/providers/{{ provider.id }}/update" class="space-y-4">
+          <div class="grid grid-cols-2 gap-4">
+            <div>
+              <label class="block text-xs text-gray-400 mb-1">Label <span class="text-gray-600">(current: {{ provider.label }})</span></label>
+              <input type="text" name="label" placeholder="{{ provider.label }}"
+                class="w-full bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm text-gray-200 focus:border-indigo-500 focus:outline-none">
+            </div>
+            <div>
+              <label class="block text-xs text-gray-400 mb-1">Runtime status <span class="text-gray-600">(current: {{ provider.runtime_status }})</span></label>
+              <select name="runtime_status"
+                class="w-full bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm text-gray-200 focus:border-indigo-500 focus:outline-none">
+                <option value="">— keep current —</option>
+                <option value="provisioned">provisioned</option>
+                <option value="not_provisioned">not_provisioned</option>
+              </select>
+            </div>
+          </div>
+
+          <div>
+            <label class="block text-xs text-gray-400 mb-1">Status <span class="text-gray-600">(current: {{ provider.status }})</span></label>
+            <select name="status"
+              class="w-full bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm text-gray-200 focus:border-indigo-500 focus:outline-none">
+              <option value="">— keep current —</option>
+              <option value="active">active</option>
+              <option value="disabled">disabled</option>
+            </select>
+          </div>
+
+          <div class="space-y-4">
+            <div>
+              <label class="block text-xs text-gray-400 mb-1">Base URL <span class="text-gray-600">(current: {{ provider.base_url or 'NULL' }})</span></label>
+              <input type="text" name="base_url" placeholder="{{ provider.base_url or 'https://api.example.com/v1' }}"
+                class="w-full bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm text-gray-200 focus:border-indigo-500 focus:outline-none">
+            </div>
+
+            <div>
+              <div>
+                <label class="block text-xs text-gray-400 mb-1 flex items-center gap-1.5">
+                  API type <span class="text-gray-600">(current: {{ provider.api_type or 'NULL' }})</span>
+                  {{ info_popover(
+                    "Every option except cli is a real, already-working adapter in the "
+                    "gateway's model library (pi-ai) — pick whichever matches this "
+                    "upstream's actual API shape, even for a vendor we don't have a "
+                    "provider row for yet. cli is different — this project's own "
+                    "concept for a provider that shells out to a CLI tool instead of "
+                    "calling an HTTP API. No custom/other option here — a genuinely "
+                    "unsupported API shape needs matching gateway-side code before it "
+                    "could ever work."
+                  ) }}
+                </label>
+                <select name="api_type"
+                  class="w-full bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm text-gray-200 focus:border-indigo-500 focus:outline-none">
+                  {# Same closed list as the add-provider form above — see the
+                     comment there for why the four unsupported options were
+                     removed. #}
+                  <option value="">— keep current —</option>
+                  <optgroup label="Anthropic">
+                    <option value="anthropic-messages">anthropic-messages</option>
+                  </optgroup>
+                  <optgroup label="OpenAI">
+                    <option value="openai-completions">openai-completions</option>
+                    <option value="openai-responses">openai-responses</option>
+                    <option value="openai-codex-responses">openai-codex-responses</option>
+                  </optgroup>
+                  <optgroup label="Google">
+                    <option value="google-generative-ai">google-generative-ai</option>
+                  </optgroup>
+                  <optgroup label="Amazon">
+                    <option value="bedrock-converse-stream">bedrock-converse-stream</option>
+                  </optgroup>
+                  <optgroup label="Other">
+                    <option value="github-copilot">github-copilot</option>
+                    <option value="ollama">ollama</option>
+                  </optgroup>
+                  <optgroup label="CLI-backed (not sent to the gateway)">
+                    <option value="cli">cli</option>
+                  </optgroup>
+                </select>
+              </div>
+            </div>
+          </div>
+
+          <div class="pt-2 border-t border-gray-800">
+            <label class="block text-xs text-gray-400 mb-1 flex items-center gap-1.5">
+              Secret Manager name <span class="text-gray-600">(current: {{ provider.secret_id or 'NULL' }})</span>
+              {{ info_popover(
+                "Just the secret's short id — the gateway resolves it against its own GCP project "
+                "(the project the VM is deployed in, not typed here) and always reads the latest version."
+              ) }}
+            </label>
+            <input type="text" name="secret_id" placeholder="{{ provider.secret_id or 'anthropic-api-key' }}"
+              class="w-full bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm text-gray-200 focus:border-indigo-500 focus:outline-none">
+          </div>
+
+          {% if provider.secret_id %}
+          <div class="pt-3 border-t border-gray-800">
+            <p class="text-xs font-semibold text-gray-400 mb-2 flex items-center gap-1.5">
+              Credential health
+              {{ info_popover(
+                "Healthy/Unhealthy come from the gateway's own resolve attempts against "
+                "Secret Manager, refreshed automatically every 5 minutes. Revoked is "
+                "different: it's an admin action here in AgentOS, not a Secret Manager "
+                "state — the secret itself is untouched and still resolves fine if "
+                "queried directly. Revoking just tells the gateway to stop using the "
+                "value going forward. It stays Revoked even through automatic refreshes "
+                "until you rotate to a new secret name above."
+              ) }}
+            </p>
+            <div class="flex items-center gap-2 text-sm">
+              {% if provider.credential_status == 'revoked' %}
+                <span class="w-2 h-2 rounded-full bg-red-500"></span>
+                <span class="text-red-400">Revoked</span>
+              {% elif provider.credential_status == 'healthy' %}
+                <span class="w-2 h-2 rounded-full bg-green-500"></span>
+                <span class="text-green-400">Healthy</span>
+              {% elif provider.credential_status == 'unhealthy' %}
+                <span class="w-2 h-2 rounded-full bg-red-500"></span>
+                <span class="text-red-400">Unhealthy{% if provider.credential_error %}: {{ provider.credential_error }}{% endif %}</span>
+              {% else %}
+                <span class="w-2 h-2 rounded-full bg-gray-600"></span>
+                <span class="text-gray-500">Not yet checked</span>
+              {% endif %}
+              <span class="text-gray-600 text-xs"
+                {% if provider.credential_checked_at %}data-utc="{{ provider.credential_checked_at.isoformat() }}"{% endif %}>
+                {% if provider.credential_checked_at %}— last checked {{ provider.credential_checked_at.strftime("%Y-%m-%d %H:%M") }} UTC{% else %}— never checked{% endif %}
+              </span>
+            </div>
+            <p class="text-2xs text-gray-600 mt-1">
+              Saving this form (or clicking Refresh below) signals the gateway
+              to re-resolve the secret immediately — no restart, no other
+              active goal is affected.
+            </p>
+          </div>
+          {% endif %}
+
+          <div class="flex items-center justify-between pt-2">
+            {% if provider.secret_id %}
+            <div class="flex gap-2">
+              <button type="button"
+                      onclick="confirmProviderAction('{{ provider.id }}', 'refresh-credentials', 'Refresh credentials?', 'Re-resolves this provider\'s secret from Secret Manager right now, instead of waiting for the 5-minute self-heal poll. No gateway restart, no other goal is affected.')"
+                      class="btn btn-secondary btn-sm">
+                Refresh credentials
+              </button>
+              <button type="button"
+                      onclick="confirmProviderAction('{{ provider.id }}', 'revoke-credentials', 'Revoke this credential?', 'Marks this credential revoked in AgentOS and tells the gateway to stop using it going forward. This does NOT touch Secret Manager or the underlying provider key — only the provider\'s own console can actually revoke that. A request already in flight will still complete. To reverse this, rotate to a new Secret Manager name below (that automatically clears the revoked mark).', true)"
+                      class="btn btn-danger btn-sm">
+                Revoke
+              </button>
+            </div>
+            {% else %}
+            <div></div>
+            {% endif %}
+            <div class="flex justify-end gap-3">
+              <button type="button" onclick="document.getElementById('edit-provider-{{ provider.id }}').classList.add('hidden')"
+                      class="btn btn-secondary btn-sm">Cancel</button>
+              <button type="submit"
+                      class="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white text-sm rounded font-medium">
+                Save changes
+              </button>
+            </div>
+          </div>
+        </form>
+      </div>
+    </div>
+    {% endfor %}
+  {% endif %}
+
+
+  {# ── Add-model modals (one per provider — pre-selects the provider) ──── #}
+  {% if can_edit %}
+    {% for provider in providers %}
+    <div id="add-model-{{ provider.id }}"
+         class="hidden fixed inset-0 z-50 flex items-center justify-center bg-black/60">
+      <div class="bg-gray-900 border border-gray-700 rounded-xl p-6 w-full max-w-2xl shadow-2xl">
+        <div class="flex items-center justify-between mb-4">
+          <h2 class="text-base font-semibold">Add model to <span class="font-mono text-sm text-gray-400">{{ provider.id }}</span></h2>
+          <button type="button" onclick="document.getElementById('add-model-{{ provider.id }}').classList.add('hidden')"
+                  class="text-gray-500 hover:text-gray-300 text-xl leading-none">&times;</button>
+        </div>
+        <p class="text-xs text-gray-500 mb-5 flex items-center gap-1.5">
+          Registered as <span class="font-mono text-gray-400">{{ provider.id }}/&lt;model name&gt;</span>.
+          Variants (context-window sizes) are added separately via the model row's
+          <span class="text-gray-300">&#8942;</span> menu.
+          {{ info_popover(
+            "The model name can be whatever this provider's own upstream API "
+            "calls it — free text, no format restriction, including further "
+            "slashes if that's how the provider names it (e.g. a Vertex-style "
+            "publishers/google/models/gemini-pro). It's joined onto \"" + provider.id + "/\" "
+            "server-side to form the registry id; you don't type the provider "
+            "prefix yourself."
+          ) }}
+        </p>
+
+        <form method="post" action="/settings/model-registry/models" class="space-y-4">
+          {# Provider is fixed by which provider's "+ Add model" button opened
+             this modal (one modal instance per provider, see the loop this
+             lives in) — no dropdown needed, it can only ever be this one. #}
+          <input type="hidden" name="provider_id" value="{{ provider.id }}">
+          <div>
+            <label class="block text-xs text-gray-400 mb-1">Model name</label>
+            <div class="flex items-center gap-2">
+              <span class="font-mono text-sm text-gray-500 whitespace-nowrap">{{ provider.id }}/</span>
+              <input type="text" name="id_suffix" required placeholder="my-model"
+                class="w-full bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm text-gray-200 focus:border-indigo-500 focus:outline-none">
+            </div>
+          </div>
+
+          <div>
+            <label class="block text-xs text-gray-400 mb-1">Label</label>
+            <input type="text" name="label" required placeholder="My Model"
+              class="w-full bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm text-gray-200 focus:border-indigo-500 focus:outline-none">
+          </div>
+
+          <div class="grid grid-cols-2 gap-4">
+            <div>
+              <label class="block text-xs text-gray-400 mb-1">Tier</label>
+              <select name="tier" required
+                class="w-full bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm text-gray-200 focus:border-indigo-500 focus:outline-none">
+                <option value="fast">fast</option>
+                <option value="balanced">balanced</option>
+                <option value="premium">premium</option>
+                <option value="agentic">agentic</option>
+              </select>
+            </div>
+            <div>
+              <label class="block text-xs text-gray-400 mb-1">Context window <span class="text-gray-600">(tokens)</span></label>
+              <input type="number" name="context_window" required min="1" max="10000000" placeholder="1000000"
+                class="w-full bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm text-gray-200 focus:border-indigo-500 focus:outline-none">
+            </div>
+          </div>
+
+          {# Short name is required for API providers but meaningless for CLI
+             ones: it exists only to build context-window variant ids, and the
+             emitter drops any variant whose provider has no base_url/
+             api_key_source — which is exactly the CLI case. Requiring it there
+             would force an operator to invent a value that can never be used.
+             Matches the seed, which deliberately leaves claude-cli/* NULL. #}
+          <div>
+            <label class="block text-xs text-gray-400 mb-1 flex items-center gap-1.5">
+              Short name
+              <span class="text-gray-600">{% if provider.api_type == 'cli' %}(not used for CLI models){% else %}(required){% endif %}</span>
+              {{ info_popover(
+                "A short nickname for THIS model — 'sonnet', 'flash', 'opus48'. Not the "
+                "provider's name. It's used to build the id of each context-window variant "
+                "you add later: short name 'sonnet' on an Anthropic model produces variants "
+                "named anthropic-sonnet-200k, anthropic-sonnet-500k, and so on. "
+                "Must be unique among this provider's models — two models under the same "
+                "provider sharing a short name would generate colliding variant ids. "
+                "Lowercase letters, digits and hyphens. CLI-backed providers never produce "
+                "context-window variants, so the field is optional and unused for them."
+              ) }}
+            </label>
+            <input type="text" name="provider_shorthand" placeholder="sonnet"
+              {% if provider.api_type != 'cli' %}required{% endif %}
+              class="w-full bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm text-gray-200 focus:border-indigo-500 focus:outline-none">
+            <p class="text-2xs text-gray-600 mt-1">
+              {% if provider.api_type == 'cli' %}
+              CLI models don't produce context-window variants, so this can be left blank.
+              {% else %}
+              Used to name context-window variants, e.g. <span class="font-mono text-gray-500">{{ provider.id }}-sonnet-200k</span>.
+              {% endif %}
+            </p>
+          </div>
+
+          <div>
+            <label class="block text-xs text-gray-400 mb-1">Tags <span class="text-gray-600">('reasoning'/'vision' feed the gateway wire contract — see tag descriptions)</span></label>
+            <div class="flex flex-wrap gap-3">
+              {% for tag in all_tags %}
+              <label class="flex items-center gap-1.5 text-xs text-gray-300" title="{{ tag.description or '' }}">
+                <input type="checkbox" name="tags" value="{{ tag.name }}"
+                  class="rounded border-gray-700 bg-gray-800 text-indigo-500 focus:ring-indigo-500">
+                {{ tag.name }}
+              </label>
+              {% endfor %}
+              {% if not all_tags %}
+              <span class="text-xs text-gray-600 italic">(no tags defined yet)</span>
+              {% endif %}
+            </div>
+          </div>
+
+          <div class="flex justify-end gap-3 pt-2">
+            <button type="button" onclick="document.getElementById('add-model-{{ provider.id }}').classList.add('hidden')"
+                    class="btn btn-secondary btn-sm">Cancel</button>
+            <button type="submit"
+                    class="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white text-sm rounded font-medium">
+              Add model
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+    {% endfor %}
+  {% endif %}
+
+  {# ── Edit-model modals (one per model row) ───────────────────────────── #}
+  {% if can_edit %}
+    {% for provider in providers %}
+      {% for m in provider.models %}
+      <div id="edit-model-{{ m.id | replace('/', '__') }}"
+           class="hidden fixed inset-0 z-50 flex items-center justify-center bg-black/60">
+        <div class="bg-gray-900 border border-gray-700 rounded-xl p-6 w-full max-w-2xl shadow-2xl">
+          <div class="flex items-center justify-between mb-4">
+            <h2 class="text-base font-semibold">Edit model <span class="font-mono text-sm text-gray-400">{{ m.id }}</span></h2>
+            <button type="button" onclick="document.getElementById('edit-model-{{ m.id | replace('/', '__') }}').classList.add('hidden')"
+                    class="text-gray-500 hover:text-gray-300 text-xl leading-none">&times;</button>
+          </div>
+          <p class="text-xs text-gray-500 mb-5">
+            Leave any field blank to keep its current value. Model id, provider,
+            and model_name are immutable; use Disable / Enable to toggle visibility.
+          </p>
+
+          <form method="post" action="/settings/model-registry/models/{{ m.id }}/update" class="space-y-4">
+            <div class="grid grid-cols-2 gap-4">
+              <div>
+                <label class="block text-xs text-gray-400 mb-1">Label <span class="text-gray-600">(current: {{ m.label }})</span></label>
+                <input type="text" name="label" placeholder="{{ m.label }}"
+                  class="w-full bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm text-gray-200 focus:border-indigo-500 focus:outline-none">
+              </div>
+              <div>
+                <label class="block text-xs text-gray-400 mb-1">Tier <span class="text-gray-600">(current: {{ m.tier }})</span></label>
+                <select name="tier"
+                  class="w-full bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm text-gray-200 focus:border-indigo-500 focus:outline-none">
+                  <option value="">— keep current —</option>
+                  <option value="fast">fast</option>
+                  <option value="balanced">balanced</option>
+                  <option value="premium">premium</option>
+                  <option value="agentic">agentic</option>
+                </select>
+              </div>
+            </div>
+
+            <div class="grid grid-cols-2 gap-4">
+              <div>
+                <label class="block text-xs text-gray-400 mb-1">Context window <span class="text-gray-600">(current: {{ "{:,}".format(m.context_window) }})</span></label>
+                <input type="number" name="context_window" min="1" max="10000000" placeholder="{{ m.context_window }}"
+                  class="w-full bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm text-gray-200 focus:border-indigo-500 focus:outline-none">
+              </div>
+              <div>
+                <label class="block text-xs text-gray-400 mb-1">Status <span class="text-gray-600">(current: {{ m.status }})</span></label>
+                <select name="status"
+                  class="w-full bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm text-gray-200 focus:border-indigo-500 focus:outline-none">
+                  <option value="">— keep current —</option>
+                  <option value="active">active</option>
+                  <option value="disabled">disabled</option>
+                </select>
+              </div>
+            </div>
+
+            <div>
+              <label class="block text-xs text-gray-400 mb-1 flex items-center gap-1.5">
+                Short name <span class="text-gray-600">(current: {{ m.provider_shorthand or 'not set' }})</span>
+                {{ info_popover(
+                  "A short nickname for this model ('sonnet', 'flash', 'opus48'), used to build "
+                  "the id of each context-window variant — e.g. anthropic-sonnet-200k. Must be "
+                  "unique among this provider's models. Leave blank to keep the current value; "
+                  "changing it renames every variant id this model generates, so anything "
+                  "pinned to an old variant id will stop resolving."
+                ) }}
+              </label>
+              <input type="text" name="provider_shorthand" placeholder="{{ m.provider_shorthand or 'sonnet' }}"
+                class="w-full bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm text-gray-200 focus:border-indigo-500 focus:outline-none">
+            </div>
+
+            <div>
+              <label class="block text-xs text-gray-400 mb-1">Tags <span class="text-gray-600">(current: {{ m.tags | join(', ') if m.tags else 'none' }})</span></label>
+              <input type="hidden" name="tags_submitted" value="1">
+              <div class="flex flex-wrap gap-3">
+                {% for tag in all_tags %}
+                <label class="flex items-center gap-1.5 text-xs text-gray-300" title="{{ tag.description or '' }}">
+                  <input type="checkbox" name="tags" value="{{ tag.name }}" {% if tag.name in m.tags %}checked{% endif %}
+                    class="rounded border-gray-700 bg-gray-800 text-indigo-500 focus:ring-indigo-500">
+                  {{ tag.name }}
+                </label>
+                {% endfor %}
+                {% if not all_tags %}
+                <span class="text-xs text-gray-600 italic">(no tags defined yet)</span>
+                {% endif %}
+              </div>
+            </div>
+
+            <div class="flex justify-end gap-3 pt-2">
+              <button type="button" onclick="document.getElementById('edit-model-{{ m.id | replace('/', '__') }}').classList.add('hidden')"
+                      class="btn btn-secondary btn-sm">Cancel</button>
+              <button type="submit"
+                      class="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white text-sm rounded font-medium">
+                Save changes
+              </button>
+            </div>
+          </form>
+        </div>
+      </div>
+      {% endfor %}
+    {% endfor %}
+  {% endif %}
+
+  {# ── Add-context-window modals (one per model row) ───────────────────── #}
+  {% if can_edit %}
+    {% for provider in providers %}
+      {% for m in provider.models %}
+      <div id="add-cw-{{ m.id | replace('/', '__') }}"
+           class="hidden fixed inset-0 z-50 flex items-center justify-center bg-black/60">
+        <div class="bg-gray-900 border border-gray-700 rounded-xl p-6 w-full max-w-md shadow-2xl">
+          <div class="flex items-center justify-between mb-4">
+            <h2 class="text-base font-semibold">Add context window <span class="font-mono text-sm text-gray-400">{{ m.id }}</span></h2>
+            <button type="button" onclick="document.getElementById('add-cw-{{ m.id | replace('/', '__') }}').classList.add('hidden')"
+                    class="text-gray-500 hover:text-gray-300 text-xl leading-none">&times;</button>
+          </div>
+          <p class="text-xs text-gray-500 mb-5">
+            Token count must be a positive multiple of 1&nbsp;000
+            (e.g. 50000, 100000, 1000000). The variant id is built from this
+            model&#39;s short name — adding 200000 here would create
+            {% if m.provider_shorthand %}
+            <span class="font-mono text-gray-400">{{ m.provider_id }}-{{ m.provider_shorthand }}-200k</span>.
+            {% else %}
+            <span class="text-amber-400">— but this model has no short name yet. Set one via Edit model first, or the variant cannot be built.</span>
+            {% endif %}
+          </p>
+
+          <form method="post" action="/settings/model-registry/models/{{ m.id }}/context-windows" class="space-y-4">
+            <div>
+              <label class="block text-xs text-gray-400 mb-1">Tokens</label>
+              <input type="number" name="tokens" required min="1000" step="1000" placeholder="100000"
+                class="w-full bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm text-gray-200 focus:border-indigo-500 focus:outline-none">
+            </div>
+
+            <div class="flex justify-end gap-3 pt-2">
+              <button type="button" onclick="document.getElementById('add-cw-{{ m.id | replace('/', '__') }}').classList.add('hidden')"
+                      class="btn btn-secondary btn-sm">Cancel</button>
+              <button type="submit"
+                      class="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white text-sm rounded font-medium">
+                Add variant
+              </button>
+            </div>
+          </form>
+        </div>
+      </div>
+      {% endfor %}
+    {% endfor %}
+  {% endif %}
+
+  {# ── Add-pricing-version modals (one per linked pricing row) ─────────────
+     Append-only: this always INSERTs a new row (never edits an existing
+     one) — see model_pricing.py's module docstring. provider/model are
+     resolved server-side from model_id, never submitted by this form. #}
+  {% if can_edit %}
+    {% for entry in pricing_linked %}
+    {% set row_key = entry.model_id | replace('/', '__') %}
+    <div id="add-price-{{ row_key }}"
+         class="hidden fixed inset-0 z-50 flex items-center justify-center bg-black/60">
+      <div class="bg-gray-900 border border-gray-700 rounded-xl p-6 w-full max-w-md shadow-2xl">
+        <div class="flex items-center justify-between mb-4">
+          <h2 class="text-base font-semibold">Add rate <span class="font-mono text-sm text-gray-400">{{ entry.model_id }}</span></h2>
+          <button type="button" onclick="document.getElementById('add-price-{{ row_key }}').classList.add('hidden')"
+                  class="text-gray-500 hover:text-gray-300 text-xl leading-none">&times;</button>
+        </div>
+        <p class="text-xs text-gray-500 mb-5">
+          Inserts a new rate version effective from the timestamp below (defaults to
+          now). To correct a mistake, add another version rather than editing history.
+        </p>
+
+        <form method="post" action="/settings/model-registry/models/{{ entry.model_id }}/pricing" class="space-y-3">
+          <div class="grid grid-cols-2 gap-3">
+            <div>
+              <label class="block text-xs text-gray-400 mb-1">Input rate ($/token)</label>
+              <input type="number" name="input_rate" step="0.00000001" required
+                     value="{{ entry.current.input_rate }}"
+                     class="w-full bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm text-gray-200 focus:border-indigo-500 focus:outline-none">
+            </div>
+            <div>
+              <label class="block text-xs text-gray-400 mb-1">Output rate ($/token)</label>
+              <input type="number" name="output_rate" step="0.00000001" required
+                     value="{{ entry.current.output_rate }}"
+                     class="w-full bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm text-gray-200 focus:border-indigo-500 focus:outline-none">
+            </div>
+            <div>
+              <label class="block text-xs text-gray-400 mb-1">Cache read rate</label>
+              <input type="number" name="cache_read_rate" step="0.00000001"
+                     value="{{ entry.current.cache_read_rate }}"
+                     class="w-full bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm text-gray-200 focus:border-indigo-500 focus:outline-none">
+            </div>
+            <div>
+              <label class="block text-xs text-gray-400 mb-1">Cache write rate</label>
+              <input type="number" name="cache_write_rate" step="0.00000001"
+                     value="{{ entry.current.cache_write_rate }}"
+                     class="w-full bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm text-gray-200 focus:border-indigo-500 focus:outline-none">
+            </div>
+          </div>
+          <div>
+            <label class="block text-xs text-gray-400 mb-1">Thinking rate (blank = use output rate)</label>
+            <input type="number" name="thinking_rate" step="0.00000001"
+                   value="{{ entry.current.thinking_rate if entry.current.thinking_rate is not none else '' }}"
+                   class="w-full bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm text-gray-200 focus:border-indigo-500 focus:outline-none">
+          </div>
+          <div>
+            <label class="block text-xs text-gray-400 mb-1">Effective from (blank = now)</label>
+            <input type="datetime-local" name="effective_from"
+                   class="w-full bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm text-gray-200 focus:border-indigo-500 focus:outline-none">
+          </div>
+          <div>
+            <label class="block text-xs text-gray-400 mb-1">Notes</label>
+            <input type="text" name="notes" placeholder="optional"
+                   class="w-full bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm text-gray-200 focus:border-indigo-500 focus:outline-none">
+          </div>
+
+          <div class="flex justify-end gap-3 pt-2">
+            <button type="button" onclick="document.getElementById('add-price-{{ row_key }}').classList.add('hidden')"
+                    class="btn btn-secondary btn-sm">Cancel</button>
+            <button type="submit"
+                    class="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white text-sm rounded font-medium">
+              Add rate version
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+    {% endfor %}
+  {% endif %}
+
+  {# ── Add-first-price modals (one per unpriced model) ──────────────────────
+     Same shape as the Add-pricing-version modal above, minus pre-filled
+     current values (there is no current rate yet — that's the point). #}
+  {% if can_edit %}
+    {% for m in unpriced_models %}
+    {% set row_key = m.id | replace('/', '__') %}
+    <div id="add-price-new-{{ row_key }}"
+         class="hidden fixed inset-0 z-50 flex items-center justify-center bg-black/60">
+      <div class="bg-gray-900 border border-gray-700 rounded-xl p-6 w-full max-w-md shadow-2xl">
+        <div class="flex items-center justify-between mb-4">
+          <h2 class="text-base font-semibold">Add price <span class="font-mono text-sm text-gray-400">{{ m.id }}</span></h2>
+          <button type="button" onclick="document.getElementById('add-price-new-{{ row_key }}').classList.add('hidden')"
+                  class="text-gray-500 hover:text-gray-300 text-xl leading-none">&times;</button>
+        </div>
+        <p class="text-xs text-gray-500 mb-5">
+          This model has no pricing yet — inserts its first rate version,
+          effective from the timestamp below (defaults to now).
+        </p>
+
+        <form method="post" action="/settings/model-registry/models/{{ m.id }}/pricing" class="space-y-3">
+          <div class="grid grid-cols-2 gap-3">
+            <div>
+              <label class="block text-xs text-gray-400 mb-1">Input rate ($/token)</label>
+              <input type="number" name="input_rate" step="0.00000001" required placeholder="0.00000000"
+                     class="w-full bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm text-gray-200 focus:border-indigo-500 focus:outline-none">
+            </div>
+            <div>
+              <label class="block text-xs text-gray-400 mb-1">Output rate ($/token)</label>
+              <input type="number" name="output_rate" step="0.00000001" required placeholder="0.00000000"
+                     class="w-full bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm text-gray-200 focus:border-indigo-500 focus:outline-none">
+            </div>
+            <div>
+              <label class="block text-xs text-gray-400 mb-1">Cache read rate</label>
+              <input type="number" name="cache_read_rate" step="0.00000001" placeholder="0.00000000"
+                     class="w-full bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm text-gray-200 focus:border-indigo-500 focus:outline-none">
+            </div>
+            <div>
+              <label class="block text-xs text-gray-400 mb-1">Cache write rate</label>
+              <input type="number" name="cache_write_rate" step="0.00000001" placeholder="0.00000000"
+                     class="w-full bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm text-gray-200 focus:border-indigo-500 focus:outline-none">
+            </div>
+          </div>
+          <div>
+            <label class="block text-xs text-gray-400 mb-1">Thinking rate (blank = use output rate)</label>
+            <input type="number" name="thinking_rate" step="0.00000001" placeholder="optional"
+                   class="w-full bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm text-gray-200 focus:border-indigo-500 focus:outline-none">
+          </div>
+          <div>
+            <label class="block text-xs text-gray-400 mb-1">Effective from (blank = now)</label>
+            <input type="datetime-local" name="effective_from"
+                   class="w-full bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm text-gray-200 focus:border-indigo-500 focus:outline-none">
+          </div>
+          <div>
+            <label class="block text-xs text-gray-400 mb-1">Notes</label>
+            <input type="text" name="notes" placeholder="optional"
+                   class="w-full bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm text-gray-200 focus:border-indigo-500 focus:outline-none">
+          </div>
+
+          <div class="flex justify-end gap-3 pt-2">
+            <button type="button" onclick="document.getElementById('add-price-new-{{ row_key }}').classList.add('hidden')"
+                    class="btn btn-secondary btn-sm">Cancel</button>
+            <button type="submit"
+                    class="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white text-sm rounded font-medium">
+              Add price
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+    {% endfor %}
+  {% endif %}
+
+  {% if view == 'misc' %}
+  {# ── Utility Models ────────────────────────────────────────────────────
+     One row per registered purpose (MISC_MODEL_PURPOSES in
+     app/services/misc_models.py). Dropdown options come from
+     list_utility_model_options() — every active row in the SAME `models`
+     registry table the Registry tab maintains, across every provider —
+     not a second hand-maintained list. Credentials are resolved at call
+     time per-provider (Secret Manager reference on the registry's
+     provider row, falling back to the provider's legacy env var) by
+     app/services/utility_llm.py — this tab only picks WHICH model, never
+     stores a credential itself. Selecting "Default" clears the override
+     (DELETE) — see admin_update_misc_model. If a purpose's current
+     override isn't in the live options (e.g. it was removed from the
+     Registry since), it's still shown so the operator doesn't silently
+     lose visibility into what's actually configured. #}
+  <div class="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden">
+    <div class="px-4 py-3 border-b border-gray-800">
+      <h2 class="text-sm font-semibold">Utility Models</h2>
+      <p class="text-xs text-gray-500 mt-1">
+        Any active model from the Registry tab, any provider. Credentials are
+        resolved from that same provider's Secret Manager reference (or its
+        legacy env var if none is set) — add a model on the Registry tab
+        first if it's missing here.
+      </p>
+    </div>
+    <table class="w-full text-sm">
+      <thead>
+        <tr class="text-left text-xs text-gray-500 border-b border-gray-800">
+          <th class="px-4 py-2 font-medium">Purpose</th>
+          <th class="px-4 py-2 font-medium">Model</th>
+          <th class="px-4 py-2 font-medium">Context window</th>
+          <th class="px-4 py-2 font-medium"></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% set options_by_id = {} %}
+        {% for pm in misc_models %}
+        {% for opt in pm.options or utility_model_options %}{% set _ = options_by_id.update({opt.id: opt}) %}{% endfor %}
+        {% set current_opt = options_by_id.get(pm.model_id) %}
+        <tr class="border-b border-gray-800/60 last:border-0">
+          <td class="px-4 py-3">
+            <div class="text-gray-200">{{ pm.label }}</div>
+            <div class="text-xs text-gray-500 font-mono">{{ pm.purpose_key }}</div>
+          </td>
+          <td class="px-4 py-3">
+            {% if can_edit %}
+            <form method="post" action="/settings/model-registry/misc-models/{{ pm.purpose_key }}/update"
+                  class="flex items-center gap-2">
+              <select name="model_id" class="bg-surface border border-border rounded px-2 py-1 text-sm font-mono">
+                <option value="" {% if not pm.is_override %}selected{% endif %}>
+                  Default ({{ pm.default_model_id }})
+                </option>
+                {% if pm.is_override and not current_opt %}
+                <option value="{{ pm.model_id }}" selected>{{ pm.model_id }} (not in Registry)</option>
+                {% endif %}
+                {% for opt in pm.options or utility_model_options %}
+                <option value="{{ opt.id }}" {% if pm.is_override and pm.model_id == opt.id %}selected{% endif %}>{{ opt.id }}</option>
+                {% endfor %}
+              </select>
+              <button type="submit" class="btn btn-secondary btn-sm">Save</button>
+            </form>
+            {% else %}
+            <span class="font-mono">{{ pm.model_id }}</span>{% if not pm.is_override %} <span class="text-xs text-gray-500">(default)</span>{% endif %}
+            {% endif %}
+          </td>
+          <td class="px-4 py-3 text-xs text-gray-500">
+            {% if current_opt and current_opt.context_window %}{{ "{:,}".format(current_opt.context_window) }} tokens{% endif %}
+          </td>
+          <td class="px-4 py-3 text-xs text-gray-500">
+            {% if pm.is_override %}<span class="text-amber-400">override</span>{% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endif %}
+
+</div>
+
+{# ── Actions-menu dropdown helpers ─────────────────────────────────────────
+   Shared by every provider-row and model-row "⋮" button — one dropdown
+   instead of a row of individual buttons. `toggleActionsMenu` closes any
+   OTHER open menu before opening this one (only one at a time), and the
+   document-level listener closes an open menu on any outside click. #}
+<script>
+  function closeActionsMenus() {
+    document.querySelectorAll('.dropdown-menu:not(.hidden)').forEach(function (el) {
+      el.classList.add('hidden');
+    });
+  }
+  function toggleActionsMenu(event) {
+    event.stopPropagation();
+    const menu = event.currentTarget.nextElementSibling;
+    const wasHidden = menu.classList.contains('hidden');
+    closeActionsMenus();
+    if (wasHidden) menu.classList.remove('hidden');
+  }
+  document.addEventListener('click', closeActionsMenus);
+  // Any dropdown item that's a real <button type="submit"> inside a <form>
+  // (Disable/Enable, not a JS-driven onclick like Edit/+Add) MUST stop
+  // propagation on its own form (or button), or this document-level
+  // listener hides the menu — display:none — during the same click's
+  // bubble phase, before the browser gets to run the button's native
+  // default action. Browsers cancel a pending form submission when its
+  // element goes hidden mid-click, so the submit silently never happens.
+  // Confirmed live: this exact bug made every Disable/Enable button in
+  // this dropdown a no-op until each form got its own stopPropagation.
+
+  async function confirmProviderAction(providerId, action, title, body, danger) {
+    const result = await window.confirmAction({ title: title, body: body, danger: !!danger });
+    if (!result || !result.confirmed) return;
+    const form = document.createElement('form');
+    form.method = 'post';
+    form.action = `/settings/model-registry/providers/${providerId}/${action}`;
+    document.body.appendChild(form);
+    form.submit();
+  }
+</script>
+{% endblock %}

@@ -122,7 +122,12 @@ def verify_bootstrap_bearer(request: Request) -> None:
     auth = request.headers.get("Authorization", "")
     if settings.agent_scoped_tokens_enabled:
         _tok = auth[len("Bearer "):] if auth.startswith("Bearer ") else ""
-        if _tok and _decode_agent_token(_tok) is not None:
+        _cl = _decode_agent_token(_tok) if _tok else None
+        # Only a per-agent ('agent') JWT may mint here. A 'human_local' token must
+        # NOT be able to mint agent JWTs at /internal/agent-token (§14.1 / §14.6
+        # bootstrap-mint guard) — it falls through to the shared-token check, which
+        # it won't satisfy, so it 401s.
+        if _cl is not None and _cl.get("typ") == "agent":
             return
     if not _bearer_matches(auth, settings.openclaw_auth_token):
         raise HTTPException(status_code=401, detail="Invalid agent token")
@@ -152,6 +157,10 @@ class AgentPrincipal:
     # revocation gap: a JWT stays valid until exp (~1h) even if the instance is
     # destroyed mid-life, so the accept path re-checks liveness (see check_principal_live).
     agent_instance_id: Optional[str] = None
+    # 'agent' (per-agent JWT) or 'human_local' (Local Execution Mode token, §14.1).
+    token_type: str = "agent"
+    # Story a human-local token is scoped to (None for per-agent tokens).
+    story_id: Optional[str] = None
 
 
 def mint_agent_token(
@@ -179,6 +188,73 @@ def mint_agent_token(
     return jwt.encode(payload, key, algorithm=_JWT_ALG)
 
 
+def mint_human_local_token(
+    agent_id: str,
+    goal_id: str,
+    story_id: str,
+    agent_instance_id: Optional[str] = None,
+    ttl_seconds: int = 3600,
+) -> str:
+    """Mint a short-lived STORY-scoped human-local JWT for the Local Execution
+    extension (§14.1). Same machinery as mint_agent_token but typ='human_local'
+    + a story_id claim; carries the SHCA instance id (aiid) so events attribute
+    to the assistant on_behalf_of the human. Verified through the SAME single
+    decoder — it authenticates /internal/*, is goal+story scoped by ownership_guard,
+    is 403'd at /approvals/decide (human gate preserved), and CANNOT mint agent
+    JWTs (verify_bootstrap_bearer only accepts typ='agent')."""
+    key = get_settings().agent_token_signing_key
+    if not key:
+        raise RuntimeError("agent_token_signing_key not configured")
+    # aiid is REQUIRED for a human-local token — without it request_actor can't
+    # resolve obo (owner) and would misattribute the action to SYSTEM (§14.1).
+    if not agent_instance_id:
+        raise RuntimeError("human_local token requires agent_instance_id for obo attribution")
+    now = int(time.time())
+    payload = {
+        "typ": "human_local",
+        "sub": agent_id,
+        "goal_id": goal_id,
+        "story_id": story_id,
+        "scopes": [],
+        "aiid": str(agent_instance_id),
+        "iat": now,
+        "exp": now + int(ttl_seconds),
+    }
+    return jwt.encode(payload, key, algorithm=_JWT_ALG)
+
+
+def mint_ext_session_token(uid: str, ttl_seconds: int = 3600) -> str:
+    """CP-minted session token for the Local Execution extension — represents the
+    HUMAN (uid). Short-lived; the extension re-mints via its refresh handle
+    (option B, §6). Distinct typ='ext_session': it is NOT accepted by
+    _decode_agent_token (agent endpoints) or verify_bootstrap_bearer — only
+    decode_ext_session_uid reads it, at the human-facing local endpoints."""
+    key = get_settings().agent_token_signing_key
+    if not key:
+        raise RuntimeError("agent_token_signing_key not configured")
+    now = int(time.time())
+    return jwt.encode(
+        {"typ": "ext_session", "sub": uid, "iat": now, "exp": now + int(ttl_seconds)},
+        key, algorithm=_JWT_ALG,
+    )
+
+
+def decode_ext_session_uid(token: str) -> Optional[str]:
+    """Verify an ext_session token → uid, else None. Kept separate from
+    _decode_agent_token so an ext_session token can never authenticate an agent
+    endpoint or mint agent JWTs (typ isolation)."""
+    key = get_settings().agent_token_signing_key
+    if not key or not token:
+        return None
+    try:
+        claims = jwt.decode(token, key, algorithms=[_JWT_ALG])
+    except jwt.PyJWTError:
+        return None
+    if claims.get("typ") != "ext_session":
+        return None
+    return str(claims.get("sub") or "") or None
+
+
 def _decode_agent_token(token: str) -> Optional[dict]:
     """Verify signature + expiry; return claims or None (never raises). algorithms
     pinned to HS256 to prevent alg-confusion attacks."""
@@ -189,7 +265,12 @@ def _decode_agent_token(token: str) -> Optional[dict]:
         claims = jwt.decode(token, key, algorithms=[_JWT_ALG])
     except jwt.PyJWTError:
         return None
-    return claims if claims.get("typ") == "agent" else None
+    # Accept per-agent ('agent') AND Local Execution human-local ('human_local')
+    # tokens through this SINGLE decoder — every consumer (verify_internal_bearer,
+    # ownership_guard, request_actor, the /approvals 403) keys off it, so widening
+    # here makes goal/story scoping + obo attribution + the approval gate all work
+    # for the local token with no side path (§14.1).
+    return claims if claims.get("typ") in ("agent", "human_local") else None
 
 
 def get_agent_principal(request: Request) -> Optional[AgentPrincipal]:
@@ -208,6 +289,8 @@ def get_agent_principal(request: Request) -> Optional[AgentPrincipal]:
         goal_id=str(claims.get("goal_id") or ""),
         scopes=tuple(claims.get("scopes") or ()),
         agent_instance_id=(str(claims["aiid"]) if claims.get("aiid") else None),
+        token_type=str(claims.get("typ") or "agent"),
+        story_id=(str(claims["story_id"]) if claims.get("story_id") else None),
     )
 
 
@@ -253,6 +336,24 @@ def require_goal_ownership(request: Request, target_goal_id: str) -> None:
                  principal.agent_id, principal.goal_id, target_goal_id)
 
 
+def require_story_ownership(request: Request, target_story_id: str) -> None:
+    """Enforce that a STORY-scoped human-local token only acts on ITS story
+    (§14.1 story-level scoping — ownership_guard is otherwise goal-only). No-op for
+    per-agent tokens (no story_id) and legacy callers. SHADOW unless AGENT_AUTHZ_ENFORCE
+    (mirrors require_goal_ownership)."""
+    principal = get_agent_principal(request)
+    if principal is None or not principal.story_id or not target_story_id:
+        return
+    if principal.story_id == target_story_id:
+        return
+    if get_settings().agent_authz_enforce:
+        _log.warning("internal_auth: DENY cross-story agent=%s token_story=%s target_story=%s",
+                     principal.agent_id, principal.story_id, target_story_id)
+        raise HTTPException(status_code=403, detail="cross-story access denied")
+    _log.warning("internal_auth: SHADOW cross-story (would-403) agent=%s token_story=%s target_story=%s",
+                 principal.agent_id, principal.story_id, target_story_id)
+
+
 async def ownership_guard(request: Request) -> None:
     """FastAPI dependency — enforce goal ownership for /internal/* endpoints, resolving
     the target goal from whatever the path/query carries: `pid`/`goal_id` (direct),
@@ -296,3 +397,7 @@ async def ownership_guard(request: Request) -> None:
                 goal = q
     if goal:
         require_goal_ownership(request, goal)
+    # Story-level scope for human-local tokens (no-op for per-agent/legacy callers).
+    _sid = pp.get("story_id") or pp.get("sid")
+    if _sid:
+        require_story_ownership(request, _sid)

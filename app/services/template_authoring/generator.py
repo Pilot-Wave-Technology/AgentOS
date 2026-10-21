@@ -1,28 +1,24 @@
-"""Gemini-backed generation of the role-specific template sections.
+"""LLM-backed generation of the role-specific template sections.
 
-Given the operator's structured answers + the chosen archetype, ask Gemini to
-author ONLY the GENERATED slots (role_bullets, working_section,
-personality_bullets) as JSON. The fixed scaffold is shown for context but the
-model is told NOT to reproduce it.
+Given the operator's structured answers + the chosen archetype, ask the
+configured utility model (`template_authoring` purpose — see
+app/services/misc_models.py) to author ONLY the GENERATED slots
+(role_bullets, working_section, personality_bullets) as JSON. The fixed
+scaffold is shown for context but the model is told NOT to reproduce it.
 
-Degrades gracefully: if GEMINI_API_KEY is unset, or the call/parse fails, we
-return deterministic fallbacks derived from the operator's input so the wizard
-stays fully usable offline. The operator then completes the sections by hand in
-the review step.
+Degrades gracefully: if no credential is configured, or the call/parse
+fails, we return deterministic fallbacks derived from the operator's
+input so the wizard stays fully usable offline. The operator then
+completes the sections by hand in the review step.
 """
 import json
 import logging
 
-from google import genai
-from google.genai import types
-
-from app.config import get_settings
 from app.services.template_authoring.models import GeneratedSections, WizardInputs
 from app.services.template_authoring.scaffolds import get_archetype
+from app.services.utility_llm import generate_utility_text
 
 logger = logging.getLogger(__name__)
-
-_MODEL = "gemini-2.5-flash"
 
 _SYSTEM_INSTRUCTION = """You author the role-specific sections of an IA (Independent Agent) template for a multi-agent software platform. An IA is a task-scoped agent dispatched to do one job and report back.
 
@@ -80,7 +76,7 @@ def _fallback(inputs: WizardInputs) -> GeneratedSections:
 
 
 def _parse(text: str) -> dict:
-    """Parse Gemini output to a dict, tolerating stray code fences."""
+    """Parse the model's output to a dict, tolerating stray code fences."""
     cleaned = text.strip()
     if cleaned.startswith("```"):
         # Strip a leading ```json / ``` fence and the trailing fence.
@@ -93,29 +89,17 @@ def _parse(text: str) -> dict:
 async def generate_role_sections(
     archetype_name: str, inputs: WizardInputs
 ) -> GeneratedSections:
-    """Generate the GENERATED slots via Gemini, or fall back deterministically."""
+    """Generate the GENERATED slots via the configured utility model, or
+    fall back deterministically."""
     archetype = get_archetype(archetype_name)
-    settings = get_settings()
-
-    if not settings.gemini_api_key:
-        logger.warning(
-            "template_authoring: GEMINI_API_KEY not set — using fallback sections for %s",
-            inputs.template_id,
-        )
-        return _fallback(inputs)
-
     prompt = _build_user_prompt(archetype, inputs)
     try:
-        client = genai.Client(api_key=settings.gemini_api_key)
-        response = await client.aio.models.generate_content(
-            model=_MODEL,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                system_instruction=_SYSTEM_INSTRUCTION,
-                response_mime_type="application/json",
-            ),
+        text = await generate_utility_text(
+            "template_authoring", prompt,
+            system_instruction=_SYSTEM_INSTRUCTION,
+            json_mode=True,
         )
-        data = _parse(response.text or "")
+        data = _parse(text)
         sections = GeneratedSections(
             role_bullets=str(data.get("role_bullets", "")).strip(),
             working_section=str(data.get("working_section", "")).strip(),
@@ -124,15 +108,15 @@ async def generate_role_sections(
         )
         if not (sections.role_bullets and sections.working_section and sections.personality_bullets):
             logger.warning(
-                "template_authoring: Gemini returned incomplete sections for %s — using fallback",
+                "template_authoring: model returned incomplete sections for %s — using fallback",
                 inputs.template_id,
             )
             return _fallback(inputs)
-        logger.info("template_authoring: generated sections via Gemini for %s", inputs.template_id)
+        logger.info("template_authoring: generated sections via utility model for %s", inputs.template_id)
         return sections
     except Exception as exc:
         logger.warning(
-            "template_authoring: Gemini generation failed for %s (%s) — using fallback",
+            "template_authoring: generation failed for %s (%s) — using fallback",
             inputs.template_id, exc,
         )
         return _fallback(inputs)

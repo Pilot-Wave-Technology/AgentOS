@@ -2,6 +2,8 @@
 
 No imports from app.slack.* — fully self-contained in the new channel system.
 """
+
+from app.channels.slack.client import make_async_client
 import logging
 from typing import Optional
 
@@ -76,9 +78,8 @@ async def resolve_user(
     if uid:
         return uid
     try:
-        from slack_sdk import WebClient
-        client = WebClient(token=bot_token)
-        info = client.users_info(user=slack_user_id)
+        client = make_async_client(bot_token)
+        info = await client.users_info(user=slack_user_id)
         profile = (info.get("user") or {}).get("profile", {})
         email = profile.get("email", "")
         display_name = profile.get("display_name") or profile.get("real_name", "")

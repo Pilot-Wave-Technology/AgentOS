@@ -35,3 +35,26 @@ if ! bash "$SEQUENCE_CHECK"; then
     echo "See migrations/SEQUENCE for the rules on adding new migrations."
     exit 1
 fi
+
+# ── Effect coverage ─────────────────────────────────────────────────────
+#
+# Every tool a profile offers must have an effect class. Unclassified
+# means IRREVERSIBLE, which denies the tool at chain stage 3 on every
+# profile that offers it — a long way from the omission, and it reads
+# as a policy decision rather than a gap.
+#
+# It belongs HERE rather than only in the container suite because the
+# container version could not run outside one `run.sh` target, and so a
+# rule written to stop a third occurrence did not stop the fifth. This
+# one needs nothing but a python interpreter.
+EFFECTS_CHECK="$REPO_ROOT/infra/e0/ci/check_effect_coverage.sh"
+
+if [ -f "$EFFECTS_CHECK" ]; then
+    echo "pre-push: checking every profile tool has an effect class..."
+    if ! bash "$EFFECTS_CHECK"; then
+        echo ""
+        echo "Push blocked. A tool is offered by a profile and has no"
+        echo "effect class, so chain stage 3 would deny every call to it."
+        exit 1
+    fi
+fi

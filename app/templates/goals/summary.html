@@ -4,7 +4,7 @@
 <script src="https://cdn.jsdelivr.net/npm/marked@15/marked.min.js"></script>
 <!-- XSS: DOMPurify sanitizes rendered markdown before innerHTML (see safe_markdown.js) -->
 <script src="https://cdn.jsdelivr.net/npm/dompurify@3/dist/purify.min.js"></script>
-<script src="/static/js/safe_markdown.js"></script>
+<script src="/static/js/safe_markdown.js?v={{ request.state.asset_v('js/safe_markdown.js') }}"></script>
 <style>
   /* Icon-swap for the Refresh/Regenerate buttons: only one icon occupies
      layout space at a time (display:none, not opacity) so the button

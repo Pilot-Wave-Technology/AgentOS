@@ -27,13 +27,17 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-# Configure logging BEFORE importing app modules so their INFO logs (DB pool,
-# leader election, LISTEN) reach Cloud Run stdout — mirrors app/main.py.
-logging.basicConfig(
-    stream=sys.stdout,
-    level=logging.INFO,
-    format="%(levelname)s %(name)s: %(message)s",
-)
+from kernel.obs import configure
+
+# Configure logging BEFORE importing app modules so their INFO logs (DB
+# pool, leader election, LISTEN) reach stdout.
+#
+# THIS SERVICE EMITTED PLAIN TEXT. It is also the single writer for git
+# topology and the one whose silence produces "story done but never
+# merged, zero errors" -- so it is the worst possible service to have
+# had unfilterable logs. Same configuration as every other entrypoint
+# now, and the ids come with it.
+configure(component="git-engine")
 
 from app.database import init_db, close_db
 from app.services.git_graph.engine import git_graph_controller

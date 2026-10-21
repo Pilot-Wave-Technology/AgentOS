@@ -157,6 +157,29 @@ async def _check_operator_workspace_ready(pool, goal_id: str, story_id: str) -> 
     return True, ""
 
 
+# A user may have only ONE story actively in flight per goal. "In flight" =
+# in_progress or blocked (blocked is reached only FROM in_progress and isn't
+# terminal, so it still occupies the user). Keyed on assigned_to — NOT on
+# active_thread_id — because the board "start" transition never binds a thread,
+# so a thread-scoped check (routers.assistant.find_busy_story_on_thread) misses a
+# board-started story. This is the single source of truth for the one-active-
+# story rule; both the board start/unblock path and the local checkout path use it.
+_ACTIVE_STORY_STATES = ("in_progress", "blocked")
+
+
+async def find_conflicting_active_story(pool, goal_id: str, actor_uid: str, story_id: str):
+    """Another story in this goal that `actor_uid` already has in flight
+    (in_progress/blocked), or None. Excludes `story_id` itself so resuming a
+    story never conflicts with itself."""
+    return await pool.fetchrow(
+        f"""SELECT id, title FROM stories
+             WHERE goal_id = $1 AND id <> $2 AND assigned_to = $3
+               AND state IN {_ACTIVE_STORY_STATES}
+             LIMIT 1""",
+        goal_id, story_id, actor_uid,
+    )
+
+
 async def apply_story_transition(
     goal_id: str,
     story_id: str,
@@ -164,6 +187,7 @@ async def apply_story_transition(
     actor_uid: str,
     pool,
     blocked_reason: str = "",
+    extra_allowed_from: tuple[str, ...] = (),
 ) -> tuple[bool, str]:
     """Validate and apply a story state transition.
 
@@ -203,8 +227,43 @@ async def apply_story_transition(
     if not new_state:
         return False, f"Unknown action '{action}'."
 
-    valid = STORY_VALID_TRANSITIONS.get(old_state, [])
-    if new_state not in valid:
+    # ALREADY THERE IS NOT A TRANSITION. A second Mark Done — a double
+    # click, a retried request, a poll that raced — used to rewrite the
+    # row and append another `story.state_changed` event saying a story
+    # moved from `done` to `done`. The ledger is the record of what
+    # happened, and that did not happen.
+    #
+    # It matters more now that completion is stamped: the stamp itself
+    # is idempotent (COALESCE, and the trigger ignores a story already
+    # in a terminal state), but a duplicate event would still be counted
+    # as a second decision by anything that reads the ledger by kind.
+    #
+    # Reported as success, not as an error: the caller asked for the
+    # story to be done and it is done.
+    if old_state == new_state:
+        return True, ""
+
+    # `extra_allowed_from` IS AN OPT-IN, PER CALLER, AND NOT A WIDENING.
+    #
+    # The LOCAL lane finishes a story from `awaiting_merge`: the branch is
+    # pushed, the pull request is merged, and Mark Done is the person's
+    # last step. The shared table has no `awaiting_merge -> done` and must
+    # not grow one -- adding it would let Slack's `/done` force a CLOUD
+    # story to done with its pull request still open, which is the exact
+    # thing `awaiting_merge` exists to prevent.
+    #
+    # So the caller that knows the story is local says so, and only that
+    # caller's transition is allowed through. `test_the_story_transition_
+    # table_is_unchanged` stays green because the table is unchanged.
+    #
+    # THIS IS A CORRECTION. Phase 4 dropped the transition entirely on the
+    # claim that "the local Mark Done path touches neither that table nor
+    # `apply_story_transition`". Line 238 of `local_execution_run.story_done`
+    # calls exactly this function, and every local Mark Done from
+    # `awaiting_merge` came back 409 -- which the extension then reported
+    # as "its plan state changed", sending people to look at the plan.
+    valid = list(STORY_VALID_TRANSITIONS.get(old_state, []))
+    if new_state not in valid and old_state not in extra_allowed_from:
         return False, f"Transition {old_state} → {new_state} is not allowed."
 
     # Assignment: only the assigned user can drive a story's lifecycle.
@@ -215,7 +274,16 @@ async def apply_story_transition(
             _log.warning("BLOCKED: user %s tried to accept story %s assigned to %s", actor_uid, story_id, assigned)
             return False, "Only the assigned user can accept this story."
         execution_mode = story.get("execution_mode") or "operator"
-        if execution_mode == "operator":
+        # Stage K: this gate exists because the operator's workspace IS a
+        # checkout — accepting a story it cannot clone would strand it. A
+        # kernel assistant clones nothing; its executor resolves its own
+        # checkout from the story's grants at dispatch, and an errand
+        # legitimately touches no repository at all. Applying a repo-and-branch
+        # requirement to those refuses work that would have run fine.
+        from app.services.assistant_kind import is_kernel_assistant_for_user  # noqa: PLC0415
+        if execution_mode == "operator" and not await is_kernel_assistant_for_user(
+            pool, assigned or actor_uid,
+        ):
             ok, err = await _check_operator_workspace_ready(pool, goal_id, story_id)
             if not ok:
                 _log.info("Accept blocked for operator story %s: %s", story_id, err)
@@ -227,6 +295,23 @@ async def apply_story_transition(
         if assigned != actor_uid:
             _log.warning("BLOCKED: user %s tried to %s story %s assigned to %s", actor_uid, action, story_id, assigned)
             return False, f"Only the assigned user ({assigned}) can perform this action."
+
+    # Concurrency guard: how many stories this user may have in flight at once
+    # in this goal — one for the operator (whose single thread rotates between
+    # stories, so a second would displace the first), four for the kernel
+    # assistant (a thread each, so they coexist). Covers both "start"
+    # (accepted → in_progress) and "unblock" (blocked → in_progress) since both
+    # put a story in flight. The SAME function runs at the assistant-import
+    # chokepoint — a limit enforced on one path and not the other is not a limit.
+    if action in ("start", "unblock"):
+        from app.services.thread_ceiling import refusal_for  # noqa: PLC0415
+        refusal = await refusal_for(pool, goal_id, actor_uid, story_id)
+        if refusal:
+            _log.info(
+                "BLOCKED: user %s tried to %s story %s — %s",
+                actor_uid, action, story_id, refusal,
+            )
+            return False, refusal
 
     # Dependency and resource checks for "start"
     if action == "start":
@@ -269,6 +354,15 @@ async def apply_story_transition(
         if unmet:
             _log.info("Story %s has unmet resource deps: %s", story_id, [r["resource_id"] for r in unmet])
             return False, "Required resources are missing or locked by another story."
+
+    # C2: a LOCAL story can be marked done only with an approved plan AND its DAG fully
+    # executed. Enforced here (not only the local router) so the board / Slack / Notion
+    # done-paths all inherit the gate. Gateway/operator stories are unaffected.
+    if action == "done" and (story.get("execution_mode") or "") == "local":
+        from app.services.local_dispatch import story_done_blocker  # noqa: PLC0415
+        blocker = await story_done_blocker(story_id)
+        if blocker:
+            return False, blocker
 
     # Build and execute the UPDATE
     set_clauses = ["state = $1", "updated_at = now()"]
@@ -316,12 +410,24 @@ async def apply_story_transition(
             context_goal_id=goal_id,
         )
 
-    # Auto-lock produced resources on start
+    # Auto-lock the resources this story WRITES TO, on start.
+    #
+    # 'modifies' is included alongside 'produces': both are write grants (see
+    # git_graph.repo_identity.WRITE_RELATIONS, which every multi-repo path resolves
+    # through), and the GO may legitimately grant a repo either way. Locking only
+    # 'produces' meant an identically-writable 'modifies' repo silently escaped the
+    # lock — the lock and the write-set disagreed about what "this story writes to"
+    # means. 'needs' is deliberately excluded: read-only context grants are not
+    # written to and must never lock a repo out from under another story.
+    #
+    # Release is relation-agnostic (the 'done' branch below clears everything
+    # locked_for this story), so widening what gets locked cannot strand a lock.
     if action == "start":
         await pool.execute(
             """UPDATE goal_resources SET locked_by=$1, locked_for=$2, locked_at=now()
                WHERE id IN (
-                   SELECT resource_id FROM story_resources WHERE story_id=$2 AND relation='produces'
+                   SELECT resource_id FROM story_resources
+                    WHERE story_id=$2 AND relation IN ('produces', 'modifies')
                ) AND (locked_for IS NULL OR locked_for = '')""",
             actor_uid, story_id,
         )
@@ -387,8 +493,16 @@ async def mark_story_reviewed(pool, goal_id: str, story_id: str) -> bool:
         return False
 
     async with pool.acquire() as conn, conn.transaction():
+        # Also clear the thread binding on this terminal transition. 'reviewed' is
+        # terminal for the active-story resolver (_NON_TERMINAL_STATES excludes it),
+        # so a reviewed story must not keep active_thread_id/is_active_focus — else the
+        # chat workspace panel (which still keys off active_thread_id) renders the
+        # finished story's cleaned-up workspace as a phantom "current story" while the
+        # assistant correctly reports no active story. Mirrors the done + cancel clears;
+        # completes the one-story-per-thread invariant across every terminal path.
         await conn.execute(
-            "UPDATE stories SET state='reviewed', last_reviewed_state='done', updated_at=now() "
+            "UPDATE stories SET state='reviewed', last_reviewed_state='done', "
+            "active_thread_id=NULL, is_active_focus=false, updated_at=now() "
             "WHERE id=$1 AND goal_id=$2 AND state='done'",
             story_id, goal_id,
         )

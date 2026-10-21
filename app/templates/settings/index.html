@@ -54,11 +54,15 @@
     </div>
   </section>
 
-  {# ── Registry (admin-only) ── #}
-  {% if user.system_role == "admin" %}
+  {# ── Registry ──
+     Agent / Skill / Tool Registry are admin-only (individually wrapped below,
+     same pattern as Users / Signup Requests / Kill Switch elsewhere in this file).
+     Model Registry's read view is open to every logged-in user; mutations are
+     gated by require_admin inside the router, so its tile stays un-wrapped. #}
   <section class="mb-8">
     <h2 class="text-xs font-semibold uppercase tracking-wider text-gray-600 mb-3">Registry</h2>
     <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+      {% if user.system_role == "admin" %}
       <a href="/settings/agent-registry" class="cp-card">
         <div class="cp-card-icon">
           <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -70,6 +74,21 @@
           <div class="cp-card-desc">Global agent definitions, templates, and instances</div>
         </div>
       </a>
+      {% endif %}
+      {% if user.system_role == "admin" %}
+      <a href="/settings/agents/refresh" class="cp-card">
+        <div class="cp-card-icon">
+          <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M16.023 9.348h4.992v-.001M2.985 19.644v-4.992m0 0h4.992m-4.993 0l3.181 3.183a8.25 8.25 0 0013.803-3.7M4.031 9.865a8.25 8.25 0 0113.803-3.7l3.181 3.182m0-4.991v4.99"/>
+          </svg>
+        </div>
+        <div>
+          <div class="cp-card-title">Refresh Agents</div>
+          <div class="cp-card-desc">Push current prompts, tools and skills to agents that already exist</div>
+        </div>
+      </a>
+      {% endif %}
+      {% if user.system_role == "admin" %}
       <a href="/settings/skills" class="cp-card">
         <div class="cp-card-icon">
           <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -81,6 +100,8 @@
           <div class="cp-card-desc">Reusable versioned prompt fragments</div>
         </div>
       </a>
+      {% endif %}
+      {% if user.system_role == "admin" %}
       <a href="/settings/tools" class="cp-card">
         <div class="cp-card-icon">
           <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -92,9 +113,24 @@
           <div class="cp-card-desc">HTTP actions, OpenAPI specs, TypeScript tools, MCP servers</div>
         </div>
       </a>
+      {% endif %}
+      {# Model Registry: view is open to every logged-in user (read-only for
+         members/editors); mutation (add / update / enable / disable) is
+         gated inside the page itself via require_admin on the POST routes.
+         The card is intentionally NOT wrapped in an admin-only branch. #}
+      <a href="/settings/model-registry" class="cp-card">
+        <div class="cp-card-icon">
+          <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M4.26 10.147a60.436 60.436 0 00-.491 6.347A48.627 48.627 0 0112 20.904a48.627 48.627 0 018.232-4.41 60.46 60.46 0 00-.491-6.347m-15.482 0a50.57 50.57 0 00-2.658-.813A59.905 59.905 0 0112 3.493a59.902 59.902 0 0110.399 5.84c-.896.248-1.783.52-2.658.814m-15.482 0A50.697 50.697 0 0112 13.489a50.702 50.702 0 017.74-3.342M6.75 15a.75.75 0 100-1.5.75.75 0 000 1.5zm0 0v-3.675A55.378 55.378 0 0112 8.443m-7.007 11.55A5.981 5.981 0 006.75 15.75v-1.5"/>
+          </svg>
+        </div>
+        <div>
+          <div class="cp-card-title">Model Registry</div>
+          <div class="cp-card-desc">Models, synthetic providers, and token pricing</div>
+        </div>
+      </a>
     </div>
   </section>
-  {% endif %}
 
   {# ── System (Model Pricing view: everyone, edit: admin-only; everything
      else in this section is admin-only end to end) ── #}
@@ -181,17 +217,23 @@
         </div>
       </a>
       {% endif %}
-      <a href="/settings/model-pricing" class="cp-card">
+      {# Story Timings is admin-only for the same reason the Kill Switch is:
+         two of the knobs destroy other people's runs when they reach work
+         that did not ask for them. Hidden rather than disabled so it is
+         never a dead-end that 403s on click. #}
+      {% if user.system_role == "admin" %}
+      <a href="/settings/timings" class="cp-card">
         <div class="cp-card-icon">
           <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M12 6v12m-3-2.818l.879.659c1.171.879 3.07.879 4.242 0 1.172-.879 1.172-2.303 0-3.182C13.536 12.219 12.768 12 12 12c-.725 0-1.45-.22-2.003-.659-1.106-.879-1.106-2.303 0-3.182s2.9-.879 4.006 0l.415.33M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/>
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M12 6v6l4 2m6-2a10 10 0 11-20 0 10 10 0 0120 0z"/>
           </svg>
         </div>
         <div>
-          <div class="cp-card-title">Model Pricing</div>
-          <div class="cp-card-desc">Token cost rates for all models and providers</div>
+          <div class="cp-card-title">Story Timings</div>
+          <div class="cp-card-desc">Compress job budgets, wait slices and reclaim patience for one story, with an expiry</div>
         </div>
       </a>
+      {% endif %}
     </div>
   </section>
 

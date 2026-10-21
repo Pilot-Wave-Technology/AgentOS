@@ -26,6 +26,26 @@ _log = logging.getLogger(__name__)
 # install, deleted ref/PR) → escalate + hold. Everything else is retried.
 _ESCALATE_CODES = (401, 403, 404)
 
+# A NODE CAN BE ESCALATED WITHOUT ANYTHING HAVING GONE WRONG.
+#
+# `detect._cancel_node` escalates a node when a person closes its PR without
+# merging — on both routes, the immediate `closed` webhook and the ten-minute
+# poll backstop. It lands in `last_error` like a failure and is therefore
+# carded like one, which tells the person that "the git engine cannot
+# continue" and offers to retry the run. Neither is true: the engine did
+# exactly what it should, and retrying re-runs work that was just rejected.
+#
+# Spelled once, here, because `detect.py` writes it and
+# `app/services/kernel_node_cards.py` reads it, and two copies of a
+# magic string is how the card silently reverts to the failure wording.
+PR_CLOSED_UNMERGED = "PR closed unmerged"
+
+
+def is_human_cancel(last_error: str | None) -> bool:
+    """Whether this node's `last_error` records a person's decision rather
+    than a fault. See `PR_CLOSED_UNMERGED`."""
+    return (last_error or "").startswith(PR_CLOSED_UNMERGED)
+
 
 def _status_code(exc: Exception) -> int:
     resp = getattr(exc, "response", None)
@@ -74,8 +94,13 @@ async def clear_node_error(executor, node_id: str) -> None:
     """Clear a stale `last_error` after a node makes clean progress. `executor` may be
     a pool or a connection. No-op if there's nothing to clear. Never raises."""
     try:
+        # The CARD CLAIM goes too. It records the error text already
+        # announced in the thread so the same failure does not post
+        # twice; leaving it behind means a node that recovers and later
+        # fails the SAME way again is never announced.
         await executor.execute(
-            "UPDATE git_nodes SET last_error = NULL, updated_at = now() "
+            "UPDATE git_nodes SET last_error = NULL, error_card_error = NULL, "
+            "updated_at = now() "
             "WHERE id = $1 AND last_error IS NOT NULL",
             node_id,
         )

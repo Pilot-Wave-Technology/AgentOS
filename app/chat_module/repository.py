@@ -10,6 +10,7 @@ NOTIFY channels (signal-only, payload is small JSON):
 from __future__ import annotations
 
 import json
+import logging
 import uuid
 from datetime import datetime, timezone
 from typing import Optional
@@ -17,6 +18,8 @@ from typing import Optional
 import asyncpg
 
 from app.database import get_pool
+
+_log = logging.getLogger(__name__)
 
 from .models import (
     Gateway,
@@ -66,20 +69,87 @@ async def notify_dispatch(thread_id: str) -> None:
         await _notify(conn, CHANNEL_DISPATCH, {"thread_id": thread_id})
 
 
-async def notify_new_message(thread_id: str, message_id: str) -> None:
+async def notify_new_message(thread_id: str, message_id: str,
+                             conn: Optional[asyncpg.Connection] = None
+                             ) -> None:
     """Signal the web-tier fan-out (CHANNEL_MSG only) that an already-persisted
     message row should be broadcast to browser subscribers on every instance.
 
     Deliberately does NOT emit CHANNEL_DISPATCH — used by card posters that
     INSERT a human-facing display message (card_data) directly and need
     cross-instance browser delivery WITHOUT waking the agent / burning a turn.
+
+    PASS `conn` WHEN THE INSERT IS IN A TRANSACTION, and the errand
+    approval card is why this parameter exists.
+
+    `_notify` says "pg_notify is transaction-aware: it fires on commit",
+    and that is true only of the transaction's OWN connection. Acquiring
+    a fresh one from the pool fires the notify IMMEDIATELY -- while the
+    caller's INSERT is still uncommitted. The listener wakes, runs
+    `SELECT ... WHERE id = $1`, finds no row, and returns at its
+    `if not row` guard. Silently: no error, no log line, no delivery.
+
+    Measured on ERR09. `errand_proposal_cards` is the one card poster
+    that wraps its insert in `conn.transaction()`, and it is the one
+    card that never arrived live -- "the approval only shows after a
+    refresh", for weeks, while every other card on the same machinery
+    worked. Nothing was wrong with the fan-out, the registries or the
+    renderer, which is where the search kept going.
+
+    Passed a connection, the notify is queued and delivered by Postgres
+    on commit, so the row is always visible by the time the listener
+    looks.
     """
     if not thread_id or not message_id:
         return
-    pool = get_pool()
-    async with pool.acquire() as conn:
-        await _notify(conn, CHANNEL_MSG,
-                      {"thread_id": thread_id, "message_id": message_id})
+    payload = {"thread_id": thread_id, "message_id": message_id}
+    if conn is not None:
+        await _notify(conn, CHANNEL_MSG, payload)
+    else:
+        pool = get_pool()
+        async with pool.acquire() as own:
+            await _notify(own, CHANNEL_MSG, payload)
+
+    # AND THE CARD GOES TO SLACK, if it is a card. Every card poster
+    # already calls this, which is what makes it the one place a new
+    # card kind reaches Slack without anybody adding a call -- and
+    # twenty-four of twenty-seven kinds reached it in no other way.
+    #
+    # The publisher side rather than the fan-out listener: that listener
+    # runs in every web instance, so posting from there would post once
+    # per instance.
+    await _relay_card_if_any(thread_id, message_id, conn)
+
+
+
+async def _relay_card_if_any(thread_id: str, message_id: str,
+                             conn: Optional[asyncpg.Connection] = None
+                             ) -> None:
+    """Mirror a card-bearing message to the platforms. Never raises.
+
+    ON THE CALLER'S CONNECTION WHEN THERE IS ONE, for the same reason
+    the notify above takes it, and this is the second time that reason
+    has had to be learned.
+
+    The relay reads the message row back before it can decide whether
+    there is a card to send. Read through `get_pool()`, that is a
+    DIFFERENT connection, which cannot see a row still inside the
+    caller's open transaction -- so it found nothing and returned, and
+    the card reached the panel and never reached Slack. Silently, with
+    no error and no log line, exactly as the notify once did.
+
+    Observed on CALY5: the errand proposal card was on the GO thread in
+    the UI and absent from its Slack channel. `errand_proposal_cards`
+    now notifies after its commit and does not need this, but the next
+    poster to wrap an insert in a transaction would have walked into it
+    a third time.
+    """
+    try:
+        from app.services.card_fanout import relay_card_for_message
+        await relay_card_for_message(conn or get_pool(), thread_id,
+                                     message_id)
+    except Exception as exc:                                   # noqa: BLE001
+        _log.warning("card relay skipped for %s: %s", message_id, exc)
 
 
 # ── thread routing (captured at enqueue, read by dispatcher) ──────────────────
@@ -202,6 +272,37 @@ async def try_claim_thread(conn: asyncpg.Connection, thread_id: str) -> bool:
 
 async def release_thread(conn: asyncpg.Connection, thread_id: str) -> None:
     await conn.execute("SELECT pg_advisory_unlock(hashtext($1)::bigint)", thread_id)
+
+
+# A SECOND lock, coarser than the thread and taken after it.
+#
+# The per-thread lock keeps two turns off one conversation. It cannot keep
+# two turns off one WORKSPACE, and since Stage K an assistant's threads
+# share a home: one `MEMORY.md`, written by a model that reads it and
+# writes the whole file back. Two of those interleaved lose the first
+# one's lines, silently, in the one turn whose job is to record what
+# happened.
+#
+# Keyed on the GATEWAY AGENT ID, which is exactly the identity of a home.
+# For an agent with a thread each that is uncontended by construction —
+# every thread has its own gateway id — so this costs those nothing and
+# needs no flag to say which kind it is.
+#
+# Acquisition order is always thread-then-home, so there is no cycle to
+# deadlock on: the home is a single resource taken last.
+
+async def try_claim_home(conn: asyncpg.Connection, gateway_agent_id: str) -> bool:
+    return bool(await conn.fetchval(
+        "SELECT pg_try_advisory_lock(hashtext($1)::bigint)",
+        f"memhome:{gateway_agent_id}",
+    ))
+
+
+async def release_home(conn: asyncpg.Connection, gateway_agent_id: str) -> None:
+    await conn.execute(
+        "SELECT pg_advisory_unlock(hashtext($1)::bigint)",
+        f"memhome:{gateway_agent_id}",
+    )
 
 
 async def select_pending_batch(thread_id: str, limit: int) -> list[QueuedMessage]:

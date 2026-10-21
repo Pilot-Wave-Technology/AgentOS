@@ -3,7 +3,7 @@
   "type": "RA",
   "name": "Security — Infrastructure / IaC / Config",
   "description": "Reviews a checked-out branch for Dockerfile/IaC/Kubernetes misconfig and insecure config (trivy config, hadolint, kube-linter).",
-  "model": "google-flash-500k/gemini-2.5-flash-500k",
+  "model": "google-flash38-500k/gemini-3.8-flash-500k",
   "emoji": "🏗️",
   "tools_allow": [
     "read",

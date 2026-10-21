@@ -2,15 +2,25 @@
   GO model + context-window picker (two dropdowns -> one hidden field).
 
   Params (set by the including template):
-    go_model_tree  : llm_models.go_model_tree() output
+    go_model_tree  : dropdowns.build_go_model_tree_v2() output (or the
+                     v1 llm_models.go_model_tree() output — same shape)
     field_name     : name of the hidden input carrying the full synthetic model id
                      (route handlers read this unchanged: "go_model" or "model")
     picker_current : currently-selected full id (edit case); "" -> tree default
     widget_id      : unique DOM id prefix (safe with multiple pickers on a page)
 
   The visible selects are display-only; the hidden field is the source of truth
-  the form submits, so the server contract (is_supported(full_id)) is unchanged.
+  the form submits, so the server contract (is_supported(full_id) or
+  is_model_registered_v2(full_id)) is unchanged.
+
+  When the tree has no bases (zero registered models OR a transient DB read
+  failure), render a disabled placeholder + a link to the admin page instead.
+  The hidden field still emits with an empty value so the containing form
+  keeps its field name; native `required` on the surrounding form (goal
+  create) or the goal_model_config change-form's server-side validator
+  cleanly rejects the empty submission.
 #}
+{% if go_model_tree.bases %}
 <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
   <div>
     <label class="block text-sm text-gray-400 mb-1.5">Model</label>
@@ -72,3 +82,24 @@
   fillSizes(initBase, initTokens);
 })();
 </script>
+{% else %}
+<div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+  <div>
+    <label class="block text-sm text-gray-400 mb-1.5">Model</label>
+    <select disabled class="input opacity-60">
+      <option>No models available</option>
+    </select>
+  </div>
+  <div>
+    <label class="block text-sm text-gray-400 mb-1.5">Context window</label>
+    <select disabled class="input opacity-60">
+      <option>—</option>
+    </select>
+  </div>
+</div>
+<p class="text-2xs text-gray-500 mt-2">
+  No models are registered in the Model Registry.
+  <a href="/settings/model-registry" class="text-indigo-400 hover:text-indigo-300">Open Model Registry →</a>
+</p>
+<input type="hidden" id="{{ widget_id }}-hidden" name="{{ field_name }}" value="" />
+{% endif %}

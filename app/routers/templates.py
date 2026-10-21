@@ -20,6 +20,10 @@ from fastapi.templating import Jinja2Templates
 from app.auth import get_current_user, require_admin
 from app.database import get_pool
 from app.roles import SystemRole
+from app.services.model_registry.dropdowns import (
+    is_dropdown_empty,
+    list_model_ids_for_dropdown_v2,
+)
 from app.services.template_sync import (
     schedule_file_push,
     schedule_file_delete,
@@ -77,11 +81,6 @@ async def template_detail(
     request: Request,
     user: dict = Depends(get_current_user),
 ):
-    # Local import: template_authoring.py imports _record_history from this
-    # module at load time, so importing it back at module level here would
-    # be circular.
-    from app.routers.template_authoring import _model_options
-
     pool = get_pool()
     tmpl = await pool.fetchrow(
         "SELECT * FROM templates WHERE id = $1", template_id,
@@ -120,7 +119,12 @@ async def template_detail(
     all_profiles = await list_profiles(pool, status="active")
     assigned_profile_ids = set(await get_template_profiles(pool, template_id))
 
-    models = await _model_options()
+    models = await list_model_ids_for_dropdown_v2(pool)
+    # `models_empty` reflects the state of the live registry BEFORE the
+    # legacy-model injection below, so the empty-state banner still fires
+    # when the DB has zero registered models even though the picker will
+    # keep the template's stale current selection.
+    models_empty = is_dropdown_empty(models)
 
     all_tools = await pool.fetch(
         "SELECT name, label, group_name, source FROM tools WHERE status = 'active' ORDER BY group_name, name",
@@ -135,8 +139,11 @@ async def template_detail(
     # Keep the template's current model selectable even if it's since fallen
     # off the allowlist (e.g. a deprecated model), so saving other fields
     # never silently changes it.
-    if tmpl["model"] and tmpl["model"] not in models:
-        models = [tmpl["model"], *models]
+    if tmpl["model"] and tmpl["model"] not in {m["id"] for m in models}:
+        models = [
+            {"id": tmpl["model"], "label": tmpl["model"], "kind": "legacy"},
+            *models,
+        ]
 
     return templates.TemplateResponse(
         "templates/detail.html",
@@ -146,6 +153,7 @@ async def template_detail(
             "can_edit": user.get("system_role") == SystemRole.PLATFORM_ADMIN,
             "template": dict(tmpl),
             "models": models,
+            "models_empty": models_empty,
             "files_by_name": files_by_name,
             "editable_filenames": EDITABLE_FILENAMES,
             "instances": [dict(r) for r in instance_rows],
@@ -224,6 +232,31 @@ async def template_update(
                 template_id, name, description, model, emoji, notes, new_version,
             )
 
+    return RedirectResponse(url=f"/templates/{template_id}", status_code=303)
+
+
+@router.post("/templates/{template_id}/apply-model-to-instances")
+async def template_apply_model_to_instances(
+    template_id: str,
+    user: dict = Depends(require_admin),
+):
+    """Explicit, opt-in bulk action: push the template's current model onto
+    every existing agent cloned from it (e.g. every user's SHCA assistant
+    cloned from default-shca). Never runs automatically on template save —
+    a template model edit alone must not silently change a model out from
+    under an agent someone is mid-conversation with.
+    """
+    from app.services.agent_registry.bulk_apply import apply_template_model_to_instances
+
+    pool = get_pool()
+    try:
+        result = await apply_template_model_to_instances(pool, template_id, user["actor_id"])
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    logger.info(
+        "template_apply_model_to_instances: template=%s by=%s updated=%d failed=%d",
+        template_id, user.get("uid", "unknown"), len(result["updated"]), len(result["failed"]),
+    )
     return RedirectResponse(url=f"/templates/{template_id}", status_code=303)
 
 

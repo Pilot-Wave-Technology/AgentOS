@@ -9,6 +9,7 @@ from app.models.agent import AgentUpdateRequest
 from app.openclaw import gateway_admin as _default_gateway
 from app.ledger.journal import append_event
 from app.ledger.schema import AGENT_UPDATED
+from app.services.model_registry.dropdowns import resolve_model_id
 from .helpers import resolve_agent_tools
 
 logger = logging.getLogger(__name__)
@@ -37,8 +38,26 @@ async def update_agent(pool, agent_id: str, patch: AgentUpdateRequest, actor_id:
     if patch.model is not None:
         patch.model = normalize_model_id(patch.model)
 
+    # `type` and `scope` are identity fields fixed at provisioning time —
+    # nothing downstream re-provisions an agent on a type/scope change (SHCA
+    # ownership semantics, GO goal-binding, type-filtered queries like
+    # deprovision_user_from_goal's `type = 'SHCA'`), so changing either here
+    # would just corrupt the row rather than actually re-type the agent.
+    # Reject explicitly rather than silently ignoring, so API callers get a
+    # clear error instead of a patch that appears to succeed but did nothing.
+    if patch.type is not None and patch.type != current.get("type"):
+        raise ValueError(
+            f"Agent '{agent_id}' type is fixed at creation and cannot be changed "
+            f"(current: {current.get('type')})"
+        )
+    if patch.scope is not None and patch.scope != current.get("scope"):
+        raise ValueError(
+            f"Agent '{agent_id}' scope is fixed at creation and cannot be changed "
+            f"(current: {current.get('scope')})"
+        )
+
     # Determine changed scalar fields (only provided non-None values that differ from current)
-    scalar_fields = ("name", "type", "scope", "model", "emoji",
+    scalar_fields = ("name", "model", "emoji",
                      "tools_allow", "tools_deny",
                      "memory_enabled", "max_tokens", "notes")
     changed_scalars: dict[str, Any] = {}
@@ -46,6 +65,16 @@ async def update_agent(pool, agent_id: str, patch: AgentUpdateRequest, actor_id:
         new_val = getattr(patch, field)
         if new_val is not None and new_val != current.get(field):
             changed_scalars[field] = new_val
+
+    # Whenever `model` changes, re-resolve its Model Registry FK
+    # companion too — including to NULL, if the new model isn't a
+    # registered row, rather than leaving `model_id` pointing at the
+    # PREVIOUS model. `resolve_model_id` returns None (not an error) in
+    # that case; `model_id` is nullable precisely for this.
+    if "model" in changed_scalars:
+        changed_scalars["model_id"] = await resolve_model_id(
+            pool, changed_scalars["model"],
+        )
 
     # Determine changed files
     changed_files: dict[str, str] = {}
@@ -146,12 +175,13 @@ async def update_agent(pool, agent_id: str, patch: AgentUpdateRequest, actor_id:
             )
             await conn.execute(
                 """INSERT INTO agent_configs
-                       (agent_id, config_version, model, type, scope, emoji,
+                       (agent_id, config_version, model, model_id, type, scope, emoji,
                         tools_allow, tools_deny, memory_enabled, max_tokens, notes, created_by)
-                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
                    ON CONFLICT (agent_id, config_version) DO NOTHING""",
                 agent_id, new_version,
                 changed_scalars.get("model", current.get("model")),
+                changed_scalars.get("model_id", current.get("model_id")),
                 changed_scalars.get("type", current.get("type")),
                 changed_scalars.get("scope", current.get("scope")),
                 changed_scalars.get("emoji", current.get("emoji", "")),
@@ -195,6 +225,25 @@ async def update_agent(pool, agent_id: str, patch: AgentUpdateRequest, actor_id:
         "Agent %s updated (v%d): scalars=%s files=%s",
         agent_id, new_version, list(changed_scalars.keys()), list(changed_files.keys()),
     )
+
+    if "model" in changed_scalars:
+        # Reset every live session for this agent — both this process's
+        # local _AgentSession cache AND the gateway's own SessionEntry
+        # cache (agents.update above only rewrote the gateway's persisted
+        # config, neither cache re-reads it on its own). See
+        # gateway_sessions.py.
+        try:
+            from app.services.gateway_sessions import reset_agent_sessions
+            reset_count = await reset_agent_sessions(agent_id)
+            logger.info(
+                "Gateway session reset after model change: agent=%s reset_count=%d",
+                agent_id, reset_count,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Gateway session reset failed for agent=%s after model change: %s",
+                agent_id, exc,
+            )
 
     updated = dict(current)
     updated.update(changed_scalars)

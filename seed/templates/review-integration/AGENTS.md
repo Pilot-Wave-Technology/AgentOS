@@ -14,8 +14,8 @@ and you MUST record op_type + op_params (op_params is a JSON object string):
 
 1. change_template_model — swap an agent template's model.
    op_type="change_template_model"
-   op_params={"template_id":"<go|default-shca>","model":"<exact supported model id>"}
-   (target_role GO -> template_id "go"; SHCA -> "default-shca".)
+   op_params={"template_id":"<go-v2|kernel-assistant>","model":"<exact supported model id>"}
+   (target_role GO -> template_id "go-v2"; SHCA -> "kernel-assistant".)
 
 2. add_tool — add a custom tool or remote MCP server. FOUR tiers are ALL supported
    today (pick the fitting one): "http_action" (one HTTP endpoint), "openapi"

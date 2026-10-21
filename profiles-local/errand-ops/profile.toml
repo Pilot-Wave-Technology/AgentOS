@@ -1,0 +1,62 @@
+# Errand, run locally in the person's editor.
+#
+# An errand produces an ANSWER, not a branch: run the thing, read the output,
+# say what it means. Locally that is the person and their agent at a terminal,
+# which is what an errand always wanted to be.
+#
+# Same departures from `profiles/errand-ops` as the coding profile makes from
+# its pod twin — no background-job set, no `run_check`, no artifacts, no
+# `propose_completion` — plus one that is specific to errands:
+#
+#   * `write` and `edit` ARE here. The pod errand profile argued itself into
+#     them (Ec1a: the profile that could compute could not persist). Locally
+#     the same argument holds and costs nothing: the person is watching, and
+#     an errand that cannot save its own output is an errand that has to
+#     paste it.
+#
+# AUTONOMOUS ERRANDS NEVER REACH HERE. An errand a person approved to run
+# unattended belongs to the GO and a pod; importing it locally would
+# double-drive the same work. The gate is in `list_local_stories` and
+# `kernel/go/drivable.autonomous_errand_predicate`, not in this file.
+
+kind   = "errand"
+domain = "ops"
+
+tools_add = [
+  "write",
+  "edit",
+  "bash",
+  "web_fetch",
+  "register_plan",
+  # THE DELIVERABLE THAT IS NOT A DIFF. Dropped from this profile on
+  # 2026-10-01 and put back the same day: the reasoning was "a local
+  # story's deliverable is its diff", which is a story argument that was
+  # also applied to errands -- where the artifact IS the answer -- and
+  # which is not reliably true of stories either. A benchmark, a
+  # migration note, an analysis is a real output with nowhere else to go.
+  # `kernel.artifact_manifest` takes a story now, so these work locally.
+  "emit_artifact",
+  "artifact_read",
+]
+
+# `git`, the same as the pod errand profile, and NOT "none". An ops errand is
+# almost always about a repository -- read the config, run the script, check
+# the output -- and the local lane materializes a workspace by cloning. "none"
+# would leave the extension with nothing to clone and no working tree to run
+# the errand in.
+#
+# Not pushing is a separate property and lives elsewhere: an errand reaches
+# `done` without a diff submission, and the publish path's refusal handling
+# (`kernel/worker/publish_block.py`) is what stopped an errand burning legs on
+# a push it never needed.
+workspace_driver = "git"
+
+prompt_files = ["AGENTS.md", "SOUL.md"]
+
+# An errand plans — the pod profile settled that and it holds here. What it
+# does not have is a gate: the person reads the plan in the same conversation
+# they asked the question in.
+requires_plan      = true
+allows_completion  = true
+has_verifier       = false
+max_subagent_depth = 0

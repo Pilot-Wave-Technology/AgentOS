@@ -93,13 +93,24 @@ async def _resolve_resource_id(prefix: str, goal_id: str, pool) -> str:
     ) or ""
 
 
+# Spelled out per table rather than interpolated, so `grep "FROM stories"`
+# finds this call site. The two are otherwise identical; the `(id = $2) DESC`
+# is load-bearing -- ids are short hierarchical prefixes, so an exact match
+# has to beat the LIKE.
+_SUBJECT_SQL = {
+    "story": """SELECT id FROM stories
+                 WHERE goal_id = $1 AND (id = $2 OR id LIKE $3)
+                 ORDER BY (id = $2) DESC, created_at DESC LIMIT 1""",
+    "task": """SELECT id FROM tasks
+                WHERE goal_id = $1 AND (id = $2 OR id LIKE $3)
+                ORDER BY (id = $2) DESC, created_at DESC LIMIT 1""",
+}
+
+
 async def _resolve_subject_id(subject_type: str, prefix: str, goal_id: str, pool) -> str:
-    table = "stories" if subject_type == "story" else "tasks"
+    sql = _SUBJECT_SQL["story" if subject_type == "story" else "task"]
     return await pool.fetchval(
-        f"""SELECT id FROM {table}
-             WHERE goal_id = $1 AND (id = $2 OR id LIKE $3)
-             ORDER BY (id = $2) DESC, created_at DESC LIMIT 1""",
-        goal_id, prefix, f"{prefix[:8]}%",
+        sql, goal_id, prefix, f"{prefix[:8]}%",
     ) or ""
 
 

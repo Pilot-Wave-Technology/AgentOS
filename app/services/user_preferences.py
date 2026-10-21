@@ -54,6 +54,9 @@ async def set_preference(user_id: str, key: str, value: bool) -> dict:
         raise ValueError(f"Unknown preference key: {key}")
     pool = get_pool()
     await pool.execute(
+        # sql: safe -- `key` is a COLUMN name, which cannot be bound as
+        # a parameter, and it is rejected above unless it is one of
+        # _ALLOWED_KEYS. An allowlist is the only safe way to do this.
         f"""INSERT INTO user_preferences (user_id, {key})
             VALUES ($1, $2)
             ON CONFLICT (user_id) DO UPDATE SET {key} = EXCLUDED.{key}, updated_at = now()""",

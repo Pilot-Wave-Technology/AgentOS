@@ -34,8 +34,13 @@ async def record_story_session_metrics(
     """
     from app.database import get_pool
     from app.openclaw import gateway_admin, GatewayError
+    from app.services.assistant_instance import resolve as _resolve_instance_id
 
-    instance_id = f"{template_agent_id}-{goal_id}-{thread_id}"
+    # The session key stays per-thread either way — only the AGENT half of it
+    # folds — so usage is still attributed to this story's own session and not
+    # to the sum of every thread in the home.
+    instance_id = await _resolve_instance_id(
+        get_pool(), template_agent_id, goal_id, thread_id)
     session_key = make_goal_session_key(instance_id, goal_id, thread_id)
 
     _log.info(

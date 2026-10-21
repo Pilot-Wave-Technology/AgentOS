@@ -1,7 +1,7 @@
 ---
 agent_type: SHCA
 prompt_kind: flush_user_prompt
-version: 4
+version: 3
 is_active: true
 notes: 071_memory_flush_prompts_v2: mandate dual write
 ---

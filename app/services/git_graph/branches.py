@@ -82,11 +82,29 @@ async def ensure_branch_resource(
         await conn.execute(
             "INSERT INTO goal_resources (id, goal_id, kind, role, name, uri, created_by, "
             "  repo_owner, repo_name, branch_name, base_branch, clone_url, parent_id, "
-            "  git_repo_id, status, summary_stale) "
+            "  git_repo_id, status, summary_stale, default_writable) "
             # role='feature': this is the story's WORKING branch (vs role='trunk'), so the
             # resolvers' `ORDER BY (role='feature') DESC` reliably prefers it.
+            #
+            # F2 — default_writable TRUE, and it was the column default
+            # (false) before. This row is granted to its member stories
+            # as `produces` four lines below -- a WRITE relation -- so a
+            # ceiling of "may never be written" contradicted the grant
+            # being made in the same function.
+            #
+            # What that cost: `list_resources` reports `writable` from the
+            # mount and `can_write` from this column, and the assistant is
+            # told in as many words that "`can_write` false means
+            # read-only by policy". So the lane came back as writable AND
+            # never-writable at once, and the assistant -- correctly --
+            # refused to guess which branch to work on and asked a human.
+            # A round trip per story, presenting as hesitancy rather than
+            # as bad data.
+            #
+            # A feature lane exists SO THAT the work can be written to it.
+            # Writing is not an exception to grant, it is the purpose.
             "VALUES ($1, $2, 'branch', 'feature', $3, $4, 'engine', $5, $6, $7, $8, $9, $10, $11, "
-            "  'active', true)",
+            "  'active', true, true)",
             resource_id, goal_id, f"{name}:{branch}",
             f"https://github.com/{owner}/{name}/tree/{branch}",
             owner, name, branch, base_branch, clone_url,
@@ -131,7 +149,8 @@ async def _is_cut_ready(conn, node_id: str) -> bool:
     has_started = await conn.fetchval(
         "SELECT EXISTS (SELECT 1 FROM git_node_stories gns JOIN stories s ON s.id = gns.story_id "
         "  WHERE gns.git_node_id = $1 "
-        "    AND s.state IN ('in_progress', 'blocked', 'done', 'reviewed'))",
+        "    AND s.state IN ('in_progress', 'blocked', 'awaiting_merge', "
+        "                 'done', 'reviewed'))",
         node_id,
     )
     if not has_started:
@@ -315,7 +334,15 @@ async def advance_node_lifecycle(conn) -> dict:
     BRANCH_CREATED → IN_PROGRESS  when any member (code) story is in_progress —
         this is what makes the `synced-to` cooperative-sync CAS (§5.5.2) live.
     BRANCH_CREATED|IN_PROGRESS → READY  when every member story is SETTLED
-        (done/reviewed/cancelled/rejected) — the branch's work is complete → its merge
+        (done/reviewed/cancelled/rejected/awaiting_merge)
+
+        `awaiting_merge` IS SETTLED FOR THIS PURPOSE, and leaving it out
+        deadlocked the lane: a coding story now waits at `awaiting_merge`
+        for its work to LAND, and the node has to reach READY for a PR to
+        be opened at all. Story waits for the merge, node waits for the
+        story to be done, neither moves, no PR. Observed on dev with
+        caf071a4. "Settled" here means the branch's work is complete --
+        which is exactly what `awaiting_merge` says. — the branch's work is complete → its merge
         story can be worked / queued. ('reviewed' = a done story the council reviewed,
         i.e. done-and-then-some — MUST count as settled or a reviewed story sticks the
         node at IN_PROGRESS forever. "settled" rather than strictly "done" also means a
@@ -341,7 +368,7 @@ async def advance_node_lifecycle(conn) -> dict:
         "  AND NOT EXISTS ("
         "    SELECT 1 FROM git_node_stories gns JOIN stories s ON s.id = gns.story_id "
         "    WHERE gns.git_node_id = git_nodes.id "
-        "      AND s.state NOT IN ('done', 'reviewed', 'cancelled', 'rejected'))"
+        "      AND s.state NOT IN ('done', 'reviewed', 'cancelled', 'rejected', 'awaiting_merge'))"
     )
     return {
         "to_in_progress": _rows_affected(to_in_progress),
@@ -368,6 +395,37 @@ async def demote_stale_ready(conn) -> int:
         "WHERE state = 'READY' AND EXISTS ("
         "  SELECT 1 FROM git_node_stories gns JOIN stories s ON s.id = gns.story_id "
         "  WHERE gns.git_node_id = git_nodes.id "
-        "    AND s.state NOT IN ('done', 'reviewed', 'cancelled', 'rejected'))"
+        "    AND s.state NOT IN ('done', 'reviewed', 'cancelled', 'rejected', 'awaiting_merge'))"
     )
     return _rows_affected(res)
+
+async def cleanup_landed_branch(conn, node_id: str) -> dict:
+    """G5, the database half of delete-on-merge: archive the engine's
+    branch resource and drop its story links, so landed branches stop
+    accumulating in the catalogue the way refs used to on GitHub.
+
+    ONLY engine-created rows. A human-registered branch (a trunk
+    designation, a long-lived integration branch) is the human's to
+    retire. Returns what it did so the caller can log honestly.
+    """
+    node = await conn.fetchrow(
+        "SELECT branch_name, git_repo_id, goal_id FROM git_nodes "
+        "WHERE id = $1", node_id)
+    if node is None:
+        return {"archived": 0, "unlinked": 0}
+    rows = await conn.fetch(
+        """
+        UPDATE goal_resources SET status = 'archived'
+         WHERE goal_id = $1 AND kind = 'branch'
+           AND branch_name = $2 AND git_repo_id = $3
+           AND created_by = 'engine' AND status <> 'archived'
+        RETURNING id
+        """,
+        node["goal_id"], node["branch_name"], node["git_repo_id"])
+    unlinked = 0
+    for r in rows:
+        result = await conn.execute(
+            "DELETE FROM story_resources WHERE resource_id = $1", r["id"])
+        unlinked += int(result.split()[-1])
+    return {"archived": len(rows), "unlinked": unlinked,
+            "branch": node["branch_name"]}

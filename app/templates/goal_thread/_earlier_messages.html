@@ -1,0 +1,12 @@
+{# Response body for GET /goals/{pid}/thread/messages/earlier.
+
+   Replaces the #load-earlier sentinel via hx-swap="outerHTML". Order matters:
+   the next sentinel comes FIRST so it stays at the top of the scroll
+   container, then the older messages in ascending time order beneath it.
+
+   When `has_older` is false the sentinel is omitted entirely — the button
+   disappears once the top of the conversation is reached. #}
+{% if has_older %}{% include "_shared/load_earlier.html" %}{% else %}
+<div class="py-2 text-center text-xs text-slate-500">Beginning of conversation</div>
+{% endif %}
+{% for msg in messages %}{% include "goal_thread/_message.html" %}{% endfor %}

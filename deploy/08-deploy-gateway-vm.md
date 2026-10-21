@@ -21,7 +21,7 @@ secret and restarts the gateway process — no VM reboot needed).
 
 ## 8.2 Confirm the gateway token matches
 The platform authenticates to the gateway with `openclaw-gateway-token` — the
-**same** secret you set in Stage ①. Both sides read the same Secret Manager
+**same** secret, created (auto-generated) by `prerequisites.sh`. Both sides read the same Secret Manager
 entry, so they match by construction. (If you ever rotate it, redeploy both.)
 
 ## 8.3 Check the gateway is up
@@ -32,10 +32,27 @@ gcloud compute ssh agentos-gateway --tunnel-through-iap --zone <your-zone> \
 Want `active (running)`. Boot/first-build logs if needed:
 `sudo tail -50 /var/log/openclaw-startup.log`.
 
+That proves the gateway runs, not that the two talk — 8.4 does.
+
+## 8.4 Prove the link (no SSH needed)
+The control plane logs `GatewayAdmin connected` each time it opens its admin
+connection to the gateway:
+```bash
+gcloud logging read 'resource.type="cloud_run_revision" AND (textPayload:"GatewayAdmin connected" OR jsonPayload.message:"GatewayAdmin connected")' \
+  --project <PROJECT_ID> --limit 3
+```
+Want recent lines from **`<prefix>-web`** and **`<prefix>-scheduler`**
+(`resource.labels.service_name`). Nothing at all means the control plane cannot
+reach the gateway — re-check 8.1 and the region/VPC.
+
+Or open the dashboard after you log in (file 09): the gateway shows **online**.
+
 ---
 
 ### ✅ Done when
 - [ ] `control-panel-url` secret set to your `service_url`
-- [ ] Gateway service is `active (running)`
+- [ ] Gateway service is `active (running)` (or skipped: no SSH)
+- [ ] `GatewayAdmin connected` lines from `<prefix>-web` and `<prefix>-scheduler`
+      (8.4), or the dashboard shows the gateway online
 
 Next: **`09-first-login-and-verify.md`**

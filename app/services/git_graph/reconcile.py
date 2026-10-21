@@ -41,7 +41,8 @@ from app.database import get_pool
 from app.ledger.journal import append_event
 
 from .plan import DerivedPlan, StoryInput, derive_plan, load_inputs
-from .repo_identity import ensure_git_repo, resolve_repo_trunk
+from .repo_identity import (ensure_git_repo, resolve_repo_trunk,
+                            resolve_ws_trunk)
 
 _log = logging.getLogger(__name__)
 
@@ -119,15 +120,28 @@ async def _gc_stale_planned(conn, goal_id: str, current_node_ids: list[str]) -> 
         )
 
     # Cancel only UN-approved, non-terminal orphan merge stories (idempotent: skips
-    # already-cancelled). Single-node merge groups today, so an orphan's group never
-    # contains a live sibling node.
-    cancelled = await conn.execute(
-        "UPDATE stories SET state = 'cancelled', updated_at = now() "
-        "WHERE story_kind = 'merge' AND state NOT IN ('done', 'cancelled') "
-        "  AND merge_approved_at IS NULL AND merge_group_id IN ("
-        "  SELECT merge_group_id FROM git_merge_group_nodes WHERE git_node_id = ANY($1::text[]))",
-        orphan_ids,
-    )
+    # already-cancelled).
+    #
+    # MULTI-NODE SAFE (multi-repo plan §11.6 / L3). Merge groups are no longer always
+    # single-node: a multi-write story's group holds one node per repo. Cancelling a
+    # group's merge story because ONE of its nodes was torn down would kill the merge
+    # for the sibling repos that are still live. So cancel only when EVERY node in the
+    # group is an orphan — i.e. the group has no surviving node. For single-node
+    # groups this is identical to the previous behaviour.
+    from app.services.story_state_ledger import record_states_where
+    cancelled = await record_states_where(
+        conn, "cancelled",
+        where=("story_kind = 'merge' AND state NOT IN ('done', 'cancelled') "
+               "AND merge_approved_at IS NULL AND merge_group_id IN ("
+               "  SELECT gmn.merge_group_id FROM git_merge_group_nodes gmn "
+               "   WHERE gmn.git_node_id = ANY($1::text[]) "
+               "   GROUP BY gmn.merge_group_id "
+               "  HAVING count(*) FILTER (WHERE NOT (gmn.git_node_id = "
+               "ANY($1::text[]))) = 0 AND NOT EXISTS ("
+               "    SELECT 1 FROM git_merge_group_nodes sib "
+               "     WHERE sib.merge_group_id = gmn.merge_group_id "
+               "       AND NOT (sib.git_node_id = ANY($1::text[]))))"),
+        params=(orphan_ids,), action="merge_group_orphaned")
     # FK-safe order: children before parent. The PLANNED-only guard on the node DELETE
     # also protects git_merge_queue (node_id ON DELETE CASCADE) — a PLANNED node is
     # never enqueued, so the cascade can never drop a live queue row.
@@ -232,21 +246,50 @@ async def _persist_topology(
 ) -> ReconcileResult:
     res = ReconcileResult(goal_id=goal_id)
     ws_merge_story: dict[str, str] = {}        # ws key -> merge story id
-    reason_by_ws = {m.workstream_key: m.reason for m in plan.merges}
+    # Merge reasons are keyed by GROUP now (plan.merges is one entry per group). For
+    # single-repo work group_key == ws.key, so this lookup is unchanged.
+    reason_by_group = {m.workstream_key: m.reason for m in plan.merges}
+    # Tracks which groups already had their merge story materialized this pass, so a
+    # multi-write story's N workstreams create exactly ONE merge story between them.
+    group_merge_story: dict[str, str] = {}
     keep_stories: list[str] = []               # parallel arrays: each placed story →
     keep_nodes: list[str] = []                 # its CURRENT node (for re-root prune)
+    keep_repos: list[str] = []                 # and that node's repo (prune is per-repo)
+    membership_nodes: list[str] = []           # node → its CURRENT merge group, so a
+    membership_groups: list[str] = []          # superseded group membership can be pruned
 
     for ws in plan.workstreams:
         head = by_id[ws.story_ids[0]]
-        # Trunk is a repo-level fact: role='trunk' resource → repo default_branch →
-        # 'main'. NOT head.default_branch (a feature branch resource's value is
-        # incidental and would let 'main' clobber a configured trunk).
-        trunk_branch = await resolve_repo_trunk(conn, goal_id, head.repo_owner, head.repo_name)
+        # WHICH REPO THIS WORKSTREAM IS FOR. Must come from the WORKSTREAM, not from
+        # the head story's scalar repo_* fields: a multi-write story has one workstream
+        # per repo but only ONE scalar repo (its first write repo). Using the scalar
+        # gave every one of its workstreams the same git_repo_id AND the same
+        # branch_name, which violates UNIQUE (git_repo_id, branch_name) on git_nodes
+        # and aborts the whole goal's reconcile transaction — and, absent the
+        # constraint, would cut repo B's branch inside repo A.
+        #
+        # head.repos carries every resolved repo (repo_identity.resolve_story_repos);
+        # match on the canonical id the workstream was keyed with. The scalar fields
+        # remain the fallback for single-repo stories and for any StoryInput built
+        # before `repos` was populated.
+        ws_repo = next(
+            (r for r in head.repos if r.get("git_repo_id") == ws.repo_id), None
+        )
+        repo_owner = (ws_repo or {}).get("repo_owner") or head.repo_owner
+        repo_name = (ws_repo or {}).get("repo_name") or head.repo_name
+        clone_url = (ws_repo or {}).get("clone_url") or head.clone_url
+        # Trunk is a LANE fact first, a repo fact second: the trunk-lane
+        # resource granted to this workstream's stories decides where it
+        # lands (a repo may carry several trunk lanes in one goal --
+        # backend and frontend branches of one app repo). With no lane
+        # grant the goal's per-repo default holds, exactly as before.
+        trunk_branch = getattr(ws, "lane", "") or await resolve_ws_trunk(
+            conn, goal_id, repo_owner, repo_name, ws.story_ids)
         repo_id = await ensure_git_repo(
             conn,
-            head.repo_owner,
-            head.repo_name,
-            clone_url=head.clone_url,
+            repo_owner,
+            repo_name,
+            clone_url=clone_url,
             trunk_branch=trunk_branch,
         )
 
@@ -281,33 +324,85 @@ async def _persist_topology(
             )
             keep_stories.append(sid)
             keep_nodes.append(node_id)
+            keep_repos.append(repo_id)
+        # Track this node's CURRENT group so stale memberships can be pruned below.
+        membership_nodes.append(node_id)
+        membership_groups.append(_group_id(ws.group_key))
 
-        # 3. Merge group + group membership (single-node group today).
-        group_id = _group_id(ws.key)
+        # 3. Merge group + group membership. A single-repo workstream is its own group
+        #    (group_key == ws.key, so the id is unchanged). A multi-write story's N
+        #    workstreams share one group_key, so all N nodes land in ONE group and the
+        #    existing whole-group gate in _finalize_merged holds the merge story open
+        #    until every repo's node is MERGED.
+        group_id = _group_id(ws.group_key)
         await conn.execute(
             "INSERT INTO git_merge_groups (id, goal_id) VALUES ($1, $2) "
             "ON CONFLICT (id) DO NOTHING",
             group_id, goal_id,
         )
+        # seq = intra-group landing order. Within one story's repos there is no
+        # declared ordering to honour, so it is the deterministic sorted-repo order
+        # derive_plan produced; the merge lane treats it as advisory ordering, not a
+        # hard gate. Single-node groups keep seq 0 exactly as before.
+        node_seq = ws.group_seq
         await conn.execute(
             "INSERT INTO git_merge_group_nodes (merge_group_id, git_node_id, seq) "
-            "VALUES ($1, $2, 0) ON CONFLICT (merge_group_id, git_node_id) DO NOTHING",
-            group_id, node_id,
+            "VALUES ($1, $2, $3) ON CONFLICT (merge_group_id, git_node_id) "
+            "DO UPDATE SET seq = EXCLUDED.seq",
+            group_id, node_id, node_seq,
         )
 
-        # 4. Materialize the merge STORY (engine-authored; plan §6).
-        merge_id = _merge_story_id(ws.key)
+        # 4. Materialize the merge STORY (engine-authored; plan §6) — ONCE per group.
+        #    The second and later workstreams of a multi-write story reuse the merge
+        #    story the first one created; creating one per workstream would give the
+        #    story N merge approvals instead of the single one the design requires.
+        # D1/R2-F3 — AN ERRAND GETS NO MERGE STORY.
+        #
+        # An errand is allocated what a story is allocated, its own
+        # branch included, and its work never LANDS. A merge story is the
+        # unit of landing, so one for an errand is a control nobody
+        # should ever press: `enqueue_ready_merges` holds the node
+        # whatever happens to the story, so approving it lands nothing
+        # and says nothing about why.
+        #
+        # Observed: errand b9f0ceb8 finished, its node parked correctly
+        # at READY, and `merge-8361abfd4f8a` sat on the board in
+        # `proposed` waiting for a human to approve a landing the
+        # platform guarantees will not happen. GO's own prompt says an
+        # errand has "no merge story and no landing wake".
+        #
+        # HERE AND NOT IN DERIVATION. The branch is still cut — that is
+        # D1 — and the plan layer stays ignorant of `work_kind`, which
+        # keeps one topology rather than two.
+        errand_only = await conn.fetchval(
+            """
+            SELECT bool_and(work_kind = 'errand')
+              FROM stories WHERE id = ANY($1::text[])
+            """, list(ws.story_ids))
+        if errand_only:
+            _log.info("reconcile: workstream %s is an errand — branch "
+                        "derived, no merge story (its work never lands)",
+                        ws.key)
+            continue
+
+        merge_id = _merge_story_id(ws.group_key)
         ws_merge_story[ws.key] = merge_id
+        if ws.group_key in group_merge_story:
+            continue
+        group_merge_story[ws.group_key] = merge_id
         assignee = ws.owners[-1] if ws.owners else ""   # last owner; goal-admin fallback at approval (L10)
-        reason = reason_by_ws.get(ws.key, "ship")
-        title = f"Merge {head.repo_name}: {ws.branch_name}"
+        reason = reason_by_group.get(ws.group_key, "ship")
+        # Name the repo this workstream actually targets, not the head's scalar — on a
+        # multi-write story the scalar is always the FIRST repo, so every merge story
+        # would claim to be for repo A.
+        title = f"Merge {repo_name}: {ws.branch_name}"
         desc = (
             f"Land workstream {ws.key} ({reason}) to trunk. "
             "Collaborative, human-approved merge: sync trunk, review the diff, run "
             "CI on the merged result, resolve conflicts; the engine performs the git "
             "land on approval."
         )
-        thread_id = _merge_thread_id(ws.key)
+        thread_id = _merge_thread_id(ws.group_key)
         # Upsert: refresh depends_on/title/assignee on RE-reconcile so the merge
         # story tracks the CURRENT workstream (its `depends_on` = the last story in
         # the handoff chain). Without this, adding/removing a member story leaves the
@@ -359,13 +454,82 @@ async def _persist_topology(
     # CURRENTLY-PLACED stories (story_id in the keep-set but under a different node),
     # so a story that is transiently unplaced (e.g. a cycle this run) is never touched
     # and removed-story orphan rows are left for a later GC.
+    #
+    # PARTITIONED BY REPO (multi-repo plan §11.6 / R2). A multi-write story is placed
+    # in one node PER REPO, so it legitimately appears in `keep_stories` more than
+    # once with different node ids. The original unqualified form
+    # (`story_id = cur.sid AND git_node_id <> cur.nid`) matched each of the story's
+    # memberships against the OTHER row's node id and deleted BOTH — silently
+    # unplacing the story from every repo. Restricting the delete to nodes in the SAME
+    # repo keeps the re-root dedup this exists for while leaving sibling-repo
+    # memberships alone. Single-repo stories appear once and behave exactly as before.
     if keep_stories:
+        # KEEP-SET SEMANTICS, not pairwise. The per-repo partition above
+        # was itself a fix -- for multi-REPO stories, whose two nodes sit
+        # in different repos and so never matched each other. LANES broke
+        # it again: a story writing cal_backend and cal_frontend has two
+        # nodes in the SAME repo, so each keep entry deleted the other's
+        # membership and the story ended up placed nowhere -- two nodes
+        # with no riders, never cut, silently stuck at PLANNED.
+        #
+        # A membership survives when its exact (story, node) pair is one
+        # this derivation produced. Re-rooting still prunes (the old pair
+        # is absent from the keep set), multi-repo still works, and any
+        # number of lanes per repo works for the same reason.
         await conn.execute(
             "DELETE FROM git_node_stories gns "
-            "USING unnest($1::text[], $2::text[]) AS cur(sid, nid) "
-            "WHERE gns.story_id = cur.sid AND gns.git_node_id <> cur.nid",
-            keep_stories, keep_nodes,
+            "USING git_nodes n "
+            "WHERE n.id = gns.git_node_id "
+            "  AND gns.story_id = ANY($1::text[]) "
+            "  AND n.git_repo_id = ANY($3::text[]) "
+            "  AND NOT EXISTS ("
+            "        SELECT 1 FROM unnest($1::text[], $2::text[]) AS k(sid, nid) "
+            "         WHERE k.sid = gns.story_id AND k.nid = gns.git_node_id)",
+            keep_stories, keep_nodes, keep_repos,
         )
+
+    # 4c. Prune SUPERSEDED merge-group membership.
+    #
+    # A node's group can change without the node itself changing: granting a second
+    # repo to an in-flight story flips its group_key from '<repo_id>:<head>' to
+    # 'story:<head>', so reconcile inserts membership in the NEW group while the OLD
+    # row survives. The node then sits in two groups and the old group keeps a live
+    # merge story — a second, stale human-approval surface for the same work, and
+    # grind's group lookup could bind a diff/fix story to whichever it happened to see.
+    #
+    # Reconcile is the ONLY writer of git_merge_group_nodes (verified), so a node
+    # legitimately belongs to exactly one group: the one its current workstream names.
+    # Anything else is stale by construction.
+    if membership_nodes:
+        await conn.execute(
+            "DELETE FROM git_merge_group_nodes gmn "
+            "USING unnest($1::text[], $2::text[]) AS cur(nid, gid) "
+            "WHERE gmn.git_node_id = cur.nid AND gmn.merge_group_id <> cur.gid",
+            membership_nodes, membership_groups,
+        )
+        # Cancel the merge story of any group that just lost its last node, then drop
+        # the empty group. Guarded to an untouched 'proposed' merge story so a group
+        # whose merge is already engaged (approved / landing / done) is never disturbed.
+        emptied = await conn.fetch(
+            "SELECT g.id FROM git_merge_groups g "
+            " WHERE g.goal_id = $1 "
+            "   AND NOT EXISTS (SELECT 1 FROM git_merge_group_nodes gmn "
+            "                    WHERE gmn.merge_group_id = g.id)",
+            goal_id,
+        )
+        for row in emptied:
+            await conn.execute(
+                "UPDATE stories SET state = 'cancelled', updated_at = now() "
+                "WHERE story_kind = 'merge' AND merge_group_id = $1 "
+                "  AND state = 'proposed' AND merge_approved_at IS NULL",
+                row["id"],
+            )
+            await conn.execute("DELETE FROM git_merge_groups WHERE id = $1", row["id"])
+        if emptied:
+            _log.info(
+                "reconcile(%s): pruned %d superseded merge group(s) after a node's "
+                "group changed", goal_id, len(emptied),
+            )
 
     # 5. Wire consumer→merge dependency edges (lazy-cut gate, §4 rule 5).
     ws_by_key = {w.key: w for w in plan.workstreams}

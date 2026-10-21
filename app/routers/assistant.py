@@ -127,13 +127,20 @@ async def _ensure_persistent_user_goal_thread(
     # is never left pointing at the old (deleted) thread.
     actor_id = await pool.fetchval("SELECT actor_id FROM users WHERE uid = $1", user_uid)
     if actor_id:
+        # SCOPED TO THIS THREAD. This used to key on (goal, actor) with no
+        # thread key, so it repointed every channel the member owned in the
+        # goal at whichever thread was last provisioned -- harmless while
+        # there was one channel per member, and corrupting the moment there
+        # is one per thread. A binding belongs to its thread for life; what
+        # can legitimately change is the agent handling it, after the
+        # assistant has been reaped and recreated.
         updated = await pool.execute(
             """UPDATE platform_channel_bindings
-               SET thread_id = $1, agent_id = $2
-               WHERE goal_id     = $3
-                 AND actor_id    = $4
+               SET agent_id = $1, updated_at = now()
+               WHERE goal_id     = $2
+                 AND thread_id   = $3
                  AND archived_at IS NULL""",
-            thread_id, agent_id, goal_id, actor_id,
+            agent_id, goal_id, thread_id,
         )
         # asyncpg.execute() returns a status string like "UPDATE 3"; parse defensively.
         try:
@@ -150,10 +157,126 @@ async def _ensure_persistent_user_goal_thread(
     return thread_id
 
 
+# Terminal story states — an assistant is only free to start a NEW story once
+# whatever it's currently holding reaches one of these. Shared by both the
+# gateway path (below) and the local-execution path
+# (app/services/local_assistant.py::bind_local_story_thread), so the two
+# import routes can't drift apart on what "busy" means.
+_ASSISTANT_FREE_STATES = ("done", "cancelled", "reviewed", "rejected")
+
+
+async def find_busy_story_on_thread(pool, thread_id: str, story_id: str):
+    """Is this assistant's thread already occupied by a different, non-terminal
+    story? Returns that story's {id, title} row, or None if free. Re-importing
+    the SAME story (id == story_id) is never "busy" against itself."""
+    return await pool.fetchrow(
+        f"""SELECT id, title FROM stories
+             WHERE active_thread_id = $1 AND id <> $2
+               AND state NOT IN {_ASSISTANT_FREE_STATES}
+             LIMIT 1""",
+        thread_id, story_id,
+    )
+
+
+async def _is_kernel_assistant(agent_id: str) -> bool:
+    """Is this one of the new assistants, or the operator being replaced?
+
+    Delegates so that the thread model here and the workspace model in
+    `operator_provisioning` can never answer this differently.
+    """
+    from app.services.assistant_kind import is_kernel_assistant  # noqa: PLC0415
+    return await is_kernel_assistant(get_pool(), agent_id)
+
+
+async def _ensure_story_thread(
+    user_uid: str, goal_id: str, agent_id: str, story_id: str,
+) -> str:
+    """A thread of its OWN for this story, created on first import.
+
+    MOVED TO `app/services/story_threads.py` and delegated to from here.
+    The local-execution lane needs the same resolver and could not import
+    a router, so it grew a second one that kept a single (goal, user)
+    thread and detached every other story bound to it -- the
+    one-story-per-thread leak this function exists to prevent, reproduced
+    one lane over. Both call the service now.
+    """
+    from app.services.story_threads import ensure_story_thread
+
+    return await ensure_story_thread(
+        get_pool(), user_uid, goal_id, agent_id, story_id)
+
+
+async def _refuse_if_story_cannot_start(
+    pool, story, user_uid: str, goal_id: str, story_id: str,
+    engine_initiated: bool,
+) -> None:
+    """Every reason not to start this story, raised before anything happens.
+
+    ONE FUNCTION so the three refusals cannot drift apart in placement — which
+    is precisely how they broke. They were three inline blocks sharing a
+    position, that position quietly stopped being "before any side effect" when
+    Stage K gave the kernel assistant a thread per story, and nothing named the
+    property they all depended on. Now the property has a name and one caller.
+
+    Raises rather than returning a string: two of the three already had distinct
+    exception types the callers discriminate on (`ExecutionPausedError` renders
+    as a warning toast, `RuntimeError` as an error toast), and flattening them
+    to a message would lose that.
+    """
+    # Kill switch — refuse to START a story while its goal or the system is
+    # frozen. This is the single shared chokepoint for every "work on this story"
+    # entry point (web "Open in assistant", Slack work-on-story new + legacy, and
+    # the git-graph branch-ready listener), so gating here blocks BOTH the
+    # story→in_progress transition AND the downstream kickoff/provisioning the
+    # callers run next (they abort on the raised error). The benign no-story
+    # thread-resolution path is unaffected. dispatch_block fails closed.
+    from app.services import execution_control  # noqa: PLC0415
+    _blk = await execution_control.dispatch_block(goal_id)
+    if _blk is not None:
+        _log.info(
+            "provision_assistant_thread_for_story refused — execution paused "
+            "(scope=%s) goal=%s story=%s uid=%s",
+            _blk.scope, goal_id, story_id, user_uid,
+        )
+        raise execution_control.ExecutionPausedError(_blk)
+
+    # Local Execution Mode (M0): refuse to START a story on the gateway if it is
+    # checked out to a local editor / in local mode — same shared chokepoint,
+    # mirrors the kill-switch refusal above. In M0 the checkout endpoints don't
+    # call this, so every caller here is a gateway path (web "Open in assistant",
+    # Slack, branch-ready) that must not start a local story. (M2 note: the local
+    # checkout path will need a local-aware provisioning entry that bypasses this.)
+    if story["checked_out_to_uid"] or (story["execution_mode"] or "") == "local":
+        _log.info(
+            "provision_assistant_thread_for_story refused — story %s checked out to "
+            "local (held_by=%s mode=%s)",
+            story_id, story["checked_out_to_uid"], story["execution_mode"],
+        )
+        raise RuntimeError(
+            "This story is checked out to a local editor and can't be started on the gateway."
+        )
+
+    # Concurrency guard. What it refuses depends on which assistant this is: a
+    # ceiling of live threads for the kernel one, and the unchanged one-story
+    # rule for the operator, whose thread still rotates. See
+    # app/services/thread_ceiling.py for why those are different questions.
+    # Engine-dispatched git stories are exempt — the engine drives its own
+    # sync/fix stories.
+    if not engine_initiated:
+        from app.services.thread_ceiling import refusal_for  # noqa: PLC0415
+        refusal = await refusal_for(pool, goal_id, user_uid, story_id)
+        if refusal:
+            _log.info(
+                "provision_assistant_thread_for_story refused — uid=%s story=%s: %s",
+                user_uid, story_id, refusal,
+            )
+            raise RuntimeError(refusal)
+
+
 async def provision_assistant_thread_for_story(
     user_uid: str, goal_id: str, story_id: str = "",
     engine_initiated: bool = False,
-) -> tuple[str, str]:
+) -> tuple[str, str, bool]:
     """Resolve the user's persistent SHCA thread for this goal and,
     optionally, rotate it onto a story.
 
@@ -165,8 +288,18 @@ async def provision_assistant_thread_for_story(
     `accepted → in_progress`, and rotates the channel's
     `current_story_id`.
 
-    Returns (thread_id, agent_id). Raises RuntimeError on provisioning
-    failure.
+    The thread is always rotated onto the requested story (the
+    assistant "opens"/is assigned the story regardless). But if the
+    thread it's being rotated FROM is still occupied by another story
+    that's `in_progress`/`blocked` — i.e. the assistant is already
+    mid-work on something else — the `in_progress` transition and
+    kickoff are withheld: the story stays assigned but doesn't start
+    until the busy story reaches a terminal state. See `assistant_busy`
+    in the return value.
+
+    Returns (thread_id, agent_id, assistant_busy). Callers must skip
+    `dispatch_story_kickoff_to_assistant` when `assistant_busy` is True.
+    Raises RuntimeError on provisioning failure.
     """
     import uuid as _uuid
     pool = get_pool()
@@ -179,34 +312,53 @@ async def provision_assistant_thread_for_story(
     else:
         agent_id = await _ensure_user_assistant_agent(user_uid)
         await _ensure_agent_in_goal(goal_id, agent_id, user_uid)
-    thread_id = await _ensure_persistent_user_goal_thread(user_uid, goal_id, agent_id)
-
-    if not story_id:
-        return thread_id, agent_id
-
+    # EVERY REFUSAL RUNS BEFORE ANY THREAD IS CREATED.
+    #
+    # The three guards below used to sit AFTER the thread resolution, and
+    # that was correct for exactly as long as resolving a thread had no
+    # side effect: the operator has ONE thread per (user, goal), so
+    # `_ensure_persistent_user_goal_thread` found the existing row for
+    # every returning user and created nothing. "Raising here aborts
+    # before the thread work" meant the marker insert, the
+    # `active_thread_id` rotation and the `accepted -> in_progress`
+    # transition further down — all genuinely below.
+    #
+    # Stage K made the kernel assistant's thread PER STORY, and
+    # `_ensure_story_thread` INSERTs. So a refused import left a real,
+    # titled, story-bound thread behind: it appeared in the sidebar, the
+    # person clicked it, and the gateway opened a session on a story that
+    # had just been refused (observed on KER15 — thread
+    # 0537d960 for story 9a015cb0, refused by the ceiling one log line
+    # later). The guard did not move; the thing it was guarding grew a
+    # side effect underneath it.
+    #
+    # Ordering them all above the resolution restores the property the
+    # comment claimed, for the kill switch and the local-checkout refusal
+    # as much as for the ceiling — all three had silently acquired the
+    # same leak.
     story = await pool.fetchrow(
         "SELECT * FROM stories WHERE id = $1 AND goal_id = $2",
         story_id, goal_id,
-    )
-    if not story:
-        return thread_id, agent_id
+    ) if story_id else None
 
-    # Kill switch — refuse to START a story while its goal or the system is
-    # frozen. This is the single shared chokepoint for every "work on this story"
-    # entry point (web "Open in assistant", Slack work-on-story new + legacy, and
-    # the git-graph branch-ready listener), so gating here blocks BOTH the
-    # story→in_progress transition below AND the downstream kickoff/provisioning
-    # the callers run next (they abort on the raised error). The benign no-story
-    # thread-resolution paths above are unaffected. dispatch_block fails closed.
-    from app.services import execution_control  # noqa: PLC0415
-    _blk = await execution_control.dispatch_block(goal_id)
-    if _blk is not None:
-        _log.info(
-            "provision_assistant_thread_for_story refused — execution paused "
-            "(scope=%s) goal=%s story=%s uid=%s",
-            _blk.scope, goal_id, story_id, user_uid,
-        )
-        raise execution_control.ExecutionPausedError(_blk)
+    if story is not None:
+        await _refuse_if_story_cannot_start(
+            pool, story, user_uid, goal_id, story_id, engine_initiated)
+
+    # A kernel assistant gets a thread PER STORY; the operator being
+    # replaced keeps the single rotating one, so existing assistants are
+    # unaffected by this until they are migrated.
+    if story_id and await _is_kernel_assistant(agent_id):
+        thread_id = await _ensure_story_thread(
+            user_uid, goal_id, agent_id, story_id)
+    else:
+        thread_id = await _ensure_persistent_user_goal_thread(
+            user_uid, goal_id, agent_id)
+
+    if not story_id:
+        return thread_id, agent_id
+    if story is None:
+        return thread_id, agent_id, False
 
     # Note: the "Story Mode Active" marker that _build_identity_md
     # uses to detect the active story is no longer inserted as a
@@ -218,12 +370,38 @@ async def provision_assistant_thread_for_story(
     # Deterministic active-story focus. The active-story resolvers (snapshot +
     # the /active-story endpoint + claude_code_communication) read is_active_focus
     # with their existing key (active_thread_id / shca_instance_id) instead of the
-    # ambiguous updated_at-DESC heuristic. Clear the flag on this thread's other
-    # stories, then mark THIS one as the single current focus. Runs for every
-    # assignment path (web / Slack / engine-initiated) since this is the choke point.
+    # ambiguous updated_at-DESC heuristic. DETACH this thread's other stories —
+    # clear BOTH is_active_focus AND active_thread_id — then mark THIS one as the
+    # single current focus. Runs for every assignment path (web / Slack /
+    # engine-initiated) since this is the choke point.
+    #
+    # Clearing active_thread_id (not just the flag) enforces one-story-per-thread.
+    # Leaving a stale active_thread_id on a superseded non-terminal story lets
+    # resolve_active_focus_story()'s fallback latch onto it once the current story
+    # goes terminal (terminal clears the current story's active_thread_id, so the
+    # stale one becomes the sole non-terminal match) — the assistant then "resumes"
+    # an old story nobody re-imported. The `AND is_active_focus` filter is dropped so
+    # bound-but-unfocused stragglers are detached too.
+    #
+    # Assistant-busy check (MUST run before the rotation below clears it):
+    # if another story is still bound to this thread and hasn't reached a
+    # terminal state (done/cancelled/reviewed/rejected), the assistant is
+    # busy. The new story still gets the thread rotated onto it (assignment
+    # always succeeds), but the in_progress transition + kickoff are withheld
+    # below until the busy story is marked done/cancelled/reviewed. Re-importing
+    # the SAME story is always allowed (excluded via `id <> $2`).
+    busy_story = await find_busy_story_on_thread(pool, thread_id, story_id)
+    assistant_busy = busy_story is not None
+    if assistant_busy:
+        _log.info(
+            "provision_assistant_thread_for_story: assistant thread=%s is busy with "
+            "story=%s (%s) — story=%s will be assigned but not started",
+            thread_id[:12] if thread_id else "-", busy_story["id"], busy_story["title"],
+            story_id,
+        )
     await pool.execute(
-        "UPDATE stories SET is_active_focus = false "
-        "WHERE active_thread_id = $1 AND id <> $2 AND is_active_focus",
+        "UPDATE stories SET is_active_focus = false, active_thread_id = NULL, "
+        "updated_at = now() WHERE active_thread_id = $1 AND id <> $2",
         thread_id, story_id,
     )
     await pool.execute(
@@ -242,7 +420,7 @@ async def provision_assistant_thread_for_story(
     # task event types) and fires the existing GO + Slack notifications
     # so the goal-channel + orchestrator audit is consistent.
     old_state = story.get("state")
-    if old_state in ("proposed", "accepted"):
+    if old_state in ("proposed", "accepted") and not assistant_busy:
         await pool.execute(
             "UPDATE stories SET state = 'in_progress', started_at = now(), "
             "updated_at = now() WHERE id = $1 AND state IN ('proposed', 'accepted')",
@@ -300,24 +478,20 @@ async def provision_assistant_thread_for_story(
                 _log.warning(
                     "Channel lifecycle relay failed for story in_progress %s: %s", story_id, exc,
                 )
-    if not engine_initiated:
-        try:
-            from app.slack import user_goal_channels as ugc
-            await ugc.set_current_story(goal_id, user_uid, story_id)
-        except Exception as exc:
-            _log.warning(
-                "set_current_story failed for goal=%s uid=%s story=%s: %s",
-                goal_id, user_uid, story_id, exc,
-            )
+    # The call that used to live here wrote `current_story_id` to the LEGACY
+    # slack_user_goal_channels table and not to platform_channel_bindings --
+    # so the canonical import path updated the table nothing reads and left
+    # the one everything reads stale. Removed with app/slack/. Rotating the
+    # binding is Phase 5's job, done against the real table.
 
     # Kickoff (GO→SHCA system message that wakes the gateway) is a
     # SEPARATE step — see dispatch_story_kickoff_to_assistant below. Callers
     # must invoke it after they're confident the rest of the flow has
     # had a chance to settle (e.g. Slack channel created, user invited,
     # welcome message posted) so the SHCA's reply lands in a place the
-    # user can already see.
+    # user can already see. Skip it entirely when assistant_busy is True.
 
-    return thread_id, agent_id
+    return thread_id, agent_id, assistant_busy
 
 
 _blocked_awareness_at: dict[str, float] = {}   # story_id → last-posted epoch (per-replica dedup)
@@ -370,7 +544,9 @@ async def dispatch_story_kickoff_to_assistant(
     Called ONLY AFTER:
       • provision_assistant_thread_for_story (DB rows, no marker insert)
       • ensure_shca_session (gateway session ready)
-      • ensure_user_goal_channel (Slack channel + welcome posted)
+      • ensure_channel_for_thread (the story's Slack channel; the
+        private member-goal channel that used to be made here was
+        removed on 2026-10-19)
       • refresh_story_resources (RESOURCES.md + IDENTITY.md updated
         for the active story — fresh OR rotated session)
 
@@ -387,6 +563,7 @@ async def dispatch_story_kickoff_to_assistant(
     from app.auth import get_agent_actor_id
     from app.database import get_pool
     from app.ledger.journal import append_event
+    from app.ledger.actors import human_principal_for_uid
     from app.ledger.schema import MESSAGE_POSTED
     from app.task_controller import SYSTEM_ACTOR_ID
 
@@ -457,26 +634,93 @@ async def dispatch_story_kickoff_to_assistant(
     # Claude Code subprocess directly).
     execution_mode = story.get("execution_mode") or "ia_dispatch"
 
+    # Stage K retires execution_mode for the kernel assistant. It reads
+    # 'operator' on every story ever written — the column was the claude-code
+    # switch, and there is nothing left for it to switch. Which executor runs a
+    # story is now the assistant's choice, made per story when it starts the
+    # run, and the kernel already carries it as (kind, domain) on the execution
+    # row. So the two things 'operator' still controls here are decided by WHO
+    # THE ASSISTANT IS instead:
+    #
+    #   needs_workspace — a story directory to hold documents and plans.
+    #                     Both kinds want one.
+    #   docs_only       — whether that directory contains a checkout. The
+    #                     operator works in its checkout; the kernel assistant
+    #                     reads the executor's, so a second one here is a copy
+    #                     that goes stale at the executor's first commit.
+    docs_only = await _is_kernel_assistant(agent_id)
+    needs_workspace = docs_only or execution_mode == "operator"
+
     # Phase 4 invariant: SHCA never starts operating on an operator-mode
     # story whose workspace is not present & fresh. "Fresh" means the
     # workspace_state is 'ready' AND the workspace was provisioned for
     # the CURRENT SHCA instance (same agent+goal+thread). If the SHCA
     # has been replaced (thread deletion + re-import), the path in
     # workspace_path points at a dead workspace and we re-provision.
-    current_instance_id = f"{agent_id}-{goal_id}-{thread_id}"
+    from app.services.assistant_instance import resolve as _resolve_instance_id
+    current_instance_id = await _resolve_instance_id(
+        pool, agent_id, goal_id, thread_id)
     workspace_is_fresh = (
         story["workspace_state"] == "ready"
         and (story.get("shca_instance_id") or "") == current_instance_id
     )
-    if execution_mode == "operator" and not workspace_is_fresh:
+
+    # Multi-repo fix, piece 1 (research/MULTI_REPO_STORIES_PLAN.md §12.5): "fresh" so
+    # far only means "cloning finished", never "finished with every granted repo". A
+    # write repo whose branch was cut a few seconds after the FIRST provisioning
+    # attempt gave up on it gets silently, permanently dropped otherwise — this is
+    # what re-opens freshness for exactly that case.
+    #
+    # Only when the workspace already reads fresh by the check above: cheap
+    # short-circuit for the common case (not-ready / different instance / non-operator),
+    # which needs no extra query at all.
+    # Not for a docs-only workspace: there is no clone set to be incomplete,
+    # and the check reads story_workspace_nodes, which such a story has none of.
+    if workspace_is_fresh and needs_workspace and not docs_only:
+        from app.services.operator_provisioning import is_write_repo_set_incomplete
+        if await is_write_repo_set_incomplete(pool, goal_id, story_id):
+            from app.services.story_kickoff_state import story_has_had_kickoff
+            if await story_has_had_kickoff(pool, story_id, thread_id):
+                # UNSAFE to redo: kickoff was sent, so real work may exist, and
+                # provision_story_workspace's clone step nukes every repo it touches.
+                # Leave the workspace as "fresh" — the missing repo stays missing —
+                # rather than risk destroying it. piece 2 (grant_resource) is what
+                # stops this case from arising in the first place; this branch only
+                # covers a story that already reached it before piece 2 shipped.
+                _log.warning(
+                    "dispatch_story_kickoff: story=%s has an incomplete write-repo set "
+                    "but kickoff was already sent — NOT re-provisioning (would risk "
+                    "destroying in-progress work). See MULTI_REPO_STORIES_PLAN.md §12.",
+                    story_id,
+                )
+            else:
+                # Provably safe: nothing has been worked on yet, so the destructive
+                # re-clone below has nothing to lose.
+                _log.info(
+                    "dispatch_story_kickoff: story=%s has an incomplete write-repo set "
+                    "and kickoff was never sent — treating the workspace as stale so "
+                    "the missing repo(s) can be safely added", story_id,
+                )
+                workspace_is_fresh = False
+
+    # Did THIS call actually change the workspace? Decides whether there is
+    # anything new to tell the assistant — see the persist guard below.
+    did_provision = False
+
+    if needs_workspace and not workspace_is_fresh:
         from app.services.operator_provisioning import provision_story_workspace
-        stale_reason = (
-            "workspace_state != ready"
-            if story["workspace_state"] != "ready"
-            else f"shca_instance_id mismatch "
-                 f"(stored={story.get('shca_instance_id') or '<none>'!r}, "
-                 f"current={current_instance_id!r})"
-        )
+        if story["workspace_state"] != "ready":
+            stale_reason = "workspace_state != ready"
+        elif (story.get("shca_instance_id") or "") != current_instance_id:
+            stale_reason = (
+                f"shca_instance_id mismatch "
+                f"(stored={story.get('shca_instance_id') or '<none>'!r}, "
+                f"current={current_instance_id!r})"
+            )
+        else:
+            # Only remaining way to reach here: the incomplete-write-repo-set branch
+            # above just flipped workspace_is_fresh, with both prior conditions true.
+            stale_reason = "write-repo set incomplete and kickoff never sent"
         _log.info(
             "dispatch_story_kickoff: provisioning operator workspace for story=%s "
             "(%s)",
@@ -503,6 +747,7 @@ async def dispatch_story_kickoff_to_assistant(
                 story_id, provision_result.get("error"),
             )
             return False
+        did_provision = True
         # Re-fetch to pick up workspace_path the provisioner just set.
         story = await pool.fetchrow(
             """SELECT title, execution_mode, workspace_state, workspace_path,
@@ -510,6 +755,53 @@ async def dispatch_story_kickoff_to_assistant(
                  FROM stories WHERE id = $1 AND goal_id = $2""",
             story_id, goal_id,
         )
+
+        # Multi-repo fix, piece 1b (research/MULTI_REPO_STORIES_PLAN.md §12.5): the
+        # gap piece 1 above (lines ~578-603) does NOT cover. That check only re-verifies
+        # a workspace that was ALREADY "ready" before this call started. It never
+        # applies here, where `provision_story_workspace` just ran THIS call and
+        # returned ok=True while deliberately skipping a write repo whose branch
+        # wasn't cut yet ("Component C will re-provision" — a legitimate, expected
+        # outcome for a single-repo story, but silently wrong for a multi-repo one
+        # about to be kicked off with only some of its repos cloned). Confirmed live
+        # 2026-08-19 on story 450a89cb: provisioning skipped agentos (not cut
+        # yet), recorded 1/2 repos, returned ok=True, and kickoff was dispatched in
+        # this SAME call — the branch-ready re-provision fired the very next log line,
+        # after the SHCA had already been told to start. Safe to defer here
+        # unconditionally: kickoff has not been sent yet at this point in the
+        # function, so there is no "unsafe to redo" case to weigh — only "wait".
+        if needs_workspace and not docs_only and story:
+            from app.services.operator_provisioning import is_write_repo_set_incomplete
+            if await is_write_repo_set_incomplete(pool, goal_id, story_id):
+                _log.info(
+                    "dispatch_story_kickoff: story=%s provisioned but still missing "
+                    "repo(s) whose branch isn't cut yet — deferring kickoff; will "
+                    "auto-resume on branch-ready", story_id,
+                )
+                return False
+
+    # LEVEL-TRIGGERED SAFETY: `branch_ready_listener` re-checks every 'ready'
+    # operator story every 45s and calls this function whenever
+    # `is_write_repo_set_incomplete` is True. That re-check is CORRECT and must
+    # keep running — the missing branch may still land. What is not correct is
+    # producing a side effect when nothing changed: this function would post the
+    # marker on every pass, and the 2-minute idempotency window below cannot stop
+    # a 45s caller (two passes fall inside it, the third lands outside — the ~135s
+    # kickoff cadence seen live on 2026-08-25, stories 476439fd and 43c40354).
+    #
+    # So post only when this call has something NEW to say: either it just
+    # (re)provisioned the workspace, or this thread has never been told about this
+    # story. THREAD-scoped deliberately — a story rotated onto a fresh assistant
+    # still needs its kickoff there, so `story_has_had_kickoff` would be wrong here.
+    if not did_provision:
+        from app.services.story_kickoff_state import thread_has_kickoff
+        if await thread_has_kickoff(pool, thread_id, story_id):
+            _log.debug(
+                "dispatch_story_kickoff: no-op for story=%s thread=%s — nothing "
+                "provisioned and this thread already has the marker",
+                story_id, thread_id[:12] if thread_id else "-",
+            )
+            return True
 
     # Phase 4 Stage 4: when the workspace is being re-provisioned (i.e.
     # this story was previously bound to a different SHCA instance and
@@ -519,7 +811,7 @@ async def dispatch_story_kickoff_to_assistant(
     # watchdog when the old SHCA was reaped), so resuming that id from
     # the new SHCA's workspace would fail. The pre-spawn below creates
     # a fresh session in the new workspace.
-    if execution_mode == "operator" and not workspace_is_fresh:
+    if needs_workspace and not docs_only and not workspace_is_fresh:
         await pool.execute(
             "UPDATE stories SET current_claude_session_id = NULL, "
             "updated_at = NOW() WHERE id = $1 "
@@ -546,7 +838,12 @@ async def dispatch_story_kickoff_to_assistant(
         isinstance(story, dict) or hasattr(story, "get"),
         (story.get("shca_instance_id") if story else None) if hasattr(story, "get") else None,
     )
-    if execution_mode == "operator" and story and (story.get("workspace_path") or ""):
+    # Never for a kernel story. Pre-spawning Claude Code was how the OPERATOR
+    # got a session id before its first planning turn; the kernel assistant
+    # does not spawn Claude Code at all — it starts a run and the Conductor
+    # dispatches an executor of the kind the assistant chose. Spawning one here
+    # would put a second agent in a workspace with no checkout for it to work in.
+    if needs_workspace and not docs_only and story and (story.get("workspace_path") or ""):
         try:
             from app.services.operator_provisioning import prespawn_claude_for_code_story
             prespawn_result = await prespawn_claude_for_code_story(
@@ -847,20 +1144,43 @@ async def dispatch_story_kickoff_to_assistant(
         # since the dispatcher may have already transitioned the story
         # (e.g. discovery → planning) before this kickoff lands.
         _current_phase = (story.get("current_phase") if isinstance(story, dict) else None) or "discovery"
-        combined = (
-            f"# Story Mode Active\n\n"
-            f"Story `{story_id}` — \"{story['title']}\"\n\n"
-            f"Type: code (Claude Code involved)\n"
-            f"Phase: {_current_phase}\n"
-            f"Workspace: `{ws_path}`\n\n"
-            f"A `story_state_snapshot` block accompanies the next human turn with "
-            f"the authoritative current state. Route yourself using the skill-"
-            f"routing table in your AGENTS.md: read the phase-specific skill it "
-            f"names for the current `next_action.state` / phase (e.g. "
-            f"`skills/assistant_discovery/SKILL.md` while in discovery), then act. "
-            f"The snapshot is the source of truth — prefer it over any value in "
-            f"this kickoff."
-        )
+        # THE KERNEL ASSISTANT HAS NO PHASES AND NO SKILLS, so the old
+        # kickoff is not merely redundant for it -- it is a set of
+        # instructions it cannot follow. It names a skill-routing table
+        # that is not in its AGENTS.md and a skills/ directory it does
+        # not read, and the first thing the model did with it was
+        # announce a phase and wait for a snapshot that never came.
+        #
+        # What it needs is the one fact the thread does not already
+        # carry: which story this is. Everything else it reads for
+        # itself, which is the point of giving it a tool surface.
+        if await _is_kernel_assistant(agent_id):
+            combined = (
+                f"A story has been imported into this thread.\n\n"
+                f"**`{story_id}`** - \"{story['title']}\"\n\n"
+                f"You have not been told what it needs. Read `story_status` "
+                f"and `list_resources` first, then ask the person here for "
+                f"whatever GO left thin: what the work is, which "
+                f"repositories it touches, and what must be true when it "
+                f"is done. GO writes stories thinly on purpose, and "
+                f"getting the rest is your job.\n\n"
+                f"Do not call `start_story` until you can answer all three."
+            )
+        else:
+            combined = (
+                f"# Story Mode Active\n\n"
+                f"Story `{story_id}` — \"{story['title']}\"\n\n"
+                f"Type: code (Claude Code involved)\n"
+                f"Phase: {_current_phase}\n"
+                f"Workspace: `{ws_path}`\n\n"
+                f"A `story_state_snapshot` block accompanies the next human turn with "
+                f"the authoritative current state. Route yourself using the skill-"
+                f"routing table in your AGENTS.md: read the phase-specific skill it "
+                f"names for the current `next_action.state` / phase (e.g. "
+                f"`skills/assistant_discovery/SKILL.md` while in discovery), then act. "
+                f"The snapshot is the source of truth — prefer it over any value in "
+                f"this kickoff."
+            )
 
         # Legacy long-form kickoff kept disabled below for reference.
         # Pre-refactor it carried the entire operator playbook inline;
@@ -1038,6 +1358,15 @@ async def dispatch_story_kickoff_to_assistant(
                 },
                 actor_id=go_actor_id,
                 actor_type=actor_type,
+                # A PERSON set this in motion. The GO is handing a story to
+                # an assistant because somebody asked for it, and `user_uid`
+                # is that somebody — already in the payload, now on the
+                # envelope where attribution is actually read from.
+                #
+                # Strict lookup, not `human_actor`: that returns the SYSTEM
+                # actor for an unknown uid, and "on behalf of the system" is
+                # not a statement about anybody.
+                on_behalf_of=await human_principal_for_uid(conn, user_uid),
                 context_goal_id=goal_id,
                 context_conversation_id=thread_id,
             )
@@ -1265,7 +1594,7 @@ async def pick_assistant_for_chat(pid: str, request: Request, user: dict = Depen
 
     from app.services import execution_control  # noqa: PLC0415
     try:
-        thread_id, agent_id = await provision_assistant_thread_for_story(
+        thread_id, agent_id, assistant_busy = await provision_assistant_thread_for_story(
             user["uid"], pid, import_story_id,
         )
     except execution_control.ExecutionPausedError as exc:
@@ -1286,7 +1615,12 @@ async def pick_assistant_for_chat(pid: str, request: Request, user: dict = Depen
     #      banner) and wakes the gateway session.
     # Both calls are best-effort: provisioning succeeded, so we redirect
     # to the chat regardless. Failures are logged but not fatal.
-    if import_story_id:
+    if import_story_id and assistant_busy:
+        _log.info(
+            "pick-shca: story=%s assigned but NOT started — assistant thread=%s is "
+            "already working on another story", import_story_id, thread_id[:12] if thread_id else "-",
+        )
+    elif import_story_id:
         try:
             from app.resource_provisioning import refresh_story_resources
             await refresh_story_resources(pid, import_story_id)
@@ -1360,6 +1694,35 @@ async def get_workspace_tree(
 
     Shape: { entries: [{path, type, size, mtimeMs}, ...], truncated: bool }
     """
+    # KERNEL MODE. When KERNEL_CONSOLE_URL is set, `sid` is a kernel
+    # execution and its files live in the executor's sandbox rather than
+    # in an assistant's directory -- the new assistant holds no
+    # workspace, so there is nothing for the gateway RPC below to walk.
+    # The page is unchanged; only where the bytes come from moves.
+    # THE POD FIRST, and before `enabled()` rather than inside it.
+    # `enabled()` asks whether KERNEL_WORKSPACE_URL is set -- one
+    # address for "the container holding the volume" -- and on
+    # Kubernetes there is no such container: every execution has its own
+    # pod and its own claim. The variable is also unset on `next`, so
+    # the gate was closed and the page fell through to the gateway RPC,
+    # which walks the assistant's directory and finds nothing. An empty
+    # panel, no error, and a workspace that was complete all along.
+    #
+    # Returns None when this story has no pod, which is every Docker and
+    # E0 run, and then the original path below is taken unchanged.
+    from app.services import kernel_workspace, kernel_workspace_pod
+    from_pod = await kernel_workspace_pod.tree(sid)
+    if from_pod is not None:
+        return JSONResponse(from_pod)
+    if kernel_workspace.enabled():
+        try:
+            return JSONResponse(await kernel_workspace.tree(sid))
+        except Exception as exc:                            # noqa: BLE001
+            _log.warning("kernel workspace tree failed (story=%s): %s",
+                         sid, exc)
+            raise HTTPException(status_code=502,
+                                detail=f"kernel console: {exc}")
+
     instance_id, ws_path = await _resolve_story_workspace_instance(
         user["uid"], pid, sid,
     )
@@ -1367,7 +1730,7 @@ async def get_workspace_tree(
     from app.openclaw import gateway_admin, GatewayError
     # Pass the story's real provisioned dir so the gateway walks it directly
     # instead of re-deriving from the (lowercased/truncated) agent id — which
-    # misses the worktree for long / uppercase-goal-id agents (e.g. RLAGT).
+    # misses the worktree for long / uppercase-goal-id agents (e.g. MARL).
     _params = {"agentId": instance_id, "storyId": sid}
     if ws_path:
         _params["workspacePath"] = ws_path
@@ -1404,6 +1767,22 @@ async def get_workspace_file(
     """
     if not path or len(path) > 1024:
         raise HTTPException(status_code=400, detail="missing or oversized path")
+
+    from app.services import kernel_workspace, kernel_workspace_pod
+    from_pod = await kernel_workspace_pod.read_file(sid, path)
+    if from_pod is not None:
+        if from_pod.get("error"):
+            raise HTTPException(status_code=404, detail=from_pod["error"])
+        return JSONResponse(from_pod)
+    if kernel_workspace.enabled():
+        try:
+            out = await kernel_workspace.read_file(sid, path)
+        except Exception as exc:                            # noqa: BLE001
+            raise HTTPException(status_code=502,
+                                detail=f"kernel console: {exc}")
+        if out.get("error"):
+            raise HTTPException(status_code=404, detail=out["error"])
+        return JSONResponse(out)
 
     instance_id, ws_path = await _resolve_story_workspace_instance(
         user["uid"], pid, sid,
@@ -1915,7 +2294,7 @@ async def mark_story_done_endpoint(
 
     pool = get_pool()
     row = await pool.fetchrow(
-        "SELECT state, current_phase, title, shca_instance_id FROM stories "
+        "SELECT state, current_phase, title, shca_instance_id, execution_mode FROM stories "
         "WHERE id = $1 AND goal_id = $2",
         sid, pid,
     )
@@ -1923,6 +2302,12 @@ async def mark_story_done_endpoint(
         raise HTTPException(status_code=404, detail="story not found")
     if row["state"] == "done":
         return JSONResponse({"ok": True, "already_done": True})
+    # A FINISHED LOCAL STORY STAYS FINISHED. Nothing here checked the starting state,
+    # so a `reviewed` or `cancelled` VS Code story could be moved back to `done`.
+    # Local stories only (rule zero: the cloud path is unchanged).
+    if row["execution_mode"] == "local" and row["state"] in ("reviewed", "cancelled", "rejected"):
+        return JSONResponse(
+            {"ok": False, "error": f"this story is already {row['state']}"}, status_code=409)
 
     # Warn if closing the story would discard uncommitted work (phases don't commit —
     # completed-phase changes only reach git via the diff-review gate). Best-effort +
@@ -1948,26 +2333,89 @@ async def mark_story_done_endpoint(
             })
 
     old_state = row["state"]
+
+    # ── DONE MEANS LANDED HERE TOO ───────────────────────────────────
+    #
+    # This is the LOCAL lane's equivalent of the pod lane's landing
+    # park, and it is the same correction: a person marking the story
+    # done while its PR is still open is saying "I have finished
+    # working", not "this is on trunk". Writing `done` here would say
+    # the second — and `done` is what releases the checkout, satisfies
+    # dependent stories and closes the thread.
+    #
+    # NO PARK, because there is nothing to park: the local lane has no
+    # pod, no leg and no envelope. The CHECKOUT LOCK is what persists
+    # instead, and holding it is exactly what keeps the story theirs
+    # while the merge is pending.
+    #
+    # The exit needs nothing new. `story_landing._sweep_cold` already
+    # finishes any story sitting at `awaiting_merge` whose nodes have
+    # all landed and which has no open landing park — which is every
+    # local story, because it never had one.
+    _to_state, _extra = "done", True
+    try:
+        from kernel.worker.landing import holds_for_merge_enabled
+
+        if holds_for_merge_enabled():
+            from app.services.story_landing import has_unlanded_work
+
+            if await has_unlanded_work(pool, sid):
+                _to_state, _extra = "awaiting_merge", False
+    except Exception:                                       # noqa: BLE001
+        # FAIL TOWARDS THE OLD BEHAVIOUR. Marking a story done is a
+        # person pressing a button, and it must not fail because the
+        # git graph could not be read.
+        _log.exception("mark-done: could not tell whether story %s has "
+                       "landed; finishing it as before", sid)
+
     # Wrap UPDATE + ledger emit in one transaction so audit trail commits
     # together with the state mutation. The ledger event also drives the
     # memory_v2 event bridge + story-complete flush trigger.
     async with pool.acquire() as conn, conn.transaction():
-        await conn.execute(
-            """UPDATE stories
-                  SET state = 'done',
-                      current_phase = 'done',
-                      execution_paused = FALSE,
-                      completed_at = NOW(),
-                      -- Clear active_thread_id on terminal transition so the
-                      -- SHCA cleanup watchdog can see the story is finished
-                      -- when joining stories→agent_instances by thread_id.
-                      -- Without this, the next story sharing this thread would
-                      -- pick up an ambiguous join match.
-                      active_thread_id = NULL,
-                      updated_at = NOW()
-                WHERE id = $1""",
-            sid,
-        )
+        if _extra:
+            await conn.execute(
+                """UPDATE stories
+                      SET state = 'done',
+                          current_phase = 'done',
+                          execution_paused = FALSE,
+                          completed_at = NOW(),
+                          -- Clear active_thread_id on terminal transition so the
+                          -- SHCA cleanup watchdog can see the story is finished
+                          -- when joining stories→agent_instances by thread_id.
+                          -- Without this, the next story sharing this thread would
+                          -- pick up an ambiguous join match. Also clear is_active_focus
+                          -- so a finished story never lingers as the thread's "focus"
+                          -- (keeps the two focus fields consistent — see the
+                          -- one-story-per-thread invariant in
+                          -- provision_assistant_thread_for_story).
+                          active_thread_id = NULL,
+                          is_active_focus = FALSE,
+                          updated_at = NOW()
+                    WHERE id = $1""",
+                sid,
+            )
+        else:
+            # WAITING, NOT FINISHED — so none of the terminal tidying
+            # happens. `completed_at` would date the story to before it
+            # landed; clearing `active_thread_id` would retire the
+            # conversation the person still needs to ask for more work
+            # in; and `current_phase` stays where it was because the
+            # work really is where they left it.
+            #
+            # NO ERRAND REACHES THIS LINE, and the proof is in
+            # `has_unlanded_work` rather than here: an errand's branch
+            # IS cut (reconcile's D1), so the node test alone would say
+            # yes and park it on a merge that never comes. The
+            # `work_kind` carve-out lives with the question, so every
+            # caller inherits it instead of re-remembering it.
+            await conn.execute(
+                """UPDATE stories
+                      SET state = 'awaiting_merge',
+                          execution_paused = FALSE,
+                          updated_at = NOW()
+                    WHERE id = $1""",
+                sid,
+            )
         from app.ledger.journal import append_event
         from app.ledger.schema import STORY_STATE_CHANGED
         from app.ledger.actors import human_actor
@@ -1982,7 +2430,7 @@ async def mark_story_done_endpoint(
                 "story_id": sid,
                 "title": row["title"],
                 "from_state": old_state,
-                "to_state": "done",
+                "to_state": _to_state,
                 "action": "mark-done",
                 "actor_uid": user["uid"],
             },

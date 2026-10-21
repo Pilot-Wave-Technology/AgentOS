@@ -853,10 +853,17 @@ async def _system_cost() -> dict:
     """
     pool = get_pool()
     # All 9 result sets come from pre-aggregated mat views — no live JOINs.
-    db, tool_rows_raw, agent_rows_raw = await asyncio.gather(
+    # Attribution rides in the SAME batch. It is two more reads against
+    # pre-aggregated views, so it costs nothing in wall-clock — the gather
+    # is already waiting on the slowest of the others.
+    from app.services import cost_attribution
+
+    db, tool_rows_raw, agent_rows_raw, by_role, thread_rows = await asyncio.gather(
         _db_cost_data(),
         pool.fetch("SELECT * FROM mv_cost_top_tools  ORDER BY calls DESC"),
         pool.fetch("SELECT * FROM mv_cost_top_agents ORDER BY cost  DESC NULLS LAST"),
+        cost_attribution.spend_by_role(),
+        cost_attribution.threads(),
     )
 
     # ── Provider/model breakdown ──────────────────────────────────────────────
@@ -1046,6 +1053,12 @@ async def _system_cost() -> dict:
 
     return {
         "source":                 "db",
+        # WHO spent it, and WHICH conversation caused it. Both were absent
+        # until the kernel started writing to token_calls: the executor's
+        # spend lived in step_journal and the verifier's nowhere, so this
+        # page reported the two cheapest spenders and looked complete.
+        "by_role":                by_role,
+        "threads":                thread_rows,
         "month_str":              _money(month_cost) if month_cost > 0 else None,
         "week_str":               _money(week_cost),
         "today_str":              _money(today_cost),
@@ -1206,6 +1219,52 @@ async def _system_review_quality() -> dict:
     return {"rows": out, "mode": "phases", "_degraded": []}
 
 
+def _scoring_constants() -> dict:
+    """Every number the "How is this calculated?" panel quotes.
+
+    One dict, built from the live tables, so the explainer renders the
+    rules rather than restating them. A test asserts each rendered
+    value equals its constant, which is what makes changing a weight a
+    one-line change instead of a one-line change plus a paragraph
+    somebody has to notice.
+    """
+    from app.services.taximeter.categories import (  # noqa: PLC0415
+        CATEGORY_WEIGHTS)
+    from app.services.taximeter.v2.normalise2 import (  # noqa: PLC0415
+        CLAMP_HIGH, CLAMP_LOW)
+    from app.services.taximeter.v2.points import (  # noqa: PLC0415
+        DECISION_POINTS, PRIORITY_POINTS, STEWARD_POINTS)
+
+    return {
+        "categories": CATEGORY_WEIGHTS,
+        "decisions": DECISION_POINTS,
+        "steward": STEWARD_POINTS,
+        "priority": PRIORITY_POINTS,
+        "clamp_low": CLAMP_LOW,
+        "clamp_high": CLAMP_HIGH,
+    }
+
+
+async def _score_rows(window_weeks: int, goal_id: str | None,
+                      sort: str, direction: str) -> list[dict]:
+    """The people rows, from whichever scorer this environment runs.
+
+    ONE DECISION POINT, read from the setting each call rather than
+    captured at import: a restart is not needed to switch, and a test
+    can flip it without reloading a module. The two scorers return the
+    same row shape, so everything downstream is unchanged.
+    """
+    from app.config import get_settings  # noqa: PLC0415
+
+    if get_settings().taximeter_scoring == "v2":
+        from app.services.taximeter.v2.activity import (  # noqa: PLC0415
+            compute_activity_v2)
+        return await compute_activity_v2(get_pool(), window_weeks, goal_id,
+                                         sort, direction)
+    from app.services.taximeter.scoring import compute_activity  # noqa: PLC0415
+    return await compute_activity(window_weeks, goal_id, sort, direction)
+
+
 async def _system_taximeter(
     window_weeks: int = 12, goal_id: str | None = None, view: str = "people",
     sort: str = "overall", direction: str = "desc",
@@ -1230,19 +1289,21 @@ async def _system_taximeter(
     Delegates entirely to app/services/taximeter/scoring.py; this function
     only exists to give the feature a slot in collect_system()'s gather and
     the standard degrade-gracefully contract every other panel here follows.
-    Also fetches the goal picker's option list and the metric reference
-    table, so the panel can render the dropdown and the "How is this
-    calculated?" modal without extra round trips.
+    Also fetches the goal picker's option list and, in `scoring`, every
+    constant the "How is this calculated?" modal quotes -- the category
+    weights, the decision and priority points, the clamp bounds -- so
+    the panel renders the rules rather than restating them, and cannot
+    describe weights the scorer is no longer using.
     """
     from app.services.taximeter.scoring import (  # noqa: PLC0415
-        compute_activity, fetch_goal_list_with_contributors, fetch_taximeter_goals,
+        fetch_goal_list_with_contributors, fetch_taximeter_goals,
     )
     try:
         goals = await fetch_taximeter_goals()
         if view == "goals" and not goal_id:
             rows, goal_list = [], await fetch_goal_list_with_contributors(window_weeks)
         else:
-            rows, goal_list = await compute_activity(window_weeks, goal_id, sort, direction), []
+            rows, goal_list = await _score_rows(window_weeks, goal_id, sort, direction), []
     except Exception as exc:  # pragma: no cover - defensive
         _log.warning("dashboard taximeter query failed: %s", exc)
         return {
@@ -1254,6 +1315,13 @@ async def _system_taximeter(
     selected_goal_name = next((g["name"] for g in goals if g["goal_id"] == goal_id), None)
     return {
         "rows": rows, "goal_list": goal_list, "goals": goals,
+        # THE NUMBERS THE EXPLAINER QUOTES, from the same tables the
+        # scorer used. The modal used to state the weights and the
+        # decision points as prose, so changing a weight meant
+        # remembering to edit a paragraph -- and the version that was
+        # not remembered is the one people read. Rendered, they cannot
+        # disagree with the maths.
+        "scoring": _scoring_constants(),
         "window_weeks": window_weeks,
         "goal_id": goal_id, "view": view, "selected_goal_name": selected_goal_name,
         "sort": sort, "dir": direction, "sort_next": _taximeter_sort_next_dirs(sort, direction),
@@ -1642,10 +1710,26 @@ def _base_agent_id(agent_id: str, goal_id: str) -> str | None:
     """
     if not agent_id or not goal_id:
         return None
+    # Only the thread-suffixed form is decoded here. An assistant that shares
+    # one home is `{agent}-{goal}` with no third part (Stage K), which is the
+    # same shape as GO's own bare `agents.id` — `go-{goal}` — so folding it
+    # would turn `go-ker14` into `go`. `_base_agent_candidates` below adds that
+    # possibility as an extra lookup candidate instead of guessing here.
     import re as _re
     pattern = _re.compile(r"-" + _re.escape(goal_id.lower()) + r"-[0-9a-f-]+$", _re.I)
     stripped = pattern.sub("", agent_id)
     return stripped if stripped != agent_id else None
+
+
+def _base_agent_candidates(agent_id: str, goal_id: str) -> list[str]:
+    """Every id this session key might resolve to, most specific first.
+
+    A candidate that is not a real agent simply fails to join, so an extra
+    one costs nothing; a wrong single answer would label one agent's cost
+    with another agent's name.
+    """
+    from app.services.assistant_instance import base_agent_candidates
+    return base_agent_candidates(agent_id, goal_id)
 
 
 async def _system_session_previews() -> dict:
@@ -1673,9 +1757,7 @@ async def _system_session_previews() -> dict:
             aid, gid = _parse_session_key(s.get("key") or "")
             if aid:
                 agent_ids.append(aid)
-                base_aid = _base_agent_id(aid, gid)
-                if base_aid:
-                    agent_ids.append(base_aid)
+                agent_ids.extend(_base_agent_candidates(aid, gid))
             if gid:
                 goal_ids.append(gid)
 
@@ -2174,6 +2256,13 @@ _MAT_VIEWS_BASE = [
     # no ordering dependency on the rest of this list — placed here anyway
     # since it's conceptually a "base" view, not a derived cost view.
     "mv_taximeter_human_activity",
+    # v2 sits BESIDE v1 and changes no score until the scorer is switched
+    # over. It has to be here from the moment it exists: a view that is
+    # created and never added to this list is refreshed exactly once, at
+    # creation, and then silently serves a frozen snapshot for ever --
+    # which looks like working software until somebody notices the
+    # numbers stopped moving.
+    "mv_taximeter_v2",
 ]
 
 # Second-level cost views: depend on mv_token_calls_priced — refresh after base.
@@ -2187,6 +2276,11 @@ _MAT_VIEWS_COST = [
     "mv_cost_by_story",
     "mv_cost_top_agents",
     "mv_cost_top_tools",
+    # Per-conversation attribution. Registered here rather than left to a
+    # manual refresh for the reason the whole list exists: a panel absent
+    # from it does not error, it silently freezes at whatever it held when
+    # it was created — which on a cost page reads as spend having stopped.
+    "mv_cost_by_thread",
 ]
 
 # Full list for cache_meta tracking (order doesn't matter for reads).
@@ -2200,11 +2294,37 @@ async def _refresh_one(pool, view_name: str) -> None:
     call runs as the function owner (migration superuser) rather than the
     app user. The app user only has SELECT on mat views; REFRESH requires
     ownership, which the migration user holds.
+
+    ONE VIEW'S FAILURE IS ITS OWN. These are gathered, and a bare
+    `gather` propagates the first exception -- so one broken view
+    aborted the whole refresh, left every OTHER view stale, and skipped
+    the timestamp update, which is the one signal that says how old the
+    dashboard is. The panel then showed old numbers under a fresh
+    `refreshed_at`, or no update at all, and nothing named the view
+    that did it.
+
+    Swallowed and logged WITH THE VIEW NAME, so the next refresh still
+    rebuilds everything else and somebody reading the log knows which
+    one to look at.
     """
-    async with pool.acquire() as conn:
-        _log.info("dashboard.refresh starting view=%s", view_name)
-        await conn.execute("SELECT refresh_mat_view($1)", view_name)
-        _log.info("dashboard.refresh done view=%s", view_name)
+    try:
+        async with pool.acquire() as conn:
+            _log.info("dashboard.refresh starting view=%s", view_name)
+            await conn.execute("SELECT refresh_mat_view($1)", view_name)
+            _log.info("dashboard.refresh done view=%s", view_name)
+    except Exception:                                       # noqa: BLE001
+        _log.exception("dashboard.refresh FAILED view=%s — the other views "
+                       "still refresh and the timestamp still moves",
+                       view_name)
+
+
+async def _refresh_gateway_cache_guarded() -> None:
+    """The gateway half of a refresh, unable to take the rest with it."""
+    try:
+        await gateway_cache.refresh_gateway_cache()
+    except Exception:                                       # noqa: BLE001
+        _log.exception("dashboard.refresh FAILED gateway_cache — the "
+                       "materialized views still refresh")
 
 
 async def refresh_materialized_views() -> datetime:
@@ -2223,9 +2343,17 @@ async def refresh_materialized_views() -> datetime:
               len(_MAT_VIEWS_BASE), len(_MAT_VIEWS_COST))
 
     # Phase 1: base mat views + gateway cache (independent, all parallel)
+    #
+    # THE GATEWAY REFRESH IS GUARDED TOO. Each view now swallows its own
+    # failure, but this call sat beside them unguarded in the same
+    # `gather` -- so a gateway that was down took every materialized
+    # view with it and skipped the timestamp, which is precisely the
+    # failure the per-view guard was added to stop. The gateway and the
+    # database are different dependencies; one being unreachable is not
+    # a reason to serve stale numbers from the other.
     await asyncio.gather(
         *[_refresh_one(pool, v) for v in _MAT_VIEWS_BASE],
-        gateway_cache.refresh_gateway_cache(),
+        _refresh_gateway_cache_guarded(),
     )
 
     # Phase 2: cost views — need mv_token_calls_priced from phase 1
@@ -2327,9 +2455,21 @@ async def fetch_taximeter_goal_breakdown(
     2026-07-08, then removed the same day once the design was finalized —
     see `TAXIMETER_V5_REDESIGN.md` for the history if it's ever revisited.
     """
-    from app.services.taximeter.scoring import compute_goal_drilldown  # noqa: PLC0415
+    # THE SAME SCORER AS THE TABLE. This ran v1 while the rows above
+    # ran v2, so a name and the breakdown behind it disagreed on one
+    # page -- which reads as a bug in the numbers rather than in the
+    # wiring, and is worse than either being wrong on its own.
+    from app.config import get_settings  # noqa: PLC0415
     try:
-        drilldown = await compute_goal_drilldown(uid, window_weeks)
+        if get_settings().taximeter_scoring == "v2":
+            from app.services.taximeter.v2.drilldown2 import (  # noqa: PLC0415
+                compute_goal_drilldown_v2)
+            drilldown = await compute_goal_drilldown_v2(
+                get_pool(), uid, window_weeks)
+        else:
+            from app.services.taximeter.scoring import (  # noqa: PLC0415
+                compute_goal_drilldown)
+            drilldown = await compute_goal_drilldown(uid, window_weeks)
         goals = drilldown["goals"]
         if goal_id:
             goals = [g for g in goals if g["goal_id"] == goal_id]
@@ -2415,6 +2555,7 @@ async def goal_cost_breakdown(goal_id: str) -> dict:
         # while goals.id itself is always uppercase (_validate_goal_id()) — a
         # plain `=` here silently drops every GO/chat-session row for the goal.
         agent_rows = await pool.fetch(
+            # sql: fragment -- the `priced` CTE is prepended from _COST_CTE at runtime
             _COST_CTE.format(extra_filter="AND UPPER(t.goal_id::text) = UPPER($1)") + """
             SELECT COALESCE(a.name, a2.name, assignee.display_name, NULLIF(p.agent_id, ''),
                             p.provider || '/' || p.model) AS agent_label,
@@ -2476,6 +2617,7 @@ async def goal_cost_breakdown(goal_id: str) -> dict:
         # with the identical COALESCE/join chain, so the same person always
         # produces the same string in both.
         phase_rows = await pool.fetch(
+            # sql: fragment -- the `priced` CTE is prepended from _COST_CTE at runtime
             _COST_CTE.format(extra_filter="AND UPPER(t.goal_id::text) = UPPER($1)") + """
             SELECT COALESCE(a.name, a2.name, assignee.display_name, NULLIF(p.agent_id, ''),
                             p.provider || '/' || p.model) AS agent_label,
@@ -2523,6 +2665,7 @@ async def goal_cost_breakdown(goal_id: str) -> dict:
         story_rows = await pool.fetch(
             _COST_CTE.format(
                 extra_filter="AND UPPER(t.goal_id::text) = UPPER($1) AND t.story_id IS NOT NULL"
+            # sql: fragment -- the `priced` CTE is prepended from _COST_CTE at runtime
             ) + """
             SELECT s.title AS story_title,
                    SUM(p.total_tokens) AS tokens,
@@ -2540,6 +2683,7 @@ async def goal_cost_breakdown(goal_id: str) -> dict:
         daily_rows = await pool.fetch(
             _COST_CTE.format(
                 extra_filter="AND UPPER(t.goal_id::text) = UPPER($1) AND t.recorded_at >= now() - interval '30 days'"
+            # sql: fragment -- the `priced` CTE is prepended from _COST_CTE at runtime
             ) + """
             SELECT (recorded_at AT TIME ZONE 'UTC')::date AS day,
                    provider,

@@ -145,6 +145,7 @@ async def setup_memory_v2_for_agent(
     agent_id: str,
     agent_type: str,
     user_uid: Optional[str] = None,
+    db_key: Optional[str] = None,
 ) -> None:
     """Run all memory_v2 hooks for a newly-created gateway agent.
 
@@ -155,6 +156,10 @@ async def setup_memory_v2_for_agent(
         agent_type: "SHCA" | "GO" | "IA" — drives which hooks fire
         user_uid: required for SHCA (cross-goal USER_MEMORY.md target);
                   ignored for GO / IA
+        db_key: canonical `{agent}-{goal}` memory key for restore (unifies local +
+                web). Callers with the abstract agent + goal pass it so restore reads
+                the shared row (the raw instance `agent_id` can't be translated —
+                normalized-vs-raw). None → snapshot.py translates/falls back.
     """
     if agent_type not in ("SHCA", "GO", "IA"):
         _log.warning(
@@ -190,8 +195,8 @@ async def setup_memory_v2_for_agent(
     if agent_type == "SHCA" and getattr(settings, "memory_v2_snapshot_enabled", False):
         try:
             from app.memory_v2 import snapshot as _snapshot
-            if await _snapshot.has_prior_snapshot(agent_id):
-                restored = await _snapshot.restore_agent_workspace(agent_id)
+            if await _snapshot.has_prior_snapshot(agent_id, db_key):
+                restored = await _snapshot.restore_agent_workspace(agent_id, db_key)
                 _log.info(
                     "memory_v2.setup: restored %d workspace files for %s",
                     restored, agent_id,

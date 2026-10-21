@@ -1,10 +1,13 @@
 """Fire-and-forget trigger for the task-runner Cloud Run Job — the generic
 async executor (see `task_runner/`). Extracted from `app/routers/
-goal_resources.py` (its original, only caller) so the "get a GCP access
-token, POST to the Cloud Run Jobs API" logic lives in exactly one place —
-the goal-weightage recompute watchdog
-(`app/services/taximeter/weightage_watchdog.py`) needs the same trigger
-and would otherwise have to duplicate it.
+goal_resources.py` so the "get a GCP access token, POST to the Cloud Run
+Jobs API" logic lives in exactly one place.
+
+IT HAD A SECOND CALLER AND NO LONGER DOES: the taximeter's goal-weightage
+watchdog was the reason for extracting it, and that whole mechanism is
+retired — a goal's weight is `1 + items completed in it this period`,
+computed live at score time. `document_render` and `goal_resources` keep
+the job and this trigger.
 """
 import asyncio
 import logging
@@ -40,7 +43,7 @@ async def trigger_task_runner(context: str) -> None:
         return
 
     project = settings.firebase_project_id
-    region = "${GCP_REGION}"
+    region = "us-central1"
     url = (
         f"https://run.googleapis.com/v2/projects/{project}/locations/{region}"
         f"/jobs/{job_name}:run"

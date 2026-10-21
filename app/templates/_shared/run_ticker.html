@@ -1,0 +1,25 @@
+    {# ── Live executor ticker ────────────────────────────────────────────
+       AT THE FOOT OF THE TRANSCRIPT, not above it. It reads as the tail of
+       the conversation — same gutter as the messages, no rule, no panel —
+       so a person's eye follows the chat straight down into what the
+       executor is doing right now. Sitting in the header, which is where
+       this started, it looked like a banner laid over the conversation.
+
+       Outside `#messages` on purpose, in two directions. It is pinned rather
+       than scrolled, because it is a live view and not history: scrolling up
+       to read something must not take the ticker away. And it is NEVER a
+       message — a row in `messages` is a row in the assistant's next prompt,
+       and forty tool lines a leg would crowd out the conversation.
+
+       `hidden` when off, so the transcript reclaims every pixel. #}
+    {% if thread_id %}
+    <div id="run-ticker" class="hidden px-5 pt-1 pb-2 font-mono text-2xs">
+      <div id="run-ticker-lines"
+           class="max-h-32 overflow-y-auto leading-relaxed space-y-px"></div>
+      {# Pinned BELOW the scroll, not inside it. It answers "what phase is
+         this run in" and that answer must not scroll away — which is the
+         whole complaint: the strip went silent at VERIFYING, because the
+         executor stops there and only the adjudicator is working. #}
+      <div id="run-ticker-phase" class="text-gray-600 italic pt-0.5"></div>
+    </div>
+    {% endif %}

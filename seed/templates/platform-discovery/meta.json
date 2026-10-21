@@ -3,7 +3,7 @@
   "type": "PlatformResearch",
   "name": "Independent Platform Research",
   "description": "Weekly breadth-first scout: what LLMs/skills/tools shipped in the last ~2 weeks, logged to the discovery feed.",
-  "model": "google-flash-500k/gemini-2.5-flash-500k",
+  "model": "google-flash38-500k/gemini-3.8-flash-500k",
   "emoji": "🔭",
   "tools_allow": [
     "read",

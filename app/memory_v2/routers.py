@@ -318,6 +318,42 @@ async def trigger_manual_flush_endpoint(
     })
 
 
+@router.post("/api/memory/snapshot-goal/{goal_id}")
+async def snapshot_goal_assistants_endpoint(
+    goal_id: str,
+    user: dict = Depends(require_admin),
+):
+    """Admin: snapshot every active SHCA assistant's LIVE VM memory in `goal_id` into
+    `agent_workspace_files` (under the canonical `{agent}-{goal}` key). Creates a durable
+    DB copy — the SAME store the local-execution seed (`read_local_memory`) reads — so
+    memory survives even with `MEMORY_V2_SNAPSHOT_ENABLED` off and is guaranteed to seed
+    a later local checkout. Idempotent: each call adds a new `manual` version; read paths
+    take the latest. Instances of the same (agent, goal) are snapshotted oldest→newest so
+    the freshest instance's memory wins on read."""
+    from app.database import get_pool  # noqa: PLC0415
+    from app.memory_v2.snapshot import snapshot_agent_workspace, memory_key  # noqa: PLC0415
+
+    rows = await get_pool().fetch(
+        "SELECT ai.gateway_agent_id, ai.template_id "
+        "  FROM agent_instances ai JOIN agents a ON a.id = ai.template_id "
+        " WHERE ai.goal_id = $1 AND a.type = 'SHCA' AND ai.status = 'active' "
+        "   AND ai.gateway_agent_id NOT LIKE '%-local' "
+        " ORDER BY ai.created_at ASC",
+        goal_id,
+    )
+    out = []
+    for r in rows:
+        key = memory_key(r["template_id"], goal_id)
+        try:
+            n = await snapshot_agent_workspace(
+                r["gateway_agent_id"], reason="manual", db_key=key,
+            )
+            out.append({"gateway_agent_id": r["gateway_agent_id"], "key": key, "files": n})
+        except Exception as exc:  # noqa: BLE001 — report per-agent, don't abort the batch
+            out.append({"gateway_agent_id": r["gateway_agent_id"], "key": key, "error": str(exc)})
+    return JSONResponse({"ok": True, "goal_id": goal_id, "count": len(out), "snapshotted": out})
+
+
 @router.post("/api/memory/compact")
 async def trigger_manual_compact_endpoint(
     request: Request,
@@ -414,6 +450,99 @@ async def get_session_usage_endpoint(
         raise HTTPException(status_code=500, detail=f"usage fetch failed: {exc}")
 
 
+_COMPACTION_SUMMARY_PREFIX = "[Compaction summary"
+
+
+def _extract_compaction_summary(messages) -> str | None:
+    """Pull the most-recent compaction summary out of a sessions.get transcript.
+
+    Two on-the-wire shapes, depending on which path ran:
+      - async compaction splices an entry with role 'compactionSummary';
+      - the sync safeguard prepends a system line beginning
+        '[Compaction summary, generated …]:'.
+    Scan newest-first and return whichever we hit first; None if neither.
+    """
+    if not isinstance(messages, list):
+        return None
+    for msg in reversed(messages):
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get("role")
+        content = msg.get("content")
+        if isinstance(content, list):  # content parts → concatenate text
+            content = "".join(p.get("text", "") for p in content if isinstance(p, dict))
+        if not isinstance(content, str) or not content.strip():
+            continue
+        if role == "compactionSummary":
+            return content.strip()
+        if role == "system" and content.lstrip().startswith(_COMPACTION_SUMMARY_PREFIX):
+            # Drop the "[Compaction summary, generated …]:" header, keep the body.
+            body = (content.split("]:", 1)[-1] if "]:" in content else content).strip()
+            if body:  # a header-only line isn't a real summary — keep scanning
+                return body
+    return None
+
+
+@router.get("/api/memory/compaction-summary")
+async def get_compaction_summary_endpoint(
+    goal_id: str,
+    agent_id: str,
+    thread_id: str = "",
+    user: dict = Depends(get_current_user),
+):
+    """Return the current compaction summary for a (goal, agent, thread).
+
+    Powers the chat 'View compaction summary' button. Reads the gateway
+    transcript via the EXISTING sessions.get RPC (no gateway change) and
+    extracts the most-recent summary; compactionCount comes from
+    sessions.status. On-demand only (button click), never polled.
+    """
+    if not goal_id or not agent_id:
+        raise HTTPException(status_code=400, detail="goal_id, agent_id required")
+
+    from app.auth import get_goal_role
+    role = await get_goal_role(user["uid"], goal_id)
+    if role is None:
+        raise HTTPException(status_code=403, detail="not a goal member")
+
+    gateway_agent_id = await _resolve_gateway_agent_id(agent_id, goal_id, thread_id)
+    session_key = (
+        f"agent:{gateway_agent_id}:{goal_id.lower()}-{thread_id}"
+        if thread_id else f"agent:{gateway_agent_id}:"
+    )
+
+    from app.openclaw import gateway_admin, GatewayError
+    summary = None
+    compaction_count = 0
+    try:
+        # sessions.get returns the LAST `limit` messages, but the compaction
+        # summary sits at the HEAD of the post-compaction transcript (the prefix
+        # it replaced). Request a generous window so a busy session's summary is
+        # still included; a compacted transcript is bounded, so this stays small.
+        got = await gateway_admin.call(
+            "sessions.get", {"key": session_key, "limit": 5000}, timeout=15,
+        )
+        summary = _extract_compaction_summary((got or {}).get("messages") or [])
+    except GatewayError as exc:
+        _log.info("compaction-summary: sessions.get failed for %s: %s", session_key, exc)
+    except Exception as exc:  # noqa: BLE001 — best-effort; UI degrades to "unavailable"
+        _log.warning("compaction-summary: sessions.get error for %s: %s", session_key, exc)
+    try:
+        status = await gateway_admin.call(
+            "sessions.status", {"key": session_key}, timeout=10,
+        )
+        compaction_count = int((status or {}).get("compactionCount") or 0)
+    except Exception:  # noqa: BLE001 — count is decorative; summary is the payload
+        pass
+    return JSONResponse({
+        "ok": True,
+        "key": session_key,
+        "has_summary": summary is not None,
+        "summary": summary or "",
+        "compaction_count": compaction_count,
+    })
+
+
 def _looks_like_uuid(s) -> bool:
     if not isinstance(s, str):
         return False
@@ -424,79 +553,7 @@ def _looks_like_uuid(s) -> bool:
         return False
 
 
-async def _resolve_gateway_agent_id(
-    agent_id: str, goal_id: str, thread_id: str,
-) -> str:
-    """Map a chat-URL agent id to the actual gateway agent id.
-
-    Both SHCA and GO are template→instance: chat URLs carry the template
-    id (SHCA: "abhishek-shca"; GO: "go-<goal>") but the gateway addresses
-    the per-instance gateway_agent_id from agent_instances. For SHCA the
-    two differ (instance gets a goal+uuid suffix); for GO they currently
-    match — but only by coincidence. Always resolve through
-    agent_instances; don't special-case either type.
-
-    Falls back to the input unchanged if no active agent_instances row
-    matches — defensive only, indicates a provisioning gap.
-    """
-    try:
-        from app.database import get_pool
-        pool = get_pool()
-        # The agent's LIVE session runs under its RAW instance id — the platform
-        # records that verbatim on the thread (threads.instance_id) and builds
-        # every session key from it (session._gateway_agent_id = instance_id).
-        # That string is deliberately NOT the same as agent_instances.gateway_
-        # agent_id, which stores the gateway-NORMALIZED id (lowercased + truncated
-        # to 64 chars) because token_calls.agent_id echoes the normalized form for
-        # cost joins. But the gateway persists the session ENTRY under the raw key
-        # (toAgentStoreSessionKey keeps the key's agent part verbatim), so for the
-        # usage/compact session key we MUST use the raw id — otherwise
-        # sessions.status looks under a key the gateway never created and the chat
-        # context-usage ring comes up empty (only worked before when a row happened
-        # to still hold the raw id). Prefer threads.instance_id; fall back to the
-        # agent_instances lookups below for GO / legacy rows with no thread instance.
-        if thread_id:
-            # Guard on the agent prefix so a shared/handed-off thread can only
-            # ever return THIS agent's instance (instance_id is built as
-            # f"{agent_id}-{goal_id}-{thread_id}", so its prefix is agent_id).
-            inst = await pool.fetchval(
-                """SELECT instance_id FROM threads
-                    WHERE id = $1 AND starts_with(instance_id, $2 || '-')""",
-                thread_id, agent_id,
-            )
-            if inst:
-                return inst
-        row = await pool.fetchrow(
-            """
-            SELECT gateway_agent_id
-              FROM agent_instances
-             WHERE template_id = $1
-               AND thread_id = $2
-               AND status = 'active'
-             ORDER BY created_at DESC
-             LIMIT 1
-            """,
-            agent_id, thread_id,
-        )
-        if row and row["gateway_agent_id"]:
-            return row["gateway_agent_id"]
-        # Fallback: try by goal alone (covers SHCAs not yet bound to a
-        # specific thread).
-        if goal_id:
-            row = await pool.fetchrow(
-                """
-                SELECT gateway_agent_id
-                  FROM agent_instances
-                 WHERE template_id = $1
-                   AND LOWER(goal_id) = LOWER($2)
-                   AND status = 'active'
-                 ORDER BY created_at DESC
-                 LIMIT 1
-                """,
-                agent_id, goal_id,
-            )
-            if row and row["gateway_agent_id"]:
-                return row["gateway_agent_id"]
-    except Exception:
-        _log.exception("_resolve_gateway_agent_id failed for %s", agent_id)
-    return agent_id
+# Moved to app.services.gateway_sessions (shared by reset_agent_sessions,
+# a second consumer) — re-exported here under the old private name so this
+# module's call site doesn't need to change.
+from app.services.gateway_sessions import resolve_gateway_agent_id as _resolve_gateway_agent_id

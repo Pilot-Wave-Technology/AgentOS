@@ -4,8 +4,16 @@ title: Branch Management
 description: Use this when creating feature branches for coding stories, deciding shared-vs-per-story strategy, or setting up paired review stories. You (GO) are the branch manager.
 applicable_to: 
 status: active
-version: 3
+version: 4
 ---
+> **PRECEDENCE NOTE (git engine).** When the Git Engine is enabled — the normal
+> case — grant the **repo** (`kind='repo'`) to a coding story, NOT a branch. The
+> engine cuts the workstream branch and links it to the story automatically, one
+> branch per repo. A story may be granted several repos; each gets its own branch and
+> its own pull request. The "grant the branch only, never the repo" guidance below
+> applies ONLY to legacy, non-engine goals. Never grant a repo's `role='trunk'` branch
+> to a story under either model.
+
 # Branch Management
 
 You are the **branch manager**. Assistants and coding agents do NOT create branches.
@@ -67,7 +75,7 @@ If diverging, explain why in the goal thread before creating branches, and wait 
 
 ## Review stories (mandatory for every coding story)
 
-Every batch of coding work needs a paired review story assigned to a human reviewer. **The merge target is the repo's trunk** — see the "Working trunks (per repo)" section of your current context for the trunk branch of each registered repo. If a trunk is registered, use it — NOT `main`. Only fall back to `main` when no trunk is registered.
+Every batch of coding work needs a paired review story assigned to a human reviewer. **The merge target is the trunk LANE the story lands on.** One repository can carry SEVERAL lanes in one goal — a backend branch and a frontend branch of one app — each its own merge target, and a story lands on the lane it was granted, not on "the repo's branch". `code_state` lists the lanes per repo and, for every live branch, the `lands_on` lane; RESOURCES.md names them under each repository. Never assume `main`: on a goal that declared lanes there is no repo-wide branch to fall back to.
 
 ```
 Coding story: "Implement Backend Auth" → feat/backend-auth

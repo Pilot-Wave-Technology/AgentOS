@@ -833,6 +833,44 @@ async def slack_setup(
     return RedirectResponse(url="/settings/integrations", status_code=303)
 
 
+def _slack_slash_commands(url: str, cmd) -> list[dict]:
+    """One entry per registered command, in the registry's own order.
+
+    `usage_hint` is Slack's one-line prompt and comes from the command's
+    own `hint` field. Parsing it out of `usage` was tried first and gave
+    "[help]" for half of them, because the first line of that block is a
+    header rather than an argument list.
+    """
+    from app.channels.slack.commands.registry import COMMANDS
+
+    out = []
+    for spec in COMMANDS:
+        entry = {
+            "command": cmd(spec.name),
+            "url": url,
+            "description": spec.summary[:150],
+            "should_escape": False,
+        }
+        if spec.hint:
+            entry["usage_hint"] = spec.hint[:120]
+        out.append(entry)
+    return out
+
+
+def _slack_bot_scopes() -> list[str]:
+    """Derived in app/channels/slack/scopes.py from the API methods we call,
+    so this manifest and the OAuth consent URL cannot ask for different sets --
+    Slack grants the intersection, and the gap shows up much later as a
+    missing_scope swallowed by an except branch."""
+    from app.channels.slack.scopes import bot_scopes
+    return bot_scopes()
+
+
+def _slack_bot_events() -> list[str]:
+    from app.channels.slack.scopes import BOT_EVENTS
+    return list(BOT_EVENTS)
+
+
 @router.get("/integrations/slack/manifest")
 async def slack_manifest(
     request: Request,
@@ -872,70 +910,26 @@ async def slack_manifest(
         },
         "features": {
             "bot_user": {"display_name": f"AgentOS{env_label}", "always_online": True},
-            "slash_commands": [
-                {
-                    "command": cmd("goal"),
-                    "url": commands_url,
-                    "description": "Goal summary, status, members, invitations, and execution control",
-                    "usage_hint": "[help | status | members | invite <email> | pause | resume | refresh]",
-                    "should_escape": False,
-                },
-                {
-                    "command": cmd("story"),
-                    "url": commands_url,
-                    "description": "List, create, transition, complete, and review stories",
-                    "usage_hint": "[help | <id> | create <title> | accept|start|block|unblock|done <id> | work <title> | review <id>]",
-                    "should_escape": False,
-                },
-                {
-                    "command": cmd("task"),
-                    "url": commands_url,
-                    "description": "List a story's tasks, show task status, or delete a task tree",
-                    "usage_hint": "[help | list <story-id> | <id> | delete <id>]",
-                    "should_escape": False,
-                },
-                {
-                    "command": cmd("resources"),
-                    "url": commands_url,
-                    "description": "List, scan, and allocate goal resources",
-                    "usage_hint": "[help | filter | add | scan <id> | grant|revoke <id> story|task <subj>]",
-                    "should_escape": False,
-                },
-                {
-                    "command": cmd("memory"),
-                    "url": commands_url,
-                    "description": "Search assistant memory and task history",
-                    "usage_hint": "<query>",
-                    "should_escape": False,
-                },
-                {
-                    "command": cmd("help"),
-                    "url": commands_url,
-                    "description": "Show available commands",
-                    "should_escape": False,
-                },
-            ],
+            # DERIVED FROM THE REGISTRY, like the scopes above. This was a
+            # hand-kept second list, and it drifted exactly as the scope
+            # lists did: it still advertised `/task`, which was removed with
+            # the task DAG, and knew nothing of /run, /park or /errand. A
+            # manifest is the only thing that registers a command with
+            # Slack, so a command missing here does not exist however well
+            # it is implemented -- and one listed here that no longer exists
+            # answers "is not a recognised command" to anyone who tries it.
+            "slash_commands": _slack_slash_commands(commands_url, cmd),
         },
         "oauth_config": {
             "redirect_urls": [f"{base}/channels/slack/oauth/callback"],
             "scopes": {
-                "bot": [
-                    "app_mentions:read", "channels:history", "channels:join",
-                    "channels:manage", "channels:read", "chat:write",
-                    "chat:write.customize", "commands", "files:read",
-                    "groups:history", "groups:read", "groups:write",
-                    "im:history", "im:read", "im:write", "mpim:read",
-                    "reactions:write", "users:read", "users:read.email",
-                ],
+                "bot": _slack_bot_scopes(),
             },
         },
         "settings": {
             "event_subscriptions": {
                 "request_url": f"{base}/channels/slack/events",
-                "bot_events": [
-                    "app_mention", "file_shared", "member_joined_channel",
-                    "message.channels", "message.groups", "message.im",
-                ],
+                "bot_events": _slack_bot_events(),
             },
             "interactivity": {
                 "is_enabled": True,

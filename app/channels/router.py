@@ -6,7 +6,7 @@ import logging
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, PlainTextResponse
 
-from app.auth import get_current_user
+from app.auth import require_admin
 from app.channels.registry import get_adapter
 
 router = APIRouter(prefix="/channels", tags=["channels"])
@@ -51,6 +51,17 @@ async def _store_verification_token(platform: str, token: str) -> None:
         _log.warning("Could not store verification token for %s: %s", platform, exc)
 
 
+
+def _report_background_failure(task) -> None:
+    """Surface what a backgrounded handler did, since nobody awaits it."""
+    try:
+        exc = task.exception()
+    except asyncio.CancelledError:
+        return
+    if exc is not None:
+        _log.error("Backgrounded channel handler failed: %s", exc, exc_info=exc)
+
+
 @router.get("/{platform}/events")
 async def platform_events_healthcheck(platform: str) -> Response:
     # Slack (and other platforms) send a GET to confirm the URL is reachable
@@ -76,7 +87,11 @@ async def platform_events(platform: str, request: Request) -> Response:
         # Notion-style verification token
         if "verification_token" in payload:
             token = payload["verification_token"]
-            _log.info("Webhook verification challenge for platform=%s token=%s", platform, token)
+            # NOT the token. It is stored and then used to authenticate
+            # subsequent deliveries, so logging it at INFO puts a live
+            # credential in Cloud Logging for its whole lifetime. That
+            # it arrived is the fact worth recording.
+            _log.info("Webhook verification challenge for platform=%s", platform)
             asyncio.create_task(_store_verification_token(platform, token))
             return JSONResponse({"verification_token": token})
     except json.JSONDecodeError:
@@ -101,8 +116,12 @@ async def platform_events(platform: str, request: Request) -> Response:
 async def oauth_install(
     platform: str,
     request: Request,
-    user: dict = Depends(get_current_user),
+    user: dict = Depends(require_admin),
 ):
+    # ADMIN, not merely signed in. Completing an install writes the
+    # workspace bot token for the entire deployment, and the form that
+    # saves the app credentials next to it was already admin-only --
+    # these two were the inconsistent half.
     adapter = get_adapter(platform)
     if adapter is None:
         raise HTTPException(status_code=404, detail=f"Unknown platform: {platform}")
@@ -113,7 +132,7 @@ async def oauth_install(
 async def oauth_callback(
     platform: str,
     request: Request,
-    user: dict = Depends(get_current_user),
+    user: dict = Depends(require_admin),
 ):
     adapter = get_adapter(platform)
     if adapter is None:
@@ -153,8 +172,27 @@ async def platform_actions(platform: str, request: Request) -> Response:
     _log.info("Interactive action received: platform=%s type=%s", platform, payload.get("type"))
 
     if hasattr(adapter, "handle_action"):
-        result = await adapter.handle_action(payload)
-        return JSONResponse(result if result is not None else {"ok": True})
+        # ACK FIRST. Slack gives an interactive endpoint THREE SECONDS, and
+        # this used to await the whole handler inline -- which, depending on
+        # the button, meant a blocking users_info(), a GitHub fetch, or for
+        # diff_approve an actual git commit and push. The user saw a timeout
+        # even when the push had succeeded, and then clicked again. (The
+        # events endpoint above has always backgrounded its work; this was
+        # the inconsistent half.)
+        #
+        # A view_submission is the exception: Slack reads its response to
+        # decide whether to close the modal or show field errors, so it has
+        # to be awaited. Those paths validate and hand the real work off
+        # themselves.
+        if payload.get("type") == "view_submission":
+            result = await adapter.handle_action(payload)
+            return JSONResponse(result if result is not None else {"ok": True})
+
+        task = asyncio.create_task(adapter.handle_action(payload))
+        # Without this an exception inside the task is never retrieved and
+        # surfaces only as a warning from the event loop at shutdown.
+        task.add_done_callback(_report_background_failure)
+        return JSONResponse({"ok": True})
 
     return JSONResponse({"ok": True})
 
@@ -191,6 +229,7 @@ async def platform_commands(platform: str, request: Request) -> Response:
         channel_id = _first("channel_id")
         team_id = _first("team_id")
         response_url = _first("response_url")
+        trigger_id = _first("trigger_id")
     except Exception as exc:
         _log.warning("Failed to parse command form: platform=%s err=%s", platform, exc)
         raise HTTPException(status_code=400, detail="Malformed form data")
@@ -201,7 +240,22 @@ async def platform_commands(platform: str, request: Request) -> Response:
     )
 
     if hasattr(adapter, "handle_command"):
-        result = await adapter.handle_command(command, text, user_id, channel_id, team_id, response_url)
+        # `trigger_id` ONLY WHERE IT IS UNDERSTOOD. It is what lets a
+        # slash command open a modal, and Slack sends it on every one --
+        # but this router serves every platform adapter, and passing an
+        # argument the others do not take would break them all for the
+        # sake of one. Asked rather than assumed.
+        import inspect
+        kwargs = {}
+        try:
+            if "trigger_id" in inspect.signature(
+                    adapter.handle_command).parameters:
+                kwargs["trigger_id"] = trigger_id
+        except (TypeError, ValueError):                       # noqa: BLE001
+            pass
+        result = await adapter.handle_command(
+            command, text, user_id, channel_id, team_id, response_url,
+            **kwargs)
         return JSONResponse(result if result is not None else {"ok": True})
 
     return JSONResponse({"ok": True})

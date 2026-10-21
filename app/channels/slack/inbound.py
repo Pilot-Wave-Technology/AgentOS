@@ -12,6 +12,8 @@ Channel routing (using platform_channel_bindings):
 Echo prevention: bot messages filtered by bot_user_id from integration credentials.
 Duplicate delivery: base.is_duplicate() with "slack" + Slack event_id.
 """
+
+from app.channels.slack.client import make_async_client
 import asyncio
 import hashlib
 import hmac
@@ -42,19 +44,38 @@ class SlackInboundAdapter:
         Reads signing secret from platform_integrations.config first (set via
         admin UI), falling back to SLACK_SIGNING_SECRET env var. Rejects
         requests older than 5 minutes to prevent replay attacks.
-        Returns True if valid; False if invalid; True with a warning if no
-        secret is configured anywhere (dev/test mode only).
+
+        FAILS CLOSED. This used to return True when no secret could be
+        found anywhere, logging "dev mode" -- and `slack_signing_secret`
+        defaults to "". All three inbound surfaces (events, actions,
+        commands) gate on this one function, so a half-finished setup, a
+        dropped DB row or a cleared secret meant the service accepted
+        unsigned POSTs from anyone and dispatched them to real handlers:
+        approve a plan, push a diff, replan a story. There is no
+        environment where that is wanted, so there is no escape hatch
+        here -- an escape hatch is just the production configuration
+        nobody meant to ship. An unconfigured deployment gets no Slack,
+        which is the correct amount of Slack for a deployment that has
+        not been configured.
         """
         from app.channels.slack.config import get_signing_secret
         from app.config import get_settings
 
-        secret = await get_signing_secret()
+        try:
+            secret = await get_signing_secret()
+        except Exception as exc:
+            # A DB blip must not become a 500: Slack disables an endpoint
+            # that keeps erroring, and recovering from that is manual.
+            _log.warning("Slack signature check: could not read signing secret: %s", exc)
+            return False
         if not secret:
             secret = get_settings().slack_signing_secret or ""
 
         if not secret:
-            _log.warning("Slack signing secret not configured — skipping verification (dev mode)")
-            return True
+            _log.error(
+                "Slack signing secret not configured — REJECTING request. "
+                "Set it at /settings/integrations.")
+            return False
 
         timestamp = headers.get("x-slack-request-timestamp", "")
         signature = headers.get("x-slack-signature", "")
@@ -96,10 +117,23 @@ class SlackInboundAdapter:
         event = payload.get("event", {})
         event_type = event.get("type", "")
 
-        # Dedup by Slack's event_id
+        # Dedup by Slack's event_id. The claim is taken BEFORE handling,
+        # which is what makes it atomic, and released again if handling
+        # raises -- see base.forget_event for why losing the event is the
+        # worse of the two failures.
         event_id = payload.get("event_id") or str(uuid.uuid4())
         if await base.is_duplicate("slack", event_id):
             return
+        try:
+            return await self._handle_claimed_event(payload, team_id, event,
+                                                    event_type, body, headers)
+        except Exception:
+            await base.forget_event("slack", event_id)
+            raise
+
+    async def _handle_claimed_event(self, payload, team_id, event, event_type,
+                                    body, headers):
+        """The body of handle_event, once the dedup claim is held."""
 
         # Filter bot's own messages
         if event.get("bot_id") or event.get("subtype") == "bot_message":
@@ -191,6 +225,7 @@ class SlackInboundAdapter:
         channel_id: str,
         team_id: str,
         response_url: str,
+        trigger_id: str = "",
     ) -> dict:
         """Dispatch a slash command and return the JSON response body."""
         from app.channels.slack.commands import handle_slack_command
@@ -201,6 +236,7 @@ class SlackInboundAdapter:
             channel_id=channel_id,
             team_id=team_id,
             response_url=response_url,
+            trigger_id=trigger_id,
         )
         return {"response_type": "ephemeral", "text": reply}
 
@@ -230,21 +266,28 @@ class SlackInboundAdapter:
                 status_code=500,
             )
 
-        scopes = ",".join([
-            "app_mentions:read", "channels:history", "channels:join", "channels:manage",
-            "channels:read", "chat:write", "chat:write.customize", "commands",
-            "files:read", "groups:history", "groups:read", "groups:write",
-            "im:history", "im:read", "im:write", "mpim:read",
-            "reactions:write", "users:read", "users:read.email",
-        ])
+        # One source of truth, derived from the API methods we call --
+        # see app/channels/slack/scopes.py. Slack grants the INTERSECTION
+        # of this and the manifest, so a hand-kept second list here is a
+        # silently under-granted scope waiting to happen.
+        from app.channels.slack.scopes import scope_string
+        scopes = scope_string()
 
         base_url = str(request.base_url).replace("http://", "https://")
         callback_url = f"{base_url}channels/slack/oauth/callback"
+
+        # CSRF: without a state parameter, anyone who can get an admin to
+        # follow a link can have us exchange and store THEIR code as this
+        # deployment's workspace credentials.
+        from app.channels.slack.oauth_state import issue as _issue_state
+        state = await _issue_state(get_pool())
+
         slack_url = (
             f"https://slack.com/oauth/v2/authorize"
             f"?client_id={client_id}"
             f"&scope={urllib.parse.quote(scopes)}"
             f"&redirect_uri={urllib.parse.quote(callback_url)}"
+            f"&state={urllib.parse.quote(state)}"
         )
         _log.info("Redirecting %s to Slack OAuth", user.get("email", "?"))
         return RedirectResponse(url=slack_url)
@@ -270,6 +313,12 @@ class SlackInboundAdapter:
             return RedirectResponse(url=f"/settings/integrations?error={error}", status_code=303)
         if not code:
             return JSONResponse({"error": "Missing OAuth code"}, status_code=400)
+
+        from app.channels.slack.oauth_state import verify as _verify_state
+        if not await _verify_state(get_pool(), request.query_params.get("state", "")):
+            _log.warning("Slack OAuth callback rejected: bad or missing state")
+            return RedirectResponse(
+                url="/settings/integrations?error=bad_oauth_state", status_code=303)
 
         # Resolve client credentials: DB config takes priority over env vars
         db_creds = await get_app_credentials()
@@ -408,14 +457,13 @@ async def _handle_goal_channel_event(
         return
 
     resolved_text = await _resolve_mentions(text, team_id, pool)
-    await _route_to_go(goal_id, user_uid, resolved_text, pool)
+    await _route_to_go(goal_id, user_uid, resolved_text, pool, binding)
 
 
 # ── Orchestrator channel handler ───────────────────────────────────────────────
 
 async def _handle_orch_channel_event(config: dict, event: dict) -> None:
     """Orchestrator channel is read-only — delete human messages and send ephemeral notice."""
-    from slack_sdk import WebClient
     from slack_sdk.errors import SlackApiError
 
     channel = event.get("channel", "")
@@ -427,10 +475,10 @@ async def _handle_orch_channel_event(config: dict, event: dict) -> None:
     if not bot_token:
         return
 
-    client = WebClient(token=bot_token)
+    client = make_async_client(bot_token)
     try:
         goal_ref = f"<#{goal_channel_id}>" if goal_channel_id else "the goal channel"
-        client.chat_postEphemeral(
+        await client.chat_postEphemeral(
             channel=channel,
             user=slack_user,
             text=(
@@ -438,7 +486,7 @@ async def _handle_orch_channel_event(config: dict, event: dict) -> None:
                 f"Use {goal_ref} to talk to the Goal Orchestrator."
             ),
         )
-        client.chat_delete(channel=channel, ts=ts)
+        await client.chat_delete(channel=channel, ts=ts)
         _log.info("Deleted human message in orch channel: channel=%s ts=%s", channel, ts)
     except SlackApiError as exc:
         _log.warning("Orch read-only enforcement failed: %s", exc)
@@ -483,7 +531,6 @@ async def _handle_user_goal_channel_event(
 
 async def _handle_member_joined(team_id: str, event: dict, pool) -> None:
     """A Slack user joined one of our channels — gate membership by email."""
-    from slack_sdk import WebClient
     from slack_sdk.errors import SlackApiError
     from app.channels.base import get_binding
     from app.channels.slack.config import get_workspace_credentials, find_goal_by_orch_channel
@@ -520,9 +567,9 @@ async def _handle_member_joined(team_id: str, event: dict, pool) -> None:
         return
 
     # Look up user's email via Slack profile
-    client = WebClient(token=bot_token)
+    client = make_async_client(bot_token)
     try:
-        info = client.users_info(user=slack_user)
+        info = await client.users_info(user=slack_user)
         profile = (info.get("user") or {}).get("profile") or {}
         email = profile.get("email", "")
         display_name = profile.get("display_name") or profile.get("real_name") or ""
@@ -532,7 +579,7 @@ async def _handle_member_joined(team_id: str, event: dict, pool) -> None:
 
     if not email:
         _log.info("Slack member_joined: no email for %s — kicking from goal channel", slack_user)
-        _kick_and_notify(client, channel, slack_user, "Your Slack profile has no email address — access denied.")
+        await _kick_and_notify(client, channel, slack_user, "Your Slack profile has no email address — access denied.")
         return
 
     uid = await auto_map_by_email(slack_user, email, display_name, pool=pool)
@@ -541,7 +588,7 @@ async def _handle_member_joined(team_id: str, event: dict, pool) -> None:
             "Slack member_joined: email %s not in users table — kicking from goal channel %s",
             email, channel,
         )
-        _kick_and_notify(client, channel, slack_user,
+        await _kick_and_notify(client, channel, slack_user,
                          "Your email address is not registered in the control panel.")
         return
 
@@ -551,7 +598,7 @@ async def _handle_member_joined(team_id: str, event: dict, pool) -> None:
     )
     if not is_member:
         _log.info("Slack member_joined: uid=%s not a goal member — kicking from %s", uid, channel)
-        _kick_and_notify(client, channel, slack_user,
+        await _kick_and_notify(client, channel, slack_user,
                          "You are not a member of this goal in the control panel.")
         return
 
@@ -561,18 +608,18 @@ async def _handle_member_joined(team_id: str, event: dict, pool) -> None:
     )
 
 
-def _kick_and_notify(client, channel: str, slack_user: str, reason: str) -> None:
+async def _kick_and_notify(client, channel: str, slack_user: str, reason: str) -> None:
     """Kick a user from a channel and send them a DM explaining why."""
     from slack_sdk.errors import SlackApiError
     try:
-        client.conversations_kick(channel=channel, user=slack_user)
+        await client.conversations_kick(channel=channel, user=slack_user)
     except SlackApiError as exc:
         _log.warning("Kick failed for %s from %s: %s", slack_user, channel, exc)
     try:
-        dm = client.conversations_open(users=slack_user)
+        dm = await client.conversations_open(users=slack_user)
         dm_channel = (dm.get("channel") or {}).get("id", "")
         if dm_channel:
-            client.chat_postMessage(
+            await client.chat_postMessage(
                 channel=dm_channel,
                 text=f":no_entry: You were removed from a channel: {reason}",
             )
@@ -596,9 +643,8 @@ async def _resolve_user(team_id: str, slack_user: str, goal_id: str, pool) -> Op
         cfg = await get_slack_config_for_goal(goal_id, pool)
         if not cfg or not cfg.get("bot_token"):
             return None
-        from slack_sdk import WebClient
-        client = WebClient(token=cfg["bot_token"])
-        info = client.users_info(user=slack_user)
+        client = make_async_client(cfg["bot_token"])
+        info = await client.users_info(user=slack_user)
         profile = (info.get("user") or {}).get("profile") or {}
         email = profile.get("email", "")
         display_name = profile.get("display_name") or profile.get("real_name") or ""
@@ -628,8 +674,18 @@ async def _get_bot_user_id(goal_id: str, pool) -> str:
 
 # ── Session routing ────────────────────────────────────────────────────────────
 
-async def _route_to_go(goal_id: str, user_uid: str, text: str, pool) -> None:
-    """Route a message to the GO session for this goal."""
+async def _route_to_go(goal_id: str, user_uid: str, text: str, pool,
+                       binding: dict | None = None) -> None:
+    """Route a message to the GO session for the thread this channel IS.
+
+    THE BINDING NAMES THE THREAD. This used to ignore the binding entirely
+    and re-read `goals.go_thread_id`, which was right while a goal had one
+    GO channel and is wrong the moment it has several: every channel's
+    replies collapsed into the single goal-wide thread, so a message sent
+    in the channel for story B appeared in the conversation about story A.
+    Falls back to go_thread_id only for a binding that carries no thread --
+    the goal-wide channel, which is still a real thing.
+    """
     from app.services.agent_driver import ensure_go_session
 
     if not text or not text.strip():
@@ -637,9 +693,10 @@ async def _route_to_go(goal_id: str, user_uid: str, text: str, pool) -> None:
 
     _log.info("Slack inbound → GO: goal=%s text_len=%d", goal_id, len(text))
     try:
-        go_thread_id = await pool.fetchval("SELECT go_thread_id FROM goals WHERE id = $1", goal_id)
+        go_thread_id = (binding or {}).get("thread_id") or await pool.fetchval(
+            "SELECT go_thread_id FROM goals WHERE id = $1", goal_id)
         if not go_thread_id:
-            _log.warning("Slack inbound: no go_thread_id for goal=%s", goal_id)
+            _log.warning("Slack inbound: no thread for goal=%s", goal_id)
             return
 
         # Kill switch — conversational freeze gate (Slack → GO). Drop the inbound
@@ -693,6 +750,8 @@ async def _route_to_go(goal_id: str, user_uid: str, text: str, pool) -> None:
                 "SELECT display_name FROM users WHERE uid = $1", user_uid,
             )
             from app.routers.goal_thread import _broadcast_to_goal_thread
+            # NAMED. Slack's goal channel is the MAIN GO thread; an
+            # errand thread's watchers must not see it.
             await _broadcast_to_goal_thread(goal_id, json.dumps({
                 "type": "message",
                 "role": "human",
@@ -700,7 +759,7 @@ async def _route_to_go(goal_id: str, user_uid: str, text: str, pool) -> None:
                 "sender_name": display or "",
                 "content": text,
                 "origin": "slack",
-            }))
+            }), go_thread_id)
         except Exception as _be:
             _log.debug("Slack inbound: GO thread broadcast failed (non-fatal): %s", _be)
         if session:
@@ -839,7 +898,6 @@ async def _handle_work_on_story(
 
     from app.channels.slack.config import get_slack_config_for_goal
     from app.channels.slack.thread_map import get_slack_user_id_for_actor
-    from slack_sdk import WebClient
 
     cfg = await get_slack_config_for_goal(goal_id, pool)
     if not cfg or not cfg.get("bot_token"):
@@ -848,7 +906,7 @@ async def _handle_work_on_story(
     # goal_channel_id is stored in gpi.config; fall back to binding if somehow absent
     goal_channel_id = cfg.get("goal_channel_id") or binding.get("external_channel_id", "")
     bot_token = cfg["bot_token"]
-    client = WebClient(token=bot_token)
+    client = make_async_client(bot_token)
 
     # ── 0. Kill switch — do not START new agent work on a frozen goal/system. ──
     # Gate up front so no story is claimed/transitioned and no assistant session
@@ -863,7 +921,7 @@ async def _handle_work_on_story(
             _blk.scope, goal_id, user_uid,
         )
         try:
-            client.chat_postEphemeral(
+            await client.chat_postEphemeral(
                 channel=goal_channel_id, user=slack_user,
                 text=(f"⏸ Execution is paused ({_blk.scope}). "
                       "Resume in the control panel before starting work on a story."),
@@ -887,12 +945,12 @@ async def _handle_work_on_story(
 
     story = _match_story(stories, clean)
     if not story:
-        _ephemeral_story_list(client, goal_channel_id, slack_user, stories, user_uid)
+        await _ephemeral_story_list(client, goal_channel_id, slack_user, stories, user_uid)
         return
 
     # ── 2. Assignment check ──────────────────────────────────────────────────
     if story["assigned_to"] and story["assigned_to"] != user_uid:
-        client.chat_postEphemeral(
+        await client.chat_postEphemeral(
             channel=goal_channel_id, user=slack_user,
             text=(
                 f"*{story['title']}* is assigned to someone else. "
@@ -912,7 +970,7 @@ async def _handle_work_on_story(
     blockers = await _unmet_dependencies(story, pool)
     if blockers:
         blocker_list = "\n".join(f"• *{b['title']}* ({b['state']})" for b in blockers)
-        client.chat_postEphemeral(
+        await client.chat_postEphemeral(
             channel=goal_channel_id, user=slack_user,
             text=f"*{story['title']}* is blocked by:\n{blocker_list}",
         )
@@ -926,7 +984,7 @@ async def _handle_work_on_story(
          WHERE sr.story_id = $1 AND gr.status = 'active'
     """, story["id"])
     if not res_count:
-        client.chat_postEphemeral(
+        await client.chat_postEphemeral(
             channel=goal_channel_id, user=slack_user,
             text=(
                 f"*{story['title']}* has no resources allocated yet — "
@@ -954,7 +1012,7 @@ async def _handle_work_on_story(
     # to in_progress, and returns the persistent (thread_id, agent_id).
     try:
         from app.routers.assistant import provision_assistant_thread_for_story
-        thread_id, agent_id = await provision_assistant_thread_for_story(
+        thread_id, agent_id, assistant_busy = await provision_assistant_thread_for_story(
             user_uid, goal_id, story["id"],
         )
     except Exception as exc:
@@ -964,38 +1022,74 @@ async def _handle_work_on_story(
     if not thread_id:
         return
 
+    if assistant_busy:
+        _log.info(
+            "Slack work-on-story: story=%s assigned but NOT started — assistant thread=%s "
+            "is already working on another story", story["id"], thread_id[:12] if thread_id else "-",
+        )
+        if response_url:
+            try:
+                async with __import__("httpx").AsyncClient(timeout=5) as _c:
+                    await _c.post(response_url, json={
+                        "response_type": "ephemeral",
+                        "replace_original": True,
+                        "text": (
+                            f"*{story['title']}* is assigned to you, but your assistant is "
+                            f"still working on another story — it'll start automatically "
+                            f"once that's done."
+                        ),
+                    })
+            except Exception as _exc:
+                _log.warning("work-on-story: could not post busy follow-up: %s", _exc)
+        return
+
     # ── 6. Fire session provisioning in parallel with channel creation ───────
     from app.services.agent_driver import ensure_shca_session
     session_task = asyncio.create_task(ensure_shca_session(goal_id, agent_id, thread_id))
 
-    # Ensure user-goal channel exists; pass story so it sets current_story_id
-    # and posts the "Now working on …" welcome message. ── 7.
-    from app.channels.slack.lifecycle import ensure_user_goal_channel
+    # ── 7. The STORY's channel, which is the one the work happens in.
+    #
+    # This used to call `ensure_user_goal_channel`, which kept a private
+    # channel per (member × goal) and is gone. That tier predated story
+    # channels and had stopped carrying anything: the conversation, the
+    # cards and the agent's replies all land in the story's own channel.
+    #
+    # It was also the source of `<goal>-<name>-<env>-2`. Its lookup
+    # matched only an UNARCHIVED binding for the actor, so once a
+    # binding was archived it created a FRESH Slack channel -- and the
+    # old one still existed, so Slack appended a numeric suffix. The
+    # unarchive path it carried sat on the found-a-binding branch and
+    # was therefore unreachable from the one state that needed it.
+    #
+    # `ensure_channel_for_thread` does not have that failure: a unique
+    # index on (integration_id, thread_id) means a second caller adopts
+    # the first's channel instead of making another, and it records
+    # `channel_name` and invites participants, neither of which the old
+    # path did.
+    from app.channels.slack.thread_channels import ensure_channel_for_thread
     try:
-        channel_id = await ensure_user_goal_channel(
+        channel_id = await ensure_channel_for_thread(
+            pool,
             goal_id=goal_id,
-            user_uid=user_uid,
-            user_actor_id=actor_id,
-            user_display_name=display_name,
-            slack_user_id=slack_user_id or slack_user,
             thread_id=thread_id,
+            title=story.get("title") or "",
+            actor_id=actor_id,
             agent_id=agent_id,
-            integration_id=cfg["integration_id"],
-            bot_token=bot_token,
-            pool=pool,
-            story=dict(story),
+            story_id=story["id"],
         )
     except Exception:
         session_task.cancel()
         raise
 
+    # None means Slack is OFF for this goal, which is ordinary and not a
+    # failure -- so the kickoff below still runs. The old code aborted
+    # here, which turned "no Slack" into "the story never starts".
     if not channel_id:
-        session_task.cancel()
-        _log.warning("Slack work-on-story: could not get user-goal channel for %s", user_uid)
-        return
+        _log.info("Slack work-on-story: no channel for thread %s (Slack off "
+                  "for goal %s); continuing with kickoff", thread_id[:12], goal_id)
 
-    # Post a follow-up pointing the user to their personal channel.
-    if response_url:
+    # Point the user at the story's channel.
+    if response_url and channel_id:
         try:
             async with __import__("httpx").AsyncClient(timeout=5) as _c:
                 await _c.post(response_url, json={
@@ -1046,14 +1140,56 @@ async def _handle_work_on_story(
         from app.routers.assistant import dispatch_story_kickoff_to_assistant
         ok = await dispatch_story_kickoff_to_assistant(goal_id, story["id"], thread_id, agent_id, user_uid)
         if not ok:
+            # SAY SO. A False here is usually not a failure: the story is
+            # already `in_progress`, but the git engine has not finished
+            # cutting its workstream branch, so the workspace is not there
+            # yet and the kickoff was deferred. The branch-ready listener
+            # resumes it on its own.
+            #
+            # The person, though, had just been told their channel was
+            # ready. Saying nothing leaves them typing into a channel whose
+            # assistant has not been started, concluding it is broken, and
+            # starting the story again -- which is how a quiet deferral
+            # turns into a support question.
             _log.warning(
                 "dispatch_story_kickoff_to_assistant returned False: goal=%s story=%s",
                 goal_id, story["id"],
             )
+            await _say_waiting_for_workspace(
+                goal_id, story["id"], thread_id, pool, response_url)
     except Exception as exc:
         _log.warning(
             "Slack work-on-story: dispatch_story_kickoff_to_shca failed: %s", exc,
         )
+
+
+
+async def _say_waiting_for_workspace(goal_id: str, story_id: str,
+                                     thread_id: str, pool,
+                                     response_url: str = "") -> None:
+    """Tell the person their story is queued behind the git engine.
+
+    Distinguishes the two reasons a kickoff defers, because the answers
+    differ: a workspace that is not ready yet resumes by itself, while
+    an assistant already busy on another story needs that one finished.
+    """
+    row = await pool.fetchrow(
+        "SELECT workspace_state, state FROM stories WHERE id = $1", story_id)
+    waiting = (row or {}).get("workspace_state") not in ("ready",)
+    text = (
+        "Your workspace is still being prepared — the branch for this story "
+        "has not been cut yet. It starts on its own as soon as it is; you do "
+        "not need to run anything again."
+        if waiting else
+        "Your assistant is finishing another story first. This one starts "
+        "when that one is done."
+    )
+    try:
+        from app.channels.base import relay_to_thread_channel
+        await relay_to_thread_channel(goal_id, thread_id, text)
+    except Exception as exc:                                   # noqa: BLE001
+        _log.warning("could not tell %s why the kickoff deferred: %s",
+                     story_id, exc)
 
 
 def _match_story(stories, text: str) -> Optional[dict]:
@@ -1071,7 +1207,7 @@ def _match_story(stories, text: str) -> Optional[dict]:
     return None
 
 
-def _ephemeral_story_list(client, channel_id: str, slack_user: str, stories, user_uid: str) -> None:
+async def _ephemeral_story_list(client, channel_id: str, slack_user: str, stories, user_uid: str) -> None:
     """Post an ephemeral showing available stories when the user's request didn't match."""
     mine = [s for s in stories if s["assigned_to"] == user_uid]
     rest = [s for s in stories if s["assigned_to"] != user_uid]
@@ -1085,7 +1221,7 @@ def _ephemeral_story_list(client, channel_id: str, slack_user: str, stories, use
     if not stories:
         lines.append("No active stories in this goal.")
     try:
-        client.chat_postEphemeral(channel=channel_id, user=slack_user, text="\n".join(lines))
+        await client.chat_postEphemeral(channel=channel_id, user=slack_user, text="\n".join(lines))
     except Exception as exc:
         _log.warning("Failed to post story list ephemeral: %s", exc)
 
@@ -1225,9 +1361,8 @@ async def _handle_file_shared(
         return
 
     try:
-        from slack_sdk import WebClient
-        client = WebClient(token=bot_token)
-        info = client.files_info(file=file_id)
+        client = make_async_client(bot_token)
+        info = await client.files_info(file=file_id)
         file_obj = info.get("file", {})
     except Exception as exc:
         _log.warning("Slack file_shared: files.info failed file=%s: %s", file_id, exc)

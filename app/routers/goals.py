@@ -193,11 +193,14 @@ async def sidebar_goals(
             # Fetch threads early so we can split assistant vs conversation groups
             goal_threads = await pool.fetchrow(
                 """SELECT go_thread_id, orchestrator_thread_id,
-                          council_thread_id, security_thread_id
+                          council_thread_id, security_thread_id,
+                          go_agent_id
                    FROM goals WHERE id = $1""",
                 gid,
             )
             go_thread = goal_threads["go_thread_id"] if goal_threads else "none"
+            # The GO's own agent id, for its errand threads further down.
+            go_agent = (goal_threads["go_agent_id"] or "") if goal_threads else ""
             orch_thread = goal_threads["orchestrator_thread_id"] if goal_threads else "none"
             # Excluded below alongside go_thread/orch_thread so these dedicated
             # channels (rendered as GO-thread sub-rows, not plain conversations)
@@ -210,11 +213,18 @@ async def sidebar_goals(
             # SHCA threads are per-(user, agent) — the most recent active thread wins.
             shca_thread_id = None
             if shca_id:
+                # Prefer the GENERAL thread — the one with no story on it. Story
+                # threads are their own rows below, and letting one of them win
+                # here put a story's unread count on the assistant channel and
+                # sent a click on "# assistant" into whichever story happened to
+                # be newest.
                 shca_thread_row = await pool.fetchrow(
                     """SELECT id FROM threads
                        WHERE agent_id = $1 AND created_by = $2 AND goal_id = $3
                          AND (status IS NULL OR status IN ('active', 'open'))
-                       ORDER BY created_at DESC LIMIT 1""",
+                       ORDER BY (story_id IS NULL OR story_id = '') DESC,
+                                created_at DESC
+                       LIMIT 1""",
                     shca_id, user["uid"], gid,
                 )
                 shca_thread_id = shca_thread_row["id"] if shca_thread_row else None
@@ -227,11 +237,37 @@ async def sidebar_goals(
                 WHERE t.goal_id = $1 AND t.task_id IS NULL
                   AND (t.status IS NULL OR t.status = '' OR t.status IN ('active', 'open'))
                   AND t.id != $3 AND t.id != $4 AND t.id != $5 AND t.id != $6
+                  -- GO THREADS STAY OUT OF THIS LIST. An autonomous
+                  -- errand's thread belongs to the GO, and this list
+                  -- links to `/chat/{agent}` -- the assistant page,
+                  -- which would relay the wrong agent's history. They
+                  -- render under the GO row instead, beside the three
+                  -- fixed channels. See `sidebar_threads.go_errand_threads`.
                   AND (t.agent_id IS NULL OR t.agent_id = '' OR NOT t.agent_id LIKE 'go-%')
                   AND (t.created_by = $2 OR $2 = ANY(COALESCE(t.participants, '{}')))
                 ORDER BY (t.created_by = $2) DESC, t.created_at DESC
                 LIMIT 20
             """, gid, user["uid"], go_thread, orch_thread, council_thread, security_thread)
+
+            # AND THE ERRAND THREADS, which are different in kind from the
+            # three fixed channels under the GO. Each of those folds into
+            # the GO's MAIN session and context; an errand thread comes
+            # and goes with its errand and has a gateway session of its
+            # own. They share a parent row because they share an agent.
+            #
+            # FETCHED HERE, RENDERED FURTHER DOWN, so their ids reach the
+            # unread-count and preview lookups below -- a row that can
+            # never show a badge cannot tell you an errand is waiting on
+            # you, which is the only thing a collapsed list is for.
+            from app.services.sidebar_threads import (  # noqa: PLC0415
+                errand_thread_row, go_errand_threads,
+            )
+            try:
+                _errand_rows = await go_errand_threads(pool, gid, go_agent)
+            except Exception as exc:                        # noqa: BLE001
+                _log.warning("sidebar: errand threads unavailable for %s: %s",
+                             gid, exc)
+                _errand_rows = []
 
             # Threads whose agent is an SHCA belong in the assistant group, not conversations
             shca_threads = [dict(t) for t in threads if t.get("agent_id") in shca_ids and not t["is_own"]]
@@ -244,7 +280,9 @@ async def sidebar_goals(
             # leaves all badges hidden (defaulting to zero).
             unread_counts: dict = {}
             _thread_ids_to_check = list({
-                tid for tid in ([go_thread, shca_thread_id] + [t["id"] for t in threads])
+                tid for tid in ([go_thread, shca_thread_id]
+                                + [t["id"] for t in threads]
+                                + [r["id"] for r in _errand_rows])
                 if tid and tid != "none"
             })
             if _thread_ids_to_check:
@@ -372,10 +410,15 @@ async def sidebar_goals(
             # council_security_channel_threads.sql), rendered as a collapsible
             # child list under the GO row using the same expand-arrow convention
             # as tasks/human_board.html's toggleSubtasks().
+            _errand_html = "".join(
+                errand_thread_row(gid, r, current_thread, unread_counts,
+                                  previews)
+                for r in _errand_rows
+            )
             _go_children_active = any(
                 seg in current_path and gid in current_path
                 for seg in ("/orchestrator", "/council", "/security")
-            )
+            ) or any(r["id"] == current_thread for r in _errand_rows)
             _go_arrow_open = "rotate-90" if _go_children_active else ""
             _go_children_hidden = "" if _go_children_active else "hidden"
 
@@ -422,9 +465,10 @@ async def sidebar_goals(
       {_sub_channel_link("orchestrator", "Agent Mesh", "sky", "M13 10V3L4 14h7v7l9-11h-7z")}
       {_sub_channel_link("council", "Goal Review Council", "amber", "M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z")}
       {_sub_channel_link("security", "Security Council", "rose", "M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z")}
+      {_errand_html}
     </div>''')
 
-            # ── Assistant (SHCA) channel link ──
+            # ── Assistant (SHCA) channel link, and its story threads ──
             shca_active = (
                 shca_id
                 and f"/goals/{gid}/chat/{shca_id}" in current_path
@@ -435,7 +479,49 @@ async def sidebar_goals(
                 _shca_badge_tid = shca_thread_id or ""
                 _shca_preview = previews.get(shca_thread_id, "") if shca_thread_id else ""
                 _shca_tooltip_title = _html.escape(f"# {shca_name}")
-                html.append(f'''
+                from app.services.sidebar_threads import (  # noqa: PLC0415
+                    assistant_story_threads, story_thread_row,
+                )
+                story_rows = await assistant_story_threads(
+                    pool, gid, shca_id, user["uid"])
+                _shca_children = "".join(
+                    story_thread_row(gid, shca_id, r, current_thread,
+                                     unread_counts, previews)
+                    for r in story_rows
+                )
+                _shca_open = bool(story_rows) and (
+                    shca_active or any(r["id"] == current_thread for r in story_rows)
+                )
+                _shca_arrow = "rotate-90" if _shca_open or story_rows else ""
+                _shca_hidden = "" if _shca_open or story_rows else "hidden"
+                # The toggle only exists when there is something to reveal —
+                # an arrow that opens an empty list reads as a broken control.
+                if story_rows:
+                    html.append(f'''
+    <div class="flex items-center">
+      <button type="button" onclick="toggleAssistantThreads('{gid}')"
+              title="Collapse/expand this assistant's story threads"
+              class="thread-icon-btn row-toggle-btn flex-shrink-0 h-5 px-1 flex items-center justify-center gap-0.5 rounded hover:bg-surface-hover">
+        <svg id="arrow-shca-{gid}" class="w-2.5 h-2.5 flex-shrink-0 text-gray-600 transition-transform {_shca_arrow}"
+             fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"/>
+        </svg>
+        <svg class="w-3 h-3 flex-shrink-0 text-violet-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M8 10h.01M12 10h.01M16 10h.01M9 16H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-5l-5 5v-5z"/>
+        </svg>
+      </button>
+      <a href="/goals/{gid}/chat/{shca_id}"
+         data-tooltip-title="{_shca_tooltip_title}"
+         data-tooltip-preview="{_shca_preview}"
+         class="sidebar-item text-2xs py-1 flex-1 {shca_cls}">
+        <span class="sidebar-label"># {shca_name}</span>
+        {_unread_badge(_shca_badge_tid, _shca_unread)}
+      </a>
+    </div>
+    <div id="shca-threads-{gid}" class="ml-4 space-y-0.5 {_shca_hidden}">{_shca_children}
+    </div>''')
+                else:
+                    html.append(f'''
     <a href="/goals/{gid}/chat/{shca_id}"
        data-tooltip-title="{_shca_tooltip_title}"
        data-tooltip-preview="{_shca_preview}"
@@ -534,19 +620,12 @@ async def list_goals(request: Request, user: dict = Depends(get_current_user)):
     goals = await _get_user_goals(
         user["uid"], user.get("system_role") == SystemRole.PLATFORM_ADMIN
     )
-    from app.llm_models import (
-        models_within_context, DEFAULT_GO_MODEL, GO_CREATE_MAX_CONTEXT,
-    )
     from app.services.tour_progress import check_and_mark_milestone_if_enabled
     auto_fire_tour = await check_and_mark_milestone_if_enabled(user, "platform-overview")
     return templates.TemplateResponse(
         "goals/list.html",
         {
             "request": request, "user": user, "goals": goals,
-            # GO-creation dropdown only offers models with a <=100K context
-            # window (gemini + anthropic alike); wider variants are hidden.
-            "supported_models":  models_within_context(GO_CREATE_MAX_CONTEXT),
-            "default_go_model":  DEFAULT_GO_MODEL,
             "auto_fire_tour": auto_fire_tour,
         },
     )
@@ -555,14 +634,18 @@ async def list_goals(request: Request, user: dict = Depends(get_current_user)):
 @router.get("/new-modal", response_class=HTMLResponse)
 async def new_goal_modal(request: Request, user: dict = Depends(require_editor)):
     """HTMX fragment — returns just the create-goal form for the global modal."""
-    from app.llm_models import go_model_tree
-    _log.debug("new_goal_modal: loaded by %s", user.get("uid"))
+    from app.services.model_registry.dropdowns import (
+        build_go_model_tree_v2, is_dropdown_empty,
+    )
+    tree = await build_go_model_tree_v2(get_pool())
+    _log.debug("new_goal_modal: loaded by %s bases=%d", user.get("uid"), len(tree["bases"]))
     return templates.TemplateResponse(
         "goals/_new_goal_form.html",
         {
             "request": request,
             "user": user,
-            "go_model_tree": go_model_tree(),
+            "go_model_tree": tree,
+            "models_empty": is_dropdown_empty(tree),
         },
     )
 
@@ -610,6 +693,14 @@ async def create_goal(
 
     # Pre-generate event_id so it can serve as its own correlation_id
     root_event_id = generate_event_id()
+
+    # Resolved before the transaction because the picker's value has to
+    # be validated whatever happens next.
+    from app.llm_models import is_supported, default_for
+    from app.services.model_registry.dropdowns import is_model_registered_v2
+    go_model = (form.get("go_model") or "").strip()
+    if not is_supported(go_model) and not await is_model_registered_v2(pool, go_model):
+        go_model = default_for("go")
 
     async with pool.acquire() as conn:
         async with conn.transaction():
@@ -693,13 +784,22 @@ async def create_goal(
                 security_thread_id, pid, user["uid"],
             )
 
-    # 5. Create the GO agent. Model is user-selectable on the new-goal
-    # form (whitelist in app/llm_models.py); falls back to the default
-    # if absent or unknown.
-    from app.llm_models import is_supported, default_for
-    go_model = (form.get("go_model") or "").strip()
-    if not is_supported(go_model):
-        go_model = default_for("go")
+    # ── 5. The GO, and a failure undoes the goal ─────────────────────
+    #
+    # AFTER THE COMMIT AND NOT INSIDE IT, for two reasons that both had
+    # to be learned the hard way. `agent_contexts` has a foreign key to
+    # `goals`, so provisioning cannot run before the row exists --
+    # trying it failed with `Key (goal_id)=(CATV9) is not present`. And
+    # putting it inside the creating transaction would hold
+    # `pg_advisory_xact_lock(GLOBAL_CHAIN_LOCK_ID)`, which
+    # `append_event` takes, across six seconds of gateway I/O -- every
+    # ledger append on the platform would queue behind a goal form.
+    #
+    # So the goal is written, provisioning runs, and a failure UNDOES
+    # the write. A goal with no orchestrator can plan nothing, and
+    # "created, but it may not be able to plan tasks yet" left a person
+    # with no way forward: the only retry was a startup sweep they
+    # could not see or trigger. Retrying is now resubmitting the form.
     try:
         go_result = await create_go_for_goal(
             goal_id=pid,
@@ -708,36 +808,50 @@ async def create_goal(
             created_by_uid=user["uid"],
             model=go_model,
         )
-        # Store GO agent ID on the goal
+        go_agent_id = (go_result or {}).get("agent_id") or ""
+        if not go_agent_id:
+            raise RuntimeError("provisioning returned no agent id")
+        # AN AGENT ID IS NOT EVIDENCE OF AN AGENT. The dead-goal guard
+        # inside returns one even when it skips, which is how a goal
+        # once came out pointing at an agent that was never created.
+        if (go_result or {}).get("skipped"):
+            raise RuntimeError(
+                f"provisioning skipped ({go_result['skipped']})")
         await pool.execute(
-            "UPDATE goals SET go_agent_id = $1 WHERE id = $2",
-            go_result["agent_id"], pid,
-        )
-        _log.info("GO agent created for goal %s: %s", pid, go_result["agent_id"])
-    except Exception as exc:
-        _log.warning("GO agent creation failed for goal %s: %s (can retry later)", pid, exc)
-        # Record the failure durably so it survives Cloud Run instance recycling.
+            "UPDATE goals SET go_agent_id = $1 WHERE id = $2", go_agent_id, pid)
+        _log.info("GO agent created for goal %s: %s", pid, go_agent_id)
+    except Exception as exc:                                # noqa: BLE001
+        _log.exception("GO provisioning failed for goal %s — undoing it", pid)
+        from app.services.goal_rollback import undo_goal_creation
+        undone = await undo_goal_creation(pool, pid)
         try:
             async with pool.acquire() as _conn:
                 await append_event(
                     _conn,
                     event_type=AGENT_PROVISIONING_FAILED,
-                    payload={
-                        "agent_type": "GO",
-                        "goal_id": pid,
-                        "error": str(exc),
-                    },
+                    payload={"agent_type": "GO", "goal_id": pid,
+                             "error": str(exc), "goal_rolled_back": undone},
                     actor_id=SYSTEM_ACTOR_ID,
                     actor_type="system",
                     context_goal_id=pid,
                 )
-        except Exception as ledger_exc:
-            _log.warning("Failed to record GO provisioning failure in ledger for %s: %s", pid, ledger_exc)
-        return flash_redirect(
-            f"/goals/{pid}",
-            "Goal created, but the Goal Orchestrator agent failed to provision — it may not be able to plan tasks yet.",
-            flash_type="warning",
-        )
+        except Exception as ledger_exc:                     # noqa: BLE001
+            _log.warning("Failed to record GO provisioning failure for %s: %s",
+                         pid, ledger_exc)
+        if undone:
+            msg = (f"Goal not created — the Goal Orchestrator could not be "
+                   f"provisioned ({type(exc).__name__}: {exc}). Nothing was "
+                   f"saved; try again once the cause is cleared.")
+        else:
+            # SAY THE TRUE THING. Claiming nothing was saved when the
+            # rollback itself failed sends somebody to create it again
+            # and hit a duplicate id they cannot see.
+            msg = (f"The Goal Orchestrator could not be provisioned "
+                   f"({type(exc).__name__}: {exc}) AND goal `{pid}` could "
+                   f"not be rolled back — it is still in the database and "
+                   f"needs an admin.")
+        return flash_redirect("/goals", msg, flash_type="error")
+
 
     # 6. Auto-provision: add creator's assistants + standard IAs to the goal
     try:
@@ -792,12 +906,16 @@ async def delete_goal(
         "  AND state NOT IN ('done','approved','failed','rejected','cancelled','halted')",
         pid,
     )
-    await pool.execute(
-        "UPDATE stories SET state = 'cancelled', updated_at = now() "
-        "WHERE goal_id = $1 "
-        "  AND state NOT IN ('done','reviewed','cancelled','rejected')",
-        pid,
-    )
+    # Through the ledger helper: cancelling a goal cancels its stories,
+    # and each is a transition somebody later asks about ("when did this
+    # stop, and why?").
+    from app.services.story_state_ledger import record_states_where
+    async with pool.acquire() as _c, _c.transaction():
+        await record_states_where(
+            _c, "cancelled",
+            where=("goal_id = $1 AND state NOT IN "
+                   "('done','reviewed','cancelled','rejected')"),
+            params=(pid,), actor_uid=user["uid"], action="goal_cancelled")
     # Terminate pending/running Goal Review Council runs for this goal. Otherwise a
     # pending run lingers forever (the dispatcher guard skips it but never clears
     # it) and a running one holds the global single-run gate until the stale
@@ -814,6 +932,19 @@ async def delete_goal(
     await pool.execute(
         "DELETE FROM execution_pauses WHERE scope = 'goal' AND scope_id = $1", pid,
     )
+
+    # AND THE RUNS IN FLIGHT. Cancelling the STORY is not a signal the
+    # reclaim sweep recognises -- it frees a workspace on `done`,
+    # `reviewed` or a CANCELLED execution -- so a deleted goal's pod
+    # kept running and its claim kept its disk, against a namespace
+    # quota of 40 claims for all executions ever.
+    try:
+        from app.services.kernel_goal_teardown import cancel_goal_runs
+
+        await cancel_goal_runs(pid, user["uid"])
+    except Exception as exc:                                # noqa: BLE001
+        _log.warning("Goal-delete run cancellation failed for %s: %s",
+                     pid, exc)
 
     # Notify connected channels before archiving bindings — relay functions need
     # active bindings to resolve the target pages/channels.
@@ -1367,15 +1498,6 @@ async def goal_integrations_page(
         ))
     except Exception as _slack_exc:
         _log.warning("Failed to load Slack config for goal %s: %s", pid, _slack_exc, exc_info=True)
-    if not _new_system_row:
-        try:
-            from app.slack.config import get_goal_slack_config, list_workspaces as _legacy_list_ws
-            slack_config = await get_goal_slack_config(pid)
-            if not slack_workspaces:
-                slack_workspaces = await _legacy_list_ws()
-        except ImportError:
-            pass
-
     import json as _json
     from app.channels.registry import registered_platforms, get_provisioner
 
@@ -1468,7 +1590,10 @@ async def goal_model_config_page(
     proj_row = await pool.fetchrow("SELECT * FROM goals WHERE id = $1", pid)
     goal = dict(proj_row)
 
-    from app.llm_models import go_model_tree, label_for
+    from app.llm_models import label_for
+    from app.services.model_registry.dropdowns import (
+        build_go_model_tree_v2, is_dropdown_empty,
+    )
     go_agent_id = goal.get("go_agent_id") or ""
     go_model = ""
     if go_agent_id:
@@ -1476,7 +1601,8 @@ async def goal_model_config_page(
             "SELECT model FROM agents WHERE id = $1", go_agent_id,
         ) or ""
 
-    _log.info("goal_model_config_page: pid=%s go_model=%s", pid, go_model)
+    tree = await build_go_model_tree_v2(pool)
+    _log.info("goal_model_config_page: pid=%s go_model=%s bases=%d", pid, go_model, len(tree["bases"]))
     return templates.TemplateResponse(
         "goals/model_config.html",
         {
@@ -1485,9 +1611,23 @@ async def goal_model_config_page(
             "goal": goal,
             "pid": pid,
             "role": role,
-            "go_model_tree": go_model_tree(),
+            "go_model_tree": tree,
+            "models_empty": is_dropdown_empty(tree),
             "go_model": go_model,
             "go_model_label": label_for(go_model) if go_model else "—",
+            # THE KERNEL's models, not the gateway's. The GO runs on the
+            # gateway and its list comes from the `models` TABLE; the
+            # executor and verifier run in the kernel, whose adapters
+            # serve a different, smaller set. Offering the wrong one
+            # would let somebody pick a model `choice.validate` then
+            # refuses -- a form rejecting its own options.
+            "kernel_models": _kernel_model_menu(),
+            "executor_model": goal.get("executor_model") or "",
+            "sandbox_size": goal.get("sandbox_size") or "",
+            "verifier_model": goal.get("verifier_model") or "",
+            # The goal's executor leg size and count; blank = defaults.
+            "leg_context_tokens": goal.get("leg_context_tokens") or "",
+            "max_legs": goal.get("max_legs") or "",
         },
     )
 
@@ -1501,10 +1641,14 @@ async def change_go_model(
     user: dict = Depends(get_current_user),
 ):
     """Change the LLM the GO agent uses for this goal."""
+    # Platform admin counts here too, for the reason spelled out at
+    # `change_kernel_models`: the same omission, the same setting class.
     role = await get_goal_role(user["uid"], pid)
-    if role != GoalRole.GOAL_ADMIN:
+    is_platform_admin = user.get("system_role") == SystemRole.PLATFORM_ADMIN
+    if role != GoalRole.GOAL_ADMIN and not is_platform_admin:
         _log.warning("change_go_model: denied uid=%s role=%s goal=%s", user["uid"], role, pid)
-        raise HTTPException(status_code=403, detail="Goal admin required")
+        raise HTTPException(
+            status_code=403, detail="Goal admin or platform admin required")
 
     pool = get_pool()
     pid = await resolve_goal_id(pid)
@@ -1519,15 +1663,11 @@ async def change_go_model(
     new_model = (form.get("model") or "").strip()
     force = bool(form.get("force"))
 
-    # Enforce the GO context-window cap server-side — the dropdown hides
-    # wider models, but a direct POST must be rejected too.
-    from app.llm_models import context_window_for, GO_CREATE_MAX_CONTEXT
-    if new_model and context_window_for(new_model) > GO_CREATE_MAX_CONTEXT:
-        raise HTTPException(
-            status_code=400,
-            detail=f"GO model context window must be <= {GO_CREATE_MAX_CONTEXT // 1000}K.",
-        )
-
+    # No context-window cap here — removed GO_CREATE_MAX_CONTEXT
+    # restriction; any registered model/size is a legitimate, explicit
+    # choice now that the registry's context-window variant system means
+    # picking a larger window is deliberate, not something to guard
+    # against.
     from app.services.model_change import change_agent_model
     result = await change_agent_model(
         agent_id=goal["go_agent_id"],
@@ -1546,20 +1686,9 @@ async def change_go_model(
 
 
 # -- Slack enable/disable (LEGACY — commented out 2026-06-18) -------------------
-# These endpoints wrote to the legacy slack_config table (app/slack/).
-# The settings page now posts to the generic channel endpoints below
-# (/{pid}/settings/channels/slack/enable and /disable) which write to
-# goal_platform_integrations and platform_channel_bindings instead.
-# Kept as comments until the legacy app/slack/ router is fully retired —
-# see documentation/SLACK_CUTOVER.md for the removal checklist.
-
-# @router.post("/{pid}/settings/slack/enable")
-# async def enable_slack(pid, request, user):
-#     ...wrote to slack_config via app.slack.lifecycle.on_goal_slack_enabled()
-
-# @router.post("/{pid}/settings/slack/disable")
-# async def disable_slack(pid, request, user):
-#     ...wrote to slack_config via app.slack.config.disable_goal_slack()
+# The legacy slack_config endpoints lived here. app/slack/ was deleted on
+# 2026-10-16; goal-level Slack is goal_platform_integrations.enabled,
+# handled by the channel routes above.
 
 
 # -- Notion enable/disable/allowlist -------------------------------------------
@@ -1569,6 +1698,120 @@ def _parse_domains(raw: str) -> list[str]:
 
 
 # ── generic channel endpoints (works for any registered platform) ──────────────
+
+# ── Executor and verifier models (kernel-side), per goal ───────────────
+#
+# A DIFFERENT REGISTRY FROM THE GO's, and the distinction is the whole
+# reason these are separate handlers rather than more fields on the one
+# above. The GO runs on the GATEWAY and its models come from the `models`
+# TABLE (`model_registry.dropdowns`); the executor and verifier run in
+# the KERNEL, whose adapters serve `kernel.harness.models.registry.
+# SUPPORTED` -- a different, smaller, hardcoded set.
+#
+# Offering the gateway's list here would let somebody pick a model the
+# kernel cannot serve, and `choice.validate` would then refuse it: a form
+# that rejects its own options.
+
+
+def _kernel_model_menu() -> list:
+    """The models a person may be OFFERED, grouped by vendor.
+
+    Delegates to `choice.menu`, which is NARROWER than what the adapters
+    can serve: Gemini is curated to the 3.8 series, because offering
+    nine -- four of them previews -- is a menu nobody can choose from
+    well. `validate` still accepts anything the registry serves, so a
+    goal configured before the curation keeps working.
+
+    One function for both the goal page and the story page: two menus
+    would drift, and the drift is a story offered a model its goal is
+    not.
+    """
+    from kernel.harness.models.choice import menu
+
+    return menu()
+
+
+@router.post("/{pid}/settings/kernel-models")
+async def change_kernel_models(
+    pid: str,
+    request: Request,
+    user: dict = Depends(get_current_user),
+):
+    """Set which model runs this goal's work and which model judges it.
+
+    GOAL_ADMIN, the same gate `change_go_model` uses: which model judges
+    is a standard, and a standard anybody could lower is not one.
+    """
+    # OR A PLATFORM ADMIN, which this gate left out.
+    #
+    # `get_goal_role` answers from `goal_members` for an ordinary goal
+    # and special-cases only `__platform__`, so a platform admin who is
+    # not a member of THIS goal comes back None and was refused -- the
+    # one role that administers the installation could not set the
+    # models its executions run on. The same route file already spells
+    # the correct test at `remove_goal`; this is that test, not a new
+    # rule.
+    #
+    # Deliberately NOT fixed inside `get_goal_role`: that function backs
+    # every access check in the app -- chat, threads, the WS -- and
+    # making platform admins goal admins everywhere would widen read
+    # access to every goal's conversations as a side effect of a models
+    # dropdown.
+    role = await get_goal_role(user["uid"], pid)
+    is_platform_admin = user.get("system_role") == SystemRole.PLATFORM_ADMIN
+    if role != GoalRole.GOAL_ADMIN and not is_platform_admin:
+        _log.warning("change_kernel_models: denied uid=%s role=%s goal=%s",
+                     user["uid"], role, pid)
+        raise HTTPException(
+            status_code=403, detail="Goal admin or platform admin required")
+
+    from kernel.harness.models.choice import UnknownModel, validate
+    from kernel.conductor.size_choice import valid as valid_size
+
+    form = await request.form()
+    try:
+        # BLANK MEANS INHERIT, not "the empty string". A cleared
+        # dropdown is a person saying "use the default", and storing ""
+        # would send an empty model id to an adapter.
+        executor = validate((form.get("executor_model") or "").strip() or None)
+        verifier = validate((form.get("verifier_model") or "").strip() or None)
+    except UnknownModel as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    # THE GOAL'S MACHINE, and without this an ERRAND could never be
+    # anything but `small`. A story can be re-sized on its own page
+    # before it runs; an errand's story is created AT APPROVAL and
+    # dispatched immediately, so there is no window in which to edit it
+    # -- the goal is the only place its rung can come from. The column
+    # existed and nothing wrote it, which is the same defect one level
+    # up that `contracts.size` was.
+    try:
+        sandbox = valid_size((form.get("sandbox_size") or "").strip() or None)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    # THE EXECUTOR'S LEG SIZE AND LEG COUNT, validated by the same module
+    # the pod applies them with, so the form cannot store a value the
+    # run would then refuse.
+    from kernel.harness.models.leg_choice import valid as valid_legs
+    try:
+        leg_tokens, leg_count = valid_legs(form.get("leg_context_tokens"),
+                                           form.get("max_legs"))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    await get_pool().execute(
+        "UPDATE goals SET executor_model = $2, verifier_model = $3, "
+        "                 sandbox_size = $4, leg_context_tokens = $5, "
+        "                 max_legs = $6 "
+        "WHERE id = $1", pid, executor, verifier, sandbox,
+        leg_tokens, leg_count)
+    _log.info("change_kernel_models: goal=%s executor=%s verifier=%s size=%s "
+              "leg_tokens=%s max_legs=%s",
+              pid, executor or "(inherit)", verifier or "(inherit)",
+              sandbox or "(inherit)", leg_tokens or "(default)",
+              leg_count or "(default)")
+    return RedirectResponse(url=f"/goals/{pid}/model-config", status_code=303)
 
 @router.post("/{pid}/settings/channels/{platform}/enable")
 async def enable_channel(
@@ -1615,6 +1858,29 @@ async def enable_channel(
             raise HTTPException(status_code=400, detail=error)
 
     _log.info("%s enabled for goal %s", platform, pid)
+
+    # BACK-FILL THE THREADS THAT ALREADY EXIST. Provisioning creates the
+    # channels that exist at this moment; under one channel per thread a
+    # goal switched on after twenty stories needs twenty of them, and
+    # nothing used to make them -- so every conversation already open
+    # stayed invisible while new ones appeared. Backgrounded because it
+    # is paced by design (conversations.create is Tier-2) and the toggle
+    # should return at once.
+    if platform == "slack":
+        import asyncio as _asyncio
+
+        async def _backfill() -> None:
+            try:
+                from app.services.slack_backfill import backfill_goal
+                await backfill_goal(get_pool(), pid)
+            except Exception as exc:                           # noqa: BLE001
+                _log.warning("Slack backfill for goal %s failed: %s", pid, exc)
+
+        _task = _asyncio.create_task(_backfill())
+        _task.add_done_callback(
+            lambda t: t.exception() and _log.warning(
+                "Slack backfill task failed: %s", t.exception()))
+
     return RedirectResponse(url=f"/goals/{pid}/integrations", status_code=303)
 
 
@@ -1672,15 +1938,6 @@ async def disable_channel(
              AND gpi.goal_id = $2""",
         platform, pid,
     )
-    # Cutover shim: also disable in legacy tables so goals that haven't been
-    # migrated to the new channel system are properly reflected in the UI.
-    # Remove after legacy app/slack/ router is retired (see documentation/SLACK_CUTOVER.md).
-    if platform == "slack":
-        try:
-            from app.slack.config import disable_goal_slack
-            await disable_goal_slack(pid)
-        except ImportError:
-            pass
     _log.info("%s disabled for goal %s", platform, pid)
     return RedirectResponse(url=f"/goals/{pid}/integrations", status_code=303)
 

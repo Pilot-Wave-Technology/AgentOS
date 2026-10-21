@@ -4,18 +4,20 @@ import hashlib
 import logging
 from typing import Any
 
+from app import local_dev
 from app.llm_models import normalize_model_id
 from app.models.agent import AgentCreateRequest
 from app.openclaw import gateway_admin as _default_gateway, GatewayError
 from app.ledger.journal import append_event
 from app.ledger.schema import AGENT_PROVISIONED
+from app.services.model_registry.dropdowns import resolve_model_id
 from .helpers import enroll_agent_principal, resolve_agent_tools
 
 logger = logging.getLogger(__name__)
 
 
 def _workspace_path(agent_id: str) -> str:
-    return f"~/.openclaw/workspace-{agent_id}"
+    return local_dev.agent_workspace_path(agent_id)
 
 
 async def provision_agent(pool, req: AgentCreateRequest, actor_id: str, *, gateway=None) -> dict[str, Any]:
@@ -157,16 +159,20 @@ async def provision_agent(pool, req: AgentCreateRequest, actor_id: str, *, gatew
             # gateway_synced_version=1 only when every post-create gateway call
             # succeeded; NULL means the agent needs a sync pass via sync-gateway.
             synced_v = 1 if gateway_sync_ok else None
+            # Best-effort FK companion to `model` — NULL if `req.model` isn't
+            # (yet) a registered Model Registry row. See
+            # `resolve_model_id`'s docstring for why that's not an error.
+            model_id = await resolve_model_id(conn, req.model)
             agent_actor_id = await conn.fetchval(
                 """INSERT INTO agents
-                       (id, name, type, scope, model, emoji,
+                       (id, name, type, scope, model, model_id, emoji,
                         tools_allow, tools_deny, memory_enabled, max_tokens, notes,
                         created_by, gateway_agent_id, workspace,
                         config_version, gateway_synced_version, gateway_sync_attempted_at)
-                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,now())
+                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,now())
                    RETURNING actor_id""",
                 agent_id, req.name, req.type, req.scope,
-                req.model, req.emoji,
+                req.model, model_id, req.emoji,
                 req.tools_allow, req.tools_deny, req.memory_enabled, req.max_tokens,
                 req.notes, actor_id, gw_agent_id, workspace,
                 1, synced_v,
@@ -179,6 +185,7 @@ async def provision_agent(pool, req: AgentCreateRequest, actor_id: str, *, gatew
                 gateway_agent_id=gw_agent_id,
                 workspace=workspace,
                 model=req.model,
+                model_id=model_id,
                 agent_type=req.type,
                 scope=req.scope,
                 emoji=req.emoji,

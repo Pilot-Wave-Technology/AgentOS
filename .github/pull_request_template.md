@@ -18,11 +18,12 @@ Describe the problem and fix in 2–5 bullets:
 
 ## Scope (select all touched areas)
 
-- [ ] Goal / Story / Task orchestration
-- [ ] Agent types (GO, Assistant, IA, RA)
+- [ ] Goal / Story / Execution
+- [ ] Agent types (GO, Assistant, council reviewers)
+- [ ] Kernel / execution plane (conductor, executor pods, profiles)
 - [ ] Ledger / event sourcing
 - [ ] Memory (V2, compaction, search)
-- [ ] Platform channels (Slack)
+- [ ] Platform channels (Slack, Notion)
 - [ ] Custom tools
 - [ ] Kill switch
 - [ ] Councils (Goal Review, Security, Platform Research)

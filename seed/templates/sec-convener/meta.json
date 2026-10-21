@@ -3,7 +3,7 @@
   "type": "RA",
   "name": "Security Council Convener",
   "description": "Synthesizes the aspect reviewers' findings into one prioritized, deduplicated remediation report.",
-  "model": "google-flash-500k/gemini-2.5-flash-500k",
+  "model": "google-flash38-500k/gemini-3.8-flash-500k",
   "emoji": "🏛️",
   "tools_allow": [
     "read",

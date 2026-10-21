@@ -14,42 +14,68 @@ from __future__ import annotations
 from typing import Any
 
 # ~5000 tokens ≈ 20000 chars. Hard ceiling for a single review.
+#
+# NOT RAISED ALONGSIDE THE INPUT BUDGETS. A reviewer now READS up to a
+# million tokens; what it WRITES is read by the convener and then by a
+# person, and neither of those got bigger. A long review is not a
+# thorough one -- it is one that has not decided what matters.
 MAX_REVIEW_CHARS = 20000
 MIN_REVIEW_CHARS = 120
 
 # Required section headings per reviewer type (must appear in the markdown).
+#
+# EVERY STAGE OWNS `## Findings` AND `## Previously open`, and that is
+# what makes the ledger work. Findings is where keyed findings are
+# emitted; Previously open is where each open finding in scope is
+# accounted for. A stage that skipped the second would leave its
+# findings open for ever, because silence is deliberately not read as
+# "resolved" -- so the heading is enforced here rather than requested in
+# a prompt.
 REQUIRED_SECTIONS: dict[str, list[str]] = {
-    "goal_health": [
-        "## Alignment",
-        "## Objective & Scope",
-        "## Strengths",
-        "## Findings",
-        "## What Could Be Better",
-        "## Recommendations",
-    ],
+    # Is it moving? Arithmetic comes pre-computed in PROGRESS_DELTA.md;
+    # this stage says which of it matters.
     "progress": [
         "## Window",
-        "## Goal Progress",
-        "## Stuck (Long-Running)",
-        "## Story Progress",
-        "## Reconciliation",
-        "## Recommended GO Actions",
+        "## Movement",
+        "## Stalled",
+        "## Ready but not started",
+        "## Findings",
+        "## Previously open",
     ],
+    # Asked against delivered, side by side. FLAGGED, NOT ADJUDICATED --
+    # a summary is where an anomaly gets smoothed away, and "a story did
+    # the wrong thing" has to survive to goal_health.
+    "story": [
+        "## Roster",
+        "## Done",
+        "## In progress",
+        "## Pending",
+        "## Blocked",
+        "## Mismatches",
+        "## Findings",
+        "## Previously open",
+    ],
+    # Is this the right work? `## Objective update` carries PROPOSED
+    # REPLACEMENT TEXT or the word none -- "the objective has drifted" is
+    # an observation nobody can act on.
+    "goal_health": [
+        "## Objective vs. reality",
+        "## Work that doesn't fit",
+        "## Went wrong",
+        "## Objective update",
+        "## Findings",
+        "## Previously open",
+    ],
+    # The packet. `## New this cycle` and `## Escalating` are separate
+    # headings because the difference between them is the whole point of
+    # reviewing the same goal every twelve hours.
     "convener": [
         "## Headline",
-        "## State of the Goal",
-        "## Top Issues",
-        "## Recommended Actions for GO",
-        "## Open Questions",
-    ],
-    "story": [
-        "## Verdict",
-        "## Scope & Outcome",
-        "## Cycle History",
-        "## Decisions Review",
-        "## Quality",
-        "## Issues",
-        "## Recommendations",
+        "## State of the goal",
+        "## New this cycle",
+        "## Escalating",
+        "## Recommended actions for GO",
+        "## Open questions",
     ],
 }
 

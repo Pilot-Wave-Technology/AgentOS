@@ -1,0 +1,133 @@
+{# Where the money went: by spender, and by the conversation that caused it.
+
+   Only on the Cost tab, never the Overview tile — the tile is four numbers
+   at a glance and this is the detail you open when one of them surprises
+   you. #}
+{% set att = c.by_role %}
+{% set rows = c.threads %}
+
+{% if att and att.available %}
+{% set TONE = {
+     'assistant':    ('bg-sky-500',     'text-sky-400'),
+     'orchestrator': ('bg-indigo-500',  'text-indigo-400'),
+     'executor':     ('bg-violet-500',  'text-violet-400'),
+     'verifier':     ('bg-emerald-500', 'text-emerald-400'),
+     'other':        ('bg-slate-500',   'text-slate-400')} %}
+
+<div class="bg-gray-900 border border-gray-800 rounded-xl p-5 mt-4">
+  <div class="flex items-baseline justify-between mb-1">
+    <h3 class="font-semibold">Where the money goes</h3>
+    <span class="text-xs text-gray-500">last 90 days</span>
+  </div>
+  <p class="text-2xs text-gray-500 mb-4">
+    Every call, attributed to the agent that made it and the conversation
+    that caused it. A story&rsquo;s executor and verifier spend is charged to
+    the thread it was started from.
+  </p>
+
+  {# ── The one bar. Segments are the whole of the spend, so the bar IS the
+       reconciliation: if it did not add up it could not be drawn. #}
+  <div class="flex h-2.5 rounded-full overflow-hidden bg-gray-800 mb-3">
+    {% for r in att.roles %}
+    <div class="{{ TONE.get(r.role, TONE['other'])[0] }}"
+         style="width: {{ '%.3f'|format(r.pct) }}%"
+         title="{{ r.role }} — {{ r.cost_str }} ({{ '%.1f'|format(r.pct) }}%)"></div>
+    {% endfor %}
+  </div>
+
+  <div class="flex flex-wrap gap-x-5 gap-y-1.5 text-xs mb-1">
+    {% for r in att.roles %}
+    <span class="flex items-baseline gap-1.5">
+      <span class="w-2 h-2 rounded-full {{ TONE.get(r.role, TONE['other'])[0] }} inline-block"></span>
+      <span class="text-gray-400 capitalize">{{ r.role }}</span>
+      <span class="font-medium tabular-nums {{ TONE.get(r.role, TONE['other'])[1] }}">{{ r.cost_str }}</span>
+      <span class="text-gray-600 tabular-nums">{{ '%.0f'|format(r.pct) }}%</span>
+    </span>
+    {% endfor %}
+    <span class="ml-auto text-gray-500 tabular-nums">total {{ att.total_str }}</span>
+  </div>
+
+  {# ── The honesty line. Two things a cost page must never hide: spend it
+       could not attribute, and spend it could not price. Both are shown even
+       when zero-adjacent, because their absence is the interesting case. #}
+  <div class="flex flex-wrap gap-x-4 text-2xs text-gray-600 mb-4">
+    {% if not att.reconciles %}
+    <span class="text-rose-400 font-semibold"
+          title="The spender totals no longer sum to the overall total. This is a bug, not a rounding artefact.">
+      &#9888; does not reconcile
+    </span>
+    {% endif %}
+    {% if att.unattributed and att.unattributed > 0 %}
+    <span title="Spend no single conversation owns — goal-level orchestration.">
+      {{ att.unattributed_str }} not tied to a conversation
+    </span>
+    {% endif %}
+    {% if att.unpriced_calls %}
+    <span class="text-amber-500/80"
+          title="These models have no rate row in model_pricing, so their spend is real but cannot be valued. They are excluded from the totals above rather than counted as free.">
+      {{ '{:,}'.format(att.unpriced_tokens) }} tokens across
+      {{ att.unpriced_calls }} call{{ '' if att.unpriced_calls == 1 else 's' }} unpriced
+    </span>
+    {% endif %}
+  </div>
+
+  {# ── Per conversation. #}
+  {% if rows %}
+  <div class="text-2xs uppercase tracking-wider text-gray-600 mb-2">
+    By conversation
+  </div>
+  <div class="overflow-x-auto">
+    <table class="w-full text-xs">
+      <thead>
+        <tr class="text-2xs uppercase tracking-wider text-gray-600 text-left">
+          <th class="pb-1.5 font-medium">Conversation</th>
+          <th class="pb-1.5 font-medium">Goal</th>
+          <th class="pb-1.5 font-medium w-40">Breakdown</th>
+          <th class="pb-1.5 font-medium text-right">Cached</th>
+          <th class="pb-1.5 font-medium text-right">Total</th>
+        </tr>
+      </thead>
+      <tbody class="align-baseline">
+        {% for t in rows %}
+        <tr class="border-t border-gray-800/70">
+          <td class="py-1.5 pr-3 max-w-xs">
+            <div class="text-gray-300 truncate" title="{{ t.title }}">{{ t.title }}</div>
+            {% if t.story_id %}
+            <div class="text-2xs text-gray-600 font-mono">story {{ t.story_id }}</div>
+            {% endif %}
+          </td>
+          <td class="py-1.5 pr-3 text-gray-500 font-mono">{{ t.goal_id }}</td>
+          <td class="py-1.5 pr-3">
+            {# Same segment order on every row, so the eye can compare down
+               the column rather than re-reading each legend. #}
+            <div class="flex h-1.5 rounded-full overflow-hidden bg-gray-800 mb-1">
+              {% for p in t.parts %}
+              <div class="{{ TONE.get(p.role, TONE['other'])[0] }}"
+                   style="width: {{ '%.3f'|format(p.cost / t.cost * 100 if t.cost else 0) }}%"
+                   title="{{ p.role }} {{ p.cost_str }}"></div>
+              {% endfor %}
+            </div>
+            <div class="flex flex-wrap gap-x-2 text-2xs text-gray-600">
+              {% for p in t.parts %}
+              <span class="{{ TONE.get(p.role, TONE['other'])[1] }}">{{ p.role[:4] }} {{ p.cost_str }}</span>
+              {% endfor %}
+            </div>
+          </td>
+          <td class="py-1.5 pr-3 text-right text-gray-600 tabular-nums"
+              title="Cache-read tokens — billed at roughly a tenth of the input rate.">
+            {{ '{:,}'.format(t.cached) }}
+          </td>
+          <td class="py-1.5 text-right font-medium text-gray-200 tabular-nums">
+            {{ t.cost_str }}
+            {% if t.unpriced %}
+            <span class="text-amber-500/80" title="{{ t.unpriced }} unpriced call(s) not included">*</span>
+            {% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endif %}
+</div>
+{% endif %}

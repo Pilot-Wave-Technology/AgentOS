@@ -3,7 +3,7 @@
   "type": "Platform",
   "name": "Platform Steward",
   "description": "GO-like main agent for the Platform Improvement goal: reads the research registry, orchestrates research/review, and creates implementation stories.",
-  "model": "anthropic-sonnet-200k/claude-sonnet-4-5-200k",
+  "model": "anthropic-sonnet55-200k/claude-sonnet-5-5-200k",
   "emoji": "🛰️",
   "tools_allow": [
     "web_fetch",

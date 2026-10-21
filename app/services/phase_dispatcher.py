@@ -118,6 +118,15 @@ async def build_dispatch_message(
     description = task.get("description") or ""
     acceptance = task.get("acceptance_criteria") or ""
 
+    # Repo scoping is computed BEFORE the resume early-return: a resumed task is the
+    # same task in the same checkout, and omitting it there let a multi-repo resume turn
+    # continue with no repository named at all.
+    repo_subdir = (task.get("repo_subdir") or "").strip()
+    repo_line = (
+        f"Repository: `{repo_subdir}/` — work only in that repository.\n"
+        if repo_subdir else ""
+    )
+
     if resume_with_answer is not None:
         # Resume / [ANSWER] turns don't need the phase prompt — the
         # message body is generic boilerplate. Skip the registry lookup
@@ -126,6 +135,7 @@ async def build_dispatch_message(
         prior_q = task.get("last_blocker_question") or "(prior question lost)"
         return (
             f"[ANSWER T{task_id}]\n"
+            f"{repo_line}"
             f"You asked: \"{prior_q}\"\n"
             f"Human answered: \"{resume_with_answer}\"\n"
             f"Continue executing task T{task_id} from where you left off. "
@@ -143,9 +153,18 @@ async def build_dispatch_message(
     inline = _phase_prompt_inline(phase)
     reminder = _phase_reminder(phase_name)
     reminder_block = f"{reminder}\n\n" if reminder else ""
+    # Multi-repo (plan M4.3): a task in a multi-repo workspace must state WHICH
+    # checkout it runs in — the assistant has several and no way to guess. Emitted
+    # only when the planner scoped the task, so single-repo dispatches are unchanged.
+    repo_block = (
+        f"Repository: `{repo_subdir}/` — `cd {repo_subdir}` before doing any work or "
+        f"running git. Do NOT edit files in any other repository for this task.\n\n"
+        if repo_subdir else ""
+    )
     return (
         f"[DISPATCH] Task T{task_id} · phase={phase_name}\n"
         f"Title: {title}\n"
+        f"{repo_block}"
         f"Description:\n{description}\n\n"
         f"Acceptance: {acceptance}\n\n"
         f"{reminder_block}"
@@ -230,6 +249,10 @@ async def find_next_dispatchable_task() -> Optional[dict]:
            -- story's execution. Separate, independent feature from the kill
            -- switch below — both gates must be clear to dispatch.
            AND s.execution_paused = FALSE
+           -- Local Execution Mode (M0): the gateway never dispatches a story
+           -- that is checked out to a local editor, nor any local-mode story.
+           AND s.checked_out_to_uid IS NULL
+           AND s.execution_mode <> 'local'
            -- Kill switch — GOAL freeze gate (the execution_pauses table is the
            -- kill switch's own store, never mixed with stories.execution_paused).
            AND NOT EXISTS (
@@ -475,7 +498,7 @@ async def dispatch_phase_task(task: dict, already_claimed: bool = False) -> dict
     # claude session (SSOT — see C5 below).
     story = await pool.fetchrow(
         """SELECT shca_instance_id, workspace_path, execution_paused,
-                  current_claude_session_id
+                  current_claude_session_id, checked_out_to_uid, execution_mode
              FROM stories WHERE id = $1""",
         story_id,
     )
@@ -491,6 +514,15 @@ async def dispatch_phase_task(task: dict, already_claimed: bool = False) -> dict
             task_id, story_id,
         )
         return {"ok": False, "error": "story execution paused"}
+    # Local Execution Mode (M0): same window guard — a story can be checked out
+    # to a local editor (or flipped to local mode) between selection and dispatch.
+    # The gateway must never run a local/checked-out story.
+    if story["checked_out_to_uid"] or (story["execution_mode"] or "") == "local":
+        _log.info(
+            "phase_dispatcher: T%s skipped — story S%s is local / checked out in dispatch window",
+            task_id, story_id,
+        )
+        return {"ok": False, "error": "story checked out to local"}
     instance_id = story["shca_instance_id"]
     ws_path = story["workspace_path"]
     if not instance_id or not ws_path:
@@ -594,6 +626,15 @@ async def dispatch_phase_task(task: dict, already_claimed: bool = False) -> dict
         await _fail_phase_dispatch(task, f"phase invoke error (timeout/crash): {exc}")
         return {"ok": False, "error": str(exc)}
 
+    # TEMP DEBUG (remove after confirming the aborted-status fix): log the raw
+    # RPC result so we can see exactly what status/error/exitCode the gateway
+    # sent back for a kill-switch-aborted turn.
+    _log.info(
+        "phase_dispatcher: DEBUG raw invoke result for T%s: status=%r exitCode=%r error=%r text_len=%d",
+        task_id, result.get("status"), result.get("exitCode"), result.get("error"),
+        len(result.get("text") or ""),
+    )
+
     # C3: the gateway per-story turn lock returned "busy" — another claude turn is
     # already in flight for this story. The result carries no real turn (empty
     # text), so do NOT hand it to the sentinel parser (that would look
@@ -610,6 +651,21 @@ async def dispatch_phase_task(task: dict, already_claimed: bool = False) -> dict
         await release_credentials_safe(task_id, "phase_dispatcher:busy_reject")
         _log.info("phase_dispatcher: T%s busy (per-story lock held) — reverted to ready for retry", task_id)
         return {"ok": False, "busy": True, "task_id": task_id}
+
+    # The gateway killed this turn via the kill-switch (chat pause button or
+    # operator force-kill) — not a crash, not off-protocol. The caller that
+    # triggered the abort (pause_story_endpoint / force_kill_task) already owns
+    # the state transition to 'blocked'/'halted' with its own state-guarded
+    # UPDATE. Handing this result to the sentinel parser would misread the
+    # empty/truncated turn as OFF_PROTOCOL and mark the task 'failed', racing
+    # and overwriting that intended outcome — so just stop here.
+    if result.get("status") == "aborted":
+        _log.info(
+            "phase_dispatcher: T%s turn aborted by kill-switch — leaving the state "
+            "transition to the caller that requested the abort",
+            task_id,
+        )
+        return {"ok": False, "aborted": True, "task_id": task_id}
 
     # Persist sessionId — belt-and-suspenders; cli-spawn also POSTs to
     # /internal/shca/stories/<sid>/claude-session, but doing it here
@@ -683,12 +739,23 @@ async def dispatch_resume_with_answer(
         return {"ok": False, "error": f"execution paused ({_blk.scope})"}
 
     story = await pool.fetchrow(
-        """SELECT shca_instance_id, workspace_path, current_claude_session_id
+        """SELECT shca_instance_id, workspace_path, current_claude_session_id,
+                  checked_out_to_uid, execution_mode
              FROM stories WHERE id = $1""",
         story_id,
     )
     if not story:
         return {"ok": False, "error": "story not found"}
+    # Local Execution Mode (M0): never resume a gateway turn for a story that is
+    # checked out to a local editor / in local mode — the resume path (a human
+    # answering a blocked task) is a gateway dispatch entry just like phase
+    # dispatch, so it needs the same guard.
+    if story["checked_out_to_uid"] or (story["execution_mode"] or "") == "local":
+        _log.info(
+            "phase_dispatcher: resume T%s skipped — story S%s is local / checked out",
+            task_id, story_id,
+        )
+        return {"ok": False, "error": "story checked out to local"}
     instance_id = story["shca_instance_id"]
     ws_path = story["workspace_path"]
     # C5: resume the story's LIVE session (SSOT), not the task's frozen copy.
@@ -794,6 +861,17 @@ async def dispatch_resume_with_answer(
         await release_credentials_safe(task_id, "phase_dispatcher:busy_reject")
         _log.info("phase_dispatcher: resume T%s busy (per-story lock held) — reverted to blocked, answer not consumed (human must resend)", task_id)
         return {"ok": False, "busy": True, "task_id": task_id}
+
+    # Same kill-switch-abort case as dispatch_phase_task above: the caller that
+    # aborted the turn owns the resulting state transition — don't hand this to
+    # the sentinel parser or it gets misread as OFF_PROTOCOL/failed.
+    if result.get("status") == "aborted":
+        _log.info(
+            "phase_dispatcher: resume T%s turn aborted by kill-switch — leaving "
+            "the state transition to the caller that requested the abort",
+            task_id,
+        )
+        return {"ok": False, "aborted": True, "task_id": task_id}
 
     text = result.get("text") or ""
     await handle_phase_task_response(task, text, result)

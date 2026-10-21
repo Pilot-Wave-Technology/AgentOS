@@ -1,0 +1,67 @@
+# What running the test suite needs, on top of requirements.txt.
+#
+# WHY THIS FILE EXISTS. The suite is ~1,400 tests and a large share of
+# them are `@pytest.mark.asyncio`. Without pytest-asyncio installed those
+# do not error in a way anyone reads as "missing dependency" -- pytest
+# emits `PytestUnknownMarkWarning`, never awaits the coroutine, and
+# reports a plain failure. On this machine that was 132 of them, and
+# they had been read as "pre-existing environment failures" for long
+# enough to become the baseline everyone worked against.
+#
+# The lesson worth keeping: a test that cannot run and a test that fails
+# look the same in a summary line. Pin the dependency so the difference
+# is visible at install time instead.
+#
+#   pip install -r requirements.txt -r requirements-dev.txt
+
+pytest>=8.0
+pytest-asyncio>=0.24
+
+# A per-test deadline, and it is a CI requirement rather than a
+# convenience. A test that hangs and a test that is slow look identical
+# while a build is running: the step produces no output and the build
+# dies on ITS timeout, with the log ending mid-suite and naming nothing.
+# With this, the hang is one named test and a traceback. Use
+# --timeout-method=thread: the default (SIGALRM) does not exist on
+# Windows, so a developer reproducing a CI failure locally would get a
+# different behaviour from CI, which is the one thing a deadline must
+# not do.
+pytest-timeout>=2.3
+
+# Parallel runs. INERT UNLESS `-n` IS PASSED, which is why installing it
+# changes nothing for Cloud Build: run_suite.sh stays serial by default
+# and only reads AGENTOS_TEST_WORKERS if someone sets it.
+#
+# Worth having because the suite is wall-clock bound by per-test
+# connection setup rather than by CPU: ~38ms a test in a Linux pod
+# against ~158ms on a Windows laptop, serial, on 12 idle cores. Each
+# worker takes its own database stamped from the shared template (see
+# conftest), so workers cannot corrupt each other's fixtures.
+pytest-xdist>=3.8
+
+# NOTE: firebase-admin is a RUNTIME dependency and is already pinned in
+# requirements.txt. It is called out here only because its absence
+# presents as a test-collection error (`test_client_capabilities.py`),
+# which reads like a test problem and is actually an un-installed
+# runtime requirement.
+
+# An actual PostgreSQL binary as a wheel, started by the suite itself
+# (see the repo-root conftest.py). No Docker, no system install.
+#
+# WHY: the suite reads DATABASE_URL and assumes something is listening.
+# When nothing is -- a stopped container, a Docker restart, a fresh
+# clone -- asyncpg spends its full connect timeout PER TEST, so a
+# missing database presents as a slow suite rather than an error. One
+# run cost fifteen minutes before anybody checked `docker ps`.
+#
+# Measured here: 11.5s the first time (initdb), 0.33s after, because
+# the cluster is cached and only the database is recreated per session.
+# Setting DATABASE_URL still wins, so CI is unaffected.
+#
+# multi-agent-RL already uses pgserver for the same reason, which is the
+# other half of the argument: two repositories sharing a ledger client
+# should not need two ways to get a database.
+#
+# cp312-only, no sdist -- fine today, and a constraint to remember on an
+# interpreter bump.
+pgserver==0.1.4

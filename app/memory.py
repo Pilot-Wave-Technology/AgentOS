@@ -289,29 +289,21 @@ async def check_and_compact(
     if not to_compact:
         return
 
-    # Summarize via Gemini
+    # Summarize via the configured utility model
     texts = [f"**{m['title']}**: {m['content']}" for m in to_compact]
     memories_text = "\n\n".join(texts)
 
-    from app.gemini_client import summarize_conversation as _gemini_call
-    # Reuse the Gemini client with a compaction-specific prompt
-    from google import genai
-    from app.config import get_settings
-    settings_obj = get_settings()
+    from app.services.utility_llm import UtilityLLMError, generate_utility_text
 
     summary = ""
-    if settings_obj.gemini_api_key:
-        try:
-            client = genai.Client(api_key=settings_obj.gemini_api_key)
-            response = await client.aio.models.generate_content(
-                model="gemini-2.5-flash",
-                contents=_COMPACTION_PROMPT.format(memories=memories_text),
-            )
-            summary = response.text.strip()
-        except Exception as exc:
-            _log.warning("Compaction summarization failed: %s", exc)
-            # Fallback: concatenate titles
-            summary = "; ".join(m["title"] for m in to_compact)
+    try:
+        summary = await generate_utility_text(
+            "memory_compaction", _COMPACTION_PROMPT.format(memories=memories_text),
+        )
+    except UtilityLLMError as exc:
+        _log.warning("Compaction summarization failed: %s", exc)
+        # Fallback: concatenate titles
+        summary = "; ".join(m["title"] for m in to_compact)
 
     if not summary:
         summary = "; ".join(m["title"] for m in to_compact)

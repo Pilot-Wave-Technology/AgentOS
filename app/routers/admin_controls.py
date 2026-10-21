@@ -204,7 +204,76 @@ async def _reason_from(request: Request) -> str:
     return ""
 
 
+async def _flag_from(request: Request, name: str) -> bool:
+    """Pull a boolean from a JSON or form body. Never raises.
+
+    Form bodies carry strings, so "false"/"0"/"off" have to mean False
+    -- a checkbox posting the string "false" read as truthy is how a
+    switch turns itself on.
+    """
+    raw = None
+    try:
+        data = await request.json()
+        if isinstance(data, dict):
+            raw = data.get(name)
+    except Exception:                                       # noqa: BLE001
+        try:
+            raw = (await request.form()).get(name)
+        except Exception:                                   # noqa: BLE001
+            raw = None
+    if isinstance(raw, bool):
+        return raw
+    return str(raw or "").strip().lower() in ("1", "true", "on", "yes")
+
+
 # ── SYSTEM scope ────────────────────────────────────────────────────────────
+
+# ── Verification, platform-wide ────────────────────────────────────────
+#
+# OFF BY DEFAULT. With it off, a story or errand that proposes completion
+# is measured against its own plan's checks, published, and parked for a
+# person to accept or ask for more -- and no verification pod, prepare
+# Job or criterion Job is created. `VERIFYING` stays in the state machine
+# with nothing entering it, so a run already in flight when the switch
+# moves is drained rather than stranded.
+#
+# PLATFORM-WIDE AND PLATFORM ADMIN ONLY. `require_admin` is the same gate
+# Freeze System uses. Every change is appended to the hash-chained
+# ledger: who, when, from what, to what, and why.
+
+@router.get("/settings/controls/verification")
+async def verification_get(user: dict = Depends(require_admin)):
+    from app.services import platform_settings
+
+    return JSONResponse(
+        await platform_settings.get(platform_settings.VERIFICATION))
+
+
+@router.post("/settings/controls/verification")
+async def verification_set(request: Request,
+                           user: dict = Depends(require_admin)):
+    """Turn verification on or off for the whole platform."""
+    from app.services import platform_settings
+
+    wanted = await _flag_from(request, "enabled")
+    reason = await _reason_from(request)
+    by = user.get("email") or user.get("uid", "")
+    try:
+        moved = await platform_settings.set_value(
+            platform_settings.VERIFICATION, wanted, by=by, reason=reason)
+    except Exception as exc:
+        return _system_issue("Set verification", exc)
+
+    # THE AUDIT IS THE POINT, so it records the transition and not just
+    # the new value: "somebody set it to off" and "somebody turned it
+    # off" are different facts when two admins act a second apart.
+    await _emit("execution.verification_changed",
+                {"was": moved["was"], "now": moved["now"],
+                 "reason": reason, "by": by}, user)
+    _log.info("VERIFICATION %s -> %s by %s (reason=%s)",
+              moved["was"], moved["now"], by, reason or "<none>")
+    return JSONResponse({"ok": True, **moved})
+
 
 @router.post("/settings/controls/pause")
 async def system_pause(request: Request, user: dict = Depends(require_admin)):
@@ -400,8 +469,93 @@ async def control_panel(
     return templates.TemplateResponse(
         "admin/controls.html",
         {"request": request, "user": user, "q": q, "page": page, "per": per,
-         "can_edit": can_edit, **panel, **goals_data},
+         "can_edit": can_edit, **panel, **goals_data,
+         **await _verification_state(),
+         **await _checkin_state()},
     )
+
+
+async def _verification_state() -> dict:
+    """What the verification switch says, for the page that renders it.
+
+    READ HERE AND NOT IN `_panel_data`, which the 10s HTMX fragment also
+    calls. An operator switch changes a few times a year; putting it on
+    the poll would run one query every ten seconds per open panel for an
+    answer the fragment does not render -- the exact shape `_panel_data`
+    documents having already removed twice.
+    """
+    from app.services import platform_settings
+
+    try:
+        row = await platform_settings.get(platform_settings.VERIFICATION)
+    except Exception as exc:                                  # noqa: BLE001
+        _log.warning("admin_controls: verification switch unreadable: %s", exc)
+        return {"verification_on": False, "verification_unknown": True,
+                "verification_by": "", "verification_at": None}
+    return {"verification_on": bool(row.get("value")),
+            "verification_unknown": False,
+            "verification_by": row.get("updated_by") or "",
+            "verification_at": row.get("updated_at")}
+
+
+async def _checkin_state() -> dict:
+    """How often GO checks in on a running autonomous errand.
+
+    SAME PLACE AND SAME REASONING as the switch above: read on the page
+    render, never on the 10s fragment poll.
+    """
+    from app.services import errand_checkin
+
+    try:
+        return {"checkin_seconds": await errand_checkin.window_s(),
+                "checkin_min": errand_checkin.MIN_S,
+                "checkin_max": errand_checkin.MAX_S,
+                "checkin_unknown": False}
+    except Exception as exc:                                  # noqa: BLE001
+        _log.warning("admin_controls: check-in interval unreadable: %s", exc)
+        return {"checkin_seconds": errand_checkin.DEFAULT_S,
+                "checkin_min": errand_checkin.MIN_S,
+                "checkin_max": errand_checkin.MAX_S,
+                "checkin_unknown": True}
+
+
+@router.post("/settings/controls/errand-checkin")
+async def errand_checkin_set(request: Request,
+                             user: dict = Depends(require_admin)):
+    """Set the errand check-in interval, in seconds.
+
+    CLAMPED RATHER THAN REJECTED. A number outside the range is a typo,
+    and the useful answer to a typo is the nearest legal value with the
+    page showing what actually landed -- not a form that refuses and
+    loses what was typed.
+    """
+    from app.services import errand_checkin, platform_settings
+
+    body = {}
+    try:
+        body = await request.json()
+    except Exception:                                         # noqa: BLE001
+        body = dict(await request.form())
+    try:
+        wanted = int(str(body.get("seconds", "")).strip())
+    except (TypeError, ValueError):
+        return JSONResponse({"error": "seconds must be a whole number"},
+                            status_code=400)
+    wanted = max(errand_checkin.MIN_S, min(errand_checkin.MAX_S, wanted))
+    reason = await _reason_from(request)
+    by = user.get("email") or user.get("uid", "")
+    try:
+        moved = await platform_settings.set_int(
+            platform_settings.CHECKIN_SECONDS, wanted, by=by, reason=reason)
+    except Exception as exc:                                  # noqa: BLE001
+        return _system_issue("set errand check-in interval", exc)
+    await _emit("execution.setting_changed",
+                {"key": platform_settings.CHECKIN_SECONDS,
+                 "was": moved.get("was"), "now": moved.get("now"),
+                 "reason": reason, "by": by}, user)
+    _log.info("ERRAND CHECK-IN %ss -> %ss by %s (reason=%s)",
+              moved.get("was"), moved.get("now"), by, reason or "<none>")
+    return {"ok": True, **moved}
 
 
 @router.get("/settings/controls/agents", response_class=HTMLResponse)

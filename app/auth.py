@@ -5,13 +5,16 @@ All user/membership data lives in PostgreSQL.
 """
 import json
 import logging
+import time
 import uuid
+from datetime import datetime, timezone
 from typing import Optional
 
 import firebase_admin
 from firebase_admin import auth as fb_auth, credentials
 from fastapi import Request, HTTPException, status
 
+from app import local_dev
 from app.config import get_settings
 from app.database import get_pool
 from app.ledger.journal import append_event
@@ -44,15 +47,27 @@ class SignupRejected(Exception):
 def _ensure_firebase_app():
     settings = get_settings()
     if not firebase_admin._apps:
-        sa_json = settings.firebase_service_account_json
-        if sa_json:
-            try:
-                sa_dict = json.loads(sa_json)
-                cred = credentials.Certificate(sa_dict)
-            except (json.JSONDecodeError, ValueError):
-                cred = credentials.Certificate(sa_json)
+        # Local dev: initialize against the Firebase Auth Emulator with a
+        # no-network credential. Delegated to app/local_dev.py so the local-only
+        # branch (and its security caveat) lives in one owned file. Gated by
+        # LOCAL_SERVER — never fires in a deployed environment.
+        emulator_host = local_dev.firebase_auth_emulator_host()
+        if emulator_host:
+            _log.warning(
+                "auth: LOCAL_SERVER on — initializing Firebase against Auth "
+                "Emulator at %s (token signatures NOT verified)", emulator_host,
+            )
+            cred = local_dev.firebase_emulator_credential()
         else:
-            cred = credentials.ApplicationDefault()
+            sa_json = settings.firebase_service_account_json
+            if sa_json:
+                try:
+                    sa_dict = json.loads(sa_json)
+                    cred = credentials.Certificate(sa_dict)
+                except (json.JSONDecodeError, ValueError):
+                    cred = credentials.Certificate(sa_json)
+            else:
+                cred = credentials.ApplicationDefault()
         firebase_admin.initialize_app(cred, {"projectId": settings.firebase_project_id})
 
 
@@ -63,7 +78,18 @@ def verify_firebase_token(token: str) -> dict:
         decoded = fb_auth.verify_id_token(token)
         return decoded
     except Exception as exc:
-        _log.warning("auth: Firebase token verification failed: %s", exc)
+        # Diagnostic: token expiry is compared against this container's own
+        # clock (time.time()). If this instance's wall clock is drifted from
+        # real time, valid tokens can appear expired/not-yet-valid — log the
+        # container's own reading of "now" so a real-time-vs-drift mismatch is
+        # visible directly in the failure log instead of requiring a repro.
+        now_epoch = time.time()
+        now_utc = datetime.fromtimestamp(now_epoch, tz=timezone.utc).isoformat()
+        _log.warning(
+            "auth: Firebase token verification failed: %s "
+            "(container_clock_epoch=%s container_clock_utc=%s)",
+            exc, now_epoch, now_utc,
+        )
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail=f"Invalid or expired Firebase token: {exc}",
@@ -288,3 +314,7 @@ async def require_goal_member(request: Request, pid: str) -> dict:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not a goal member")
     user["goal_role"] = role
     return user
+
+
+from app.services.api_keys import ApiPrincipal, require_api_key  # noqa: E402
+

@@ -3,7 +3,7 @@
   "type": "RA",
   "name": "Council Convener",
   "description": "Synthesizes council reviewer findings into one ranked feedback packet for the GO agent.",
-  "model": "google-flash-500k/gemini-2.5-flash-500k",
+  "model": "google-flash38-1m/gemini-3.8-flash-1m",
   "emoji": "🏛️",
   "tools_allow": [
     "read",

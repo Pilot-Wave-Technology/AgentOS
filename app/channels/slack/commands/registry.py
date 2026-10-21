@@ -35,6 +35,11 @@ class CommandContext:
     # Full command name as the user typed it (with env suffix), e.g. "resources-feature".
     # Handlers use this in usage strings so they always show the correct invocation.
     command: str = ""
+    # SLACK'S HANDLE FOR OPENING A MODAL, and it is perishable: valid for
+    # three seconds, single use, and absent when Slack retries. A handler
+    # that wants a dialog must therefore still work without one -- see
+    # `/run pause`, which takes its reason inline when this is empty.
+    trigger_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -45,7 +50,11 @@ class SlackCommand:
     group: str
     dispatch: Callable[[CommandContext], Awaitable[str]]
     admin: bool = False                         # True → marked "(admin)" in /help
-    aliases: tuple = ()                         # alternate command names
+    # Slack's one-line argument prompt, shown in the composer. Explicit
+    # rather than parsed out of `usage`: the first line of that block is a
+    # header like "/goal [help]", so deriving it produced "[help]" for half
+    # the commands and a sentence fragment for the rest.
+    hint: str = ""
 
 
 # ── Dispatch adapters ─────────────────────────────────────────────────────────
@@ -68,18 +77,30 @@ async def _d_story(c: CommandContext) -> str:
     )
 
 
-async def _d_task(c: CommandContext) -> str:
-    from app.channels.slack.commands.task import handle
-    return await handle(
-        c.args, c.channel_id, c.team_id,
-        slack_user_id=c.user_id, response_url=c.response_url,
-        command=c.command,
-    )
-
-
 async def _d_resources(c: CommandContext) -> str:
     from app.channels.slack.commands.resources import handle
     return await handle(c.args, c.user_id, c.channel_id, c.team_id, c.response_url,
+                        command=c.command)
+
+
+async def _d_run(c: CommandContext) -> str:
+    from app.channels.slack.commands.run import handle
+    return await handle(c.args, c.channel_id, c.team_id,
+                        slack_user_id=c.user_id, response_url=c.response_url,
+                        command=c.command, trigger_id=c.trigger_id)
+
+
+async def _d_park(c: CommandContext) -> str:
+    from app.channels.slack.commands.park import handle
+    return await handle(c.args, c.channel_id, c.team_id,
+                        slack_user_id=c.user_id, response_url=c.response_url,
+                        command=c.command)
+
+
+async def _d_errand(c: CommandContext) -> str:
+    from app.channels.slack.commands.errand import handle
+    return await handle(c.args, c.channel_id, c.team_id,
+                        slack_user_id=c.user_id, response_url=c.response_url,
                         command=c.command)
 
 
@@ -122,16 +143,11 @@ COMMANDS: list[SlackCommand] = [
             "      needing reassignment must be handled from the web Members page.\n"
             "      Example: `/goal remove alice@example.com`\n"
             "\n"
-            "  /goal pause [reason]\n"
-            "      Freeze autonomous task dispatch for this goal. Admin only.\n"
-            "\n"
-            "  /goal resume\n"
-            "      Clear a pause and restart task dispatch. Admin only.\n"
-            "\n"
             "  /goal refresh\n"
             "      Reset the gateway session for this channel. Use if the agent stops responding."
         ),
         GROUP_READ, _d_goal,
+        hint="[help | status | members | invite <email> | refresh]",
     ),
     SlackCommand(
         "story",
@@ -151,10 +167,19 @@ COMMANDS: list[SlackCommand] = [
             "      elaborate it into tasks. Example: `/story create Add export to CSV`\n"
             "\n"
             "  /story accept <id>\n"
-            "      Accept a proposed story and claim it (proposed → accepted).\n"
+            "      Claim a proposed story without starting it yet\n"
+            "      (proposed → accepted). Use `start` to begin.\n"
             "\n"
             "  /story start <id>\n"
-            "      Start work on an accepted story (accepted → in_progress).\n"
+            "      BEGIN. Accepts the story if it is still proposed, assigns\n"
+            "      it to you, sets up your assistant's workspace and opens\n"
+            "      the story's channel — one command from proposed to\n"
+            "      working. `open`, `import` and `work` do the same thing.\n"
+            "\n"
+            "  /story cancel <id> [reason]\n"
+            "      Cancel a story: bridges whatever depended on it and records\n"
+            "      why. A started code story is refused — its branch is cut and\n"
+            "      work may already be committed.\n"
             "\n"
             "  /story block <id> <reason>\n"
             "      Mark a story as blocked with a reason. Example: `/story block a1b2c3d4 waiting on API key`\n"
@@ -165,33 +190,11 @@ COMMANDS: list[SlackCommand] = [
             "  /story done <id> [feedback]\n"
             "      Mark a story done. Optionally include feedback for the GO.\n"
             "\n"
-            "  /story work <title-or-id>\n"
-            "      Open your personal assistant channel for a specific story.\n"
-            "      Equivalent to @mentioning the bot in the goal channel.\n"
-            "\n"
             "  /story review <id> [approve|reject] [feedback]\n"
             "      Clear a human-review checkpoint on a story. Feedback is optional."
         ),
         GROUP_WORK, _d_story,
-    ),
-    SlackCommand(
-        "task",
-        "List, show status, or delete tasks. Run `/task help` for subcommands.",
-        (
-            "/task [help]\n"
-            "\n"
-            "  /task list <story-id>\n"
-            "      List all tasks for a story, ordered by state (in-progress first).\n"
-            "      <story-id> is the 8-char story id from /story. Example: `/task list a1b2c3d4`\n"
-            "\n"
-            "  /task <id>\n"
-            "      Show the current status of a single task — state and any blocked reason.\n"
-            "      <id> is the 8-char task id shown in /task list. Example: `/task b5c6d7e8`\n"
-            "\n"
-            "  /task delete <id>\n"
-            "      Hard-delete a task and its subtask tree. Admin only."
-        ),
-        GROUP_WORK, _d_task,
+        hint="[<id> | create <title> | start|cancel|accept|block|done <id> | review <id>]",
     ),
     SlackCommand(
         "resources",
@@ -222,12 +225,35 @@ COMMANDS: list[SlackCommand] = [
             "      Remove a resource allocation from a story or task. Admin only."
         ),
         GROUP_READ, _d_resources,
+        hint="[help | <filter> | add | scan <id> | grant|revoke <id> story <subj>]",
     ),
     SlackCommand(
         "memory",
         "Search Assistant memory, decisions, and task history",
         "/memory <query>",
         GROUP_READ, _d_memory,
+        hint="<query>",
+    ),
+    SlackCommand(
+        "run",
+        "See and steer a story's execution. Run `/run help` for subcommands.",
+        __import__("app.channels.slack.commands.run", fromlist=["USAGE"]).USAGE,
+        GROUP_WORK, _d_run,
+        hint="[<story-id> | pause | resume | retry | cancel | more <what>]",
+    ),
+    SlackCommand(
+        "park",
+        "Answer the question an execution is waiting on. `/park help` for more.",
+        __import__("app.channels.slack.commands.park", fromlist=["USAGE"]).USAGE,
+        GROUP_WORK, _d_park,
+        hint="[answer <text> | approve | revise <what> | decline <why>]",
+    ),
+    SlackCommand(
+        "errand",
+        "Approve or decline the autonomous runs the GO proposes.",
+        __import__("app.channels.slack.commands.errand", fromlist=["USAGE"]).USAGE,
+        GROUP_WORK, _d_errand,
+        hint="[approve <id> | decline <id> <why>]",
     ),
     SlackCommand("help", "Show this list of commands", "/help", GROUP_META, _d_help),
 ]
@@ -248,12 +274,11 @@ INTERACTIVE_ACTIONS: list[tuple] = [
 
 def _command_map() -> dict[str, SlackCommand]:
     """name/alias → SlackCommand. Built fresh so it always reflects COMMANDS."""
-    out: dict[str, SlackCommand] = {}
-    for cmd in COMMANDS:
-        out[cmd.name] = cmd
-        for alias in cmd.aliases:
-            out[alias] = cmd
-    return out
+    # `aliases` used to be a field here, declared on every command and set
+    # on none — so this loop ran zero times, forever, and the field read as
+    # a feature the product had. Removed; if an alias is ever wanted, it
+    # should arrive with a command that uses it.
+    return {cmd.name: cmd for cmd in COMMANDS}
 
 
 def lookup(cmd_name: str) -> SlackCommand | None:

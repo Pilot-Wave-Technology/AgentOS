@@ -1,0 +1,29 @@
+# Base tool surface — every executor gets these, whatever its profile.
+#
+# The test for belonging here: would an executor of ANY kind be broken
+# without it? Orientation, skills and the ability to stop and ask are true
+# of a coding story, a research story and a one-off errand alike.
+#
+# Anything a profile could reasonably not want belongs in that profile's
+# `tools_add` instead. `write` is the example: an errand has no business
+# editing the workspace, so it is not here.
+#
+# Each profile's EFFECTIVE surface is (base + tools_add) - tools_deny, and
+# `./run.sh profiles` prints it resolved so the list a reviewer needs is
+# never something they have to assemble in their head.
+
+tools = [
+  "read",       # read one file
+  "glob",       # find files by pattern
+  "grep",       # search file contents
+  "list_dir",   # list a directory — what is HERE, when glob's guess missed
+  "skill",      # load one skill's instructions on demand
+  "ask_human",  # park with a question, resume on the answer
+  # THE OTHER DIRECTION, and in base because a person may ask any
+  # profile. Answering parks nothing, changes nothing and stops no job;
+  # it exists so a question reaching a live leg has somewhere to go
+  # other than the model expressing itself by doing work.
+  "reply_to_human",
+  "register_action_template",
+]
+

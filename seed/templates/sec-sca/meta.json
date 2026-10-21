@@ -3,7 +3,7 @@
   "type": "RA",
   "name": "Security — Dependencies & Supply Chain (SCA)",
   "description": "Scans a checked-out branch for vulnerable/outdated dependencies and supply-chain risk (trivy fs).",
-  "model": "google-flash-500k/gemini-2.5-flash-500k",
+  "model": "google-flash38-500k/gemini-3.8-flash-500k",
   "emoji": "📦",
   "tools_allow": [
     "read",

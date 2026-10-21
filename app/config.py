@@ -1,3 +1,4 @@
+from pydantic import field_validator
 from pydantic_settings import BaseSettings
 from functools import lru_cache
 
@@ -14,6 +15,10 @@ class Settings(BaseSettings):
     # OpenClaw Gateway
     openclaw_ws_url: str = "ws://VM-INTERNAL-IP:18793"
     openclaw_auth_token: str = "YOUR_OPENCLAW_AUTH_TOKEN"
+    # STRIPPED AT THE BOUNDARY -- see _strip_shared_token below. This
+    # value is compared byte-for-byte against a header built by callers
+    # that read the same secret through a shell, and a shell strips
+    # trailing newlines where Cloud Run does not.
     # Per-agent scoped tokens (shared-token fix — SHARED_TOKEN_SECURITY_FIX_PLAN.md).
     # HMAC signing key for per-agent JWTs (minted AND verified by the control plane only; never
     # leaves the backend). Empty = minting disabled -> shared-bearer fallback.
@@ -38,6 +43,96 @@ class Settings(BaseSettings):
     # early 401s a still-legacy caller. Default False (safe rollout).
     agent_reject_shared_token: bool = False
 
+    # ── ONE SECRET, TWO READERS, DIFFERENT BYTES ─────────────────────
+    #
+    # Every gateway -> control-panel call in the `next` environment was
+    # refused, and the caller was told "HTTP 405 Method Not Allowed".
+    # The token was right; the BYTES were not.
+    #
+    # Cloud Run mounts a secret's payload verbatim, so a value stored
+    # with a trailing newline arrives here as token-plus-newline. Every
+    # other reader of the same secret goes through a shell --
+    #
+    #   OPENCLAW_GATEWAY_TOKEN=$(gcloud secrets versions access latest ...)
+    #
+    # in the VM's startup script, redeploy.sh and
+    # scripts/infra/deploy_execution_plane.sh -- and command
+    # substitution strips trailing newlines. So the gateway, the
+    # conductor and the executors all hold "<token>" and this process
+    # held token-plus-newline, and hmac.compare_digest is (correctly)
+    # not in the business of being lenient about that.
+    #
+    # IT FAILED IN ONE DIRECTION ONLY, which is why it read as anything
+    # but a credential problem. The gateway TRIMS the token it receives
+    # (resolveSharedConnectAuth in agent_os_openclaw's auth-context.ts), so
+    # the control panel's connections were accepted, agents ran, and
+    # chat worked -- while every call back the other way was refused.
+    #
+    # Normalising here rather than at each comparison means the value
+    # SENT to the gateway (app/openclaw.py) and the value COMPARED
+    # against (app/internal_auth.py) cannot disagree, and a secret
+    # rotated by someone typing `echo` into a file is not an outage.
+    # WHICH TAXIMETER SCORER SERVES THE PANEL. v1 counts raw events and
+    # takes each goal's weight from a number an LLM wrote on it; v2
+    # counts decisions in the stories you own, items and priority
+    # points, and weighs a goal by what it actually delivered.
+    #
+    # A SETTING RATHER THAN A DEPLOY, so an environment can be put back
+    # on v1 without a code change if v2 turns out to be wrong about
+    # something, and the two can be compared on the same data.
+    #
+    # THE DEFAULT IS v2 AS OF S6, AND NOT BEFORE. It stayed v1 through
+    # S4 and S5 deliberately: the dashboard still said "Weightage ...
+    # set by an LLM" for a weight no LLM sets any more, and v2 numbers
+    # under v1 explanations are worse than either on its own. The text
+    # is rendered from the same constants the scorer uses now, so the
+    # two cannot drift apart again.
+    taximeter_scoring: str = "v2"
+
+    @field_validator("taximeter_scoring", mode="after")
+    @classmethod
+    def _known_scorer(cls, v: str) -> str:
+        """Refuse an unknown value at startup rather than silently
+        falling back. A typo in an env var would otherwise look exactly
+        like a deliberate choice of v1, and nobody would find it until
+        they wondered why the new scores never appeared."""
+        got = (v or "").strip().lower()
+        if got not in ("v1", "v2"):
+            raise ValueError(
+                f"taximeter_scoring must be 'v1' or 'v2', not {v!r}")
+        return got
+
+    @field_validator("openclaw_auth_token", mode="after")
+    @classmethod
+    def _strip_shared_token(cls, v: str) -> str:
+        return v.strip() if isinstance(v, str) else v
+
+    @field_validator("*", mode="after")
+    @classmethod
+    def _whitespace_is_unset(cls, v):
+        """A whitespace-only setting is NOT configured. Make that true.
+
+        SECRET MANAGER REJECTS AN EMPTY PAYLOAD, so `prerequisites.sh`
+        creates unprovided secrets with a single space -- there has to be
+        SOME version or Cloud Run refuses to deploy a service that
+        references the secret, which is a real constraint and not a
+        mistake.
+
+        The mistake was the next sentence. `CONFIG.md`, the deploy guide
+        and the script's own comment all stated that "consumers treat
+        whitespace-only as unset". No consumer did: every guard in the
+        codebase is `if not key`, and `" "` is truthy. So an
+        unconfigured Slack, GitHub or OpenAI credential read as
+        CONFIGURED, and the feature behind it failed later and
+        elsewhere -- a 401 from a vendor, or a webhook that verified
+        every signature against one space.
+
+        One validator makes the sentence true, and it is on `"*"` for a
+        reason: the next secret somebody adds inherits the behaviour
+        without having to know this paragraph exists.
+        """
+        return "" if isinstance(v, str) and v.strip() == "" else v
+
     # GCS — overridable per deployment via GCS_WORKSPACE_BUCKET_PREFIX /
     # GCS_RESOURCE_BUCKET. Defaults are this deployment's real buckets; the public
     # (AgentOS) build replaces every default here with a placeholder + setup doc.
@@ -46,6 +141,17 @@ class Settings(BaseSettings):
     # Bucket where a removed agent's MEMORY.md/memory/sessions are archived before
     # deletion. Override via AGENT_ARCHIVE_BUCKET.
     agent_archive_bucket: str = "${ARCHIVE_BUCKET}"
+    # Private bucket holding the VS Code extension .vsix files + a `latest.json`
+    # manifest ({version, object, notes}). The control plane streams these to
+    # teammates via /extension/*, so the bucket stays private (only the CP SA
+    # reads it). Override via EXTENSION_DIST_BUCKET.
+    extension_dist_bucket: str = ""
+    # Object-key prefix (channel) WITHIN that bucket, so one bucket holds a
+    # separate artifact set per environment — prod/, dev/, feature/. Each
+    # deployment serves only its own channel's latest.json + .vsix, so promoting
+    # never clobbers another env's artifact. Set per-env in cloudbuild*.yaml via
+    # EXTENSION_DIST_PREFIX. Empty = bucket root (legacy layout).
+    extension_dist_prefix: str = ""
 
     # Cloud Run task-runner job — generic async executor (currently: document
     # pre-rendering for PDF/DOCX/XLSX/CSV). Fired via run.jobs.run; the job polls
@@ -73,6 +179,25 @@ class Settings(BaseSettings):
     app_env: str = "development"
     debug: bool = False
     log_level: str = "INFO"  # Set LOG_LEVEL=DEBUG for verbose gateway/DB logs
+
+    # Local development master switch (LOCAL_SERVER=true). SINGLE source of truth
+    # for "am I running the local dev stack?". When true, cloud services are
+    # swapped for local replicas — currently just the Firebase Auth Emulator
+    # standing in for real Firebase. GCS is never emulated locally (real
+    # buckets via ADC in both modes; see local-development/README.md). All of
+    # that behaviour is gated behind this one flag via app/local_dev.py;
+    # nothing local-only ever activates unless this is true. MUST stay False
+    # in every deployed environment.
+    local_server: bool = False
+    # Local-replica endpoint, only consulted when local_server is true.
+    # (firebase-admin also reads FIREBASE_AUTH_EMULATOR_HOST natively; local_dev.py
+    # keeps os.environ in sync with this value.)
+    firebase_auth_emulator_host: str = "localhost:9099"
+    # Replaces the "~" in every "~/.openclaw/workspace-<id>" path sent to the
+    # gateway (see app/local_dev.py:agent_workspace_path). Empty = unchanged
+    # behavior (the literal "~", expanded by the gateway's own OS home dir).
+    # Only meaningful when local_server is true; irrelevant in production.
+    local_workspace_root: str = ""
 
     # Slack integration (optional — leave empty to disable)
     slack_client_id: str = ""
@@ -116,9 +241,14 @@ class Settings(BaseSettings):
     # changes are deployed and verified.
     memory_v2_bridge_enabled: bool = False        # ledger event → memory file bridge
     memory_v2_flush_enabled: bool = False         # story-complete + pre-reap flushes
-    memory_v2_snapshot_enabled: bool = False      # workspace snapshot/restore on reap
+    memory_v2_snapshot_enabled: bool = False      # workspace snapshot/restore on reap + restore-on-provision
     memory_v2_user_memory_enabled: bool = False   # USER_MEMORY.md cross-goal sharing
     memory_v2_periodic_snapshot_hours: int = 6    # periodic snapshot cadence
+    # The 6h periodic snapshot loop (a safety net) is now gated SEPARATELY from the
+    # event-driven snapshot/restore above, so the local↔web memory sync (which needs
+    # snapshot_enabled for the pre-reap + restore-on-provision paths) doesn't force the
+    # heavy periodic loop on. Default OFF everywhere.
+    memory_v2_periodic_snapshot_enabled: bool = False
 
     # Goal Review Council — Phase 1. When true, THIS process runs the council
     # dispatcher loop (claims runs, spawns reviewer RAs, delivers to GO).
@@ -219,6 +349,24 @@ class Settings(BaseSettings):
     # OFF: the engine deploys idle (leader election + git_dispatch listener only)
     # until the lane work lands and this is enabled per-environment (dev first).
     gitgraph_enabled: bool = False
+    # Multi-repo stories (research/MULTI_REPO_STORIES_PLAN.md). When true, a story may
+    # be granted N repos: each WRITE grant becomes its own git node / branch / PR, and
+    # the workspace clones one directory per repo. Ships OFF so every phase of the
+    # rollout is behaviour-preserving — with it false the platform keeps the historical
+    # "exactly one repo per story" rule. Requires a gateway that accepts a repo LIST in
+    # `shca.workspace.setup` (plan Phase G), so do NOT enable before that redeploy.
+    multi_repo_enabled: bool = False
+    # Git-credential broker (research/MULTI_REPO_STORIES_PLAN.md M5). When true, story
+    # workspaces get a callback credential helper that fetches a freshly minted token
+    # from /internal/git-credential per git operation, instead of an installation
+    # token embedded in each clone's .git/config. Ships OFF: the gateway must be
+    # redeployed with the G.6 helper AND this endpoint must be reachable from the VM
+    # before flipping it, or git auth breaks for every operator story.
+    git_credential_broker_enabled: bool = False
+    # Absolute base URL the story workspace uses to reach this control panel. Only
+    # needed when git_credential_broker_enabled is on — the VM is not the CP, so it
+    # cannot infer the address from the request. e.g. https://control-panel-dev.../
+    control_panel_public_url: str = ""
     # HMAC secret (X-Hub-Signature-256) for the git-engine coexistence webhooks
     # (POST /webhooks/github/{repoId} on the web tier). Empty = signature check
     # skipped (dev). The webhook only wakes the engine (NOTIFY git_dispatch); the
@@ -243,6 +391,14 @@ class Settings(BaseSettings):
     task_dag_ceiling: int = 4
     task_dag_ceiling_enforce: bool = False
 
+    # Message-thread pagination (GO thread + the read-only agent channels).
+    # Set explicitly per environment in cloudbuild*.yaml's control-panel step;
+    # these defaults only apply if that is ever removed. Local dev overrides
+    # them lower via local.values to exercise paging on a small database.
+    # See app/routers/thread_paging.py.
+    thread_initial_message_limit: int = 30
+    thread_earlier_page_size: int = 30
+
     # Ledger provenance audit: when ON, ledger.journal.append_event logs a warning
     # if an event's actor_id has no row in `actors` (i.e. attribution won't
     # resolve). Positive-cached + run before the advisory lock, so steady-state
@@ -250,16 +406,27 @@ class Settings(BaseSettings):
     # (safe everywhere); flip to False via LEDGER_ACTOR_AUDIT=false to silence.
     ledger_actor_audit: bool = True
 
-    # Available LLM models shown in dropdowns
+    # Available LLM models shown in dropdowns.
+    #
+    # NO PRE-3-SERIES GEMINI IS OFFERED. The 2.5 ids were here until
+    # 2026-10-18; a model nobody should start on does not belong in a
+    # dropdown, and leaving them listed is how a new agent lands on one
+    # by a click. An agent already pinned to 2.5 keeps running — its
+    # `agents.model` row is untouched and the gateway rewrites the wire
+    # id (`opencode-zen-models.ts`) — so this stops new selections
+    # without moving anything live.
     available_models: list[str] = [
-        "google/gemini-2.5-flash",
-        "google/gemini-2.5-pro",
-        "anthropic/claude-sonnet-4-6",
+        "google/gemini-3.8-flash",
+        "anthropic/claude-opus-5-5",
+        "anthropic/claude-sonnet-5-5",
         "anthropic/claude-haiku-4-5",
-        "openai/gpt-4o",
+        # NO OPENAI ENTRY. `openai/gpt-4o` was offered here while nothing
+        # in AgentOS reads OPENAI_API_KEY -- picking it gave an agent that
+        # looked configured and failed on its first turn. The key is still
+        # carried end to end, so re-add an id here the day a provider
+        # actually resolves it.
         "claude-cli/opus",
         "claude-cli/sonnet",
-        "claude-cli/haiku",
     ]
 
     class Config:

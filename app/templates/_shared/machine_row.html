@@ -1,0 +1,71 @@
+{# Which machine this story's work runs on, and a way to change it.
+
+   SHARED by the assistant's thread and the GO's, because the question
+   "what is this running on?" is asked in both and the answer used to be
+   visible in neither. The rung was settable -- by the GO at
+   create_story, by a person on the story page -- and then invisible
+   from the conversation where the work is actually discussed.
+
+   ALWAYS SHOWN when the thread has a story, including while a run is in
+   flight: that is when somebody most wants to know, and an element that
+   disappears exactly when it matters is worse than no element.
+
+   The SELECT is disabled while a run is live. `machine_lock` decides,
+   and the same rule guards the endpoint -- this is the affordance, not
+   the enforcement.
+
+   Requires: `pid`, `current_story` (id, sandbox_size), and
+   `machine_locked` (a reason string, or empty when it can be changed).
+#}
+{% if current_story %}
+<div id="machine-row"
+     class="px-4 py-1.5 border-b border-border bg-surface/20
+            flex items-center gap-2 text-2xs flex-wrap">
+  <span class="text-gray-500 uppercase tracking-wider">Machine</span>
+
+  <form method="post"
+        action="/goals/{{ pid }}/stories/{{ current_story.id }}/sandbox-size"
+        class="flex items-center gap-2"
+        data-toast-submit data-fail="Could not change the machine.">
+    {# WHERE TO COME BACK TO. Without it the endpoint sends you to the
+       story detail page -- inherited from `story_executor_model`, which
+       is right when you are ON that page and wrong from a thread: you
+       land somewhere you cannot edit, press Back, and the browser
+       serves the cached thread still showing the old value. It reads
+       like the change did not save. It did. #}
+    <input type="hidden" name="return_to"
+           value="{{ request.url.path }}{% if request.url.query %}?{{ request.url.query }}{% endif %}">
+    <select name="sandbox_size"
+            class="input input-sm py-0.5 text-2xs"
+            {% if machine_locked %}disabled{% endif %}
+            onchange="this.form.requestSubmit()">
+      {# Blank is INHERIT -- the goal's setting, then the work's own
+         profile. Not the same as choosing `small`, and the label has to
+         say so or somebody reads an unset story as a small one. #}
+      <option value="" {% if not current_story.sandbox_size %}selected{% endif %}>
+        default for this work
+      </option>
+      {% for rung, blurb in [
+           ('small',  '2.5 CPU / 9 GiB'),
+           ('medium', '6.5 CPU / 23 GiB'),
+           ('large',  '14 CPU / 52 GiB')] %}
+      <option value="{{ rung }}"
+              {% if current_story.sandbox_size == rung %}selected{% endif %}>
+        {{ rung }} — {{ blurb }}
+      </option>
+      {% endfor %}
+    </select>
+    <noscript><button type="submit" class="btn btn-sm">Set</button></noscript>
+  </form>
+
+  {% if machine_locked %}
+  <span class="text-gray-600" title="{{ machine_locked }}">
+    locked while it runs — cancel to change it
+  </span>
+  {% else %}
+  <span class="text-gray-600">
+    fixed once a run starts; medium and large wait for a machine
+  </span>
+  {% endif %}
+</div>
+{% endif %}

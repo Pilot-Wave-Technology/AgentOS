@@ -1,0 +1,2046 @@
+# The conductor, and the egress proxy it needs to reach anything.
+#
+# Applied by scripts/infra/deploy_execution_plane.sh, which renders the
+# ${...} names through scripts/infra/render.py. Plain YAML rather than a
+# templating tool: a handful of substitutions do not justify a
+# dependency.
+#
+# NOT envsubst, which an earlier version of this comment claimed was
+# available. The cloud-sdk image ships kubectl and the GKE auth plugin
+# and NOT gettext, so it is a command-not-found in the only image this
+# is applied from -- and envsubst renders an unset variable as the
+# empty string, which would apply a conductor pointed at a bucket
+# named nothing rather than refuse.
+#
+# WHAT RUNS HERE AND WHAT DOES NOT. The conductor admits, dispatches and
+# reaps. It creates execution pods; it does not BE one, and it runs no
+# model output — which is why it can hold the database credential at all.
+#
+# NO `managed-by: kernel` ON ANYTHING IN THIS FILE, and it is not a
+# style choice. That label means "a container the kernel CREATED for an
+# execution": kernel/drivers/kubernetes.py lists by
+# `managed-by=kernel` and the orphan sweep destroys whatever it finds
+# with no matching execution row.
+#
+# The conductor and the proxy are infrastructure. They carried the
+# label, so the reconciler found them, could not match them to an
+# execution, and logged:
+#
+#   reconcile would destroy container conductor-7d: no matching execution
+#   reconcile would destroy container egress-proxy: no matching execution
+#   reconcile: 0 goal(s), would have 4 would_reap
+#
+# It only said "would" because AGENTOS_RECONCILE_DELETE is "0". Setting
+# that to "1" -- which the comment on it invites, later, deliberately --
+# would have had the conductor delete itself and its own egress every
+# sweep. The dry-run default is what stood between a working cluster and
+# a self-eating one.
+#
+# ON-DEMAND, NOT SPOT. It holds the leases. A preempted lease-holder
+# stalls every goal rather than one story, and $47/month is not where to
+# economise.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: conductor
+  namespace: ${NAMESPACE}
+  labels:
+    app: conductor
+spec:
+  # TWO, and it is safe: admission is `FOR UPDATE SKIP LOCKED`, leases
+  # are generation-fenced, and every transition is a CAS. Two replicas
+  # is what makes a rolling update not a gap in dispatch.
+  #
+  # The reconcile pass was the exception to all three and is no longer:
+  # `orphan_sweep` reads a keep-set of container ids and then destroys
+  # what is not in it, so the other replica dispatching in between made
+  # the set stale and a live story's container into an orphan. It now
+  # takes a non-blocking advisory lock (kernel/conductor/lock.py) and
+  # the replica that misses it skips the tick. That lock is the
+  # precondition for setting AGENTOS_RECONCILE_DELETE to "1" below.
+  replicas: 2
+  selector:
+    matchLabels:
+      app: conductor
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: conductor
+    spec:
+      # WHERE THE CONTROL PLANE LIVES, and on Standard it must be said.
+      # Autopilot placed these wherever it liked and that was invisible;
+      # with named pools, a conductor replica with no selector lands on
+      # a STORY pool and does three things wrong at once. It takes 1 CPU
+      # and 4 GiB of a node sized for one execution. It breaks
+      # one-story-per-machine silently, because the anti-affinity rule
+      # excludes other EXECUTION pods and a conductor is not one, so a
+      # story shares the machine and contends for CPU. And it evicts the
+      # warm placeholders, which hold negative priority -- so the
+      # control plane quietly eats the capacity kept for stories.
+      #
+      # No taint on the pool is needed: execution pods select their tier
+      # explicitly, so nothing drifts the other way.
+      #
+      # RENDERED AND NOT LITERAL, BECAUSE AUTOPILOT REFUSES THE KEY.
+      # `agentos.io/node-class` is a custom label, and Autopilot's
+      # Warden rejects any nodeSelector key outside its own allowlist --
+      # not at schedule time, at ADMISSION. `kubectl apply` comes back
+      # "denied by autogke-node-affinity-selector-limitation" and the
+      # Deployment is not patched at all, so the cluster keeps running
+      # the previous image and the deploy goes red having changed
+      # nothing. Written literally here, it froze the Autopilot cluster
+      # on the commit before it landed and kept three deploys red.
+      #
+      # So deploy_execution_plane.sh asks the cluster which kind it is
+      # and exports the line: the pool pin on Standard, and
+      # `kubernetes.io/os: linux` on Autopilot -- on the allowlist, true
+      # of every node, and therefore a constraint that constrains
+      # nothing. It is a real selector rather than an empty string
+      # because render.py refuses to render a variable that is empty,
+      # which is the guard that stops a blank bucket name reaching a
+      # manifest. One file serves both clusters while the migration is
+      # in flight, and the Standard side is the one that survives it.
+      nodeSelector:
+        ${PLATFORM_NODE_SELECTOR}
+      # AND PAST THE TAINT ON THAT POOL. The selector says this pod may
+      # use the pool; the taint is what keeps the OTHER environment's
+      # pods -- which carry no env selector and so match every pool of
+      # their class -- from landing here. A control-plane pod without
+      # the toleration is repelled by its own pool and stays Pending,
+      # which reports nothing, so the two are rendered together from
+      # one decision in deploy_execution_plane.sh.
+      #
+      # On an environment whose pools are untainted this line renders
+      # as a comment and the pod spec is unchanged.
+      ${PLATFORM_TOLERATIONS}
+      # SPREAD ACROSS THE POOL'S MACHINES, because two replicas on one
+      # machine are one replica with a larger bill. The conductor is what dispatches legs and reaps what they leave behind;
+      # both replicas lost at once is the fleet stopping, not slowing.
+      #
+      # PREFERRED, and the contrast with kernel/drivers/k8s_placement.py
+      # is deliberate rather than an inconsistency. A story's rule is
+      # REQUIRED because its purpose is resource isolation: a story that
+      # shares a machine has already lost the thing the rule exists to
+      # give it, so waiting for a machine is better than proceeding
+      # without one. This rule's purpose is survival of a lost node,
+      # and REQUIRED here would trade that for a worse failure -- during
+      # a rolling update or a node replacement the surge replica could
+      # find no second machine, and the rollout would stall with the
+      # platform mid-upgrade. Spread when it is possible; never block on
+      # it.
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels: {app: conductor}
+                topologyKey: kubernetes.io/hostname
+      serviceAccountName: agentos-conductor
+      # LONGER THAN THE DRAIN, and that is the whole reason for the
+      # number. `kernel/worker/service_drain.py` waits DRAIN_DEFAULT_S
+      # (180) for the legs already in flight before it lets the process
+      # exit; a grace period shorter than that is SIGKILL arriving
+      # mid-drain,
+      # which is the behaviour the drain exists to end.
+      #
+      # It was 60, and nothing drained at all -- `LegSupervisor.drain`
+      # had no caller -- so every rolling update threw away whatever
+      # legs were running. A leg is a model turn already paid for.
+      #
+      # Raise this BEFORE raising AGENTOS_DRAIN_MAX_S, never after.
+      terminationGracePeriodSeconds: 210
+      # ── HOW THE CONDUCTOR REACHES CLOUD SQL ─────────────────────────
+      # It could not. On Cloud Run the database arrives as a Unix socket
+      # that `--set-cloudsql-instances` mounts; there is no such thing on
+      # GKE, and this Deployment had no proxy — so the conductor would
+      # have started, failed every tick on a connection error, and
+      # logged it, which reads as a broken cluster rather than a missing
+      # sidecar.
+      #
+      # A NATIVE SIDECAR — an initContainer with restartPolicy: Always —
+      # and not an ordinary container, for two reasons that both bite:
+      # it starts and becomes ready BEFORE the conductor, so the first
+      # tick has a database rather than racing one; and it is terminated
+      # AFTER, so a conductor finishing a transaction during a rolling
+      # update is not cut off by its own proxy exiting first.
+      #
+      # No credential: the proxy authenticates as the pod's Workload
+      # Identity, which holds cloudsql.client and nothing else.
+      initContainers:
+        - name: cloud-sql-proxy
+          image: gcr.io/cloud-sql-connectors/cloud-sql-proxy:2.14.1
+          restartPolicy: Always
+          args:
+            - --structured-logs
+            - --port=5432
+            - ${CLOUDSQL_INSTANCE}
+          resources:
+            requests: {cpu: "250m", memory: 512Mi}
+            limits: {cpu: "250m", memory: 512Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: {drop: ["ALL"]}
+            runAsNonRoot: true
+      containers:
+        - name: conductor
+          image: ${IMAGE}
+          command: ["python", "-m", "kernel.worker.service"]
+          # RESTART A WEDGED PROCESS. Measured: both pods froze for
+          # thirty minutes, all three loops, error_count 0, READY 2/2,
+          # because a Kubernetes API call with no timeout blocked the
+          # event loop and nothing checked whether the loops were still
+          # turning. kernel/drivers/k8s_call.py stops the block; this is
+          # what notices if anything else ever does the same.
+          #
+          # An `exec` probe and not `httpGet`: the conductor runs no HTTP
+          # server, and the kubelet running this from OUTSIDE the process
+          # is the property that makes it work while every coroutine is
+          # blocked. It reads a file mtime and touches no database.
+          #
+          # THE NUMBERS. The loops tick every 4s (INTERVAL_S), so 120s is
+          # thirty missed ticks -- far outside normal jitter and well
+          # inside the thirty minutes this replaces. initialDelay covers
+          # the 60s the process may spend waiting for its database
+          # (DB_WAIT_S) plus room to reach a first pass. A draining pod
+          # reports healthy on purpose; see kernel/obs/alive.py, or this
+          # would SIGKILL every rollout part-way through its 180s drain.
+          livenessProbe:
+            exec:
+              command: ["python", "-m", "kernel.obs.alive", "120"]
+            initialDelaySeconds: 120
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          env:
+            # WHICH BUILD THIS IS. Read by `kernel/obs/fields.py`, which
+            # logs "unset" without it -- and did, on every line of both
+            # services, so nothing in the logs said which code produced
+            # it. `heartbeat.py` also groups by it to spot two builds
+            # serving at once during a rollout, which it cannot do while
+            # every replica reports the same "unset".
+            # THE LLM HALF OF THE VERIFIER, AND IT HAS NEVER BEEN ON.
+            #
+            # `quick.available()` is `GEMINI_API_KEY and
+            # AGENTOS_ASSIST == "1"`. The key is mounted; this was set
+            # nowhere in this repository, so `available()` has been
+            # False in both Deployments since they existed and FIVE
+            # features returned early without a log line:
+            #
+            #   verifier/assess.py      the assessor -- the second key
+            #   verifier/investigate.py why a claim was refused
+            #   verifier/assist.py      verifier assist
+            #   answerer/agent.py       answering a person's question
+            #   worker/scout.py         drafting a setup for a bare repo
+            #
+            # So every verdict this deployment has produced passed on
+            # ONE key: the mechanical checks, which are written by the
+            # same model whose work they check. `assess.py` exists
+            # precisely because that is not enough.
+            #
+            # OFF IS THE RIGHT DEFAULT WHERE IT CAME FROM. The flag's own
+            # docstring: "a deterministic suite that quietly starts
+            # calling a live model on every refusal is a suite whose
+            # green means something different on Tuesdays." That is
+            # about E0 and CI. It is not about a production verifier,
+            # and the reasoning simply never followed these components
+            # into their own Deployments.
+            - name: AGENTOS_ASSIST
+              value: "1"
+            # THE STORY REVIEW RUNS IN THE POD THAT DID THE WORK.
+            #
+            # On, a finished coding story does not go terminal at
+            # acceptance: it takes one more phase in the same pod, under
+            # a read-only profile with no tool that can write, and a
+            # reviewer reads the real workspace before the story leaves
+            # `done`. Off, all four "the story is finished" paths write
+            # DONE exactly as they did before and the council's gateway
+            # reviewer runs instead.
+            #
+            # A SWITCH RATHER THAN A DEPLOYMENT, because the first real
+            # story is the test and being able to put it back without a
+            # revert is what makes running that test reasonable. Set it
+            # to "0" to fall back; nothing else needs to change.
+            #
+            # Three places read it and must agree -- `worker.finish`,
+            # `go_wake_events` and `council.runs` -- through one
+            # accessor, `finish.in_pod_review_enabled`.
+            - name: STORY_REVIEW_IN_POD
+              value: "1"
+            # Does a finished coding story wait for its merge before
+            # reaching `done`? Off, every path writes exactly what it
+            # wrote before. It must also be on POD_ENV_ALLOWLIST --
+            # one of the four paths that finish a story runs in the
+            # pod, so a conductor-only setting is half on.
+            - name: STORY_HOLDS_FOR_MERGE
+              value: "1"
+            - name: BUILD_SHA
+              value: "${BUILD_SHA}"
+            - name: AGENTOS_DRIVER
+              value: kubernetes
+            - name: AGENTOS_K8S_NAMESPACE
+              value: "${NAMESPACE}"
+            # ── WHETHER THIS CLUSTER'S POOLS CARRY agentos.io/env ──
+            #
+            # DECIDED BY LOOKING, in deploy_execution_plane.sh, which
+            # asks the cluster rather than taking a flag: a flag can be
+            # set wrong and the cost falls on whichever environment is
+            # live. `off` means pods select their class alone, which is
+            # exactly the behaviour of every build before this existed.
+            #
+            # The environment NAME is not passed -- it is derived from
+            # the namespace above, so the two cannot disagree. This
+            # says only whether the nodes can satisfy it.
+            # QUOTED, AND NOT COSMETICALLY. YAML 1.1 reads bare `off`
+            # and `on` as BOOLEANS, so an unquoted value renders as
+            # `false` and the API server refuses the whole manifest --
+            # a string field given a bool. The deploy would fail at
+            # apply, before anything ran, which is the good version of
+            # this mistake; the bad version is a future value that
+            # happens to parse as a string and silently means nothing.
+            - name: AGENTOS_NODE_POOL_SCOPED
+              value: "${NODE_POOL_SCOPED}"
+            - name: AGENTOS_K8S_SERVICE_ACCOUNT
+              value: agentos-execution
+            # A criterion's Job runs as SOMEBODY ELSE. It has to read
+            # the committed tree out of the artifact store, and giving
+            # that grant to agentos-execution would hand the executor
+            # bucket read through the same Workload Identity.
+            - name: AGENTOS_K8S_VERIFIER_SERVICE_ACCOUNT
+              value: agentos-verifier
+            # And a fourth for the environment replay, which WRITES the
+            # directory it captured. Read and write are different
+            # capabilities: a criterion able to write could put objects
+            # where the control panel and the `artifact` criterion read.
+            - name: AGENTOS_K8S_CAPTURE_SERVICE_ACCOUNT
+              value: agentos-capture
+            # OUR OWN IMAGE, named to ourselves. The initContainer that
+            # fetches a criterion's tree runs `python -m
+            # kernel.artifacts.fetch`, which exists here and in no base
+            # image a contract will ever name.
+            - name: AGENTOS_EXECUTION_IMAGE
+              value: "${IMAGE}"
+            # THE SANDBOX'S BASE IMAGE, which is not ours. A contract
+            # that names none inherits this, and until now the fallback
+            # was a literal in the kernel -- `agentos-kernel/fixture:dev`,
+            # built by hand on one laptop and pushed to no registry. In
+            # the cloud that resolves to docker.io and does not exist:
+            # ImagePullBackOff, pod never ready, 120s dispatch timeout,
+            # reconcile recover, dispatch again, for ever.
+            #
+            # Built from infra/e0/fixtures/Dockerfile -- the same recipe
+            # E0 builds locally -- so the sandbox, the Verifier's prepare
+            # container and a developer's laptop are one environment.
+            # python3 + pytest + node + npm + pnpm + git, digest-pinned.
+            - name: AGENTOS_SANDBOX_BASE_IMAGE
+              # QUOTED, AND THE QUOTES ARE load-BEARING. A Kubernetes env
+              # value must be a STRING, and YAML 1.1 reads a bare `off`
+              # as the boolean false -- so the `off` sentinel that these
+              # three variables use when a thing is not configured
+              # rendered as `value: false` and the API server refused the
+              # whole Deployment with "unrecognized type: string".
+              # Measured on build 519395f1, which created the verifier
+              # and every new NetworkPolicy and then could not patch the
+              # conductor. The Norway problem, wearing `off`.
+              value: "${SANDBOX_BASE_IMAGE}"
+            # E6 -- AND THE SAME IMAGE BY DIGEST, because the tag half
+            # of this pair has been warning about itself on every run.
+            #
+            # `contracts.base_digest` has existed since F1 and every
+            # reader prefers it to `base_image`, but no INSERT path ever
+            # wrote one -- and `new_version`'s supersede branch copies
+            # the column forward, so a single NULL propagates through
+            # every later amendment. Executions 205 and 207-210 all
+            # carried it, and all of them logged
+            #
+            #   parity: the contract names an image by TAG, not a
+            #   digest -- the Verifier may not have run the image that
+            #   was approved
+            #
+            # which is true, and is exactly the ambiguity F4 cannot
+            # tolerate: a tag that moved between dispatch and
+            # verification means the check ran somewhere else.
+            #
+            # ON BOTH DEPLOYMENTS, and that is not redundancy. The
+            # WORKER mints contracts and the conductor dispatches them,
+            # so setting it on one alone repeats NCAL4 run 191 -- the
+            # fix reaching the process that acts and missing the process
+            # that decides. `sandbox_spec.POD_ENV_ALLOWLIST` carries the
+            # name so it survives the trip into the pod.
+            - name: AGENTOS_SANDBOX_BASE_DIGEST
+              value: "${SANDBOX_BASE_DIGEST}"
+            # The store port of the egress proxy, which is the only way
+            # out of a criterion's pod. Its allowlist for this port is
+            # the object store and nothing else.
+            - name: AGENTOS_STORE_PROXY
+              value: http://egress-proxy:3129
+            # The FULL port, for execution pods. 3129's allowlist is the
+            # object store alone -- right for a criterion, useless to an
+            # executor that must reach the forge. The conductor holds
+            # this to PASS ON, not to use: its own policy is `egress: {}`
+            # and it makes no outbound calls on a model's behalf.
+            - name: AGENTOS_EGRESS_PROXY
+              value: http://egress-proxy:3128
+            # ── D1: THE EXECUTION POD'S OWN DATABASE ────────────────
+            # Phase D moves the model leg into the pod, and `leg_lock`
+            # is a Postgres ADVISORY lock held for the whole leg --
+            # chosen because it dies with its connection, so a crashed
+            # worker cannot strand a run. Move the leg without the lock
+            # and a conductor deploy releases it while the pod's leg
+            # runs on: the double-run kernel/worker/lease.py exists to
+            # prevent. So the pod needs a connection of its own, through
+            # a proxy sidecar of its own.
+            #
+            # ON THE CONDUCTOR AND NOT ON THE VERIFIER, because this is
+            # passed ON rather than used: the conductor is what builds
+            # execution pod manifests. The verifier creates criterion
+            # Jobs, which must reach the object store and nothing else.
+            #
+            # NOT ${CLOUDSQL_INSTANCE}, though it will normally hold the
+            # same value. The conductor having a database and an
+            # EXECUTION POD having one are different decisions with
+            # different blast radii -- the second puts a proxy beside
+            # model-authored code -- and spelling them with one variable
+            # would make the second a side effect of the first.
+            #
+            # `off`, not blank: render.py refuses an empty ${...}
+            # because an empty value is indistinguishable from the
+            # rendering bug it exists to catch, so "no database yet" has
+            # to be a word. deploy_execution_plane.sh sets it to `off`
+            # until the key and the narrow role's password are in Secret
+            # Manager, and the pod is then exactly what it is today.
+            #
+            # The proxy listens on a UNIX SOCKET on the worker-only
+            # volume and NEVER on TCP -- containers in a pod share a
+            # network namespace, so a port would be reachable from the
+            # sandbox. kernel/drivers/k8s_sqlproxy.py is the argument in
+            # full; §10 of the refactor plan is the decision.
+            - name: AGENTOS_EXECUTION_SQL_INSTANCE
+              value: "${EXECUTION_SQL_INSTANCE}"
+            # THE STORE IS A BUCKET HERE. The control panel reads the
+            # artifact store in its own process and lives on Cloud Run,
+            # so there is no shared filesystem between them — this is a
+            # prerequisite for the split, not a preference.
+            - name: ARTIFACT_STORE
+              value: gcs
+            - name: ARTIFACT_BUCKET
+              value: "${ARTIFACT_BUCKET}"
+            # WHERE THE CONTROL PANEL IS, and it is load-bearing rather
+            # than informational. The execution pod's git credential
+            # helper asks the panel's broker for a per-story GitHub
+            # token, and that endpoint is derived from this value --
+            # see kernel/workspace/broker.py. The conductor passes it
+            # into the pod manifest; without it the helper is never
+            # built, the clone runs unauthenticated, and the pod dies
+            # in workspace-compose saying git could not read a
+            # username from a terminal.
+            #
+            # A plain value, not a secret: it is a public https URL.
+            # It comes from the control-panel-url-<env> secret only
+            # because `sync-url` already maintains it there after every
+            # control-panel deploy, so this is one source of the fact
+            # rather than a second copy of it.
+            - name: CONTROL_PANEL_URL
+              value: "${CONTROL_PANEL_URL}"
+            - name: AGENTOS_LOG_FORMAT
+              value: json
+            # NOW IT DELETES, and "later" is here. This read "0" with
+            # the note: the reconciler has never run against production
+            # data, a week of counting costs a log line per tick, and
+            # being wrong once costs a running story its container.
+            #
+            # IT HAS NOW COUNTED, against real data, for hours. Every
+            # tick it named exactly the executions that were terminal
+            # and exactly the one orphaned pod, and never once named a
+            # live run:
+            #
+            #   reconcile: 0 goal(s), would have 1 would_reap,
+            #              11 would_release
+            #
+            # while eleven claims -- one per execution ever attempted --
+            # sat Bound against a quota of forty. The counting was the
+            # evidence this flag was waiting for, and continuing to
+            # count is now the failure mode: the fortieth execution is
+            # the fortieth EVER, and after it nothing in this
+            # environment can run a story at all.
+            #
+            # The guards that make this safe are unchanged and are in
+            # kernel/conductor/reclaim.py: terminal states only, the pod
+            # destroyed before the claim, and one execution's failure
+            # never stopping the sweep reaching the next.
+            - name: AGENTOS_RECONCILE_DELETE
+              value: "1"
+          envFrom:
+            - secretRef:
+                name: conductor-secrets
+          resources:
+            requests: {cpu: "1", memory: 4Gi}
+            limits: {cpu: "1", memory: 4Gi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: {drop: ["ALL"]}
+            runAsNonRoot: true
+            runAsUser: 1000
+---
+# THE VERIFIER, which is the conductor's image with a different
+# entrypoint. Phase E1; see docs/refactor/conductor_revamp_plan.md §5.
+#
+# WHY IT IS A DEPLOYMENT OF ITS OWN. Four workload classes with
+# incompatible time constants shared one event loop, one thread pool and
+# one 1-CPU container. Verification is the slowest of them — a criterion
+# is a Job, and a Job is ~30s of pod scheduling and image pull before
+# any check runs — and it was MEASURED freezing both conductors for 154s
+# and 184s. Phase R threaded those calls and execution 210 then ran a
+# full verification with 0 restarts, so this is now about blast radius
+# and scaling rather than stability: a verifier that wedges must not
+# stop admission, dispatch and the mailbox with it.
+#
+# NOTHING IS CUT OVER YET. The conductor still runs `adjudicate_pass`
+# and `dryrun_pass` in its own tick, and that is safe rather than
+# sloppy: `verdict_lock` is a per-EXECUTION advisory lock built in
+# Phase R so two conductor REPLICAS could not both spend a criterion
+# container on one claim, and two DEPLOYMENTS are the same argument with
+# a different noun. So this can be rolled out, watched and rolled back
+# while nothing depends on it.
+#
+# NO `managed-by: kernel` HERE EITHER, for the reason at the top of this
+# file — and with more at stake. `orphan_sweep` destroyed live capture
+# Jobs on 2026-09-17 because they carried that label with no matching
+# execution; a whole Deployment carrying it would be the conductor
+# deleting the verifier every reconcile pass.
+#
+# AND IT DOES NOT REAP. `AGENTOS_RECONCILE_DELETE` is deliberately
+# absent from the env block below: exactly one process may collect
+# external things, and it is the conductor. Two sweeps racing over one
+# set of pods is that same fault with a second actor.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: verifier
+  namespace: ${NAMESPACE}
+  labels:
+    app: verifier
+spec:
+  # ONE, to start. Not because more would be unsafe — `verdict_lock` and
+  # the unique index are what make one-verdict-per-claim true, and they
+  # do not care how many processes ask — but because a second replica
+  # doubles the Kubernetes API load of a component that has never run on
+  # its own. Raise it once a soak says what one costs.
+  replicas: 1
+  selector:
+    matchLabels:
+      app: verifier
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: verifier
+    spec:
+      # Placed with the conductor, and the reason is on its Deployment
+      # above: a control-plane pod with no selector lands on a story
+      # pool, contends with the execution it is meant to be serving, and
+      # evicts the warm placeholders on its way in.
+      nodeSelector:
+        ${PLATFORM_NODE_SELECTOR}
+      # AND PAST THE TAINT ON THAT POOL. The selector says this pod may
+      # use the pool; the taint is what keeps the OTHER environment's
+      # pods -- which carry no env selector and so match every pool of
+      # their class -- from landing here. A control-plane pod without
+      # the toleration is repelled by its own pool and stays Pending,
+      # which reports nothing, so the two are rendered together from
+      # one decision in deploy_execution_plane.sh.
+      #
+      # On an environment whose pools are untainted this line renders
+      # as a comment and the pod spec is unchanged.
+      ${PLATFORM_TOLERATIONS}
+      # ITS OWN KUBERNETES IDENTITY SINCE PLAN 11.5a, and the sentence
+      # this replaces said the opposite: "the conductor's identity, and
+      # not a fourth one ... minting a separate KSA would mean a second
+      # Role that has to be kept identical to the first". Keeping them
+      # identical is exactly what E1 measured the cost of. One Role
+      # bound to one account grants the UNION of what both Deployments
+      # do, and that union handed this process `delete` on
+      # `persistentvolumeclaims` -- the disk an execution's workspace
+      # lives on. A compromised verifier could destroy the very work it
+      # is being asked to judge. The two Roles below are therefore
+      # deliberately NOT identical, and that is the whole point of them.
+      #
+      # THE GOOGLE IDENTITY IS UNCHANGED AND STILL SHARED, ON PURPOSE.
+      # This KSA is annotated onto the SAME Google account as
+      # `agentos-conductor` (`agentos-cond-<env>`), because this process
+      # needs precisely what that account holds and nothing more:
+      # cloudsql.client for the pool, and the artifact store BOTH WAYS --
+      # it reads the committed tree and writes the captured environment
+      # back. Splitting the GOOGLE half is a separate change with a
+      # separate blast radius; this one splits the KUBERNETES half,
+      # which is the half E1 flagged.
+      #
+      # ── A HUMAN COMMAND IS OWED BEFORE THIS MANIFEST IS DEPLOYED ────
+      #
+      # ServiceAccount OBJECTS are not rendered from this file. They
+      # carry `iam.gke.io/gcp-service-account` annotations, which are
+      # per-environment, and scripts/infra/gke_cluster.sh creates the
+      # other four out of band. This fifth one is not in that script yet
+      # -- that file was another agent's this wave -- so until it is,
+      # both of these must be run once per environment FIRST, or
+      # `kubectl rollout status deployment/verifier` times out on a
+      # ReplicaSet that cannot create a pod:
+      #
+      #   kubectl apply -n ${NAMESPACE} -f - <<'YAML'
+      #   apiVersion: v1
+      #   kind: ServiceAccount
+      #   metadata:
+      #     name: agentos-verifier-control
+      #     annotations:
+      #       iam.gke.io/gcp-service-account: agentos-cond-next@PROJECT.iam.gserviceaccount.com
+      #   YAML
+      #
+      #   gcloud iam service-accounts add-iam-policy-binding \
+      #     agentos-cond-next@PROJECT.iam.gserviceaccount.com \
+      #     --project=PROJECT --role=roles/iam.workloadIdentityUser \
+      #     --member="serviceAccount:PROJECT.svc.id.goog[${NAMESPACE}/agentos-verifier-control]"
+      #
+      # The second is not optional decoration: without the
+      # workloadIdentityUser binding the annotation above resolves to
+      # nothing, the metadata server refuses, and the cloud-sql-proxy
+      # sidecar fails before this process reads a row.
+      #
+      # AND NOT `agentos-verifier`, WHICH IS A DIFFERENT ACCOUNT. That
+      # one is what a CRITERION'S JOB runs as. Binding this Deployment
+      # to it would hand every criterion -- repository code, chosen by a
+      # model -- the right to create and delete pods, and it holds
+      # `storage.objects.get` only, so this process could no longer
+      # write the environment it captured. The three JOB identities this
+      # process names in its env below are untouched.
+      serviceAccountName: agentos-verifier-control
+      # LONGER THAN THE DRAIN. `kernel/verifier/service.py` waits
+      # AGENTOS_DRAIN_MAX_S (180) for the adjudications already in
+      # flight; a grace period shorter than that is SIGKILL arriving
+      # mid-drain, and a cancelled adjudication is a criterion container
+      # already paid for and thrown away.
+      terminationGracePeriodSeconds: 210
+      # THE SAME PROXY AS THE CONDUCTOR'S, and it has to be: this
+      # process holds the pool that `adjudicate_pass` claims a
+      # connection from for the whole of a verification. A native
+      # sidecar (initContainer + restartPolicy: Always) so it is ready
+      # BEFORE the first tick and terminated AFTER the last.
+      #
+      # No credential: it authenticates as the pod's Workload Identity,
+      # which holds cloudsql.client and nothing else.
+      initContainers:
+        - name: cloud-sql-proxy
+          image: gcr.io/cloud-sql-connectors/cloud-sql-proxy:2.14.1
+          restartPolicy: Always
+          args:
+            - --structured-logs
+            - --port=5432
+            - ${CLOUDSQL_INSTANCE}
+          resources:
+            requests: {cpu: "250m", memory: 512Mi}
+            limits: {cpu: "250m", memory: 512Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: {drop: ["ALL"]}
+            runAsNonRoot: true
+      containers:
+        - name: verifier
+          image: ${IMAGE}
+          command: ["python", "-m", "kernel.verifier.service"]
+          # THE SAME PROBE AS THE CONDUCTOR'S, AND NOW THE SAME DEADLINE.
+          # It was 300 while `dryrun_pass` was serial: one pass was a
+          # capture Job (~28s, measured) plus a criterion Job (~30s) per
+          # pending question, so three questions ran past 120s and a
+          # probe firing there destroyed a dry run rather than catching a
+          # wedge. E3 removed that: both of this loop's passes now SPAWN
+          # their work onto bounded task pools (VERIFY_CONCURRENCY 6,
+          # DRYRUN_CONCURRENCY 4) and return, so no Job is ever awaited
+          # inside the pass.
+          #
+          # THE ARITHMETIC, since a deadline without one is a guess.
+          # A worst-case pass is now:
+          #     pool.acquire()      <= 30s   (ACQUIRE_MAX_S; past it the
+          #                                   pass raises PoolBusy)
+          #     verifying()          1 indexed SELECT
+          #     stranded_verifying() 1 SELECT + <= 20 UPDATEs
+          #     pending()            1 indexed SELECT
+          #     the heartbeat        1 UPDATE
+          #     spawning tasks       no await at all
+          # ~24 statements, so even at a pathological 200ms each the
+          # body is ~5s and the pass is <= 35s. Add the 4s sleep between
+          # passes and the longest legitimate gap between two `alive`
+          # touches is ~39s.
+          #
+          # 120 is therefore three consecutive worst-case passes, and
+          # that headroom is the point: this process has exactly ONE
+          # loop, so unlike the conductor it has no second loop ticking
+          # to cover a bad pass, and a saturated pool must be allowed to
+          # clear itself rather than restart the pod. With
+          # failureThreshold 3 and periodSeconds 30 the kill lands ~90s
+          # after the deadline is first breached — under four minutes
+          # against the thirty-minute wedge this probe exists for.
+          #
+          # Not lower than 120: `alive.late()` floors a loop's own limit
+          # at max(deadline, 10 x 4s), and dropping under the
+          # conductor's value would make the two deployments disagree
+          # about what "wedged" means for no measured reason.
+          livenessProbe:
+            exec:
+              command: ["python", "-m", "kernel.obs.alive", "120"]
+            initialDelaySeconds: 120
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          env:
+            # WHICH BUILD THIS IS. Read by `kernel/obs/fields.py`, which
+            # logs "unset" without it -- and did, on every line of both
+            # services, so nothing in the logs said which code produced
+            # it. `heartbeat.py` also groups by it to spot two builds
+            # serving at once during a rollout, which it cannot do while
+            # every replica reports the same "unset".
+            # THE LLM HALF OF THE VERIFIER, AND IT HAS NEVER BEEN ON.
+            #
+            # `quick.available()` is `GEMINI_API_KEY and
+            # AGENTOS_ASSIST == "1"`. The key is mounted; this was set
+            # nowhere in this repository, so `available()` has been
+            # False in both Deployments since they existed and FIVE
+            # features returned early without a log line:
+            #
+            #   verifier/assess.py      the assessor -- the second key
+            #   verifier/investigate.py why a claim was refused
+            #   verifier/assist.py      verifier assist
+            #   answerer/agent.py       answering a person's question
+            #   worker/scout.py         drafting a setup for a bare repo
+            #
+            # So every verdict this deployment has produced passed on
+            # ONE key: the mechanical checks, which are written by the
+            # same model whose work they check. `assess.py` exists
+            # precisely because that is not enough.
+            #
+            # OFF IS THE RIGHT DEFAULT WHERE IT CAME FROM. The flag's own
+            # docstring: "a deterministic suite that quietly starts
+            # calling a live model on every refusal is a suite whose
+            # green means something different on Tuesdays." That is
+            # about E0 and CI. It is not about a production verifier,
+            # and the reasoning simply never followed these components
+            # into their own Deployments.
+            - name: AGENTOS_ASSIST
+              value: "1"
+            - name: BUILD_SHA
+              value: "${BUILD_SHA}"
+            - name: AGENTOS_DRIVER
+              value: kubernetes
+            - name: AGENTOS_K8S_NAMESPACE
+              value: "${NAMESPACE}"
+            # ── WHETHER THIS CLUSTER'S POOLS CARRY agentos.io/env ──
+            #
+            # DECIDED BY LOOKING, in deploy_execution_plane.sh, which
+            # asks the cluster rather than taking a flag: a flag can be
+            # set wrong and the cost falls on whichever environment is
+            # live. `off` means pods select their class alone, which is
+            # exactly the behaviour of every build before this existed.
+            #
+            # The environment NAME is not passed -- it is derived from
+            # the namespace above, so the two cannot disagree. This
+            # says only whether the nodes can satisfy it.
+            # QUOTED, AND NOT COSMETICALLY. YAML 1.1 reads bare `off`
+            # and `on` as BOOLEANS, so an unquoted value renders as
+            # `false` and the API server refuses the whole manifest --
+            # a string field given a bool. The deploy would fail at
+            # apply, before anything ran, which is the good version of
+            # this mistake; the bad version is a future value that
+            # happens to parse as a string and silently means nothing.
+            - name: AGENTOS_NODE_POOL_SCOPED
+              value: "${NODE_POOL_SCOPED}"
+            # NAMED BUT NOT SPENT. The verifier creates no execution
+            # pods — that is the conductor's `dispatch_pass`.
+            # `KubernetesDriver.__init__` reads this to build itself, so
+            # leaving it out would have the two processes construct
+            # subtly different drivers from one class, which is the kind
+            # of difference nobody thinks to look for.
+            - name: AGENTOS_K8S_SERVICE_ACCOUNT
+              value: agentos-execution
+            # THE TWO THIS PROCESS ACTUALLY SPENDS. A criterion's Job
+            # runs as `agentos-verifier` (storage.objects.get, so it can
+            # read the tree it checks and nothing else); the environment
+            # replay's capture Job runs as `agentos-capture`, which
+            # WRITES. Read and write are different capabilities and are
+            # therefore different accounts — see `capture-egress` below
+            # for what that containment is holding back.
+            - name: AGENTOS_K8S_VERIFIER_SERVICE_ACCOUNT
+              value: agentos-verifier
+            - name: AGENTOS_K8S_CAPTURE_SERVICE_ACCOUNT
+              value: agentos-capture
+            # OUR OWN IMAGE, named to ourselves: a criterion's
+            # initContainer runs `python -m kernel.artifacts.fetch`,
+            # which exists here and in no base image a contract names.
+            - name: AGENTOS_EXECUTION_IMAGE
+              value: "${IMAGE}"
+            # And the base that a contract naming none inherits. The
+            # prepare container runs the committed tree's setup in it.
+            - name: AGENTOS_SANDBOX_BASE_IMAGE
+              value: "${SANDBOX_BASE_IMAGE}"
+            # E6, and the verifier needs it for the reason the parity
+            # check exists: this process is the one that COMPARES what
+            # ran against what was approved, so it cannot be the one
+            # that has only a tag. See the note on the conductor's copy
+            # for why a NULL `base_digest` propagated through every
+            # amendment.
+            - name: AGENTOS_SANDBOX_BASE_DIGEST
+              value: "${SANDBOX_BASE_DIGEST}"
+            # BOTH PORTS, AND THE VERIFIER USES NEITHER ITSELF. It holds
+            # them to PASS ON: `k8s_egress.proxy_for` picks the address
+            # from the label the pod is about to be given, so a
+            # criterion Job (`store`, 3129) and a capture Job
+            # (`capture`, 3128) each get the one their NetworkPolicy
+            # admits. A pod labelled for one port and pointed at the
+            # other does not fail, it hangs.
+            - name: AGENTOS_STORE_PROXY
+              value: http://egress-proxy:3129
+            - name: AGENTOS_EGRESS_PROXY
+              value: http://egress-proxy:3128
+            # THE STORE, BOTH WAYS. The verifier reads the committed
+            # tree out of it and writes the captured environment back,
+            # in this process, with this pod's Workload Identity.
+            - name: ARTIFACT_STORE
+              value: gcs
+            - name: ARTIFACT_BUCKET
+              value: "${ARTIFACT_BUCKET}"
+            # Read by `KubernetesDriver.__init__` when it builds the pod
+            # specs it hands the Kubernetes API. Not a secret: a public
+            # https URL, and the conductor's copy of this comment
+            # explains why its absence was fatal rather than cosmetic.
+            - name: CONTROL_PANEL_URL
+              value: "${CONTROL_PANEL_URL}"
+            - name: AGENTOS_LOG_FORMAT
+              value: json
+          # THE SAME BUNDLE, and it is what makes DATABASE_URL and
+          # AGENT_TOKEN_SIGNING_KEY present. The second is not optional:
+          # podfs tokens are DERIVED from it (kernel/workspace/
+          # podfs_auth.py), so without it this process can open the
+          # execution pod's port and be refused by every call it makes.
+          #
+          # It also carries the model keys. §5/E1 says the verifier gets
+          # them "except for assist/investigate" — and those two ARE
+          # verifier code that calls a model, so the exception is the
+          # case. A narrower bundle is worth doing and is not this
+          # change: it would have to split a Secret two Deployments
+          # share.
+          envFrom:
+            - secretRef:
+                name: conductor-secrets
+          # MODEST, and deliberately smaller than the conductor's. The
+          # heavy work is in the JOBS this process creates, not in it —
+          # what stays here is tar slicing and git archive, which Phase
+          # R moved onto the `infra` executor. 0.5 vCPU with 2Gi is
+          # inside Autopilot's 1:1 to 6.5:1 memory-per-vCPU window.
+          resources:
+            requests: {cpu: "500m", memory: 2Gi}
+            limits: {cpu: "500m", memory: 2Gi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: {drop: ["ALL"]}
+            runAsNonRoot: true
+            runAsUser: 1000
+---
+# TWO ROLES, AND THEY ARE DELIBERATELY NOT THE SAME ONE.
+#
+# THE FINDING (E1, recorded in plan 11.5a). The conductor and the
+# verifier reached the API through ONE Role bound to ONE account,
+# `agentos-conductor`. A single Role is the UNION of everything its
+# holders do, and this union included `delete` on
+# `persistentvolumeclaims` -- `ws-exec-<id>` is the disk an execution's
+# workspace lives on, so a compromised verifier could destroy the very
+# work it was asked to judge. 5.18 then gave the verifier podfs write as
+# well, so the item grew rather than shrank.
+#
+# A Role and not a ClusterRole in both cases: nothing either process
+# does is cluster-wide, and a ClusterRole would let one compromise reach
+# production's namespace on the same cluster -- which is the
+# shared-cluster trade this whole design accepts on the condition that
+# the boundaries are real.
+#
+# WHAT RBAC CANNOT DO, STATED HERE SO NOBODY GOES LOOKING FOR IT.
+# Kubernetes RBAC has no label selector. `resourceNames` is an
+# exact-match allowlist with no wildcards, and a verification pod is
+# `verify-<execution id>` -- an unbounded set. So "may delete
+# verification pods but not execution pods" is NOT EXPRESSIBLE, and the
+# verifier keeps `delete` on `pods`. The note on that rule names the one
+# call that forces it and what removing it would take.
+#
+# NOTHING IS BOUND TO `agentos-execution`. That is the identity a
+# model's bash can reach through the metadata server, and it holds no
+# Kubernetes rights at all -- no Role and no RoleBinding, deliberately
+# ABSENT rather than empty, because an empty Role is a thing somebody
+# adds one verb to. `app/services/tests/test_rbac_split.py` asserts it
+# stays that way.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: conductor
+  namespace: ${NAMESPACE}
+rules:
+  # FOUR REAPERS ARE WHY THIS ONE STAYS BROAD, and each destroys a
+  # different kind of thing:
+  #
+  #   kernel/conductor/orphans.py      execution pods
+  #   kernel/conductor/reclaim.py      verification pods and claims
+  #   kernel/conductor/jobs_sweep.py   Jobs
+  #   kernel/conductor/ephemeral.py    PVCs podcheck left behind
+  #
+  # All four decide "may I destroy this" in `kernel/ownership.py` -- by
+  # label and by database row, NEVER by RBAC. Narrowing a verb here
+  # disables a reaper, and a sweep that collects nothing looks exactly
+  # like a clean cluster: that is how twelve orphaned pods came to hold
+  # bridge ports until an unrelated gate failed with "no free port in
+  # 9200-9399".
+  - apiGroups: [""]
+    resources: [pods]
+    # create  dispatch (`KubernetesDriver._ensure_pod`)
+    # get     `await_ready`, `resolve_bridge_host`
+    # list    `list_containers` -- the orphan sweep and reclaim
+    # delete  orphans.py and reclaim.py
+    verbs: [get, list, create, delete]
+  - apiGroups: [""]
+    resources: [persistentvolumeclaims]
+    # create  dispatch (`_ensure_pvc`)
+    # list    `list_workspaces`, and reclaim's verification claims
+    # delete  `release_workspace` and ephemeral.py
+    #
+    # NO `get`: nothing in this process reads a claim by name. That is
+    # `claim_exists`, and it belongs to the verifier.
+    verbs: [list, create, delete]
+  - apiGroups: [batch]
+    resources: [jobs]
+    # `jobs_sweep` lists them and deletes the ones no execution wants.
+    #
+    # `create` AND `get` ARE BACK, AND THE REASON THEY LEFT IS THE
+    # LESSON. E12 removed them on this reasoning: "`adjudicate_pass`
+    # moved to the verifier Deployment and `dryrun_pass` retired with
+    # the dry run (plan 5.6), so nothing in this process runs a Job any
+    # more -- `kernel/worker/loop.py` says so at the point where both
+    # used to be called."
+    #
+    # Two of the three Job-runners in that file were enumerated. The
+    # third is `deliver_questions`, which is the ANSWERER, and it runs a
+    # Job through the same `k8s_run.run_job` as the other two. So from
+    # E12 until this line, every question a person asked came back as
+    #
+    #   "I could not look into this -- the model that answers questions
+    #    about a story is not available right now."
+    #
+    # while the model was fine and the account simply could not create
+    # the Job. Measured on `next` 2026-09-22, run 262, questions 207 and
+    # 208:
+    #
+    #   jobs.batch is forbidden: User
+    #   "system:serviceaccount:agentos-staging:agentos-conductor" cannot
+    #   create resource "jobs" in API group "batch"
+    #
+    # A SCOPE-DOWN IS ONLY AS GOOD AS ITS ENUMERATION, and the way to
+    # enumerate callers is to grep for the driver -- `run_job` -- not to
+    # recall which features were moved.
+    verbs: [get, list, create, delete]
+  - apiGroups: [batch]
+    resources: [jobs/status]
+    # `run_job` polls `read_namespaced_job_status`, and `get` on `jobs`
+    # does not carry the subresource. The verifier's Role says the same
+    # thing at more length, having paid for it first.
+    verbs: [get]
+  # NO `watch` ON ANYTHING, AND IT WAS GRANTED BEFORE THIS CHANGE.
+  # Nothing in the kernel opens one: every Kubernetes call goes through
+  # `kernel/drivers/k8s_call.py`, whose own comment says "if watch is
+  # ever added it must not come through here" -- that module exists to
+  # bound a call, and a watch is an unbounded one. A verb nobody uses is
+  # a verb nobody notices being used.
+  #
+  # AND NO `pods/log`. `k8s_run._logs` is the only reader in the kernel
+  # and it runs in the verifier. A pod's output outlives the pod in
+  # Cloud Logging either way -- see kernel/drivers/k8s_logref.py, which
+  # exists because "its output is unavailable" was the expensive kind of
+  # false.
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: conductor
+  namespace: ${NAMESPACE}
+subjects:
+  - kind: ServiceAccount
+    name: agentos-conductor
+    namespace: ${NAMESPACE}
+roleRef:
+  kind: Role
+  name: conductor
+  apiGroup: rbac.authorization.k8s.io
+---
+# AND THE VERIFIER'S OWN. Everything this process measurably calls, and
+# nothing the conductor's reapers need.
+#
+# WHAT IT LOSES IS THE POINT OF THE SPLIT:
+#
+#   persistentvolumeclaims delete  It can no longer destroy an
+#       execution's workspace, which is where the work actually lives.
+#       A deleted POD is survivable on purpose -- `destroy()` keeps the
+#       claim, and reclaim.py argues at length that this is the
+#       preemption guarantee. A deleted CLAIM is a story's work, gone,
+#       with nothing to re-attach.
+#   persistentvolumeclaims list    It reads ONE claim, by a name it
+#       computes (`verify-ws-<id>`). It never enumerates them, so it
+#       cannot discover the claims of executions it is not judging.
+#   jobs list                      `run_job` creates, polls and deletes
+#       by name. Only the conductor's sweep enumerates Jobs.
+#   watch, everywhere              As above: nothing watches.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: verifier
+  namespace: ${NAMESPACE}
+rules:
+  - apiGroups: [""]
+    resources: [pods]
+    # create  `k8s_verify.ensure` -- the warm verification pod
+    # get     `k8s_verify.await_ready` and `address`
+    # list    `k8s_run._find_pod`, which finds a Job's pod by its label
+    #
+    # delete  LEFT BROAD, AND IT IS THE ONE THING THIS SPLIT DOES NOT
+    #   FIX. `kernel/verifier/handover.py:detach` takes the warm pod off
+    #   its claim so the prepare Job can attach it: the claim is
+    #   ReadWriteOncePod, so a Job submitted while the pod holds the
+    #   disk stays Pending until its deadline rather than failing. It
+    #   sits on the hot path of `rebuild._refresh`, inside the `try`
+    #   that turns any raise into `prepare_crashed` -- so a 403 there
+    #   does not degrade, it blocks that execution from ever becoming
+    #   judgeable, on every tick, silently.
+    #
+    #   It CANNOT be scoped to verification pods: see the note above on
+    #   what RBAC cannot express. Removing it means moving `detach`
+    #   behind the conductor, which already owns `reap_verification` --
+    #   a kernel change and not a manifest one, and it is the follow-up
+    #   this split deliberately leaves open rather than pretending to
+    #   have closed.
+    verbs: [get, list, create, delete]
+  - apiGroups: [""]
+    resources: [pods/log]
+    # `run_job` reads the criterion's log AND the fetch initContainer's,
+    # always and not only on failure: plan 13, a container that says
+    # nothing leaves a silence identical to one that never ran.
+    verbs: [get]
+  - apiGroups: [""]
+    resources: [persistentvolumeclaims]
+    # create  `k8s_verify.ensure` -- `verify-ws-<id>`, a SECOND claim,
+    #         named so that reclaim's `ws-exec-<id>` parser cannot match
+    #         it (kernel/ownership.py says why that matters).
+    # get     `claim_exists`, asked before a prepare Job is spent.
+    #
+    # NO `delete`: `handover.detach` passes `keep_claim=True`, always --
+    # the disk is the thing the rebuild is rebuilding ONTO.
+    verbs: [get, create]
+  - apiGroups: [batch]
+    resources: [jobs]
+    # Criterion Jobs, capture Jobs and prepare Jobs, all of them through
+    # `kernel/drivers/k8s_run.py:run_job`, which deletes in a `finally`
+    # because a verifier that leaks a Job per criterion is one nobody
+    # runs.
+    verbs: [get, create, delete]
+  - apiGroups: [batch]
+    resources: [jobs/status]
+    # jobs/status IS A SEPARATE SUBRESOURCE, and `get` on `jobs` does not
+    # carry it. `run_job` polls `read_namespaced_job_status`, so without
+    # this EVERY criterion of EVERY story fails:
+    #
+    #   jobs.batch "crit-6913365ebd64" is forbidden: User
+    #   "system:serviceaccount:agentos-staging:agentos-conductor" cannot get
+    #   resource "jobs/status" in API group "batch"
+    #
+    # Measured on `next` 2026-09-16 -- the Verifier could not run a single
+    # check, and a dry-run reported the plan's checks as unapprovable,
+    # which reads as a badly written plan rather than a missing verb. The
+    # account named in that message is the one this Deployment used to
+    # wear; the rule moved here with the process that needs it, and the
+    # message is kept verbatim so the next person to meet it finds this
+    # rule rather than re-deriving it.
+    #
+    # The calls are `create/delete/read_namespaced_job*` and nothing
+    # else, so `status` needs `get` alone and not `patch`.
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: verifier
+  namespace: ${NAMESPACE}
+subjects:
+  # THE FIFTH IDENTITY, AND IT IS APPLIED OUT OF BAND. See the long note
+  # on the verifier Deployment's `serviceAccountName` above for the two
+  # commands a human owes before this manifest is deployed. A RoleBinding
+  # whose subject does not exist is accepted by the API server and grants
+  # nothing, so forgetting them shows up as the Deployment failing to
+  # create a pod at all -- loud, and before anything runs.
+  - kind: ServiceAccount
+    name: agentos-verifier-control
+    namespace: ${NAMESPACE}
+roleRef:
+  kind: Role
+  name: verifier
+  apiGroup: rbac.authorization.k8s.io
+---
+# EGRESS, AND WHY IT IS A DEPLOYMENT.
+#
+# A transparent per-node proxy would be a DaemonSet, and on Autopilot
+# that is STRUCTURALLY IMPOSSIBLE: it needs NET_ADMIN, hostNetwork or
+# privileged, and all three are blocked. So it is an ordinary Deployment
+# that pods are pointed at, and the NetworkPolicy below is what makes
+# pointing at it non-optional.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: egress-allowlist
+  namespace: ${NAMESPACE}
+data:
+  squid.conf: |
+    # TWO PORTS, TWO ALLOWLISTS, ONE PROXY.
+    #
+    # An execution pod runs model-authored code and needs a package
+    # index, a git host and a model API. A CRITERION needs one thing:
+    # the artifact store its committed tree arrives from. On Docker a
+    # criterion gets `network_mode: none` and needs nothing at all, and
+    # giving it the executor's reach here would quietly drop F2's
+    # defence — "a criterion that can reach the internet can fetch a
+    # version of itself that passes, and can exfiltrate the tree it was
+    # given".
+    #
+    # It is one Deployment because two would be two things to keep
+    # running for one decision; the NetworkPolicies below decide which
+    # PORT each class of pod may reach, and squid decides which hosts
+    # that port may reach. Neither alone is the control.
+    http_port 3128 name=full
+    http_port 3129 name=store
+
+    acl SSL_ports port 443
+    acl Safe_ports port 80 443
+    acl CONNECT method CONNECT
+    acl from_full myportname full
+    acl from_store myportname store
+
+    # The store, and only the store. Criteria.
+    acl store_hosts dstdomain .googleapis.com
+
+    # Everything an executor legitimately reaches. A package index, a
+    # TOOLCHAIN ARTEFACT HOST, the git hosts, the image registry, the
+    # model APIs.
+    #
+    # "TOOLCHAIN ARTEFACT HOST" IS NEW, AND NAMING IT IS THE POINT. The
+    # rule used to say "a package index", and the list below grew to
+    # thirteen of them across six languages while quietly failing to
+    # cover a second kind of thing: where a BUILD TOOL fetches what it
+    # needs to run. node-gyp wants Node's headers; Playwright wants
+    # browser binaries. Neither is a package and neither was allowed.
+    #
+    # Measured, not assumed: execution 230 installed better-sqlite3 with
+    # --build-from-source, node-gyp reached for
+    # nodejs.org/download/release/v22.12.0/node-v22.12.0-headers.tar.gz,
+    # the proxy answered 403, and the install fell back to a prebuilt
+    # binary. It reported that honestly, which is the only reason anyone
+    # noticed. A package with NO prebuilt would simply have failed --
+    # and Phase 2 had just added build-essential precisely so native
+    # modules could compile. The compiler was there; its headers were
+    # not reachable. Each half correct, the wire between them missing.
+    acl full_hosts dstdomain .googleapis.com .pkg.dev .gcr.io
+    acl full_hosts dstdomain .github.com .githubusercontent.com
+    # THE CREDENTIAL BROKER, which an executor cannot clone without.
+    # `GitDriver` persists a credential.helper that calls
+    # the control panel's /internal/git-credential to mint a scoped
+    # (spelled without the dollar-brace form on purpose: render.py
+    # substitutes those ANYWHERE in this file, comments included, and
+    # refuses an unset name -- so naming a variable that way in prose
+    # makes the manifest unrenderable)
+    # token per git operation, and the control panel is a Cloud Run
+    # service -- a .run.app host, which was not on this list. So a
+    # private clone failed at the proxy, reported by git as an
+    # authentication failure rather than as a blocked host.
+    acl full_hosts dstdomain .run.app
+    acl full_hosts dstdomain .pypi.org .pythonhosted.org
+    acl full_hosts dstdomain .npmjs.org .yarnpkg.com
+    acl full_hosts dstdomain .anthropic.com
+    acl full_hosts dstdomain .debian.org .ubuntu.com
+
+    # THE OTHER ECOSYSTEMS, and their absence was a ceiling nobody had
+    # written down. `kernel/verifier/setups.py` is language-blind on
+    # purpose -- "the kernel never learns what pip or npm are", it runs
+    # the repository's own `.agentos/setup.sh` -- so a Rust or Go repo
+    # was free to declare its environment and then could not fetch it:
+    # the proxy denied the host and the failure surfaced as a setup
+    # command that simply did not work.
+    #
+    # A registry per line, named exactly. The rule this list encodes is
+    # "a package index, the git hosts, the image registry, the model
+    # APIs", and these are package indexes; nothing here widens what an
+    # execution may reach in KIND, only in language.
+    acl full_hosts dstdomain .crates.io .rust-lang.org
+    acl full_hosts dstdomain .golang.org .go.dev
+    acl full_hosts dstdomain .maven.org .gradle.org
+    acl full_hosts dstdomain .rubygems.org
+    acl full_hosts dstdomain .packagist.org
+    acl full_hosts dstdomain .nuget.org
+
+    # TOOLCHAIN ARTEFACTS, per the rule above. Not package indexes: what
+    # a build tool downloads in order to build at all.
+    #
+    # `.nodejs.org` -- node-gyp's headers, and the only entry here with
+    # a measured failure behind it rather than a prediction.
+    acl full_hosts dstdomain .nodejs.org
+    # `.playwright.dev` -- browser binaries. A frontend story that wants
+    # an end-to-end test cannot install one today, and the failure would
+    # arrive as a download error inside a test runner rather than as a
+    # blocked host.
+    acl full_hosts dstdomain .playwright.dev
+    # `.deno.land` and `.jsr.io` -- the image ships Deno for the
+    # TypeScript tool tier, so a Deno script may resolve dependencies.
+    # Shipping the runtime and denying its registry is the same
+    # half-a-wire this block exists to stop.
+    acl full_hosts dstdomain .deno.land .jsr.io
+    # `.astral.sh` -- uv's own host, for `uv tool` and self-update. The
+    # interpreters it installs come from GitHub, which is already here.
+    acl full_hosts dstdomain .astral.sh
+
+    # DELIBERATELY ABSENT, so the next person does not have to relitigate
+    # each one:
+    #
+    #   gitlab.com, bitbucket.org  no repository lives there. A git host
+    #                              nobody uses is reach bought for
+    #                              nothing.
+    #   docker.io, quay.io         pulling an arbitrary image is a
+    #                              different KIND of thing from fetching
+    #                              a package, and .pkg.dev already
+    #                              serves the images we build.
+    #   hashicorp.com              terraform and vault mutate
+    #                              infrastructure. Not an index.
+    #   unpkg, jsdelivr, esm.sh    npm mirrors. `.npmjs.org` already
+    #                              provides the capability, so these add
+    #                              surface and no function.
+    #   any telemetry endpoint     never.
+
+    http_access deny !Safe_ports
+    http_access deny CONNECT !SSL_ports
+    http_access allow from_store store_hosts
+    http_access allow from_full full_hosts
+    http_access deny all
+
+    # A PROXY THAT CACHES A PACKAGE INDEX SERVES A STALE ONE, and a
+    # verification that installed yesterday's package is not the
+    # verification anybody asked for.
+    cache deny all
+
+    # LOG TO FILES, NOT TO /dev/stdout, and the reason is the privilege
+    # drop above working. `access_log stdio:/dev/stdout` fails with
+    #
+    #   FATAL: Cannot open '/dev/stdout' for writing.
+    #
+    # because by the time squid opens its logs it IS uid 13, and
+    # /dev/stdout is a symlink to root's /proc/self/fd/1. The container
+    # then exits 1 on a loop.
+    #
+    # The image already solves this: its entrypoint backgrounds
+    # `tail -F /var/log/squid/*.log`, so the default file destinations
+    # reach stdout anyway. Leaving these unset uses those defaults and
+    # works WITH the image instead of around it.
+    access_log daemon:/var/log/squid/access.log squid
+    cache_log /var/log/squid/cache.log
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: egress-proxy
+  namespace: ${NAMESPACE}
+  labels: {app: egress-proxy}
+spec:
+  replicas: 2
+  selector:
+    matchLabels: {app: egress-proxy}
+  template:
+    metadata:
+      labels: {app: egress-proxy}
+      annotations:
+        # THE ALLOWLIST'S FINGERPRINT, AND WITHOUT IT A CHANGE TO THE
+        # ALLOWLIST DOES NOTHING. Squid reads its configuration once, at
+        # start. The ConfigMap above is mounted into this pod, so a
+        # deploy that edits it updates the file on disk and leaves the
+        # running process on the configuration it booted with -- and
+        # Kubernetes has no reason to restart the pod, because nothing
+        # in its spec changed.
+        #
+        # Measured, not reasoned: the deploy that added .nodejs.org to
+        # the allowlist went green, the ConfigMap in the cluster carried
+        # the new host, and `grep nodejs.org /etc/squid/squid.conf`
+        # inside the running pod returned nothing. The conductor and the
+        # verifier had rolled because BUILD_SHA is in their environment
+        # and so their spec changed every deploy; the proxy has no such
+        # field and had been running the same process since a deploy two
+        # hours earlier.
+        #
+        # This is the standard remedy and it is better than restarting
+        # the proxy on every deploy: the value is a hash of the
+        # allowlist block alone, so the pod rolls when the RULES change
+        # and stays up when only an image tag did. deploy_execution_
+        # plane.sh computes it; a stale or missing value means the
+        # deploy did not, and render.py refuses to render it empty.
+        agentos.io/egress-config: "${EGRESS_CONFIG_SHA}"
+    spec:
+      # Placed with the conductor, and the reason is on its Deployment
+      # above: a control-plane pod with no selector lands on a story
+      # pool, contends with the execution it is meant to be serving, and
+      # evicts the warm placeholders on its way in.
+      nodeSelector:
+        ${PLATFORM_NODE_SELECTOR}
+      # AND PAST THE TAINT ON THAT POOL. The selector says this pod may
+      # use the pool; the taint is what keeps the OTHER environment's
+      # pods -- which carry no env selector and so match every pool of
+      # their class -- from landing here. A control-plane pod without
+      # the toleration is repelled by its own pool and stays Pending,
+      # which reports nothing, so the two are rendered together from
+      # one decision in deploy_execution_plane.sh.
+      #
+      # On an environment whose pools are untainted this line renders
+      # as a comment and the pod spec is unchanged.
+      ${PLATFORM_TOLERATIONS}
+      # SPREAD ACROSS THE POOL'S MACHINES, because two replicas on one
+      # machine are one replica with a larger bill. Every outbound call a story makes goes through this;
+      # losing all of it at once is every leg failing on its next fetch.
+      #
+      # PREFERRED, and the contrast with kernel/drivers/k8s_placement.py
+      # is deliberate rather than an inconsistency. A story's rule is
+      # REQUIRED because its purpose is resource isolation: a story that
+      # shares a machine has already lost the thing the rule exists to
+      # give it, so waiting for a machine is better than proceeding
+      # without one. This rule's purpose is survival of a lost node,
+      # and REQUIRED here would trade that for a worse failure -- during
+      # a rolling update or a node replacement the surge replica could
+      # find no second machine, and the rollout would stall with the
+      # platform mid-upgrade. Spread when it is possible; never block on
+      # it.
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels: {app: egress-proxy}
+                topologyKey: kubernetes.io/hostname
+      serviceAccountName: agentos-execution
+      volumes:
+        - name: allowlist
+          configMap: {name: egress-allowlist}
+      containers:
+        - name: proxy
+          image: ${PROXY_IMAGE}
+          ports:
+            - containerPort: 3128
+              name: full
+            - containerPort: 3129
+              name: store
+          volumeMounts:
+            - name: allowlist
+              mountPath: /etc/squid/squid.conf
+              subPath: squid.conf
+              readOnly: true
+          resources:
+            requests: {cpu: "250m", memory: 512Mi}
+            limits: {cpu: "250m", memory: 512Mi}
+          # STARTS AS ROOT AND DROPS ITSELF, WHICH NEEDS TWO CAPABILITIES.
+          #
+          # Two wrong answers came before this one. `runAsNonRoot: true`
+          # stopped the pod outright — `ubuntu/squid` is uid 0 and the
+          # kubelet refuses such a container with "image will run as
+          # root". Then root with `drop: ["ALL"]` let it start and
+          # crashloop:
+          #
+          #   ERROR: initgroups: unable to set groups for User proxy
+          #   ERROR: setgid: (1) Operation not permitted
+          #
+          # Squid's model is to start privileged, set up its spool and
+          # log directories, and then drop to the `proxy` user. setgid
+          # and setuid are exactly the calls that do that, and they need
+          # CAP_SETGID and CAP_SETUID — which `drop: ["ALL"]` removed.
+          # The hardening prevented the process from DE-privileging
+          # itself, and left it running as root right up until it died.
+          #
+          # Granting the two back is not a relaxation. It is what lets
+          # squid finish as uid 13 instead of uid 0, which is stricter
+          # than either of the configurations that failed.
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+              add: ["SETUID", "SETGID"]
+            runAsUser: 0
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: egress-proxy
+  namespace: ${NAMESPACE}
+spec:
+  selector: {app: egress-proxy}
+  ports:
+    - name: full
+      port: 3128
+      targetPort: 3128
+    - name: store
+      port: 3129
+      targetPort: 3129
+---
+# The one hole in default-deny: a workload that needs egress may reach
+# the proxy and DNS, and nothing else directly. Reach becomes a question
+# the proxy answers per request rather than a property of where a pod
+# sits.
+#
+# SELECTED ON INTENT, not on the app name — and on WHICH intent, which
+# is the part that changed. An execution pod runs model-authored code
+# and needs a package index, a git host and a model API. A criterion
+# needs the artifact store its tree arrives from and nothing else, so it
+# carries `egress: store` and is admitted only to the port whose
+# allowlist is one entry long.
+#
+# The first version gave both classes `egress: proxy` on the reasoning
+# that "a verifier installs dependencies". It does not: dependencies
+# reach a criterion through the recorded environment replay, which
+# exists precisely so a check never needs a network. Handing criteria
+# the executor's reach would have dropped F2's defence — a criterion
+# that can reach the internet can fetch a version of itself that passes.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: workload-egress-via-proxy
+  namespace: ${NAMESPACE}
+spec:
+  podSelector:
+    matchLabels: {agentos.io/egress: proxy}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels: {app: egress-proxy}
+      ports:
+        - {protocol: TCP, port: 3128}
+    - ports:
+        - {protocol: UDP, port: 53}
+        - {protocol: TCP, port: 53}
+---
+# D1 — THE ONE THING THE CLOUD SQL PROXY CANNOT SEND THROUGH SQUID.
+#
+# The execution pod carries a `cloud-sql-proxy` sidecar so that the leg's
+# advisory lock can move into the pod with the leg (Phase D2); see
+# kernel/drivers/k8s_sqlproxy.py. Two of its three destinations are
+# already covered: `sqladmin.googleapis.com` and the OAuth token endpoint
+# are HTTPS, the container is given HTTP_PROXY/HTTPS_PROXY, and
+# `.googleapis.com` is on squid's full allowlist above. The DATA
+# connection is not — it is a raw TLS dial to the instance on 3307, and
+# no HTTP proxy can carry that. Without this rule the namespace's
+# default-deny DROPS it, which is a hang and not a refusal: the proxy
+# would sit retrying, the socket would never appear, and the failure
+# would arrive as a leg that never starts.
+#
+# PINNED TO THE INSTANCE, AND TO ONE PORT. Not `- ports: [3307]` with no
+# destination, which needs no deploy-time lookup and would hand
+# model-authored code an arbitrary outbound TCP channel to any listener
+# on that port — precisely the exfiltration squid's allowlist exists to
+# close. ${CLOUDSQL_IP} is read from the instance at deploy time; it is
+# the PRIMARY address because the proxy dials the primary by default, so
+# adding `--private-ip` to the sidecar means changing both or reaching
+# nothing.
+#
+# WHAT THIS DOES HAND THE SANDBOX, stated rather than glossed:
+# NetworkPolicy is per-POD, so `bash` in the sandbox can also open a TCP
+# connection to the instance on 3307. That is exactly the reach a leaked
+# key was already priced at in §10 — "may open a TCP connection to the
+# instance, not an identity" — because the instance requires the
+# ephemeral client certificate the proxy mints from a credential that is
+# on a volume the sandbox does not mount. Per-pod granularity is the
+# reason the credential boundary here is filesystem and user rather than
+# network position, and this rule is where that shows.
+#
+# SELECTED ON `app`, NOT ON `agentos.io/egress`. The egress label is
+# shared with the verifier's criterion Jobs and the capture Job, and
+# neither has any business dialling the database.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: execution-egress-to-sql
+  namespace: ${NAMESPACE}
+spec:
+  podSelector:
+    matchLabels: {app: agentos-execution}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - ipBlock:
+            cidr: ${CLOUDSQL_IP}/32
+      ports:
+        - {protocol: TCP, port: 3307}
+---
+# THE PREPARE JOB: the full port, AND one execution pod's podfs.
+#
+# It streams the committed tree onto the verification volume (plan 5.15)
+# and then runs `setups.REGISTRY`'s own command against it, so it needs
+# a package index AND 9101. No other class has that pair.
+#
+# NOT `proxy`, which also selects the EXECUTION pod: model-authored code
+# there would inherit the 9101 rule and could dial other stories'
+# workspaces. NOT `capture`, which carries the metadata server for a
+# sidecar calling `storage.Client()` -- this Job has no sidecar and no
+# cloud identity to mint, and granting metadata would hand a credential
+# path to the one container here that runs a repository's own
+# `.agentos/setup.sh`.
+#
+# The read-only podfs token is the second barrier: scoped to this
+# execution and to reads, so reaching the port is not reaching the
+# workspace.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: prepare-egress
+  namespace: ${NAMESPACE}
+spec:
+  podSelector:
+    matchLabels: {agentos.io/egress: prepare}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels: {app: egress-proxy}
+      ports:
+        - {protocol: TCP, port: 3128}
+    - to:
+        - podSelector:
+            matchLabels: {app: agentos-execution}
+      ports:
+        - {protocol: TCP, port: 9101}
+    - ports:
+        - {protocol: UDP, port: 53}
+        - {protocol: TCP, port: 53}
+---
+# THE CAPTURE JOB, WHICH IS THE ONE WORKLOAD THAT NEEDS BOTH HALVES.
+#
+# Measured on execution 205. The env replay runs in a Job with two
+# containers: a WORK container that runs `pip install` and needs the
+# full allowlist, and a SIDECAR that uploads the captured directory with
+# `storage.Client()` and therefore needs 169.254.169.254 for the project
+# id and the token. It wore `egress: proxy`, which grants the first and
+# not the second, so:
+#
+#   pip:      exit 0, five packages installed
+#   sidecar:  OSError: Project was not passed and could not be
+#             determined from the environment
+#
+# -- an empty archive, every criterion `error` rather than `fail`, and
+# the run looping VERIFYING -> RUNNING with the executor asked to repair
+# work that was never broken.
+#
+# WHY NOT JUST ADD THE RULE TO `proxy`. Because that label also selects
+# the EXECUTION pod, and the sandbox there shares the pod's network
+# namespace: metadata would let model-authored code mint a Workload
+# Identity token for `agentos-execution`. The note on
+# `verifier-egress-to-store` makes that argument and it is still right.
+# This policy exists so the grant can follow the identity boundary that
+# was already drawn -- the capture Job runs as `agentos-capture`, which
+# is neither the execution nor the verifier identity.
+#
+# IT IS STILL A WIDENING, AND WORTH NAMING. The package LIST being
+# replayed is model-chosen, and a hostile package executes its own code
+# at install time. What that code could then reach is a token for
+# `agentos-capture`, so that account must hold object write on the
+# artifact bucket and nothing else -- it is the whole of the blast
+# radius, and the reason this is a third account rather than a reused
+# one.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: capture-egress
+  namespace: ${NAMESPACE}
+spec:
+  podSelector:
+    matchLabels: {agentos.io/egress: capture}
+  policyTypes: [Egress]
+  egress:
+    # The same full port as `proxy`: this pod runs the tree's own setup
+    # script and a package install.
+    - to:
+        - podSelector:
+            matchLabels: {app: egress-proxy}
+      ports:
+        - {protocol: TCP, port: 3128}
+    # AND THE AUTH PATH, which is the one rule `proxy` does not have.
+    # A link-local address is never proxied, so NO_PROXY naming it is
+    # necessary and not sufficient -- the policy has to admit it too.
+    # That was the half missed after execution 202: the variable was
+    # fixed, the rule was not, and the symptom did not change.
+    - to:
+        - ipBlock:
+            cidr: 169.254.169.254/32
+      ports:
+        - {protocol: TCP, port: 80}
+    - ports:
+        - {protocol: UDP, port: 53}
+        - {protocol: TCP, port: 53}
+---
+# AND THE PROXY ITSELF HAS TO BE ALLOWED OUT.
+#
+# The third leg, and the last one missing. This namespace's egress
+# design has three: the executor may reach the proxy, the proxy may
+# receive it, and the proxy may reach the internet. `default-deny`
+# closes all three and only the FIRST was ever opened.
+#
+# Each missing leg failed differently, which is why neither was
+# obvious. With the proxy unable to RECEIVE, packets were dropped and
+# git waited 133 seconds for a TCP connection -- reading as a proxy
+# that was down. With the proxy unable to LEAVE, squid answered
+# immediately with
+#
+#   CONNECT tunnel failed, response 503
+#
+# -- reading as a blocked host, when in fact squid could not resolve
+# the name or open the socket because nothing let it try.
+#
+# WIDE ON PURPOSE, AND THIS IS THE ONE PLACE THAT SHOULD BE. The
+# control over where an execution may reach is squid's allowlist, which
+# is per-port and specific -- `.github.com`, `.pypi.org`, the model
+# APIs. Restating it as CIDRs here would be a second declaration of the
+# same policy in a form that cannot express a hostname, and the two
+# would disagree the first time a domain moved. The proxy is the one
+# pod in the namespace whose job is to reach the internet; the
+# allowlist is what makes that safe.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: egress-proxy-egress
+  namespace: ${NAMESPACE}
+spec:
+  podSelector:
+    matchLabels: {app: egress-proxy}
+  policyTypes: [Egress]
+  egress:
+    - {}
+---
+# AND THE PROXY HAS TO BE ALLOWED TO RECEIVE IT.
+#
+# `default-deny` selects EVERY pod in this namespace, both directions.
+# The two policies around this one open the executor's and the
+# criterion's EGRESS toward the proxy -- and nothing opened the proxy's
+# INGRESS, so both ends never agreed and every packet was dropped.
+#
+# The symptom is the expensive part: a dropped packet is a timeout, not
+# a refusal, so git reported
+#
+#   Failed to connect to egress-proxy port 3128 after 132886 ms
+#
+# which reads as a proxy that is down. The proxy was up the whole time
+# and answering nothing, because nothing was allowed to arrive.
+#
+# It had never been exercised: the verifier's store fetch has the same
+# shape and no criterion has run on this substrate yet, so both halves
+# of the namespace's only egress route were closed from the day they
+# were written.
+#
+# Two rules rather than one, matching the two ports: an executor may
+# reach the full allowlist on 3128 and a criterion the store alone on
+# 3129, and merging them would let a criterion reach the forge -- which
+# is precisely what F2 splits the ports to prevent.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: egress-proxy-ingress
+  namespace: ${NAMESPACE}
+spec:
+  podSelector:
+    matchLabels: {app: egress-proxy}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels: {agentos.io/egress: proxy}
+      ports:
+        - {protocol: TCP, port: 3128}
+    # THE CAPTURE CLASS USES THE SAME PORT, AND BOTH SIDES HAVE TO SAY
+    # SO. Adding `capture` to the egress side alone would have left the
+    # proxy refusing it here -- and a default-deny drop does not reset,
+    # so `pip install` would HANG rather than fail. That is strictly
+    # worse than the OSError this whole change exists to remove, and it
+    # is the original fault of this module with a new spelling.
+    - from:
+        - podSelector:
+            matchLabels: {agentos.io/egress: capture}
+      ports:
+        - {protocol: TCP, port: 3128}
+    - from:
+        - podSelector:
+            matchLabels: {agentos.io/egress: prepare}
+      ports:
+        - {protocol: TCP, port: 3128}
+    - from:
+        - podSelector:
+            matchLabels: {agentos.io/egress: store}
+      ports:
+        - {protocol: TCP, port: 3129}
+---
+# A criterion's Job. The store port, DNS, and nothing else — so the
+# closest this substrate gets to the Docker driver's `network_mode:
+# none`, which is what a criterion runs with locally.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: verifier-egress-to-store
+  namespace: ${NAMESPACE}
+spec:
+  podSelector:
+    matchLabels: {agentos.io/egress: store}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels: {app: egress-proxy}
+      ports:
+        - {protocol: TCP, port: 3129}
+    # THE METADATA SERVER, WHICH IS THE AUTH PATH AND NOT THE DATA PATH.
+    #
+    # `kernel/artifacts/gcs.py` builds `storage.Client()` with no
+    # arguments on purpose -- Workload Identity -- and that client gets
+    # its token, and the project id, from 169.254.169.254. The proxy
+    # above carries the BYTES to storage.googleapis.com; nothing carried
+    # the credential, because a link-local address is not proxied.
+    #
+    # So every criterion pod failed before it read anything:
+    #
+    #   metadata_exit=28
+    #   OSError: Project was not passed and could not be determined
+    #
+    # -- proven with a pod wearing this label and the verifier's service
+    # account. That is the whole of Kubernetes verification: TREE_MODEL
+    # "fetch" has the criterion's initContainer PULL the committed tree
+    # from the store, and CAPTURE_MODEL "artifact" has a sidecar write
+    # the result back. Both authenticate this way, and neither has ever
+    # run.
+    #
+    # ONLY THIS LABEL, and that is the point of it being a separate
+    # policy. `workload-egress-via-proxy` selects the EXECUTION pod,
+    # whose sandbox shares the pod's network namespace -- granting
+    # metadata there would let model-authored code mint a Workload
+    # Identity token for `agentos-execution`, which is precisely the
+    # "the sandbox holds no credential" property the pod design rests
+    # on. The execution pod does not need it either: `emit_artifact` is
+    # a worker-side tool, so it runs in the CONDUCTOR, which reads the
+    # file out of the pod and writes the store with its own identity.
+    #
+    # The token this buys is the verifier's, and `agentos-verifier`
+    # exists as a third identity for exactly this reason: it holds
+    # `storage.objects.get` and nothing else.
+    - to:
+        - ipBlock:
+            cidr: 169.254.169.254/32
+      ports:
+        - {protocol: TCP, port: 80}
+    - ports:
+        - {protocol: UDP, port: 53}
+        - {protocol: TCP, port: 53}
+---
+# WHO MAY CALL A SHIM THAT RUNS BASH.
+#
+# On Docker the sandbox binds 127.0.0.1 and joins the caller's network
+# namespace, so the reach is the namespace and nothing else can dial it.
+# A pod shares no namespace with the conductor, so the shim binds
+# 0.0.0.0 and that control is gone -- and the namespace has NO ingress
+# policy otherwise, which in Kubernetes means every pod may reach every
+# port of every other. Any workload in agentos-* could have posted
+# /tool to any sandbox and had it run a command.
+#
+# So the control moves here. This is not defence in depth; with the bind
+# widened it is the only thing standing in front of the bridge.
+#
+# THREE PEERS, AND ONLY ONE OF THEM GETS 9100. The conductor drives the
+# sandbox and so has both ports. The control panel's file explorer and
+# (from Phase E1) the verifier get 9101 alone -- the worker's workspace
+# surface -- because 9100 runs arbitrary bash in the container the model
+# drives. Nothing else from anywhere.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: execution-bridge-ingress
+  namespace: ${NAMESPACE}
+spec:
+  podSelector:
+    matchLabels: {app: agentos-execution}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels: {app: conductor}
+      ports:
+        # 9100 the sandbox's bridge, 9101 the worker's workspace
+        # surface. Two listeners because they are two trust levels: the
+        # sandbox holds no credential and the worker holds the git
+        # broker bearer, and putting workspace operations on the
+        # sandbox's port would hand the container the model drives the
+        # one credential this design keeps away from it.
+        - {protocol: TCP, port: 9100}
+        - {protocol: TCP, port: 9101}
+    # THE CONTROL PANEL, WHICH IS NOT A POD. The file explorer reads the
+    # workspace out of the execution's pod, and the panel runs on Cloud
+    # Run -- it reaches the cluster through the `openclaw-connector-us`
+    # VPC connector and matches no podSelector, so the
+    # rule above could never admit it. The explorer was unreachable for
+    # this reason and not any of the ones we looked at first.
+    #
+    # 9101 ONLY, and that is the whole point of there being two ports.
+    # 9100 is the sandbox's bridge -- arbitrary bash and file writes in
+    # the container the model drives. 9101 is the worker's workspace
+    # surface: read, archive, explore. Opening 9100 to a CIDR would let
+    # anything that can reach the connector run commands inside a
+    # sandbox, which is the boundary the whole pod design exists to
+    # hold.
+    - from:
+        - ipBlock:
+            # SUBSTITUTED, not literal. This is the Serverless VPC
+            # connector's range, and terraform lets the deployer pick
+            # it (`connector_cidr`). It was hardcoded to our 10.8.0.0/28
+            # -- which is also the tfvars default, so it worked for
+            # anyone who left it alone and silently blocked the file
+            # explorer for anyone who did not: the policy is
+            # default-deny, so a wrong range is a HANG, not a refusal.
+            cidr: ${CONNECTOR_CIDR}
+      ports:
+        - {protocol: TCP, port: 9101}
+    # AND THE VERIFIER, ON 9101 ALONE. Phase E1 moves adjudication into
+    # a Deployment of its own, and adjudication is the biggest single
+    # CALLER of podfs: `archive` and `digest` fetch the committed tree
+    # out of the execution pod, `heads` is the D1 lane guard, and
+    # `publish` is how work reaches the forge at all — that op exists
+    # because `publish_execution` used to run git in the CONDUCTOR
+    # against a `/workspace` it did not have, so no story could ever be
+    # delivered.
+    #
+    # WITHOUT THIS RULE IT IS A HANG, NOT A REFUSAL. The namespace is
+    # default-deny and a drop does not reset, so a verifier dialling
+    # 9101 unadmitted would sit in `socket.create_connection` holding a
+    # pool thread — which is exactly the shape of THE WEDGE (per-op
+    # timeouts exist because of it) and it would read as a slow
+    # criterion rather than a missing line of YAML.
+    #
+    # 9101 AND NEVER 9100, for the reason the rule above gives: 9100
+    # runs arbitrary bash in the container the model drives, and
+    # verification has no business there. The verifier reads trees and
+    # writes verdicts; feedback to the executor is a mailbox ROW, not a
+    # call into its sandbox.
+    - from:
+        - podSelector:
+            matchLabels: {app: verifier}
+      ports:
+        - {protocol: TCP, port: 9101}
+    # THE PREPARE JOB, streaming the committed tree onto the volume.
+    # 9101 only, never 9100: 9100 is the sandbox's bridge and runs
+    # `bash`, and this Job reads a tree rather than executing anything
+    # in somebody else's pod.
+    #
+    # NOT `app: agentos-verification`. That is the criteria pod, it has
+    # `egress: []` on purpose, and admitting it here would be pointless
+    # as well as wrong -- see plan 5.15a.
+    - from:
+        - podSelector:
+            matchLabels: {app: agentos-verifier}
+      ports:
+        - {protocol: TCP, port: 9101}
+---
+# The conductor needs the database and the Kubernetes API, not the
+# proxy: it makes no outbound calls on a model's behalf.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: conductor-egress
+  namespace: ${NAMESPACE}
+spec:
+  podSelector:
+    matchLabels: {app: conductor}
+  policyTypes: [Egress]
+  egress:
+    - {}
+---
+# The verifier needs the database, the Kubernetes API, the artifact
+# store and the execution pods' podfs port. Same four as the conductor,
+# so the same rule — and stated separately because the two Deployments
+# carry different `app` labels and a policy selects on one of them.
+#
+# NOT `verifier-egress-to-store`, which is three policies up and is a
+# different thing wearing a similar name: that one selects
+# `agentos.io/egress: store`, which is a CRITERION'S JOB — a pod that
+# must reach the object store and nothing else, because a check that can
+# reach the internet can fetch a version of itself that passes. This one
+# selects the verifier DEPLOYMENT, which creates those Jobs and is not
+# one.
+#
+# WIDE, AND MATCHING THE CONDUCTOR ON PURPOSE. Two of the four
+# destinations cannot be written as a stable CIDR here: the Kubernetes
+# API's ClusterIP and Cloud SQL's address are both facts about the
+# cluster rather than about this manifest. Narrowing one of these two
+# policies and not the other would leave the tighter one looking like
+# the reviewed answer and the looser one like an oversight, when they
+# have the same reach for the same reasons — so they move together or
+# not at all.
+#
+# It is not the hole it looks like. This pod runs no model output: it
+# creates Jobs and reads their logs. The classes that DO run model
+# output — the execution pod, the capture Job, the criterion — each have
+# their own policy above, and every one of them is confined to a squid
+# port whose allowlist is the actual control.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: verifier-egress
+  namespace: ${NAMESPACE}
+spec:
+  podSelector:
+    matchLabels: {app: verifier}
+  policyTypes: [Egress]
+  egress:
+    - {}
+---
+# THE VERIFICATION POD: NOTHING OUT, AND ONE THING IN.
+#
+# Phase E7. `kernel/verifier/pod.py` builds a warm, long-lived pod per
+# execution that holds the tree and the `.venv` on a PVC and runs every
+# criterion in one container. This is the policy that makes it safe to
+# run somebody's test suite in.
+#
+# EGRESS IS EMPTY, AND THAT IS THE WHOLE REASON VERIFICATION IS SPLIT
+# ACROSS TWO PODS. F2d: a check that can reach the internet can fetch a
+# version of itself that passes, and can post the tree it was handed
+# somewhere. NetworkPolicy selects PODS and never containers -- plan
+# 5.0 records the four per-container escapes that were researched and
+# closed on Autopilot, seccomp and AppArmor among them -- so an install
+# (which needs a network) and a criterion (which must have none) cannot
+# share a pod. They do not: the networked prepare Job writes the `.venv`
+# onto the volume and exits, and this pod attaches it afterwards.
+#
+# NOT EVEN DNS, deliberately, and it is worth saying why the usual
+# `- ports: [53]` rule is absent. Resolving a name and then being
+# dropped on the connect is the same hang one step later, so the DNS
+# rule would buy nothing and would read as though some egress were
+# intended. Absent, a `curl` in a criterion fails inside the check's own
+# timeout, which is where an unexpected network call belongs.
+#
+# THIS POD ALSO CARRIES NO `agentos.io/egress` LABEL, so it matches
+# none of the four classes above and default-deny already denies it.
+# Stated anyway: a default relied on silently is a default somebody
+# changes, and `egress-proxy-ingress` has already been widened once by
+# somebody adding a class.
+#
+# THE ONE THING IN IS THE VERIFIER DEPLOYMENT, ON THE BRIDGE PORT. The
+# Deployment orchestrates and judges; the pod runs commands
+# (kernel/verifier/shell.py). BOTH SIDES OF THIS ONE CONNECTION AGREE:
+# `verifier-egress` above is `- {}`, so the Deployment may dial out to
+# here, and this rule admits it. The namespace has no other ingress
+# policy, which in Kubernetes means every pod may reach every port of
+# every other -- so without this rule the shim would be open to anything
+# in agentos-*, and the shim runs bash.
+#
+# NOT the conductor and NOT the control panel, which both appear in
+# `execution-bridge-ingress`. Neither has business in here: the file
+# explorer reads the EXECUTOR's workspace, and the conductor does not
+# adjudicate after E12.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: verification-pod-isolated
+  namespace: ${NAMESPACE}
+spec:
+  podSelector:
+    matchLabels: {app: agentos-verification}
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels: {app: verifier}
+      ports:
+        # 9100, the shim's own default -- `kernel/verifier/pod.py`
+        # names it once and the manifest, the probe and the client all
+        # read it from there. The same NUMBER as the execution pod's
+        # sandbox and a different POD, which is what keeps the two
+        # apart; `execution-bridge-ingress` selects `app:
+        # agentos-execution` and never matches this one.
+        - {protocol: TCP, port: 9100}
+  egress: []
+---
+# ── WHAT A NODE UPGRADE MAY TAKE AT ONCE ────────────────────────────────
+#
+# THE PROBLEM THE ANTI-AFFINITY ABOVE DOES NOT SOLVE. Spreading the
+# replicas decides WHERE they run. It says nothing about EVICTION, and
+# eviction is not hypothetical here: the platform pool is created with
+# `--enable-autoupgrade` (scripts/infra/gke_standard_pools.sh), so GKE
+# drains and replaces these two machines on its own schedule, unattended
+# and usually at night.
+#
+# A drain evicts pods without asking how many of a Deployment are still
+# serving. With two nodes and no budget, the sequence that kills the
+# control plane is ordinary: node A is drained, conductor-1 goes
+# Terminating, node B is drained before conductor-1 has come back
+# somewhere, and for a few minutes nothing dispatches a leg or reaps
+# what one left behind. Everything recovers on its own, which is exactly
+# why nobody would ever find the cause.
+#
+# A PodDisruptionBudget is the one thing that makes a drain WAIT. The
+# eviction API honours it, so `kubectl drain` and the upgrade that runs
+# it block until evicting the next pod would breach the budget.
+#
+# IT DOES NOT COVER THE NODE SIMPLY DYING. A PDB constrains VOLUNTARY
+# disruption -- upgrades, drains, the autoscaler compacting. Hardware
+# loss is involuntary and takes what it takes; that is what the second
+# replica and the anti-affinity are for. The two mechanisms cover the
+# two halves and neither covers both.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: conductor
+  namespace: ${NAMESPACE}
+spec:
+  # ONE OF TWO, which for a two-replica Deployment is the only useful
+  # number. `minAvailable: 2` would forbid every voluntary eviction and
+  # so block the upgrade entirely -- a cluster that cannot be patched,
+  # which is a worse outcome than the one being prevented.
+  minAvailable: 1
+  selector:
+    matchLabels: {app: conductor}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: egress-proxy
+  namespace: ${NAMESPACE}
+spec:
+  # Every outbound call a story makes goes through this. Losing all of
+  # it at once is every running leg failing on its next fetch, and
+  # failing in a way that reads as the internet being broken.
+  minAvailable: 1
+  selector:
+    matchLabels: {app: egress-proxy}
+# ── AND DELIBERATELY NONE FOR THE VERIFIER ──────────────────────────────
+#
+# It runs a single replica, and `minAvailable: 1` over one replica is
+# the classic footgun: the budget can never be satisfied while the pod
+# is being moved, so every drain of the node holding it blocks FOREVER.
+# The node upgrade stalls, and the symptom is a cluster that has been
+# "upgrading" for a week.
+#
+# What it would protect is small in any case. The verifier Deployment
+# dispatches verification Jobs; it is not the Jobs, which are separate
+# pods that keep running while it restarts. And verification is off by
+# default (`platform_settings`), so on most deployments this pod is
+# idle. A few minutes of absence during a node replacement costs a short
+# delay in picking work up again, which is the correct thing to trade
+# for a cluster that can be patched.

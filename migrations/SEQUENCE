@@ -4,7 +4,7 @@
 #   0001_baseline_schema  — full schema (structure only), squashed from the
 #                           internal migration history.
 #   0002_baseline_seed    — the platform ship-set: templates (GO, assistant,
-#                           IAs, RA/security councils, platform agents), their
+#                           RA/security councils, platform agents), their
 #                           prompt files, active skills, tools, tool profiles,
 #                           and all linkages. No user data / secrets.
 #
@@ -14,3 +14,10 @@
 #   • Each name maps to <name>.sql (or <name>.py) in this directory.
 0001_baseline_schema
 0002_baseline_seed
+0003_kernel_roles_and_grants
+0004_execution_pod_login
+0005_kernel_role_grants
+0006_platform_settings_defaults
+0007_model_windows_tags_and_defaults
+0008_goal_leg_budget
+0009_retire_legacy_templates

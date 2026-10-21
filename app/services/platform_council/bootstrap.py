@@ -264,11 +264,11 @@ def _tool_specs(base: str) -> list[dict]:
         #    in-scope integration stories). ─────────────────────────────────────
         {"name": "apply_model_change", "label": "Change a template's model",
          "description": "Change an agent template's model (template-only; future instances). "
-                        "template_id is 'go' (GO) or 'default-shca' (SHCA). model must be a "
+                        "template_id is 'go-v2' (GO) or 'kernel-assistant' (assistant). model must be a "
                         "supported model id.",
          "url": f"{P}/apply/model_change", "method": "POST",
          "body": {"template_id": "{{template_id}}", "model": "{{model}}"},
-         "schema": schema({"template_id": "go | default-shca | <template id>",
+         "schema": schema({"template_id": "go-v2 | kernel-assistant | <template id>",
                            "model": "supported model id"}, ["template_id", "model"])},
         {"name": "apply_add_skill", "label": "Add a skill",
          "description": "Add a reusable skill (prompt fragment). applicable_to is a JSON array "

@@ -1,14 +1,16 @@
-"""Lightweight Gemini API client for summarization tasks."""
+"""Utility-LLM client for summarization tasks.
+
+Despite the filename (kept for import-site stability), this no longer
+calls Gemini directly — it delegates to `app/services/utility_llm.py`,
+which resolves whichever provider/model each purpose is configured for
+(Registry-managed wire id, e.g. `google/gemini-2.5-flash` or
+`anthropic/claude-sonnet-4-5`) and dispatches to the matching SDK.
+"""
 import logging
 
-from google import genai
-from google.genai import types
-
-from app.config import get_settings
+from app.services.utility_llm import UtilityLLMError, generate_utility_text
 
 _log = logging.getLogger(__name__)
-
-_SUMMARY_MODEL = "gemini-2.5-flash"
 
 _SUMMARY_PROMPT = """You are summarizing a conversation between a human and an AI project manager agent.
 The agent is about to resume this conversation after a break and needs context.
@@ -29,7 +31,8 @@ CONVERSATION:
 
 
 async def summarize_conversation(messages: list[dict]) -> str:
-    """Call Gemini to summarize a conversation for agent context.
+    """Call the configured utility model to summarize a conversation for
+    agent context.
 
     Args:
         messages: List of dicts with keys: role, content, created_at
@@ -37,12 +40,6 @@ async def summarize_conversation(messages: list[dict]) -> str:
     Returns:
         Summary string (max ~1500 chars)
     """
-    settings = get_settings()
-    if not settings.gemini_api_key:
-        _log.warning("GEMINI_API_KEY not configured — skipping summarization")
-        return ""
-
-    # Format messages for the prompt
     conversation_lines = []
     for msg in messages:
         role = msg.get("role", "unknown")
@@ -58,16 +55,11 @@ async def summarize_conversation(messages: list[dict]) -> str:
     prompt = _SUMMARY_PROMPT.format(conversation=conversation_text)
 
     try:
-        client = genai.Client(api_key=settings.gemini_api_key)
-        response = await client.aio.models.generate_content(
-            model=_SUMMARY_MODEL,
-            contents=prompt,
-        )
-        summary = response.text.strip()
+        summary = await generate_utility_text("conversation_summary", prompt)
         _log.info("Generated conversation summary (%d chars)", len(summary))
         return summary
-    except Exception as exc:
-        _log.warning("Gemini summarization failed: %s", exc)
+    except UtilityLLMError as exc:
+        _log.warning("Conversation summarization failed: %s", exc)
         return ""
 
 
@@ -78,20 +70,11 @@ async def reconcile_goal_summary(system_prompt: str, user_prompt: str) -> str:
     snapshot) and passes the system_prompt separately. Returns the updated
     summary text, or "" on failure (caller leaves the prior summary intact).
     """
-    settings = get_settings()
-    if not settings.gemini_api_key:
-        _log.warning("GEMINI_API_KEY not configured — skipping goal summary")
-        return ""
-
     try:
-        client = genai.Client(api_key=settings.gemini_api_key)
-        response = await client.aio.models.generate_content(
-            model=_SUMMARY_MODEL,
-            contents=user_prompt,
-            config=types.GenerateContentConfig(system_instruction=system_prompt),
+        return await generate_utility_text(
+            "goal_summary_reconcile", user_prompt, system_instruction=system_prompt,
         )
-        return (response.text or "").strip()
-    except Exception as exc:
+    except UtilityLLMError as exc:
         _log.warning("Goal summary reconciliation failed: %s", exc)
         return ""
 
@@ -125,10 +108,6 @@ async def generate_thread_title(
     Returns:
         Title string (max ~10 words), or empty string on failure.
     """
-    settings = get_settings()
-    if not settings.gemini_api_key:
-        return ""
-
     conversation_lines = []
     for msg in messages:
         role = msg.get("role", "unknown")
@@ -147,18 +126,14 @@ async def generate_thread_title(
     )
 
     try:
-        client = genai.Client(api_key=settings.gemini_api_key)
-        response = await client.aio.models.generate_content(
-            model=_SUMMARY_MODEL,
-            contents=prompt,
-        )
-        title = response.text.strip().strip('"').strip("'")
+        title = await generate_utility_text("thread_title", prompt)
+        title = title.strip('"').strip("'")
         # Enforce max 10 words
         words = title.split()
         if len(words) > 10:
             title = " ".join(words[:10])
         _log.info("Generated thread title: %s", title)
         return title
-    except Exception as exc:
+    except UtilityLLMError as exc:
         _log.warning("Thread title generation failed: %s", exc)
         return ""

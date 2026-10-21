@@ -1,0 +1,46 @@
+{# I5f — GO asks to run an errand unattended, and somebody says yes.
+
+   THE ONLY CARD THIS THREAD RENDERS. Every other message here is
+   markdown and stays that way. This one needs buttons because a person
+   cannot approve prose — and the goal thread is where the ask belongs:
+   there is no story yet and no owner, the rule is "any human in the goal
+   may approve", and posting into one person's assistant would silently
+   pick one.
+
+   Contract: `msg.proposal` is the card_data dict (see `_proposal_of`),
+   already filtered to card_type == 'errand_proposal'.
+
+   THE DECIDED STAMP MATTERS. Without it the buttons come back on every
+   reload for a proposal already settled, and the second click gets a 409
+   that reads as a broken page. Same stamp the park cards use. #}
+{% set p = msg.proposal %}
+<div class="mt-2 rounded-lg border border-amber-500/40 bg-amber-500/5 p-3"
+     data-proposal="{{ p.proposal_id }}">
+  <div class="text-xs font-semibold text-amber-300 mb-2">
+    🤖 {{ p.title or 'An errand that would run without you' }}
+  </div>
+  {% if p.decided %}
+    <div class="text-xs text-slate-400 italic">
+      {% if p.decided == 'approve' %}✓ Approved — you own its runs
+      {% else %}✕ Declined{% endif %}
+    </div>
+  {% else %}
+    <div class="flex flex-wrap gap-2 items-center"
+         id="proposal-actions-{{ p.proposal_id }}">
+      <button type="button"
+              class="px-2 py-1 rounded text-xs font-medium bg-emerald-600 hover:bg-emerald-500 text-white"
+              onclick="decideProposal({{ p.proposal_id }}, 'approve')">
+        ✓ Approve — I'll own these runs
+      </button>
+      <button type="button"
+              class="px-2 py-1 rounded text-xs font-medium bg-rose-700 hover:bg-rose-600 text-white"
+              onclick="decideProposal({{ p.proposal_id }}, 'decline')">
+        ✕ Decline
+      </button>
+      {# A decline with no reason gets re-proposed next week. #}
+      <input type="text" id="proposal-note-{{ p.proposal_id }}"
+             class="flex-1 min-w-[12rem] px-2 py-1 rounded text-xs bg-slate-800 border border-slate-700 text-slate-200"
+             placeholder="Why not? (required to decline)">
+    </div>
+  {% endif %}
+</div>

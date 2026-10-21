@@ -43,6 +43,56 @@
     </div>
   </div>
 
+  <!-- ── Verification toggle ───────────────────────────────────────────── -->
+  {# Platform-wide and OFF BY DEFAULT. With it off, a story or errand that
+     proposes completion is measured against its own plan's checks, published,
+     and parked for a person to accept or ask for more; no verification pod or
+     Job is created. VERIFYING stays a state with nothing entering it, so a run
+     already in flight when this moves drains rather than stranding. #}
+  <div class="card p-4 mb-6 flex items-center gap-4">
+    <div>
+      <h2 class="text-base font-semibold text-gray-100 flex items-center gap-1.5">Verification
+        {{ info_popover(
+          "Platform-wide, and off by default. Off: a completed story or errand is measured against the checks in its own approved plan, its work is pushed, and a person is asked whether it is done or needs more. On: the claim is additionally re-run from scratch in a clean verification pod that has the committed tree and none of the agent's session. Turning it on costs a pod and a disk per story; turning it off changes nothing about work already in flight. Platform-admin only, and every change is recorded in the audit ledger."
+        ) }}
+      </h2>
+      <p class="text-2xs text-gray-500 mt-0.5">
+        {% if verification_unknown %}
+          The switch could not be read, so verification is treated as off.
+        {% elif verification_on %}
+          Completion claims are re-run in a clean verification pod before a person is asked.
+        {% else %}
+          Completion claims are measured against the plan's own checks, then a person decides.
+        {% endif %}
+        {% if verification_by %}
+          <span class="text-gray-600">Last changed by {{ verification_by }}{% if verification_at %} on {{ verification_at.strftime('%Y-%m-%d %H:%M UTC') }}{% endif %}.</span>
+        {% endif %}
+      </p>
+    </div>
+    <div class="ml-auto flex items-center gap-2">
+      {% if verification_on %}
+        <span class="flex items-center gap-1.5 text-sm text-sky-400">
+          <span class="w-1.5 h-1.5 rounded-full bg-sky-400 flex-shrink-0"></span>
+          Verification on
+        </span>
+        {% if can_edit %}
+        <button onclick="verificationOff()" class="px-4 py-2 rounded bg-gray-700 hover:bg-gray-600 font-bold text-sm">Turn off</button>
+        {% endif %}
+      {% else %}
+        <span class="flex items-center gap-1.5 text-sm text-gray-400">
+          <span class="w-1.5 h-1.5 rounded-full bg-gray-600 flex-shrink-0"></span>
+          Verification off
+        </span>
+        {% if can_edit %}
+        <button onclick="verificationOn()" class="px-4 py-2 rounded bg-sky-700 hover:bg-sky-600 font-bold text-sm">Turn on</button>
+        {% endif %}
+      {% endif %}
+      {% if not can_edit %}
+        <span class="text-2xs text-gray-500 ml-1">(admin-only to change)</span>
+      {% endif %}
+    </div>
+  </div>
+
   <!-- ── Goals list ────────────────────────────────────────────────────── -->
   <div class="mb-5">
     <h2 class="text-base font-semibold text-gray-100 mb-3">All Goals</h2>
@@ -169,6 +219,45 @@
     {% endif %}
   </div>
 
+  <!-- ── Errand check-in interval ──────────────────────────────────────── -->
+  {# How often the GO is woken to ASK a running autonomous errand how its plan
+     is going. Event wakes (a park, a failure, a job gone quiet) are not on this
+     clock and fire within a minute regardless -- this is only the "nothing has
+     happened, go and look" cadence, and it is the one number an operator wants
+     to shorten while watching the feature work. #}
+  <div class="card p-4 mb-6 flex items-center gap-4">
+    <div>
+      <h2 class="text-base font-semibold text-gray-100 flex items-center gap-1.5">Errand check-in
+        {{ info_popover(
+          "How often the Goal Orchestrator is woken to ask a RUNNING autonomous errand how its plan is going. It asks, it does not steer. This clock covers only the quiet case: a park, a failed leg or a job that has gone silent wakes the GO within a minute whatever this is set to. Each check-in costs one GO turn per running errand, so fifteen minutes is four turns an hour each. The floor is the sweep interval, because a shorter setting would promise a cadence nothing delivers."
+        ) }}
+      </h2>
+      <p class="text-2xs text-gray-500 mt-0.5">
+        {% if checkin_unknown %}
+          The interval could not be read, so the default is in force.
+        {% else %}
+          A running autonomous errand is asked for progress every
+          {{ (checkin_seconds // 60) if checkin_seconds >= 60 else 1 }}
+          minute{{ '' if checkin_seconds < 120 else 's' }}.
+        {% endif %}
+        Event wakes are not on this clock.
+      </p>
+    </div>
+    <div class="ml-auto flex items-center gap-2">
+      {% if can_edit %}
+        <input id="checkin-seconds" type="number" inputmode="numeric"
+               min="{{ checkin_min }}" max="{{ checkin_max }}" step="30"
+               value="{{ checkin_seconds }}"
+               class="w-28 px-2 py-2 rounded bg-gray-900 border border-gray-700 text-sm text-gray-100 text-right">
+        <span class="text-2xs text-gray-500">seconds</span>
+        <button onclick="setCheckin()" class="px-4 py-2 rounded bg-sky-700 hover:bg-sky-600 font-bold text-sm">Save</button>
+      {% else %}
+        <span class="text-sm text-gray-400">{{ checkin_seconds }}s</span>
+        <span class="text-2xs text-gray-500 ml-1">(admin-only to change)</span>
+      {% endif %}
+    </div>
+  </div>
+
   <!-- ── Active agents + halted tasks (read-only operational view) ─────── -->
   {# Agent-level action buttons (Stop / Force-kill / Resume) are preserved in
      the backend router (admin_controls.py) but are not shown in the UI for now.
@@ -186,6 +275,42 @@
 <script>
 // systemPause()/systemResume() are defined globally in base.html (shared
 // confirmAction() modal: same type-to-confirm tier as goal pause/resume).
+
+// The switch only ever takes effect on the NEXT completion claim, which is
+// why neither direction asks for a type-to-confirm phrase: nothing in flight
+// changes course. Turning it ON does spend a pod and a disk per story, so
+// that direction asks for a reason; the ledger records both transitions.
+async function verificationOn() {
+  const result = await window.confirmAction({
+    title: 'Turn verification on',
+    body: 'From the next completion claim onward, every story re-runs its checks in a clean verification pod before a person is asked. That is one extra pod and one disk per story. Runs already in flight are unaffected.',
+    reason: true,
+  });
+  if (!result) return;
+  await _controlPost('/settings/controls/verification',
+                     {enabled: true, reason: result.reason});
+}
+async function verificationOff() {
+  const result = await window.confirmAction({
+    title: 'Turn verification off',
+    body: 'From the next completion claim onward, a story is measured against the checks in its own approved plan, its work is pushed, and a person is asked whether it is done. No verification pod is created. Any run already verifying finishes as it is.',
+    reason: true,
+  });
+  if (!result) return;
+  await _controlPost('/settings/controls/verification',
+                     {enabled: false, reason: result.reason});
+}
+
+// The interval only governs the QUIET check-in; event wakes are unaffected,
+// which is why this asks for no confirmation. Out-of-range values are clamped
+// server-side and the reload shows what actually landed.
+async function setCheckin() {
+  const el = document.getElementById('checkin-seconds');
+  const seconds = parseInt(el.value, 10);
+  if (!Number.isFinite(seconds)) { el.focus(); return; }
+  await _controlPost('/settings/controls/errand-checkin',
+                     {seconds: seconds, reason: 'operator set check-in interval'});
+}
 
 function applyFilter(key, value) {
   const url = new URL(window.location.href);

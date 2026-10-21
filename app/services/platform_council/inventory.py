@@ -26,10 +26,13 @@ from __future__ import annotations
 
 import re
 
-from app.llm_models import SUPPORTED_MODELS, context_window_for, label_for
+from app.llm_models import context_window_for, label_for
+from app.services.model_registry.management import get_base_model_v2, list_base_models_v2
 
-GO_TEMPLATE_ID = "go"
-SHCA_TEMPLATE_ID = "default-shca"
+# The templates GO and every assistant are created from today. `go` and
+# `default-shca` were retired; profiling them described agents nobody runs.
+GO_TEMPLATE_ID = "go-v2"
+SHCA_TEMPLATE_ID = "kernel-assistant"
 
 # Provider families OpenClaw can run TODAY (the supportability gate). Synthetic
 # context-window providers (google-flash-1m, anthropic-sonnet-200k, …) are
@@ -90,7 +93,15 @@ def _price_for(model_id: str, pricing: dict) -> str:
 async def build_model_catalog_md(pool) -> str:
     """The model fact sheet for Model Research: supported families (the
     supportability gate), every available model with context window + real
-    pricing, and the synthetic context variants."""
+    pricing, and the synthetic context variants.
+
+    Reads the live Model Registry (`models` table, family B) instead of
+    the hardcoded `SUPPORTED_MODELS` list — a model added through the
+    admin UI now shows up here too. `tier == 'test'` is still the
+    real-vs-synthetic split: `add_context_window_v2` stamps every
+    materialized context-window variant with `tier='test'`, matching the
+    convention the original hardcoded list used.
+    """
     pricing = await _latest_pricing(pool)
     out: list[str] = ["# Model Catalog"]
     out.append(
@@ -108,15 +119,16 @@ async def build_model_catalog_md(pool) -> str:
         "out-of-family option is useful signal, not noise."
     )
 
-    real = [m for m in SUPPORTED_MODELS if m.get("tier") != "test"]
-    synthetic = [m for m in SUPPORTED_MODELS if m.get("tier") == "test"]
+    models = await list_base_models_v2(pool, include_disabled=False)
+    real = [m for m in models if m.get("tier") != "test"]
+    synthetic = [m for m in models if m.get("tier") == "test"]
 
     out.append("\n## Available models (real upstreams)")
     out.append("| model id | label | family | context | pricing |")
     out.append("|---|---|---|---|---|")
     for m in real:
-        fam = _family_of(m.get("provider", ""))
-        ctx = context_window_for(m["id"])
+        fam = _family_of(m.get("provider_id", ""))
+        ctx = m["context_window"]
         out.append(
             f"| `{m['id']}` | {m.get('label','')} | {fam} | "
             f"{ctx:,} | {_price_for(m['id'], pricing)} |"
@@ -130,7 +142,7 @@ async def build_model_catalog_md(pool) -> str:
             "an agent with more/less context. Not separate models."
         )
         for m in synthetic:
-            out.append(f"- `{m['id']}` (ctx {context_window_for(m['id']):,})")
+            out.append(f"- `{m['id']}` (ctx {m['context_window']:,})")
     out.append("")
     return "\n".join(out)
 
@@ -159,9 +171,20 @@ async def _template_profile_md(pool, template_id: str, role_label: str) -> str:
         f"\nThis is the **{role_label} ONLY**. Recommend the best model for THIS "
         f"role's workload — do not generalize across roles.\n"
     )
+    # Prefer the live Model Registry; `label_for`/`context_window_for`
+    # (the old SUPPORTED_MODELS-backed helpers) are a fallback only, for
+    # a `templates.model` value that predates the registry or was never
+    # registered — this is a research fact sheet, not an enforcement
+    # path, so degrade gracefully rather than raise.
+    registry_row = await get_base_model_v2(pool, tmpl["model"])
+    model_label = registry_row["label"] if registry_row else label_for(tmpl["model"])
+    model_ctx = (
+        registry_row["context_window"] if registry_row
+        else context_window_for(tmpl["model"])
+    )
     out.append(f"- **template id:** `{tmpl['id']}`")
-    out.append(f"- **current model:** `{tmpl['model']}` ({label_for(tmpl['model'])})")
-    out.append(f"- **current context window:** {context_window_for(tmpl['model']):,} tokens")
+    out.append(f"- **current model:** `{tmpl['model']}` ({model_label})")
+    out.append(f"- **current context window:** {model_ctx:,} tokens")
     out.append(f"- **tools granted:** {', '.join(allow) if allow else '(none)'}")
     out.append(
         "\n**Workload profile:** infer from the prompt + tools below — is this role "

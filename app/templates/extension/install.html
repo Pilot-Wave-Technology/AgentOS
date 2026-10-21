@@ -1,0 +1,93 @@
+{% extends "base.html" %}
+{% block title %}VS Code Extension{% endblock %}
+{% block content %}
+<div class="p-8 max-w-3xl mx-auto">
+  <div class="flex items-center gap-3 mb-1">
+    <h1 class="text-2xl font-bold">AgentOS — VS Code Extension</h1>
+    {% if version %}
+    <span class="text-xs font-medium px-2 py-0.5 rounded-full bg-brand/15 text-brand-light">v{{ version }}</span>
+    {% endif %}
+  </div>
+  <p class="text-sm text-gray-500 mb-8">
+    Work your assigned coding stories locally in VS Code — the control plane stays the
+    system of record. Anyone on the team can install it from here.
+  </p>
+
+  <!-- Download -->
+  <section class="cp-card !block mb-6 p-6">
+    <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
+      <div>
+        <div class="cp-card-title text-base">Download the extension</div>
+        <div class="cp-card-desc">
+          {% if version %}Latest release: v{{ version }}.{% else %}
+          No release published yet — check back once your admin uploads it.{% endif %}
+          A <code>.vsix</code> file you install in VS Code.
+        </div>
+      </div>
+      <a href="/extension/download"
+         class="inline-flex items-center justify-center gap-2 px-4 py-2 rounded-md bg-brand hover:bg-brand-light text-white text-sm font-medium whitespace-nowrap transition-colors">
+        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5"
+                d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5M16.5 12L12 16.5m0 0L7.5 12m4.5 4.5V3"/>
+        </svg>
+        Download .vsix
+      </a>
+    </div>
+  </section>
+
+  <!-- Your control plane URL -->
+  <section class="mb-8">
+    <h2 class="text-xs font-semibold uppercase tracking-wider text-gray-600 mb-2">Your control plane URL</h2>
+    <p class="text-sm text-gray-500 mb-2">
+      Paste this into the extension when it asks (it matches this deployment automatically).
+    </p>
+    <div class="flex items-center gap-2">
+      <code id="cp-url" class="flex-1 px-3 py-2 rounded-md bg-surface-hover border border-border text-sm break-all">{{ control_plane_url }}</code>
+      <button onclick="copyCpUrl()" data-tooltip-title="Copy"
+              class="px-3 py-2 rounded-md border border-border hover:bg-surface-hover text-sm whitespace-nowrap transition-colors">Copy</button>
+    </div>
+  </section>
+
+  <!-- Steps -->
+  <section class="mb-8">
+    <h2 class="text-xs font-semibold uppercase tracking-wider text-gray-600 mb-3">Install steps</h2>
+    <ol class="space-y-3 text-sm text-gray-300 list-decimal ml-5">
+      <li>
+        Install the coding CLI —
+        <a href="https://docs.claude.com/en/docs/claude-code/setup" target="_blank" rel="noopener"
+           class="text-brand-light hover:underline">Claude Code</a>
+        (recommended) or
+        <a href="https://developers.openai.com/codex/cli" target="_blank" rel="noopener"
+           class="text-brand-light hover:underline">Codex</a> — and make sure it's on your <code>PATH</code>.
+      </li>
+      <li>Click <strong>Download .vsix</strong> above.</li>
+      <li>
+        In VS Code: <strong>Extensions</strong> view → <code>⋯</code> menu →
+        <strong>Install from VSIX…</strong> → pick the file → <strong>Reload Window</strong>.
+      </li>
+      <li>
+        The <strong>Get started</strong> walkthrough opens: set the control plane URL to the value
+        above, sign in, and confirm the CLI. Your stories then appear in the sidebar.
+      </li>
+      <li>
+        <strong>Updates</strong> are automatic — the extension checks this deployment daily and
+        prompts you to download &amp; reinstall the newer <code>.vsix</code>.
+      </li>
+    </ol>
+  </section>
+</div>
+
+<script>
+function copyCpUrl() {
+  const el = document.getElementById('cp-url');
+  const text = el ? el.textContent.trim() : '';
+  if (!text) return;
+  navigator.clipboard.writeText(text).then(function () {
+    const btn = event.target;
+    const prev = btn.textContent;
+    btn.textContent = 'Copied';
+    setTimeout(function () { btn.textContent = prev; }, 1500);
+  }).catch(function () {});
+}
+</script>
+{% endblock %}

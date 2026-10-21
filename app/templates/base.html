@@ -4,6 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>{% block title %}Agent OS{% endblock %}</title>
+  <link rel="icon" type="image/svg+xml" href="/static/favicon.svg" />
   <!-- Theme + scale: runs before stylesheets load to prevent FOUC -->
   <script>
   (function() {
@@ -70,13 +71,25 @@
 <div class="flex h-full">
 
   <!-- ── Sidebar ──────────────────────────────────────────────────────── -->
+  {# `relative` so the resize handle can sit against this element's own
+     trailing edge. `overflow-hidden` STAYS -- it is what clips the
+     labels during the collapse animation -- so the handle sits just
+     INSIDE the edge rather than straddling it, or it would be clipped
+     away entirely. #}
   <nav id="sidebar"
-    class="sidebar-expanded flex-shrink-0 bg-surface border-r border-border flex flex-col transition-all duration-200 ease-in-out overflow-hidden z-30">
+    class="sidebar-expanded relative flex-shrink-0 bg-surface border-r border-border flex flex-col transition-all duration-200 ease-in-out overflow-hidden z-30">
+
+    {# DRAG TO WIDEN. 240px truncated long goal names, and thread rows
+       now carry six-word story titles, so the default cuts more than it
+       used to. Width persists per browser in localStorage; the collapse
+       toggle ignores it and expanding restores it. #}
+    <div id="sidebar-resizer" role="separator" aria-orientation="vertical"
+         aria-label="Resize sidebar" title="Drag to resize"></div>
 
     <!-- Header: Logo + Toggle -->
     <div id="sidebar-header" class="flex items-center justify-between px-4 h-14 flex-shrink-0">
       <a href="/goals" class="flex items-center gap-2.5 sidebar-label">
-        <span class="text-brand text-lg font-bold">⬡</span>
+        <img src="/static/favicon.svg" alt="" class="w-5 h-5 flex-shrink-0" />
         <span class="font-semibold text-sm tracking-wide text-gray-100">Agent OS</span>
       </a>
       <button onclick="toggleSidebar()" class="p-1.5 rounded-md hover:bg-surface-hover transition-colors" title="Toggle sidebar">
@@ -176,6 +189,13 @@
         <span class="sidebar-label">Dashboard</span>
       </a>
       {% endif %}
+      <a href="/kernel/executions" data-tooltip-title="Executions"
+         class="sidebar-item {% if request.url.path == '/kernel/executions' %}sidebar-item-active{% endif %}">
+        <svg class="w-4 h-4 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M5.25 5.653c0-.856.917-1.398 1.667-.986l11.54 6.348a1.125 1.125 0 010 1.971l-11.54 6.347a1.125 1.125 0 01-1.667-.985V5.653z"/>
+        </svg>
+        <span class="sidebar-label">Executions</span>
+      </a>
       <a href="/settings" id="sidebar-settings-link" data-tooltip-title="Settings"
          class="sidebar-item {% if request.url.path == '/settings' or request.url.path.startswith('/settings/') %}sidebar-item-active{% endif %}">
         <svg class="w-4 h-4 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -183,6 +203,13 @@
           <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/>
         </svg>
         <span class="sidebar-label">Settings</span>
+      </a>
+      <a href="/extension" id="sidebar-extension-link" data-tooltip-title="VS Code Extension"
+         class="sidebar-item {% if request.url.path == '/extension' %}sidebar-item-active{% endif %}">
+        <svg class="w-4 h-4 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5M16.5 12L12 16.5m0 0L7.5 12m4.5 4.5V3"/>
+        </svg>
+        <span class="sidebar-label">VS Code Extension</span>
       </a>
     </div>
 
@@ -514,6 +541,39 @@ function toggleGoChildren(gid) {
   if (arrow) arrow.classList.toggle('rotate-90');
 }
 
+// ── Assistant story threads expand/collapse ──
+// One row per story or errand the assistant is running, under the assistant
+// channel. Same convention as toggleGoChildren above; the collapsed state is
+// remembered per goal so a person who keeps it shut does not have to shut it
+// again on every navigation (the sidebar re-renders on each page load).
+function toggleAssistantThreads(gid) {
+  const children = document.getElementById('shca-threads-' + gid);
+  const arrow = document.getElementById('arrow-shca-' + gid);
+  if (!children) return;
+  const nowHidden = !children.classList.contains('hidden');
+  children.classList.toggle('hidden');
+  if (arrow) arrow.classList.toggle('rotate-90');
+  try {
+    localStorage.setItem('shcaThreads:' + gid, nowHidden ? 'closed' : 'open');
+  } catch (e) { /* private mode — the default open state is fine */ }
+}
+// Re-apply the remembered state after the sidebar HTML lands.
+function restoreAssistantThreadState() {
+  document.querySelectorAll('[id^="shca-threads-"]').forEach(function (el) {
+    const gid = el.id.slice('shca-threads-'.length);
+    let pref = null;
+    try { pref = localStorage.getItem('shcaThreads:' + gid); } catch (e) { return; }
+    // Never collapse a list containing the thread being looked at — the row
+    // showing where you are is the one that must not be hidden.
+    if (pref !== 'closed' || el.querySelector('.shca-thread-current')) return;
+    el.classList.add('hidden');
+    const arrow = document.getElementById('arrow-shca-' + gid);
+    if (arrow) arrow.classList.remove('rotate-90');
+  });
+}
+document.addEventListener('htmx:afterSwap', restoreAssistantThreadState);
+document.addEventListener('DOMContentLoaded', restoreAssistantThreadState);
+
 // ── Kill switch: system + goal pause/resume (app-wide, used by banner +
 //    goal detail button). Defined globally so any page can call them. ──
 async function _controlPost(url, body) {
@@ -786,6 +846,14 @@ async function goalDelete(pid) {
   };
   if (!firebase.apps.length) firebase.initializeApp(fbConfig);
   const auth = firebase.auth();
+  {% if request.state.firebase_auth_emulator_host %}
+  // LOCAL_SERVER on — route auth to the local Firebase Auth Emulator.
+  auth.useEmulator("http://{{ request.state.firebase_auth_emulator_host }}");
+  // The Firebase SDK auto-injects a fixed "Running in emulator mode..." banner
+  // with no public API to disable it; hide it via its documented class name.
+  document.head.insertAdjacentHTML('beforeend',
+    '<style>.firebase-emulator-warning{display:none!important}</style>');
+  {% endif %}
 
   async function refreshToken() {
     try {

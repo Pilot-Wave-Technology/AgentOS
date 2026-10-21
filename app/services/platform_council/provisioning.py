@@ -14,6 +14,7 @@ import asyncio
 import logging
 import uuid
 
+from app import local_dev
 from app.database import get_pool
 from app.openclaw import gateway_admin, GatewayError
 from app.ledger.journal import append_event
@@ -161,9 +162,10 @@ async def create_platform_steward_for_goal(
     Returns {"agent_id", "gateway_agent_id", "workspace"}.
     """
     from app.llm_models import is_supported, label_for
+    from app.services.model_registry.dropdowns import is_model_registered_v2
 
     gw_agent_id = STEWARD_AGENT_ID                       # short fixed id (one per env)
-    workspace_path = f"~/.openclaw/workspace-{gw_agent_id}"
+    workspace_path = local_dev.agent_workspace_path(gw_agent_id)
     display_name = "Platform Steward"
 
     pool = get_pool()
@@ -184,7 +186,8 @@ async def create_platform_steward_for_goal(
     if tmpl is None:
         raise RuntimeError(
             f"Templates row {STEWARD_TEMPLATE_ID!r} missing — run platform_v2_steward.sql first")
-    if not model or not is_supported(model):
+    if not model or (not is_supported(model)
+                     and not await is_model_registered_v2(pool, model)):
         model = tmpl["model"]
     model_label = label_for(model)
     tools_allow = list(tmpl["tools_allow"])
@@ -364,7 +367,7 @@ async def create_platform_shca_for_goal(goal_id: str = PLATFORM_GOAL_ID,
     once-per-build recreate."""
     from app.llm_models import label_for
     gw_agent_id = PLATFORM_SHCA_AGENT_ID
-    workspace_path = f"~/.openclaw/workspace-{gw_agent_id}"
+    workspace_path = local_dev.agent_workspace_path(gw_agent_id)
     display_name = "Platform Integration Assistant"
     pool = get_pool()
 

@@ -21,6 +21,7 @@ from typing import Optional, Union
 
 import asyncpg
 
+from app import local_dev
 from app.database import get_pool
 from app.openclaw import gateway_admin, GatewayError, make_task_session_key
 from app.resource_provisioning import generate_resources_md
@@ -336,7 +337,7 @@ async def create_instance(task: dict) -> Optional[str]:
         return None
 
     template = dict(template)
-    workspace = f"~/.openclaw/workspace-{instance_id}"
+    workspace = local_dev.agent_workspace_path(instance_id)
 
     # Resolve tool allow/deny lists through the registry (profiles + direct tools +
     # cancellation). This is the same resolver used by provision.py — the dispatch
@@ -1380,7 +1381,11 @@ async def create_subtasks_from_planner(parent_task: dict, planner_output: str) -
                     _asyncio.create_task(_rle(goal_id, "task.created", {
                         "task_id": st_id,
                         "task_title": st_title,
-                        "story_id": str(task.get("story_id") or ""),
+                        # `parent_task` is this function's parameter; a bare `task`
+                        # here was an unbound name whose NameError the debug-level
+                        # except below swallowed, silently dropping every planner
+                        # subtask's task.created relay to Notion/Slack.
+                        "story_id": str(parent_task.get("story_id") or ""),
                         "state": "pending",
                     }))
                 except Exception as _exc:
@@ -2457,42 +2462,10 @@ class TaskController:
         if bulk_ready and not bulk_ready.endswith(" 0"):
             _log.info("Bulk pending→ready (template already set): %s", bulk_ready)
 
-        # Tasks with NO template and NO parent → auto-assign planner-ia
-        # Skip tasks created by GO (created_by starts with 'go-') — those are human-owned
-        updated = await pool.fetch(
-            """UPDATE tasks SET template_id = 'planner-ia', assigned_to = 'planner-ia'
-               WHERE state = 'pending' AND status = 'active'
-               AND (depends_on = '{}' OR depends_on IS NULL)
-               AND (template_id IS NULL OR template_id = '')
-               AND parent_task_id IS NULL
-               AND (created_by IS NULL OR NOT created_by LIKE 'go-%')
-               RETURNING id, goal_id""",
-        )
-        if updated:
-            _log.info("Auto-assigned planner-ia to %d task(s) — ids=%s",
-                      len(updated),
-                      ",".join(r["id"] for r in updated))
-        for row in updated:
-            corr_id = await get_task_correlation_id(pool, row["id"])
-            last_evt = await get_last_event_id(pool, row["id"])
-            planner_actor = await pool.fetchval(
-                "SELECT actor_id FROM agents WHERE id = 'planner-ia'",
-            ) or _actor_uuid(agent_id="planner-ia")
-            await emit_task_event(
-                pool,
-                event_type=TASK_ASSIGNED,
-                task_id=row["id"], goal_id=row["goal_id"],
-                payload=task_assigned_payload(
-                    assignee=actor_ref(planner_actor, "independent_agent", "planner-ia"),
-                    assignment_reason="Auto-assigned: no template_id, top-level task needs planning",
-                ),
-                actor_id=SYSTEM_ACTOR_ID, actor_type="system",
-                correlation_id=corr_id,
-                causation_ids=[last_evt] if last_evt else None,
-                summary="Auto-assigned to planner-ia",
-                agent_id="planner-ia",
-            )
-            _log.info("Task %s auto-assigned to planner-ia", row["id"])
+        # NO AUTO-ASSIGN TO planner-ia ANY MORE. It was the IA flow's
+        # planner and its template is retired, so an un-templated top-level
+        # task would have been dispatched to an agent nobody runs. Such a
+        # task now waits until someone gives it a template.
 
     async def _dispatch_task(self, pool, task: dict):
         """Create instance and dispatch, or handle human checkpoint.

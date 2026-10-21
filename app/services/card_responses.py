@@ -89,6 +89,26 @@ async def handle_card_response(
         )
     task = dict(task_row)
 
+    # CROSS-GOAL IDOR. The task id arrives from outside -- a Slack action_id,
+    # a modal's private_metadata, a websocket frame -- and proving the caller
+    # is *a* user proves nothing about whether they may touch THIS task.
+    # chat.py:1550-1559 scopes its own fetch to the goal the socket is
+    # authorized for and says why; the Slack path had no equivalent, so a
+    # mapped Slack user could answer, approve or replan any task in any goal
+    # by id. The check lives HERE rather than at each call site because the
+    # call sites are the thing that keeps growing: button, modal submit,
+    # websocket, and whatever comes next.
+    from app.auth import get_goal_role  # noqa: PLC0415
+    if await get_goal_role(user_uid, task.get("goal_id") or "") is None:
+        _log.warning(
+            "card response REFUSED: uid=%s is not a member of goal=%s (task=%s)",
+            user_uid, task.get("goal_id"), task_id,
+        )
+        return CardResponseResult(
+            ok=False, action="noop", task_id=task_id,
+            error="not authorized for this goal",
+        )
+
     # Kill switch — refuse to act on a card (answer / approve / request-changes /
     # replan) while the task's goal or the system is frozen. Every branch below
     # either injects the human's text into the LIVE agent session or mutates task
@@ -249,13 +269,31 @@ async def handle_card_response(
         from app.task_controller import create_subtasks_from_planner, task_controller
         _log.info("Plan approved for task %s — creating subtasks", task_id)
 
+        # THE TRANSITION IS THE LOCK. This used to check the state, create
+        # the subtasks, and THEN update -- so two clicks both passed the
+        # check and both created a subtask tree. Not theoretical: the
+        # interactive endpoint used to blow Slack's 3s budget and show the
+        # user a timeout on a click that had in fact worked, which is an
+        # invitation to click again. Claim the transition first; whoever
+        # loses the race does nothing.
+        # Same shape as diff_review.py's decided_at CAS, and for the same
+        # reason.
+        claimed = await pool.fetchval(
+            "UPDATE tasks SET state = 'in_progress' "
+            " WHERE id = $1 AND state = 'awaiting_approval' RETURNING id",
+            task_id,
+        )
+        if not claimed:
+            _log.info("Plan approval for task %s lost the race — already claimed",
+                      task_id)
+            return CardResponseResult(
+                ok=True, action="noop", task_id=task_id,
+                user_message="That plan has already been approved.",
+            )
+
         result = task.get("result", "")
         if result:
             await create_subtasks_from_planner(task, result)
-
-        await pool.execute(
-            "UPDATE tasks SET state = 'in_progress' WHERE id = $1", task_id,
-        )
         await emit_task_event(
             pool,
             event_type=TASK_STATUS_CHANGED,

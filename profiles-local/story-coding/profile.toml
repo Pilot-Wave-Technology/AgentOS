@@ -1,0 +1,69 @@
+# Coding story, run locally in the person's editor.
+#
+# Edit this file to change what a local coding executor may do. Edit prompt.md
+# to change who it is. Neither needs a code change.
+#
+# HOW THIS DIFFERS FROM `profiles/story-coding` AND WHY, in one place:
+#
+#   * No `story_commit` / `sync_trunk`. The person's own git is right there;
+#     the extension pushes the branch at Submit Diff and the git engine owns
+#     the merge. A tool for committing would be a worse `git commit`.
+#   * No `bash_wait` / `bash_background` / `bash_output` / `bash_jobs` /
+#     `bash_kill` / `run_check`. Those exist because a pod's `bash` stops at
+#     120s and a poll costs a step. Claude Code's own Bash has neither limit.
+#   * No `propose_completion`. Completion is the person submitting the diff
+#     and marking the story done — they are the one who decides.
+#   * No `publish_artifact` -- it promotes an artifact into a goal
+#     RESOURCE and needs a `produces`/`modifies` grant the story
+#     usually does not hold, so it would answer E_NOT_GRANTED every
+#     time. `emit_artifact` needs no grant: a manifest row is a claim
+#     about the run itself.
+#   * No `env_setup` / `env_install`. There is no Verifier rebuilding this
+#     tree from a manifest; the person's machine is already set up, and an
+#     install they did not ask for is an install on their laptop.
+#   * No `goal_knowledge`. `.agentos-memory/` is seeded at checkout from the
+#     SAME shared store, so what the goal already settled is already here.
+#
+# What is left is the honest list: the editor tools the agent brings, plus the
+# one verb that reaches the control plane.
+
+kind   = "story"
+domain = "coding"
+
+tools_add = [
+  "write",
+  "edit",
+  "bash",
+  "subagent",       # Claude Code's own Task tool; the person is paying for it
+  "web_fetch",
+  "register_plan",  # the one control-plane verb: plan, then the person approves
+  # THE DELIVERABLE THAT IS NOT A DIFF. Dropped from this profile on
+  # 2026-10-01 and put back the same day: the reasoning was "a local
+  # story's deliverable is its diff", which is a story argument that was
+  # also applied to errands -- where the artifact IS the answer -- and
+  # which is not reliably true of stories either. A benchmark, a
+  # migration note, an analysis is a real output with nowhere else to go.
+  # `kernel.artifact_manifest` takes a story now, so these work locally.
+  "emit_artifact",
+  "artifact_read",
+]
+
+# A real clone with a real remote — the extension cuts nothing itself; the
+# branch comes from the git engine and the push goes back to it.
+workspace_driver = "git"
+
+# Read from the WORKSPACE on checkout and appended to prompt.md. prompt.md says
+# what a local coding executor is; these say what THIS project's conventions
+# are. Same two files the pod profile reads, for the same reason.
+prompt_files = ["AGENTS.md", "SOUL.md"]
+
+# The person approves their own plan in their own editor, and decides when the
+# work is done. Both are still true statements about the run — they just name a
+# human rather than a gate.
+requires_plan      = true
+allows_completion  = true
+
+# No Verifier locally. The checks in the plan are evidence for the person
+# reviewing the diff, not a gate something else runs.
+has_verifier       = false
+max_subagent_depth = 1

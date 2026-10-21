@@ -18,6 +18,7 @@ import hashlib
 import json
 import logging
 import os
+import time
 import uuid
 from typing import Optional
 
@@ -26,7 +27,7 @@ import asyncpg
 from . import collect
 from . import repository as repo
 from .config import get_chat_config
-from .models import ThreadContext
+from .models import MessageKind, ThreadContext
 from .repository import CHANNEL_DISPATCH
 
 _log = logging.getLogger(__name__)
@@ -54,8 +55,12 @@ class Dispatcher:
         self._tasks.append(asyncio.create_task(self._poll_loop()))
         self._tasks.append(asyncio.create_task(self._reaper_loop()))
         await self._initial_sweep()
-        _log.info("chat_module: dispatcher started (%d workers, instance=%s)",
-                  self._workers, self.cfg.instance_id)
+        _log.info(
+            "chat_module: dispatcher started (%d workers, instance=%s, poll=%ds, "
+            "compaction hold soft=%ds hard=%ds)",
+            self._workers, self.cfg.instance_id, self.cfg.dispatch_poll_interval_s,
+            self.cfg.compaction_soft_hold_s, self.cfg.compaction_max_hold_s,
+        )
 
     async def stop(self) -> None:
         _log.info("chat_module: dispatcher stopping (draining)…")
@@ -184,6 +189,27 @@ class Dispatcher:
                 _log.debug("chat_module: thread=%s has more queued — re-enqueuing", thread_id)
                 self._enqueue_thread(thread_id)
 
+    @staticmethod
+    async def _defer_for_compaction(session, thread_id: str) -> bool:
+        """Whether to hold this thread for an in-flight compaction.
+
+        Fails OPEN: no session, an older session object without the bounded
+        check, or an error all mean "dispatch". A conversational gate that fails
+        closed turns any local fault into an indefinite silence, which is the
+        failure mode this whole change exists to remove.
+        """
+        check = getattr(session, "should_defer_for_compaction", None) if session else None
+        if check is None:
+            return False
+        try:
+            return bool(await check(thread_id))
+        except Exception:
+            _log.warning(
+                "chat_module: compaction gate check failed thread=%s — dispatching",
+                thread_id, exc_info=True,
+            )
+            return False
+
     async def _process_thread(self, thread_id: str) -> bool:
         """Claim the thread (advisory lock), collect a batch, run one turn.
         Returns True if a turn was dispatched (re-enqueue to drain stragglers)."""
@@ -218,28 +244,28 @@ class Dispatcher:
                 return False
             _log.info("chat_module: thread=%s no execution freeze — proceeding", thread_id)
 
-            # Compaction gate.
+            # Compaction gate. Bounded — see chat_module/compaction_gate.py.
+            # Must NOT use `is_compacting()`, which reports the raw latch with no
+            # expiry; that is what turned one lost event into a 53h stall.
             session = await self._ensure_session(ctx)
-            if session is not None and getattr(session, "is_compacting", None):
-                if session.is_compacting(thread_id):
-                    _log.info(
-                        "chat_module: deferring thread=%s — agent mid-compaction "
-                        "(resume on compaction-end NOTIFY)", thread_id,
-                    )
-                    return False
+            if await self._defer_for_compaction(session, thread_id):
+                _log.info(
+                    "chat_module: deferring thread=%s — agent mid-compaction "
+                    "(resumes on compaction-end NOTIFY, or on gate expiry)", thread_id,
+                )
+                return False
 
             window = collect.collect_window_ms(ctx, self.cfg)
             if window > 0:
                 _log.debug("chat_module: thread=%s collect window %dms — sleeping", thread_id, window)
                 await asyncio.sleep(window / 1000.0)
             # Re-check after the collect-window: compaction can start mid-wait.
-            if session is not None and getattr(session, "is_compacting", None):
-                if session.is_compacting(thread_id):
-                    _log.info(
-                        "chat_module: deferring thread=%s — compaction started "
-                        "during collect-window", thread_id,
-                    )
-                    return False
+            if await self._defer_for_compaction(session, thread_id):
+                _log.info(
+                    "chat_module: deferring thread=%s — compaction started "
+                    "during collect-window", thread_id,
+                )
+                return False
 
             batch = await repo.select_pending_batch(thread_id, self.cfg.collect_max_batch)
             if not batch:
@@ -284,9 +310,42 @@ class Dispatcher:
                           thread_id, [m.kind.value for m in batch])
                 return False
 
-            _log.info("chat_module: thread=%s dispatching batch len=%d goal=%s",
-                      thread_id, len(batch), ctx.goal_id)
-            await self._run_batch(ctx, batch, session=session)
+            # System-initiated turns run ONE AT A TIME PER HOME.
+            #
+            # A person typing keeps only the per-thread lock — two people, or
+            # one person in two threads, must never wait on each other. But a
+            # SYSTEM_WAKE is nobody waiting: it is the memory checkpoint, the
+            # consolidation, a GO wake. Those are exactly the turns that write
+            # the workspace's shared files, and since Stage K an assistant's
+            # threads share a workspace. `MEMORY.md` is written by reading it
+            # and writing the whole file back, so two checkpoints overlapping
+            # lose one of them — silently, in the turn whose entire job is to
+            # record what happened.
+            #
+            # Uncontended for any agent that has a gateway id per thread, which
+            # is every agent except a shared home. So it needs no flag saying
+            # which kind this is: the key IS the home.
+            home_key = (
+                ctx.gateway_agent_id
+                if any(m.kind is MessageKind.SYSTEM_WAKE for m in batch)
+                else ""
+            )
+            if home_key and not await self._claim_home(conn, home_key, thread_id):
+                # Deferred, not dropped: the row stays queued and the next tick
+                # or NOTIFY picks it up. Running it unserialized would be the
+                # data loss this exists to prevent.
+                return False
+            try:
+                _log.info("chat_module: thread=%s dispatching batch len=%d goal=%s",
+                          thread_id, len(batch), ctx.goal_id)
+                await self._run_batch(ctx, batch, session=session)
+            finally:
+                if home_key:
+                    try:
+                        await repo.release_home(conn, home_key)
+                    except Exception:
+                        _log.warning("chat_module: home=%s failed to release lock",
+                                     home_key, exc_info=True)
             return True
         finally:
             if claimed:
@@ -296,6 +355,33 @@ class Dispatcher:
                 except Exception:
                     _log.warning("chat_module: thread=%s failed to release lock", thread_id, exc_info=True)
             await pool.release(conn)
+
+    # How long a system turn waits for another system turn in the same home.
+    # Short: a memory checkpoint is one model turn, and if the holder is
+    # slower than this it is better to come back on the next tick than to
+    # pin a pool connection behind it.
+    _HOME_LOCK_WAIT_S = 20.0
+    _HOME_LOCK_POLL_S = 0.5
+
+    async def _claim_home(self, conn, home_key: str, thread_id: str) -> bool:
+        """Bounded wait for the home lock. False means defer, never proceed.
+
+        A blocking `pg_advisory_lock` would be simpler and is wrong here: it
+        waits forever on a connection this function is holding, so one wedged
+        turn would take the pool down with it rather than one thread.
+        """
+        deadline = time.monotonic() + self._HOME_LOCK_WAIT_S
+        while True:
+            if await repo.try_claim_home(conn, home_key):
+                return True
+            if time.monotonic() >= deadline:
+                _log.info(
+                    "chat_module: thread=%s deferring — another system turn holds "
+                    "home=%s (they share one workspace and one MEMORY.md)",
+                    thread_id, home_key,
+                )
+                return False
+            await asyncio.sleep(self._HOME_LOCK_POLL_S)
 
     async def _run_batch(self, ctx: ThreadContext, batch, *, session=None) -> None:
         msg_ids = [m.id for m in batch]
@@ -405,7 +491,11 @@ class Dispatcher:
         formatted = "\n\n".join(lines)
         try:
             from app.services.go_agent import build_go_context
-            ctxt = await build_go_context(ctx.goal_id)
+            # THE THREAD, because an errand thread must be told which
+            # errand it is. Goal threads pass one too and get nothing
+            # extra: `errand_block` returns "" for a thread with no
+            # story attached.
+            ctxt = await build_go_context(ctx.goal_id, ctx.thread_id)
         except Exception:
             _log.warning("chat_module: _compose_go_turn build_go_context failed goal=%s", ctx.goal_id, exc_info=True)
             ctxt = ""

@@ -2,7 +2,7 @@
 
 Single source of truth for which `agents.model` strings the control
 panel offers. The openclaw fork routes on provider prefix natively
-(see openclaw_fork_03122026/src/agents/model-selection.ts), so all
+(see agentos-gateway/src/agents/model-selection.ts), so all
 we need on this side is: a curated list, defaults per role, and a
 validator.
 
@@ -27,8 +27,12 @@ SUPPORTED_MODELS: list[ModelEntry] = [
     {"id": "anthropic/claude-opus-4-7",    "label": "Claude Opus 4.7",      "provider": "anthropic",  "tier": "premium"},
 
     # Google (Vertex / Gemini API)
-    {"id": "google/gemini-2.5-flash",      "label": "Gemini 2.5 Flash",     "provider": "google",     "tier": "fast"},
-    {"id": "google/gemini-2.5-pro",        "label": "Gemini 2.5 Pro",       "provider": "google",     "tier": "premium"},
+    # NO PRE-3-SERIES GEMINI. The 2.5 flash and pro ids were here until
+    # 2026-10-18. An agent already pinned to one keeps running -- its
+    # `agents.model` row is untouched and the gateway rewrites the wire
+    # id -- but nothing should be able to CHOOSE one, and a catalogue
+    # entry is a choice waiting to be made.
+    {"id": "google/gemini-3.8-flash",      "label": "Gemini 3.8 Flash",     "provider": "google",     "tier": "fast"},
 
     # ─── Synthetic context-window variants ─────────────────────────────
     # Each `<base>-{100k,200k,500k,1m}` provider is a fake wrapper around
@@ -39,15 +43,30 @@ SUPPORTED_MODELS: list[ModelEntry] = [
     # provider receives the real model name. Use these to test
     # compaction behavior at fixed token budgets without touching the
     # global contextTokens cap.
-    {"id": "google-flash-50k/gemini-2.5-flash-50k",       "label": "Gemini Flash (50K test)",    "provider": "google-flash-50k",      "tier": "test"},
-    {"id": "google-flash-100k/gemini-2.5-flash-100k",     "label": "Gemini Flash (100K test)",   "provider": "google-flash-100k",     "tier": "test"},
-    {"id": "google-flash-200k/gemini-2.5-flash-200k",     "label": "Gemini Flash (200K test)",   "provider": "google-flash-200k",     "tier": "test"},
-    {"id": "google-flash-500k/gemini-2.5-flash-500k",     "label": "Gemini Flash (500K test)",   "provider": "google-flash-500k",     "tier": "test"},
-    {"id": "google-flash-1m/gemini-2.5-flash-1m",         "label": "Gemini Flash (1M test)",     "provider": "google-flash-1m",       "tier": "test"},
-    {"id": "google-pro-100k/gemini-2.5-pro-100k",         "label": "Gemini Pro (100K test)",     "provider": "google-pro-100k",       "tier": "test"},
-    {"id": "google-pro-200k/gemini-2.5-pro-200k",         "label": "Gemini Pro (200K test)",     "provider": "google-pro-200k",       "tier": "test"},
-    {"id": "google-pro-500k/gemini-2.5-pro-500k",         "label": "Gemini Pro (500K test)",     "provider": "google-pro-500k",       "tier": "test"},
-    {"id": "google-pro-1m/gemini-2.5-pro-1m",             "label": "Gemini Pro (1M test)",       "provider": "google-pro-1m",         "tier": "test"},
+    # THE 3.8 VARIANTS, AND THEY WERE MISSING. `DEFAULT_GO_MODEL` and
+    # `DEFAULT_SHCA_MODEL` below have pointed at
+    # `google-flash38-500k/gemini-3.8-flash-500k` since 2026-09-24, and
+    # that id was in no catalogue entry -- so every new agent ran on a
+    # model the dropdown could not show and a validator could not find.
+    #
+    # NEW ALIASES, not a repointing of `google-flash-*`, which is the
+    # convention the 3.7 entry below records: redefining an existing
+    # alias silently moves every agent pointing at it.
+    {"id": "google-flash38-50k/gemini-3.8-flash-50k",     "label": "Gemini 3.8 Flash (50K test)",   "provider": "google-flash38-50k",    "tier": "test"},
+    {"id": "google-flash38-100k/gemini-3.8-flash-100k",   "label": "Gemini 3.8 Flash (100K test)",  "provider": "google-flash38-100k",   "tier": "test"},
+    {"id": "google-flash38-200k/gemini-3.8-flash-200k",   "label": "Gemini 3.8 Flash (200K test)",  "provider": "google-flash38-200k",   "tier": "test"},
+    {"id": "google-flash38-500k/gemini-3.8-flash-500k",   "label": "Gemini 3.8 Flash (500K)",       "provider": "google-flash38-500k",   "tier": "test"},
+    {"id": "google-flash38-1m/gemini-3.8-flash-1m",       "label": "Gemini 3.8 Flash (1M test)",    "provider": "google-flash38-1m",     "tier": "test"},
+    # Gemini 3.7 at a fixed 500K. A NEW ALIAS rather than repointing
+    # google-flash-500k, which is the convention anthropic-sonnet5-*
+    # already follows -- redefining the existing one would silently
+    # move every agent pointing at the 2.5 variant onto 3.7.
+    {"id": "google-flash37-500k/gemini-3.7-flash-500k", "label": "Gemini 3.7 Flash (500K)",   "provider": "google-flash37-500k",   "tier": "test"},
+    # The four `google-pro-*/gemini-2.5-pro-*` variants were removed on
+    # 2026-10-18 rather than re-pointed. They existed to test compaction
+    # at fixed budgets, which the 3.8 flash variants above now cover, and
+    # re-pointing them to a flash model under a name that says "pro"
+    # would be a worse lie than deleting them.
     {"id": "anthropic-sonnet-50k/claude-sonnet-4-5-50k",  "label": "Claude Sonnet 4.5 (50K test)",   "provider": "anthropic-sonnet-50k",  "tier": "test"},
     {"id": "anthropic-sonnet-100k/claude-sonnet-4-5-100k","label": "Claude Sonnet 4.5 (100K test)",  "provider": "anthropic-sonnet-100k", "tier": "test"},
     {"id": "anthropic-sonnet-200k/claude-sonnet-4-5-200k","label": "Claude Sonnet 4.5 (200K test)",  "provider": "anthropic-sonnet-200k", "tier": "test"},
@@ -62,7 +81,7 @@ SUPPORTED_MODELS: list[ModelEntry] = [
     {"id": "anthropic-opus48-500k/claude-opus-4-8-500k",  "label": "Claude Opus 4.8 (500K test)",    "provider": "anthropic-opus48-500k", "tier": "test"},
     {"id": "anthropic-sonnet5-50k/claude-sonnet-5-50k",   "label": "Claude Sonnet 5 (50K test)",     "provider": "anthropic-sonnet5-50k", "tier": "test"},
     {"id": "anthropic-sonnet5-100k/claude-sonnet-5-100k", "label": "Claude Sonnet 5 (100K test)",    "provider": "anthropic-sonnet5-100k","tier": "test"},
-    {"id": "anthropic-sonnet5-200k/claude-sonnet-5-200k", "label": "Claude Sonnet 5 (200K test)",    "provider": "anthropic-sonnet5-200k","tier": "test"},
+    {"id": "anthropic-sonnet5-200k/claude-sonnet-5-200k", "label": "Claude Sonnet 5 (200K)",         "provider": "anthropic-sonnet5-200k","tier": "balanced"},
     {"id": "anthropic-sonnet5-500k/claude-sonnet-5-500k", "label": "Claude Sonnet 5 (500K test)",    "provider": "anthropic-sonnet5-500k","tier": "test"},
 
     # NOTE: claude-cli/* and codex-cli/* providers are intentionally
@@ -75,20 +94,39 @@ SUPPORTED_MODELS: list[ModelEntry] = [
     # state, cleaner model swaps).
 ]
 
-# Per-role defaults. The GO stays on a small (<=100K) window so its
+# Per-role defaults. The GO defaults to a small (100K) window so its
 # orchestration sessions compact early; SHCAs hold longer human
-# conversations, so they default to the 200K-window Flash variant.
-DEFAULT_GO_MODEL:   str = "google-flash-100k/gemini-2.5-flash-100k"
-DEFAULT_SHCA_MODEL: str = "google-flash-200k/gemini-2.5-flash-200k"
-
-# Max context window (tokens) offered when CREATING a GO. The GO-creation
-# dropdown is filtered to models at or under this — see models_within_context().
-GO_CREATE_MAX_CONTEXT: int = 100_000
+# conversations, so they default to Claude Sonnet 5 at a 200K window. Both
+# are defaults only, not caps — any registered context-window variant is
+# a valid explicit choice for either role (the old GO_CREATE_MAX_CONTEXT
+# hard cap was removed; the registry's variant system means a larger
+# selection is deliberate, not something to guard against).
+# NOTE: the canonical templates row 'default-shca' overrides this constant at
+# provision time (see set_default_shca_model_sonnet5.sql) — keep them in sync.
+# BOTH ON GEMINI 3.8 FLASH AT 500K since 2026-09-24, and both are
+# defaults for NEW provisioning only -- a live agent keeps the model it
+# holds until somebody re-provisions or switches it.
+#
+# A planner reads goal_state + code_state + plan previews in one turn,
+# so the window is the point; 500K is also what the goal-setup picker
+# now preselects, so the form and this fallback agree.
+#
+# THE TEMPLATE ROWS SAY THE SAME (`default_models_flash38.sql`) and must
+# keep saying it: resolution is explicit choice > `templates.model` >
+# this constant, so either one left behind is silently dead for half the
+# surfaces.
+#
+# The GO default moved off `gemini-3.7-flash-500k` for a second reason:
+# the picker no longer offers that model at all (`go_model_choices.sql`),
+# and a default the menu cannot show is a goal landing on something
+# nobody chose.
+DEFAULT_GO_MODEL:   str = "google-flash38-500k/gemini-3.8-flash-500k"
+DEFAULT_SHCA_MODEL: str = "google-flash38-500k/gemini-3.8-flash-500k"
 
 
 def normalize_model_id(model_id: str) -> str:
-    """Bridge unprefixed model IDs (gemini-2.5-flash) to the slash-separated
-    form OpenClaw requires (google/gemini-2.5-flash).
+    """Bridge unprefixed model IDs (gemini-3.8-flash) to the slash-separated
+    form OpenClaw requires (google/gemini-3.8-flash).
 
     The agent registry's dropdown fetches model IDs from the gateway's
     `models.list` RPC, which on some OpenClaw builds returns the bare
@@ -154,6 +192,14 @@ _NATIVE_CONTEXT_WINDOWS: dict[str, int] = {
     "anthropic/claude-haiku-4-5":  200_000,
     "anthropic/claude-sonnet-4-5": 200_000,
     "anthropic/claude-opus-4-7":   200_000,
+    "google/gemini-3.8-flash":     1_000_000,
+    # THE 2.5 ENTRIES STAY, and that is not an oversight. This is a
+    # LOOKUP, not a choice: an agent pinned to 2.5 before 2026-10-18
+    # keeps running, and dropping its row here would not move it off the
+    # model -- it would just lose its context window and compact against
+    # a default. Nothing can SELECT these any more (they are gone from
+    # MODELS and from `available_models`); they only answer for what is
+    # already pinned.
     "google/gemini-2.5-flash":     1_000_000,
     "google/gemini-2.5-pro":       1_000_000,
 }
@@ -177,16 +223,9 @@ def context_window_for(model_id: str) -> int:
     return 1_000_000
 
 
-def models_within_context(max_tokens: int) -> list[ModelEntry]:
-    """SUPPORTED_MODELS whose context window is <= max_tokens, preserving
-    list order. Used to cap the GO-creation dropdown (gemini + anthropic
-    alike) to small-window models."""
-    return [m for m in SUPPORTED_MODELS if context_window_for(m["id"]) <= max_tokens]
-
-
-# Default context-window size pre-selected in the GO model picker. The picker's
-# size dropdown still offers every window the chosen base model supports — this
-# is the default, not a cap (contrast the legacy GO_CREATE_MAX_CONTEXT filter).
+# Default context-window size pre-selected in the GO model picker. The
+# picker's size dropdown offers every window the chosen base model
+# supports — this is only the default, not a cap.
 GO_DEFAULT_CONTEXT: int = 100_000
 
 

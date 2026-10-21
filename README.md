@@ -1,104 +1,175 @@
 # AgentOS
 
-A multi-agent orchestration platform that breaks down long-running goals into stories and tasks, dispatches them to a fleet of LLM agents, and keeps humans in the loop at every decision point — through a web UI or Slack.
+A platform for running long software goals with LLM agents, where a person
+stays in the loop at the points that matter and the work happens in isolated
+containers rather than on somebody's laptop.
 
-AgentOS is the **control plane**. It manages state, memory, credentials, and approvals. A companion gateway — the **`agent_os_openclaw`** branch of this repo — hosts the agent runtime and executes the work.
+You describe a goal. An orchestrator agent proposes stories. You accept one. An
+assistant scopes it with you and starts it. The work then runs in its own pod —
+with its own workspace, its own database login and no credentials it does not
+need — and comes back as a branch and a pull request for you to accept.
+
+> ### Read this before you run it
+>
+> **AgentOS agents write to your repositories.** They create branches, push
+> commits and open pull requests in whatever GitHub organisation you point them
+> at, through a GitHub App you install. They do not merge without a person, and
+> every story's work goes to a branch of its own — but the write access is real,
+> and it is the point. Give it an organisation you are comfortable with.
+>
+> It also spends money on LLM APIs, with your keys, in the background.
 
 ---
 
-## How it works
+## What it is made of
 
-Goals decompose into stories, stories decompose into tasks. Each layer has a dedicated agent type and a human approval gate.
+AgentOS is **two branches of this one repository**, deployed in that order:
+
+| Branch | Role |
+|---|---|
+| **`agent_os_openclaw`** | the gateway — hosts the agents that hold a conversation. **Deploy first**; it creates the shared network. |
+| **`agent_os_platform`** (this one) | the control plane, the scheduler and the execution plane. |
+
+Neither is useful without the other.
+
+This branch contains four planes, and only one of them thinks:
 
 ```
-Goal  ──────────────────────────────────────────────────────────────────
-  │
-  ├─ GO Agent (Goal Orchestrator)
-  │    Reads the goal description and team resources, proposes stories.
-  │
-  ├─ Stories  [proposed → accepted → in_progress → blocked → done]
-  │    Humans accept, reject, or rewrite each story before work begins.
-  │
-  │    └─ Tasks  [pending → ready → in_progress → automated_review → awaiting_approval → done]
-  │         │
-  │         └─ IA (Independent Agent)
-  │              Task-scoped agent. Dispatched automatically when a task
-  │              is ready. Output reviewed by an RA (Reviewer Agent)
-  │              before reaching the human approval gate.
-  │
-  └─ Assistant
-       Per-(goal, user) agent with persistent 3-scope memory (global scope spans goals).
-       Surfaces the plan, answers questions, and handles approvals inline.
+  CONTROL PLANE    app/      Cloud Run, stateless    the UI, the API, the board
+  GATEWAY PLANE              one Node process        the agents that TALK
+  KERNEL PLANE     kernel/   conductor + verifier    decides WHEN work runs.
+                                                     Contains no model call.
+  EXECUTION PLANE  a pod     one per execution       the workspace, the shell, the git
+
+                        PostgreSQL — the only shared state
 ```
 
-Every state transition writes to an append-only ledger (SHA-256 chained). Nothing is deleted; everything is traceable.
+There is no message broker: fan-out is `LISTEN/NOTIFY` and advisory locks.
 
 ---
 
-## Architecture
+## How work actually flows
 
-AgentOS ships as **two branches of this one repository**, deployed in order (gateway first):
+```
+  goal ──► story ──► execution ──► leg ──► step
+   │         │           │
+   │         │           └─ one ATTEMPT at running it, in a pod
+   │         └─ the unit a PERSON accepts
+   └─ the unit of accountability
+```
 
-| Branch | Role | Tech |
-|---|---|---|
-| **`agent_os_openclaw`** | Agent gateway — agent runtime, workspace management, LLM calls. **Deploy first** (Stage ①); it creates the shared VPC and archive bucket. (The gateway + LLM secrets are created earlier by `prerequisites.sh`.) | Node.js / TypeScript |
-| **`agent_os_platform`** (this branch) | Control plane — goals, stories, tasks, memory, platform integrations (Stage ②). | Python / FastAPI / PostgreSQL |
+A story is not the thing that runs; an **execution** is. Inside the pod an
+executor works in **legs** — one conversation each, starting from an empty
+context and leaving a brief for the next — until it claims it is finished. A
+person accepts the claim. The work lands on trunk.
 
-The control plane and gateway communicate over a VPC-internal WebSocket. The control plane creates/destroys agent instances and sends messages; the gateway streams responses back. Neither is useful without the other.
+**[`HOW_A_STORY_EXECUTES.md`](HOW_A_STORY_EXECUTES.md) is the document to read
+next.** It defines every one of those words and shows where each lives.
 
-### Control-plane services (split by default)
+---
 
-The control plane ships in a **split** deployment by default — one image, four Cloud Run services, each isolated and independently scalable:
+## What is actually enforced
 
-| Service | Runs |
+Most "human in the loop" claims are prompts. These are not:
+
+- **An agent cannot approve anything.** Resolving an approval raises
+  `E_APPROVAL_NOT_HUMAN` without a human uid, and that uid defaults to nothing.
+- **An assistant cannot create a story, grant a resource, provision, commit or
+  verify** — because no such function is reachable from its surface. The
+  boundary is a missing function, not an instruction.
+- **The model's shell runs as a different user** from the process holding the
+  database, in a container that holds no cloud credential at all.
+- **A reviewer cannot change what it is reviewing**, and cannot run the test
+  suite it is judging — a reviewer that can run the suite can report its own
+  measurement as a finding about somebody else's work.
+- **A tool not on a profile's list is refused by name.** The chain is
+  fail-closed, so a mistake is a clear refusal rather than a silent hole.
+- **`irreversible` effects can never be pre-approved.** Naming one in a profile
+  stops the profile loading.
+
+---
+
+## What you get
+
+**Goal-oriented work** — everything traces to a goal, with dependencies between
+stories tracked and the graph closing over cancellations rather than leaving
+dangling edges.
+
+**Isolated execution** — one pod per execution, two containers, two users, a
+default-deny network and an egress proxy. Required: every executor runs on the
+GKE cluster that Terraform creates.
+
+**A git engine** — cuts each story's branch, tracks what depends on what, and
+runs a merge queue so dependent work lands in an order that builds.
+
+**Review councils** — goal review, security review, and a platform research
+council that studies AgentOS itself. Goal review ships on; security review and
+platform research ship off and are switched on in `terraform.tfvars`.
+
+**Persistent agent memory** — assistants accumulate memory across sessions,
+built from the ledger rather than from the chat transcript.
+
+**Custom tools** — define HTTP endpoints, OpenAPI specs or MCP servers in the
+UI; agents pick them up within a minute, with a credential broker that only
+hands over what the tool declared.
+
+**An append-only ledger** — every state change is a hash-chained event.
+Projections are derived from events, not the other way round.
+
+**A kill switch** — pause or halt work at system or goal scope.
+
+---
+
+## Tech
+
+| | |
 |---|---|
-| **`agentos-web`** | Public web UI, chat, and agent callbacks (`app.main`) |
-| **`agentos-council`** | Goal Review + Security councils and the research dispatcher (`app.council_worker`) |
-| **`agentos-git`** | The git dependency-graph engine (`app.git_engine_worker`) |
-| **`agentos-management`** | Settings / dashboard / admin backends (`app.management_worker`) |
+| API | Python 3.12 · FastAPI · uvicorn |
+| Database | PostgreSQL, asyncpg, **raw SQL — no ORM** |
+| Frontend | Jinja2 + HTMX, no build step |
+| Auth | Firebase |
+| Execution | Kubernetes (GKE Standard), one pod per execution |
+| Models | Anthropic Claude · Google Gemini |
+| Deployment | Cloud Run · Cloud Build · Cloud SQL · GKE |
 
-Prefer a smaller/cheaper footprint? Set `service_profile = "single"` in `terraform.tfvars` and everything runs in **one** service (`app.single`) with the worker loops in-process — one always-on instance instead of four. Both are first-class; see [`deploy/`](deploy/).
-
----
-
-## Key capabilities
-
-**Goal-oriented orchestration** — every piece of work traces back to a goal. Dependencies between tasks are tracked and enforced; completing one task can unblock others automatically.
-
-**Human-in-the-loop at every layer** — story acceptance, task approval, and plan revision are first-class operations, not afterthoughts. Agents pause and wait; they do not proceed without a gate.
-
-**Persistent agent memory** — the Assistant agent builds a three-scoped memory (global/goal/conversation) with full-text search. It remembers preferences, past decisions, and conventions across sessions.
-
-**Platform integrations** — Slack is a full operational surface. Users can create tasks, approve work, and converse with agents without opening the web UI.
-
-**Custom tools** — admins define tools (HTTP endpoints, OpenAPI specs, TypeScript functions, MCP servers) through the web UI. Agents pick them up in under a minute — no gateway restart, no deploy.
-
-**Kill switch** — operators can pause or force-kill work at system or goal scope. Pause is reversible; force-kill (`halted`) is terminal.
-
-**Append-only ledger** — every state mutation is a ledger event with SHA-256 hash chaining. Projection tables are derived from events, not the other way around.
+Raw SQL is a deliberate choice, held up by build-time sweeps rather than a type
+system: the suite PREPAREs every SQL literal against a real schema, so a column
+that does not exist fails the build instead of a request. See
+[`tests/README.md`](tests/README.md).
 
 ---
 
-## Tech stack
+## Deploying it
 
-| Layer | Technology |
+Start at **[`deploy/README.md`](deploy/README.md)** and work through the files
+in order. Budget about two hours the first time.
+
+You will need a Google Cloud project with billing, a GitHub organisation and an
+App, a Firebase project, and API keys for both Anthropic and Gemini.
+[`deploy/warmup.md`](deploy/warmup.md) is the checklist.
+
+**Run [`./preflight.sh`](preflight.sh) between stages.** It checks that what the
+last step was supposed to create actually exists, and it treats "could not
+determine" as a failure rather than a pass. A deploy into a half-provisioned
+project is the expensive case: it comes up, serves some requests, and fails on
+the ones you did not test.
+
+The execution plane — the GKE cluster every executor runs on — is created by
+the same `terraform apply` and finished by the build
+([`./execution-plane.sh`](execution-plane.sh)).
+
+Each organisation runs AgentOS from its **own fork** — see
+[`FORKING.md`](FORKING.md).
+
+---
+
+## Finding your way around
+
+| | |
 |---|---|
-| API framework | Python 3.12 · FastAPI · uvicorn |
-| Database | PostgreSQL (asyncpg) |
-| Frontend | Jinja2 + HTMX — no build step |
-| Auth | Firebase (JWT verification + signup gate) |
-| Agent gateway | `agent_os_openclaw` — derived from OpenClaw (WebSocket, VPC-internal) |
-| LLM APIs | Anthropic Claude · Google Gemini |
-| File storage | Google Cloud Storage |
-| Platform integrations | Slack SDK |
-| Deployment | Google Cloud Run · Cloud Build · Cloud SQL |
-
----
-
-## Deploy
-
-Deploying is a guided, ordered process — **start with [`deploy/README.md`](deploy/README.md)**. It walks you end-to-end: gather prerequisites, run the one-time setup, deploy the gateway (Stage ①), then this control plane (Stage ②).
-
-You'll need a Google Cloud project (billing + owner), a GitHub org + App, a Firebase project, and LLM API keys (Anthropic + Gemini). The guide's first file, [`deploy/warmup.md`](deploy/warmup.md), is a checklist of everything to have ready.
-
-Each organization runs AgentOS from its **own fork** — see [`FORKING.md`](FORKING.md).
+| [`HOW_A_STORY_EXECUTES.md`](HOW_A_STORY_EXECUTES.md) | the vocabulary, end to end — **start here** |
+| [`ARCHITECTURE.md`](ARCHITECTURE.md) | the same system by component |
+| [`CONFIG.md`](CONFIG.md) | every setting and where it comes from |
+| [`deploy/`](deploy/README.md) | standing it up |
+| [`app/`](app/README.md) · [`kernel/`](kernel/README.md) | the two halves of the code |
+| [`FORKING.md`](FORKING.md) · [`VISION.md`](VISION.md) | why it is shaped this way |

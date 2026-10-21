@@ -32,9 +32,16 @@ def _sha256(text: str) -> str:
 
 async def apply_model_change(*, template_id: str, model: str) -> dict:
     from app.llm_models import is_supported
-    if not is_supported(model):
-        return {"ok": False, "reason": f"model {model!r} is not in the supported list"}
+    from app.services.model_registry.dropdowns import is_model_registered_v2
+
     pool = get_pool()
+    # OR'd, same pattern as create_goal/change_agent_model (story
+    # 5dafee43): a model added through the admin UI's Model Registry —
+    # not yet in the hardcoded SUPPORTED_MODELS list — must be a valid
+    # target here too, or the Platform Council's apply-flow can't ever
+    # use a newly-registered model.
+    if not is_supported(model) and not await is_model_registered_v2(pool, model):
+        return {"ok": False, "reason": f"model {model!r} is not in the supported list"}
     row = await pool.fetchrow(
         "SELECT id, model FROM templates WHERE id=$1 AND status='active'", template_id)
     if not row:

@@ -3,7 +3,7 @@
 Converts internal card_data dicts (approval, question, progress, completion,
 failure) into Slack Block Kit JSON for rich interactive messages.
 
-Button action_id conventions (parsed in app/slack/actions.py and channels/slack/inbound.py):
+Button action_id conventions (parsed in channels/slack/actions.py):
   card_approve_{task_id}
   card_changes_{task_id}
   card_reply_{task_id}_{index}    # index into card["options"]
@@ -43,6 +43,20 @@ def render_card_as_blocks(card: dict) -> Optional[list[dict]]:
         return _render_diff_review(card)
     if card_type == "dag_recovery":
         return _render_dag_recovery(card)
+
+    # Everything the GO thread shows — kernel parks, errand proposals,
+    # verdicts, stalls, PR cards, the local-execution family. Twenty-four
+    # kinds reached this point and got None, which the caller turns into
+    # plain text, dropping exactly the buttons that make the card useful.
+    from app.channels.slack.go_cards import render as _render_go_card
+    go = _render_go_card(card)
+    if go is not None:
+        return go
+
+    _log.warning(
+        "Slack: no renderer for card_type=%r — posting as plain text, so "
+        "any buttons on it are lost. Add it to app/channels/slack/go_cards.py.",
+        card_type or "<missing>")
     return None
 
 

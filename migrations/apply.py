@@ -29,6 +29,20 @@ import socket
 import sys
 import time
 
+# THIS SCRIPT PRINTS NON-ASCII, AND WINDOWS CONSOLES ARE NOT UTF-8.
+# The progress line is `  -> name  (sha256=...)` with a real arrow and a
+# real ellipsis, and on a cp1252 console `print` raises
+# UnicodeEncodeError. The migration itself had already COMMITTED by
+# then, so the traceback came from the line announcing success: the
+# runner exited non-zero with a database that was actually migrated,
+# and the obvious next move -- run it again -- is the one thing that
+# cannot help. Re-encode the stream instead of hunting the characters.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass  # not a real tty, or already utf-8; nothing to fix
+
 import asyncpg
 
 
@@ -47,7 +61,7 @@ def read_sequence() -> list[str]:
         sys.exit(2)
 
     names = []
-    with open(SEQUENCE_FILE) as f:
+    with open(SEQUENCE_FILE, encoding="utf-8") as f:
         for line in f:
             name = line.strip()
             if name and not name.startswith("#"):
@@ -81,19 +95,15 @@ async def _ensure_tracking_table(conn) -> None:
 
 
 async def _grant_app_role(conn) -> None:
-    """Grant the runtime (DML) role access to everything the migrate (DDL) role
-    created. Cloud SQL users don't share table access by default, so without this
-    the app gets 'permission denied for table ...' on every query. Idempotent;
-    ALTER DEFAULT PRIVILEGES also covers tables future migrations create."""
-    role = os.environ.get("APP_DB_ROLE", "app_user")
-    if not role.replace("_", "").isalnum():
-        raise ValueError(f"unsafe APP_DB_ROLE: {role!r}")
-    await conn.execute(f'GRANT USAGE ON SCHEMA public TO "{role}"')
-    await conn.execute(f'GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO "{role}"')
-    await conn.execute(f'GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA public TO "{role}"')
-    await conn.execute(f'ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO "{role}"')
-    await conn.execute(f'ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO "{role}"')
-    print(f"Granted DML privileges on schema public to {role!r}.")
+    """The app's DML grants and the pod login's password -- see _access.py."""
+    # Beside this file, however it was launched (script, -m, or a runner
+    # whose working directory is elsewhere).
+    here = os.path.dirname(os.path.abspath(__file__))
+    if here not in sys.path:
+        sys.path.insert(0, here)
+    from _access import grant_app_role, sync_leg_password
+    await grant_app_role(conn)
+    await sync_leg_password(conn)
 
 
 async def _prime_matviews(conn) -> None:

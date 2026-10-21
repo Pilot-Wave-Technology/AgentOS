@@ -3,7 +3,7 @@
   "type": "Platform",
   "name": "Platform Research Convener",
   "description": "Persistent admins-only research convener for the Platform Improvement goal.",
-  "model": "anthropic-sonnet-100k/claude-sonnet-4-5-100k",
+  "model": "anthropic-sonnet55-100k/claude-sonnet-5-5-100k",
   "emoji": "🔭",
   "tools_allow": [
     "read",

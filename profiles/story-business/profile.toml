@@ -1,0 +1,48 @@
+# Business / research story executor.
+#
+# Same harness as the coding profile. What differs is data in this file and
+# the text in prompt.md — if changing profile ever requires a code change,
+# Eb5's rule has broken and Eb6's diff proof will show it.
+
+kind   = "story"
+domain = "business"
+
+# No story_commit and no bash: there is no repository to commit to, and a
+# shell is not part of this surface. Durability comes from the copyin
+# driver's checkpoint instead.
+# No story_commit: there is no repository. No bash: not this surface.
+tools_add = [
+  # L — what this goal already settled. Read it BEFORE choosing a
+  # framework or a pattern: a plan that re-opens a decision a person
+  # already approved costs a whole review cycle to discover.
+  "goal_knowledge",
+  "write",
+  "edit",
+  "propose_completion",
+  "register_plan",        # E6h - plan, then approval, then work
+  "subagent",             # E7b/E7c - investigate | build
+  # THE ONLY THING THIS PROFILE PRODUCES. Its deliverable is documents
+  # and findings, not a tree, and `artifact_manifest` -- which only
+  # `emit_artifact` writes -- is what `artifact_kind` answers an
+  # `{expect: "artifact"}` check from. Without it this profile could
+  # register exactly the check its own prompt tells it to write and
+  # never satisfy it, refusing its own claim on every attempt.
+  "emit_artifact",
+  "artifact_read",
+  "publish_artifact",  # G6: durable new version of a granted document/dataset        # read stored outputs by id (E7)
+  "web_fetch",            # egress: guarded against SSRF, see tools_web
+  # Pending: "subagent" (E7b), "register_plan" (E6h), "web_fetch"/"web_search".
+  # Research is most of this profile's work, so the web tools matter here
+  # most — they are still not listed until they exist.
+]
+
+# Folders copied in from a drive or object store, checkpointed by archive,
+# published by copy-back. No git anywhere in this profile.
+workspace_driver = "copyin"
+
+prompt_files = ["AGENTS.md", "SOUL.md"]
+
+allows_completion  = true
+requires_plan      = true
+has_verifier       = true
+max_subagent_depth = 1

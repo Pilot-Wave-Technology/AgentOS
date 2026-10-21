@@ -9,9 +9,6 @@ This service:
   - serves dashboard, settings (including my-agents, model-pricing, memory prompts,
     signup-requests, integrations, claude-phases), notifications, and control-panel routes
   - runs the gateway_cache_refresh_loop so dashboard panel reads are instant
-  - runs the Taximeter goal-weightage watchdog (app/services/taximeter/
-    weightage_watchdog.py) — a lightweight periodic check, not goal-operational
-    work; the actual recompute happens in the separate task-runner Cloud Run Job
   - does NOT register auth routes — login/signup/logout/refresh all live on the
     main service, which validates the firebase_token cookie before proxying
   - does NOT start task_controller, chat_module, council/security dispatchers,
@@ -23,11 +20,14 @@ The /health route exists so Cloud Run has a port to probe.
 """
 import asyncio
 import logging
+
+from kernel.obs import configure
 import sys
 import time
 
 from fastapi import FastAPI, Request
 from fastapi.responses import RedirectResponse, PlainTextResponse
+from app.error_responses import unauthorized_response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
@@ -39,48 +39,15 @@ from app.routers import admin, notifications
 from app.routers import dashboard
 from app.routers import control_panel
 from app.routers import assistant
-from app.routers import model_pricing as model_pricing_router
 from app.memory_v2 import routers as memory_v2_routers
 
-# Configure structured logging — mirrors app/main.py so Cloud Run maps severity.
-import json as _json
-import traceback as _traceback
-
-
-class _CloudRunFormatter(logging.Formatter):
-    _LEVEL_MAP = {
-        logging.DEBUG: "DEBUG",
-        logging.INFO: "INFO",
-        logging.WARNING: "WARNING",
-        logging.ERROR: "ERROR",
-        logging.CRITICAL: "CRITICAL",
-    }
-
-    def format(self, record: logging.LogRecord) -> str:
-        payload = {
-            "severity": self._LEVEL_MAP.get(record.levelno, "DEFAULT"),
-            "logger": record.name,
-            "message": record.getMessage(),
-            "logging.googleapis.com/sourceLocation": {
-                "file": record.pathname,
-                "line": record.lineno,
-                "function": record.funcName,
-            },
-        }
-        if record.exc_info:
-            payload["exception"] = "".join(_traceback.format_exception(*record.exc_info))
-        return _json.dumps(payload)
-
-
-_log_level = getattr(logging, get_settings().log_level.upper(), logging.INFO)
-_handler = logging.StreamHandler(sys.stdout)
-_handler.setFormatter(_CloudRunFormatter())
-logging.basicConfig(handlers=[_handler], level=_log_level)
-
-for _uvicorn_logger in ("uvicorn", "uvicorn.access", "uvicorn.error"):
-    _uv_log = logging.getLogger(_uvicorn_logger)
-    _uv_log.handlers = [_handler]
-    _uv_log.propagate = False
+# One configuration, shared -- see kernel/obs. What was here was a
+# VERBATIM copy of the formatter in app/main.py, which is how two
+# services come to emit two shapes: the copy drifts and nobody sees it,
+# because each one looks right on its own. configure() also re-points
+# uvicorn's own loggers, which is why the loop that used to follow this
+# is gone rather than kept.
+configure(component="agent-management")
 
 app = FastAPI(title="Management Service", docs_url=None, redoc_url=None)
 
@@ -95,7 +62,6 @@ app.include_router(control_panel.router)
 app.include_router(notifications.router)
 # Settings sub-pages that are proxied from the main service and must be served here.
 app.include_router(assistant.router)        # /settings/my-agents (+ assistant picker)
-app.include_router(model_pricing_router.router)   # /settings/model-pricing
 app.include_router(memory_v2_routers.router)      # /settings/memory/prompts
 
 templates = Jinja2Templates(directory="app/templates")
@@ -144,8 +110,11 @@ async def inject_firebase_config(request: Request, call_next):
 @app.on_event("startup")
 async def on_startup():
     await init_db()
-    from app.services.taximeter.weightage_watchdog import weightage_watchdog_loop
-    asyncio.create_task(weightage_watchdog_loop())
+    # THE WEIGHTAGE WATCHDOG IS GONE. It existed to notice when the
+    # Gemini job had not set a goal's weight recently and to nudge it.
+    # A goal's weight is now `1 + items completed in it this period`,
+    # computed live from the view at score time, so there is nothing to
+    # fall behind and nothing to watch.
     logging.getLogger("app.management_worker").info("Management service started")
 
 
@@ -190,11 +159,14 @@ async def signup_rejected_handler(request: Request, exc: SignupRejected):
 @app.exception_handler(401)
 async def unauthorized_handler(request: Request, exc):
     logging.getLogger("app.management_worker").warning(
-        "management: 401 on path=%s — redirecting to /login (cookie present=%s)",
+        "management: 401 on path=%s (cookie present=%s, bearer present=%s)",
         request.url.path,
         bool(request.cookies.get("firebase_token")),
+        bool(request.headers.get("authorization")),
     )
-    return RedirectResponse(url="/login")
+    # See app/error_responses.py: redirecting a bearer-token caller to the
+    # login page reports the wrong fault as 405.
+    return unauthorized_response(request)
 
 
 @app.exception_handler(400)

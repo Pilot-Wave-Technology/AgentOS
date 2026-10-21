@@ -8,8 +8,13 @@
 <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11/build/highlight.min.js"></script>
 <!-- XSS: DOMPurify sanitizes rendered markdown before it hits innerHTML (see safe_markdown.js) -->
 <script src="https://cdn.jsdelivr.net/npm/dompurify@3/dist/purify.min.js"></script>
-<script src="/static/js/safe_markdown.js"></script>
-<script src="/static/js/markdown_renderer.js"></script>
+<script src="/static/js/safe_markdown.js?v={{ request.state.asset_v('js/safe_markdown.js') }}"></script>
+<script src="/static/js/markdown_renderer.js?v={{ request.state.asset_v('js/markdown_renderer.js') }}"></script>
+<script src="/static/js/kernel_park_card.js?v={{ request.state.asset_v('js/kernel_park_card.js') }}"></script>
+<!-- `defer`, so it runs after the inline script below has defined
+     RUN_THREAD_ID and RUN_BASE -- those carry Jinja and cannot move. -->
+<script src="/static/js/run_controls.js?v={{ request.state.asset_v('js/run_controls.js') }}" defer></script>
+<script src="/static/js/workspace_panel.js?v={{ request.state.asset_v('js/workspace_panel.js') }}" defer></script>
 
 <style>
   /* Agent bubble prose overrides for a clean dark-mode look */
@@ -61,54 +66,8 @@
   }
   .agent-prose pre:hover .code-copy-btn { opacity: 1; }
   .code-copy-btn:hover { background: rgba(255,255,255,0.15); color: #e2e8f0; }
-  /* Agent card styles */
-  .agent-card { border-radius: 0.75rem; padding: 1rem 1.25rem; border: 1px solid; }
-  .agent-card.card-question { border-color: #4f46e5; background: rgba(79,70,229,0.06); }
-  .agent-card.card-progress { border-color: #374151; background: rgba(55,65,81,0.3); }
-  .agent-card.card-completion { border-color: #059669; background: rgba(5,150,105,0.06); }
-  .agent-card.card-failure { border-color: #dc2626; background: rgba(220,38,38,0.06); }
-  .agent-card.card-approval { border-color: #d97706; background: rgba(217,119,6,0.06); }
-  .agent-card.card-review { border-color: #7c3aed; background: rgba(124,58,237,0.06); }
-  .card-review-body .review-task-ref { font-size: 0.75rem; color: #6b7280; margin-bottom: 0.5rem; }
-  .card-review-body .review-verdict-row { display: flex; align-items: center; gap: 0.75rem; margin-bottom: 0.5rem; }
-  .review-verdict-badge { font-size: 0.75rem; font-weight: 600; padding: 0.2rem 0.6rem; border-radius: 999px; }
-  .verdict-approved { background: rgba(5,150,105,0.15); color: #34d399; }
-  .verdict-changes_required { background: rgba(217,119,6,0.15); color: #fbbf24; }
-  .verdict-rejected { background: rgba(220,38,38,0.15); color: #f87171; }
-  .review-score { font-size: 0.75rem; color: #9ca3af; }
-  .card-review-body .review-summary { font-size: 0.875rem; color: #d1d5db; margin-bottom: 0.5rem; }
-  .card-review-body details { margin-top: 0.5rem; }
-  .card-review-body summary { font-size: 0.75rem; color: #6b7280; cursor: pointer; }
-  .card-review-body summary:hover { color: #9ca3af; }
-  .card-review-body ul { list-style: disc; padding-left: 1.25rem; margin-top: 0.25rem; font-size: 0.8rem; color: #9ca3af; }
-  .card-review-body li { margin-bottom: 0.2rem; }
-  .card-review-body .review-updated-spec { margin-top: 0.5rem; font-size: 0.8rem; color: #9ca3af; border-top: 1px solid #374151; padding-top: 0.5rem; }
-  .agent-card .card-header { display: flex; align-items: center; gap: 0.5rem; font-size: 0.75rem; color: #9ca3af; margin-bottom: 0.5rem; }
-  .agent-card .card-title { font-size: 0.875rem; font-weight: 600; color: #e2e8f0; margin-bottom: 0.25rem; }
-  .agent-card .card-body { font-size: 0.875rem; color: #d1d5db; line-height: 1.5; }
-  .agent-card .card-body .agent-prose { font-size: 0.875rem; }
-  .agent-card .card-context { margin-top: 0.5rem; }
-  .agent-card .card-context summary { font-size: 0.75rem; color: #6b7280; cursor: pointer; }
-  .agent-card .card-context summary:hover { color: #9ca3af; }
-  .agent-card .card-context .detail-content { margin-top: 0.5rem; font-size: 0.8rem; color: #9ca3af; max-height: 600px; overflow-y: auto; }
-  .agent-card .card-options { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-top: 0.75rem; }
-  .agent-card .card-option { padding: 0.375rem 0.75rem; border-radius: 0.5rem; font-size: 0.75rem; font-weight: 500; cursor: pointer; transition: all 0.15s; border: 1px solid transparent; }
-  .agent-card .card-option.opt-primary { background: #4f46e5; color: white; }
-  .agent-card .card-option.opt-primary:hover { background: #4338ca; }
-  .agent-card .card-option.opt-secondary { background: #374151; color: #e5e7eb; }
-  .agent-card .card-option.opt-secondary:hover { background: #4b5563; }
-  .agent-card .card-option.opt-danger { background: rgba(220,38,38,0.15); color: #fca5a5; border-color: rgba(220,38,38,0.3); }
-  .agent-card .card-option.opt-danger:hover { background: rgba(220,38,38,0.25); }
-  .agent-card .card-custom-input { margin-top: 0.5rem; display: flex; gap: 0.5rem; }
-  .agent-card .card-custom-input input { flex: 1; background: #1f2937; border: 1px solid #374151; border-radius: 0.5rem; padding: 0.375rem 0.75rem; font-size: 0.75rem; color: #e5e7eb; }
-  .agent-card .card-custom-input input:focus { outline: none; border-color: #4f46e5; }
-  .agent-card .card-custom-input button { padding: 0.375rem 0.75rem; background: #374151; color: #e5e7eb; border-radius: 0.5rem; font-size: 0.75rem; cursor: pointer; white-space: nowrap; }
-  .agent-card .card-custom-input button.opt-replan { background: rgba(234,88,12,0.2); color: #fb923c; border: 1px solid rgba(234,88,12,0.3); }
-  .agent-card .card-custom-input button.opt-replan:hover { background: rgba(234,88,12,0.3); }
-  .agent-card .card-artifacts { margin-top: 0.5rem; font-size: 0.75rem; color: #9ca3af; }
-  .agent-card .card-responded { margin-top: 0.5rem; font-size: 0.75rem; color: #6b7280; font-style: italic; }
-  .agent-card.responded { opacity: 0.6; }
-  .agent-card.responded .card-options, .agent-card.responded .card-custom-input { display: none; }
+  /* Agent card styles moved to /static/css/app.css, shared with the
+     GO thread, which renders the same cards. */
 </style>
 
 <div class="flex h-full">
@@ -177,6 +136,13 @@
                     class="text-emerald-400 transition-all duration-300"/>
           </svg>
         </div>
+        <!-- View the current compaction summary (what the agent retained after context compaction). -->
+        <button id="btn-compaction-summary" type="button" title="View compaction summary"
+          class="w-7 h-7 flex items-center justify-center rounded-md text-gray-600 hover:text-brand-light hover:bg-surface-hover transition-colors">
+          <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h4m3 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/>
+          </svg>
+        </button>
         <form action="/goals/{{ pid }}/chat/{{ agent.id }}/threads/{{ thread_id }}/delete" method="post"
           data-confirm="This cannot be undone." data-confirm-danger="true" data-confirm-phrase="Delete this conversation">
           <button id="btn-delete-conversation" type="submit" title="Delete conversation"
@@ -279,234 +245,36 @@
     </script>
 
     <!-- Messages -->
-    {# Operator-mode action banner (Stage 3-d/3-l + Stage 5 pause/replan): #}
-    {% if current_story and current_story.workspace_state == 'ready' %}
-    <div id="phase-banner" class="px-4 py-2 border-b border-border bg-indigo-500/5 flex items-center gap-3 text-2xs flex-wrap">
-      <span class="text-gray-500 uppercase tracking-wider">Phase:</span>
-      <span class="font-mono {% if current_story.execution_paused %}text-amber-300{% else %}text-indigo-300{% endif %}">
-        {% if current_story.execution_paused %}⏸ paused{% else %}{{ current_story.current_phase or 'planning' }}{% endif %}
-      </span>
-      {{ info_popover(
-        "The assistant works this story through a plan → execute → review loop: discovery/planning (writing and scoping a plan), awaiting_plan_approval (waiting on you to approve it), executing (running the approved plan), awaiting_next (a diff landed - continue planning or mark done), awaiting_review (waiting on a diff review). \"paused\" means you (or an admin) froze it - Resume or Replan to continue.",
-        label="What do these phases mean?"
-      ) }}
-      {% if current_story.execution_paused %}
-      <button onclick="resumeStory()" class="ml-auto px-3 py-1 rounded bg-emerald-600 hover:bg-emerald-500 text-white text-2xs font-semibold">
-        ▶ Resume
-      </button>
-      <button onclick="replanStory()" class="px-3 py-1 rounded bg-indigo-600 hover:bg-indigo-500 text-white text-2xs font-semibold">
-        ♻ Replan
-      </button>
-      {% elif current_story.current_phase == 'awaiting_plan_approval' or (current_story.current_phase == 'planning' and current_story.current_plan_path) %}
-      <button id="approve-plan-btn" onclick="approvePlan()" class="ml-auto px-3 py-1 rounded bg-green-600 hover:bg-green-500 text-white text-2xs font-semibold">
-        ✓ Approve plan
-      </button>
-      {# Mark-done only for a continuation cycle (story already shipped ≥1 plan). A
-         never-approved story isn't "done" — it's cancelled from the board. #}
-      {% if current_story.current_plan_id %}
-      <button onclick="markStoryDone()" title="Close the story without running this new plan" class="px-3 py-1 rounded bg-green-600 hover:bg-green-500 text-white text-2xs font-semibold">
-        ✓ Mark story done
-      </button>
-      {% endif %}
-      {% elif current_story.current_phase == 'planning' %}
-      <span id="approve-plan-placeholder" class="ml-auto px-3 py-1 text-gray-500 text-2xs italic">Writing plan…</span>
-      {% if current_story.current_plan_id %}
-      <button onclick="markStoryDone()" title="Close the story without adding this feature" class="px-3 py-1 rounded bg-green-600 hover:bg-green-500 text-white text-2xs font-semibold">
-        ✓ Mark story done
-      </button>
-      {% endif %}
-      {% elif current_story.current_phase == 'discovery' %}
-      <span class="ml-auto text-gray-400">Scoping the work.</span>
-      {% elif current_story.current_phase == 'executing' %}
-      <button onclick="pauseStory()" class="ml-auto px-3 py-1 rounded bg-amber-600 hover:bg-amber-500 text-white text-2xs font-semibold">
-        ⏸ Pause
-      </button>
-      {% elif current_story.current_phase == 'awaiting_next' %}
-      <span class="ml-auto text-gray-400">Diff pushed. Continue planning or:</span>
-      <button onclick="markStoryDone()" class="px-3 py-1 rounded bg-green-600 hover:bg-green-500 text-white text-2xs font-semibold">
-        ✓ Mark story done
-      </button>
-      {% elif current_story.current_phase == 'awaiting_review' %}
-      <span class="ml-auto text-gray-400">Awaiting diff review.</span>
-      <button id="gen-diff-review-btn" onclick="retryDiffReview()" class="px-3 py-1 rounded bg-indigo-600 hover:bg-indigo-500 text-white text-2xs font-semibold">
-        ⟳ Generate diff review
-      </button>
-      {% endif %}
-      <span id="phase-banner-msg" class="ml-auto text-gray-500 hidden"></span>
+    {# 'ready' does not always mean every granted repo landed yet — see
+       is_write_repo_set_incomplete's docstring; the git engine can still be
+       cutting a sibling repo's branch a few seconds behind this one. #}
+    {% if current_story and current_story.workspace_state == 'ready' and current_story.workspace_repos_incomplete %}
+    <div class="px-4 py-2 border-b border-border bg-amber-500/10 flex items-center gap-2 text-2xs text-amber-200">
+      <span>⏳</span>
+      <span>Landing repos — the git engine is still cutting a branch for at least one repo this story needs. The workspace will pick it up automatically once it's ready; no action needed.</span>
     </div>
     {% endif %}
+    {# THE PHASE BANNER IS GONE, and with it the whole claude-code
+       plan/execute/review strip: "Phase: planning", "Writing plan...",
+       Approve plan, Pause, Replan, Mark story done.
+
+       It described a state machine kernel stories are not in. Gating it
+       on `current_phase` stopped it appearing for them, which fixed the
+       wrong half of the problem: the strip is not wanted for the stories
+       that DO set a phase either -- nobody monitors that loop from here
+       any more. The run-control bar below reports the state a run is
+       actually in, and cards on the thread carry the decisions.
+
+       The endpoints its buttons called are untouched; only this strip
+       is. Anything still driving that loop drives it from the story
+       page, not from the middle of a conversation. #}
+    {% include "_shared/machine_row.html" %}
+    {% include "_shared/run_controls.html" %}
 
     <div id="messages" class="flex-1 overflow-y-auto px-5 py-4 space-y-4">
       {% if thread_id %}
-      {% for msg in messages %}
-      {% if msg.card_data and msg.card_data is mapping and msg.card_data.kind == 'story_state_snapshot' %}
-      {# Phase 4 Stage 4: pre-turn state snapshot for SHCA. Expanded by  #}
-      {# default so the human sees exactly what context SHCA is reading. #}
-      <div class="flex justify-start">
-        <details class="max-w-3xl w-full" open>
-          <summary class="cursor-pointer text-2xs text-gray-400 hover:text-gray-200 select-none px-2 py-1 inline-flex items-center gap-1.5 rounded bg-indigo-500/10 border border-indigo-500/30">
-            <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
-            <span class="font-semibold text-indigo-300">Assistant context</span>
-            {% if msg.card_data.phase and msg.card_data.phase != 'none' %}<span class="text-gray-600">·</span><span class="text-gray-400">phase={{ msg.card_data.phase }}</span>{% endif %}
-            {% if msg.card_data.story_type and msg.card_data.story_type != 'none' %}<span class="text-gray-600">·</span><span class="text-gray-400">type={{ msg.card_data.story_type }}</span>{% endif %}
-            {% if msg.card_data.claude_session_id and msg.card_data.claude_session_id not in ('none', '(not spawned yet)') %}<span class="text-gray-600">·</span><span class="text-gray-400">claude={{ msg.card_data.claude_session_id[:8] }}…</span>{% endif %}
-          </summary>
-          <pre class="mt-1.5 px-3 py-2 text-2xs font-mono text-gray-300 bg-indigo-500/5 border border-indigo-500/20 rounded whitespace-pre-wrap">{{ msg.content }}</pre>
-        </details>
-      </div>
-      {% elif msg.card_data and msg.card_data is mapping and msg.card_data.kind == 'claude_tool_progress' %}
-      {# Stage 3 live progress: one-line activity card from Claude's hook #}
-      <div class="flex justify-start">
-        <div class="max-w-3xl w-full px-3 py-1.5 text-2xs font-mono border-l-2 border-indigo-500/40 bg-indigo-500/5 text-gray-400 flex items-center gap-2">
-          <span class="text-gray-600" data-utc="{{ msg.created_at.isoformat() if msg.created_at else '' }}">{{ msg.created_at.strftime('%b %d, %H:%M:%S') if msg.created_at else '' }} UTC</span>
-          {% if msg.card_data.task_id %}<span class="text-indigo-300">T{{ msg.card_data.task_id }}</span>{% endif %}
-          <span class="text-gray-300">{{ msg.content }}</span>
-        </div>
-      </div>
-      {% elif msg.card_data and msg.card_data is mapping and msg.card_data.kind == 'phase_task_progress' %}
-      {# Stage 3-i: task progress card (mechanical, bypasses SHCA LLM) #}
-      <div class="flex justify-start">
-        <div class="max-w-3xl w-full px-4 py-3 rounded-xl text-sm border
-                    {% if msg.card_data.sentinel == 'DONE' %}border-green-500/30 bg-green-500/5
-                    {% elif msg.card_data.sentinel == 'BLOCKED' %}border-amber-500/30 bg-amber-500/5
-                    {% elif msg.card_data.sentinel == 'FAILED' %}border-red-500/30 bg-red-500/5
-                    {% else %}border-gray-500/30 bg-gray-500/5{% endif %}">
-          <div class="flex items-center gap-2 text-xs font-mono mb-1">
-            <span class="px-1.5 py-0.5 rounded bg-surface text-gray-300">T{{ msg.card_data.task_id }}</span>
-            <span class="text-gray-500">·</span>
-            <span class="text-indigo-300">{{ msg.card_data.phase }}</span>
-            <span class="text-gray-500">·</span>
-            <span class="font-semibold
-                         {% if msg.card_data.sentinel == 'DONE' %}text-green-400
-                         {% elif msg.card_data.sentinel == 'BLOCKED' %}text-amber-400
-                         {% elif msg.card_data.sentinel == 'FAILED' %}text-red-400
-                         {% else %}text-gray-400{% endif %}">{{ msg.card_data.sentinel or 'output' }}</span>
-          </div>
-          {# Render markdown via the .agent-prose[data-md] page-load handler.       #}
-          {# Claude's PHASE_TASK_DONE summaries use headers/lists/bold/code. The    #}
-          {# handler falls back to escaped pre-wrap if marked.parse returns empty,  #}
-          {# so weird input can't leave the body blank.                             #}
-          <div class="agent-prose text-gray-200 text-sm" data-md="{{ msg.content | e }}">{{ msg.content }}</div>
-          {% if msg.card_data.card_subkind == 'blocked-question' %}
-          <div class="mt-2 text-2xs text-amber-300 italic">↳ Reply in chat to answer this question; it's auto-relayed to Claude.</div>
-          {% endif %}
-        </div>
-      </div>
-      {% elif msg.card_data and msg.card_data is mapping and msg.card_data.kind == 'diff_review' %}
-      {# Stage 3-l: diff review card #}
-      <div class="flex justify-start">
-        <div class="max-w-3xl w-full px-4 py-3 rounded-xl text-sm border border-blue-500/40 bg-blue-500/5">
-          <div class="flex items-center gap-2 text-xs font-semibold uppercase tracking-wider text-blue-300 mb-2">
-            <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2"/>
-            </svg>
-            Diff Review
-            <span class="text-2xs text-gray-500 font-normal ml-2">{{ msg.card_data.stat }}</span>
-          </div>
-          <div class="agent-prose text-gray-200" data-md="{{ msg.content | e }}">{{ msg.content }}</div>
-          {% if msg.card_data.decided %}
-          <div class="mt-3 text-2xs font-semibold uppercase tracking-wider
-                      {% if msg.card_data.decided == 'approve' %}text-emerald-300{% else %}text-rose-300{% endif %}">
-            {% if msg.card_data.decided == 'approve' %}✓ Approved &amp; pushed{% else %}✗ Rejected: sent back to Claude{% endif %}
-          </div>
-          {% else %}
-          <form data-approval-id="{{ msg.card_data.approval_id }}"
-                onsubmit="return decideDiff(event, '{{ msg.card_data.approval_id }}')"
-                class="mt-3 flex gap-2 items-center">
-            <textarea name="feedback" rows="2" placeholder="Optional feedback if rejecting…"
-                      class="input text-2xs flex-1"></textarea>
-            <button type="button" onclick="decideDiffAction(event, '{{ msg.card_data.approval_id }}', 'approve')"
-                    class="px-3 py-2 rounded bg-green-600 hover:bg-green-500 text-white text-2xs font-semibold">
-              ✓ Approve & push
-            </button>
-            <button type="button" onclick="decideDiffAction(event, '{{ msg.card_data.approval_id }}', 'reject')"
-                    class="px-3 py-2 rounded bg-red-600 hover:bg-red-500 text-white text-2xs font-semibold">
-              ✗ Reject
-            </button>
-          </form>
-          {% endif %}
-        </div>
-      </div>
-      {% elif msg.card_data and msg.card_data is mapping and msg.card_data.kind == 'dag_recovery' %}
-      {# Phase 3: DAG recovery card (Replan / Retry / Abandon). mode='failed' (red) | 'blocked' (amber). #}
-      {% set _blocked = msg.card_data.mode == 'blocked' %}
-      <div class="flex justify-start">
-        <div class="max-w-3xl w-full px-4 py-3 rounded-xl text-sm border {% if _blocked %}border-amber-500/40 bg-amber-500/5{% else %}border-rose-500/40 bg-rose-500/5{% endif %}">
-          <div class="flex items-center gap-2 text-xs font-semibold uppercase tracking-wider {% if _blocked %}text-amber-300{% else %}text-rose-300{% endif %} mb-2">
-            {% if _blocked %}Phase Blocked — answer in chat to resume, or:{% else %}Phase Failed{% endif %}
-          </div>
-          <div class="agent-prose text-gray-200" data-md="{{ msg.content | e }}">{{ msg.content }}</div>
-          {% if msg.card_data.decided %}
-          <div class="mt-3 text-2xs font-semibold uppercase tracking-wider text-gray-400">
-            {{ msg.card_data.decided }}
-          </div>
-          {% else %}
-          <div class="mt-3 flex gap-2 items-center flex-wrap recovery-card">
-            <input name="feedback" placeholder="Optional feedback for replan…"
-                   class="input text-2xs flex-1 min-w-40" />
-            {% for opt in msg.card_data.options %}
-            <button type="button" onclick="recoverAction(event, '{{ opt }}')"
-                    class="px-3 py-2 rounded text-white text-2xs font-semibold
-                    {% if opt == 'replan' %}bg-blue-600 hover:bg-blue-500
-                    {% elif opt == 'abandon' %}bg-red-600 hover:bg-red-500
-                    {% elif opt == 'review_keep' %}bg-emerald-600 hover:bg-emerald-500
-                    {% else %}bg-gray-600 hover:bg-gray-500{% endif %}">
-              {% if opt == 'replan' %}♻ Replan{% elif opt == 'retry' %}↻ Retry{% elif opt == 'review_keep' %}📥 Review &amp; keep{% elif opt == 'abandon' %}✕ Abandon{% else %}{{ opt }}{% endif %}
-            </button>
-            {% endfor %}
-          </div>
-          {% endif %}
-        </div>
-      </div>
-      {% elif msg.card_data %}
-      <div class="flex justify-start" data-utc="{{ msg.created_at.isoformat() if msg.created_at else '' }}">
-        <div class="card-container max-w-2xl w-full">
-          <script type="application/json" class="card-json">{{ ((msg.card_data | tojson) if msg.card_data is mapping else msg.card_data) | replace("</", "<\\/") | safe }}</script>
-        </div>
-      </div>
-      {% elif msg.sender == 'system' or (msg.content or '').startswith('# Story Mode Active') %}
-      <!-- System / story-kickoff message: distinct context banner, markdown rendered.
-           Matches sender='system' (legacy import-task path) AND the GO-attributed
-           "# Story Mode Active" kickoff that fires when a user starts working on
-           a story: both should look like context, not chat. -->
-      <div class="flex justify-center" data-utc="{{ msg.created_at.isoformat() if msg.created_at else '' }}">
-        <div class="max-w-3xl w-full px-4 py-3 rounded-xl text-sm border border-indigo-500/30 bg-indigo-500/5">
-          <div class="flex items-center gap-2 text-xs font-semibold uppercase tracking-wider text-indigo-300 mb-2">
-            <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/>
-            </svg>
-            Context loaded
-          </div>
-          <div class="agent-prose text-gray-200" data-md="{{ msg.content | e }}">{{ msg.content }}</div>
-        </div>
-      </div>
-      {% elif msg.role == 'agent' and msg.sender == 'go' %}
-      <!-- Relay from the Goal Orchestrator into this assistant's thread. It is an
-           INBOUND message to the assistant (the assistant replies to it), not the
-           assistant's own output: render it distinctly with GO attribution so it
-           never masquerades as the assistant. -->
-      <div class="flex justify-start" data-utc="{{ msg.created_at.isoformat() if msg.created_at else '' }}">
-        <div class="max-w-3xl w-full px-4 py-3 rounded-xl text-sm border border-emerald-500/30 bg-emerald-500/5">
-          <div class="flex items-center gap-2 text-xs font-semibold uppercase tracking-wider text-emerald-300 mb-2">
-            <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z"/>
-            </svg>
-            Goal Orchestrator
-          </div>
-          <div class="agent-prose text-gray-200" data-md="{{ msg.content | e }}">{{ msg.content }}</div>
-        </div>
-      </div>
-      {% else %}
-      <div class="flex flex-col {% if msg.role == 'human' %}items-end{% else %}items-start{% endif %}"
-           data-utc="{{ msg.created_at.isoformat() if msg.created_at else '' }}">
-        {% if msg.role == 'human' and msg.sender_name %}<span class="text-[0.67rem] text-gray-500 mb-0.5 mr-1">{{ msg.sender_name }}</span>{% endif %}
-        <div class="{% if msg.role == 'human' %}max-w-xl{% else %}max-w-3xl{% endif %} px-4 py-2.5 rounded-2xl text-sm
-          {% if msg.role == 'human' %}bg-brand text-white rounded-br-sm{% else %}bg-surface border border-border text-gray-200 rounded-bl-sm{% endif %}">
-          <div class="agent-prose" data-md="{{ msg.content | e }}">{{ msg.content }}</div>
-        </div>
-      </div>
-      {% endif %}
-      {% endfor %}
+      {% if has_older %}{% with before_id = oldest_message_id %}{% include "_shared/load_earlier.html" %}{% endwith %}{% endif %}
+      {% for msg in messages %}{% include "chat/_message.html" %}{% endfor %}
       <div id="typing-indicator" class="hidden justify-start">
         <div class="bg-surface border border-border rounded-2xl rounded-bl-sm px-4 py-3">
           <div class="flex gap-1.5">
@@ -551,6 +319,8 @@
       </div>
       {% endif %}
     </div>
+
+    {% include "_shared/run_ticker.html" %}
 
     <!-- Input -->
     <div class="px-5 py-3 border-t border-border">
@@ -598,54 +368,7 @@
     </div>
   </div>
 
-  {% if current_story and current_story.workspace_state == 'ready' %}
-  <!-- Horizontal resizer between chat and workspace panel -->
-  <div id="ws-resize-handle-x"
-       class="w-1 flex-shrink-0 bg-border hover:bg-indigo-500/60 cursor-col-resize transition-colors"
-       title="Drag to resize"></div>
-  <!-- Right rail: workspace file viewer (Stage 1 of plan-approval flow) -->
-  <aside id="workspace-panel"
-         class="flex-shrink-0 border-l border-border bg-surface/30 flex flex-col"
-         style="width: 24rem;"
-         data-story-id="{{ current_story.id }}">
-    <div class="px-4 py-2.5 border-b border-border flex items-center gap-2">
-      <svg class="w-4 h-4 text-indigo-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
-              d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z"/>
-      </svg>
-      <div class="min-w-0 flex-1">
-        <div class="text-xs font-semibold text-gray-200 truncate">Workspace</div>
-        <div class="text-2xs text-gray-500 truncate" title="{{ current_story.title }}">{{ current_story.title }}</div>
-      </div>
-      <button id="ws-refresh-btn" class="text-2xs text-gray-500 hover:text-gray-300 px-2 py-1 rounded hover:bg-surface" title="Refresh tree">
-        ↻
-      </button>
-    </div>
-    <div id="ws-panel-body" class="flex-1 min-h-0 flex flex-col">
-      <!-- File tree -->
-      <div id="ws-tree" class="overflow-y-auto px-2 py-2 text-xs font-mono"
-           style="flex: 1 1 auto; min-height: 4rem;">
-        <div class="text-gray-500 text-2xs italic px-2 py-1">Loading…</div>
-      </div>
-      <!-- Vertical resizer between tree and content pane (only shown when content is open) -->
-      <div id="ws-resize-handle-y"
-           class="hidden h-1 flex-shrink-0 bg-border hover:bg-indigo-500/60 cursor-row-resize transition-colors"
-           title="Drag to resize"></div>
-      <!-- File content (collapsible) -->
-      <div id="ws-content-pane" class="hidden flex-col border-t border-border"
-           style="flex: 1 1 50%; min-height: 6rem;">
-        <div class="px-3 py-1.5 border-b border-border bg-surface/40 flex items-center gap-2 text-2xs">
-          <span id="ws-content-path" class="font-mono text-gray-300 truncate flex-1"></span>
-          <span id="ws-content-meta" class="text-gray-600"></span>
-          <button onclick="closeWsContent()" class="text-gray-500 hover:text-gray-300 px-1.5">✕</button>
-        </div>
-        <div id="ws-content-body" class="flex-1 min-h-0 overflow-y-auto px-3 py-2 text-xs">
-          <!-- markdown renders into .agent-prose; code into <pre><code> -->
-        </div>
-      </div>
-    </div>
-  </aside>
-  {% endif %}
+  {% include "_shared/workspace_panel.html" %}
 </div>
 
 <script>
@@ -659,6 +382,18 @@ const currentUid = {{ user.uid | tojson }};
 const CURRENT_STORY_ID = {% if current_story %}"{{ current_story.id }}"{% else %}""{% endif %};
 const INITIAL_PHASE = {% if current_story %}"{{ current_story.current_phase or '' }}"{% else %}""{% endif %};
 const INITIAL_PLAN_PATH = {% if current_story and current_story.current_plan_path %}"{{ current_story.current_plan_path }}"{% else %}""{% endif %};
+
+// ── Kernel run controls ────────────────────────────────────────────────
+//
+// The endpoint derives the story from this THREAD, so nothing here sends a
+// story id — a button in one conversation must not be able to reach another
+// conversation's executor. Polled because the run moves on its own: it can
+// park on a plan, finish, or take the pause seconds after it was asked.
+const RUN_THREAD_ID = {% if thread_id %}"{{ thread_id }}"{% else %}""{% endif %};
+const RUN_BASE = `/goals/{{ pid }}/threads/${RUN_THREAD_ID}/run`;
+// The rest lives in /static/js/run_controls.js, shared with the GO
+// thread, which renders the same bar for an errand. The two consts
+// above stay here because they carry Jinja.
 
 const messagesEl = document.getElementById('messages');
 const inputEl = document.getElementById('msg-input');
@@ -734,6 +469,59 @@ setInterval(() => {
   if (document.visibilityState === 'visible') refreshUsageRing();
 }, 8000);
 
+// ── Compaction summary modal (on-demand) ──────────────────────────────────
+// Shows what the agent actually retained after context compaction. Reads the
+// gateway transcript through the CP's /api/memory/compaction-summary endpoint
+// (which uses the existing sessions.get RPC — no gateway change). Button only
+// exists when a thread is bound, so the ids below are always populated.
+(function initCompactionSummary() {
+  const btn = document.getElementById('btn-compaction-summary');
+  if (!btn) return;
+  const cGoalId = '{{ pid }}';
+  const cAgentId = '{{ agent.id }}';
+  const cThreadId = '{{ thread_id or "" }}';
+  const modal = document.createElement('div');
+  modal.id = 'compaction-modal';
+  modal.className = 'hidden fixed inset-0 z-50 items-center justify-center bg-black/60 p-4';
+  modal.innerHTML =
+    '<div class="bg-surface border border-border rounded-lg max-w-2xl w-full max-h-[80vh] flex flex-col shadow-xl">'
+    + '<div class="flex items-center justify-between px-4 py-3 border-b border-border">'
+    + '<div class="text-sm font-semibold">Compaction summary '
+    + '<span id="compaction-count" class="text-2xs text-gray-500 font-normal"></span></div>'
+    + '<button id="compaction-close" type="button" class="text-gray-500 hover:text-gray-300 text-xl leading-none px-1">&times;</button>'
+    + '</div>'
+    + '<div id="compaction-body" class="px-4 py-3 overflow-y-auto text-sm text-gray-300 leading-relaxed"></div>'
+    + '</div>';
+  document.body.appendChild(modal);
+  const body = modal.querySelector('#compaction-body');
+  const countEl = modal.querySelector('#compaction-count');
+  const hide = () => { modal.classList.add('hidden'); modal.classList.remove('flex'); };
+  const show = () => { modal.classList.remove('hidden'); modal.classList.add('flex'); };
+  modal.addEventListener('click', (e) => { if (e.target === modal) hide(); });
+  modal.querySelector('#compaction-close').addEventListener('click', hide);
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape') hide(); });
+  btn.addEventListener('click', async () => {
+    body.innerHTML = '<div class="text-gray-500">Loading…</div>';
+    countEl.textContent = '';
+    show();
+    try {
+      const qs = new URLSearchParams({goal_id: cGoalId, agent_id: cAgentId, thread_id: cThreadId});
+      const resp = await fetch(`/api/memory/compaction-summary?${qs}`);
+      const data = await resp.json().catch(() => ({}));
+      if (!resp.ok) { body.innerHTML = '<div class="text-red-400">Couldn\'t load the compaction summary.</div>'; return; }
+      countEl.textContent = `· ${(data && data.compaction_count) || 0} compaction(s)`;
+      if (data && data.has_summary && data.summary) {
+        const html = safeMarkdown(data.summary);
+        body.innerHTML = (typeof html === 'string') ? html : '';
+      } else {
+        body.innerHTML = '<div class="text-gray-500">No compaction summary yet — this session hasn\'t been compacted.</div>';
+      }
+    } catch (e) {
+      body.innerHTML = '<div class="text-red-400">Couldn\'t load the compaction summary.</div>';
+    }
+  });
+})();
+
 // ── Markdown renderer ──────────────────────────────────────────────────────
 // Base config (breaks/gfm/async, plain code(), link() with target=_blank) is
 // in /static/js/markdown_renderer.js, loaded above. marked.use() accumulates
@@ -795,21 +583,28 @@ document.addEventListener('click', function (e) {
   if (btn) copyCode(btn);
 });
 
-// Render stored messages on page load (Jinja escapes content; data-md holds raw text).
+// Render stored messages (Jinja escapes content; data-md holds raw text).
 // IMPORTANT: only overwrite innerHTML if renderMd produced something. Otherwise
 // keep the server-rendered fallback so we never end up with a blank bubble when
 // marked.parse fails on weird input.
-document.querySelectorAll('.agent-prose[data-md]').forEach(el => {
-  const rendered = renderMd(el.dataset.md);
-  if (rendered && rendered.trim()) {
-    el.innerHTML = rendered;
-  } else if (el.dataset.md) {
-    // Fallback: render the raw text with preserved whitespace so newlines
-    // don't collapse into one wall of text.
-    el.style.whiteSpace = 'pre-wrap';
-    el.textContent = el.dataset.md;
-  }
-});
+// Guarded by data-md-done so it is safe to re-run over the whole container when
+// "Load earlier" prepends rows — already-rendered (and live-streaming) bubbles
+// are skipped; only the freshly paged-in rows hydrate.
+function hydrateChatMarkdown(root) {
+  (root || document).querySelectorAll('.agent-prose[data-md]:not([data-md-done])').forEach(el => {
+    el.dataset.mdDone = '1';
+    const rendered = renderMd(el.dataset.md);
+    if (rendered && rendered.trim()) {
+      el.innerHTML = rendered;
+    } else if (el.dataset.md) {
+      // Fallback: render the raw text with preserved whitespace so newlines
+      // don't collapse into one wall of text.
+      el.style.whiteSpace = 'pre-wrap';
+      el.textContent = el.dataset.md;
+    }
+  });
+}
+hydrateChatMarkdown();
 
 // ── Connection ─────────────────────────────────────────────────────────────
 function setConnStatus(state) {
@@ -925,9 +720,8 @@ function handleGatewayMessage(data) {
     }
     currentAgentBubble = null;
     currentAgentContent = "";
-    // A phase_changed push arrived mid-stream: now that the message is fully
-    // rendered, reload so the phase banner re-renders (WS-primary path).
-    if (_pendingPhaseReload) { window.location.reload(); return; }
+    // The deferred phase reload went with the banner it existed to
+    // re-render; nothing sets `_pendingPhaseReload` any more.
     // Reactive plan-ready check: Claude just finished a turn: see if it
     // wrote the plan file (validate-plan hook sets current_plan_path).
     // Also the lost-frame fallback for phase_changed (rare).
@@ -1053,14 +847,13 @@ function handleGatewayMessage(data) {
     swapBannerToPlanReady();
 
   } else if (data.type === 'phase_changed') {
-    // WS-primary phase-banner update: the assistant's story_phase tool moved the
-    // story to a new phase. Reload so the banner + its phase-specific buttons
-    // re-render. If a reply is still streaming, defer the reload to
-    // token_stream_end so we don't cut the message off.
-    if (data.to_phase && _bannerPhase && data.to_phase !== _bannerPhase) {
-      if (currentAgentBubble) { _pendingPhaseReload = true; }
-      else { window.location.reload(); }
-    }
+    // NO LONGER RELOADS. This existed to re-render the phase banner and
+    // its phase-specific buttons, and that strip has been removed — so a
+    // reload here now throws away the page, the scroll position and any
+    // half-typed message to re-render nothing at all. The push itself is
+    // left alone: it is the assistant's story_phase tool reporting a real
+    // transition, and other listeners may want it.
+    _bannerPhase = data.to_phase || _bannerPhase;
 
   } else if (data.type === 'plan_approved_notify') {
     // Fired by approve_plan() after tasks are dispatched: gives live
@@ -1335,32 +1128,11 @@ function appendSystemMessage(text, opts = {}) {
 }
 
 // ── Card rendering ──────────────────────────────────────────────────────
-const cardIcons = { question: '❓', progress: '📋', completion: '✅', failure: '❌', approval: '🎯', review: '🔍' };
-const cardColors = {
-  question: 'card-question', progress: 'card-progress',
-  completion: 'card-completion', failure: 'card-failure', approval: 'card-approval', review: 'card-review',
-};
-
-function buildReviewHtml(card) {
-  const verdictLabels = { approved: 'Approved', changes_required: 'Changes Required', rejected: 'Rejected' };
-  const verdict = card.verdict || '';
-  const label = verdictLabels[verdict] || verdict;
-  const score = card.quality_score ?? '?';
-  const findings = (card.findings || []).map(f => `<li>${escapeHtml(f)}</li>`).join('');
-  const recs = (card.recommendations || []).map(r => `<li>${escapeHtml(r)}</li>`).join('');
-  return `
-    <div class="card-review-body">
-      <div class="review-task-ref">Re: ${escapeHtml(card.reviewed_task_title || '')}</div>
-      <div class="review-verdict-row">
-        <span class="review-verdict-badge verdict-${escapeHtml(verdict)}">${escapeHtml(label)}</span>
-        <span class="review-score">${score}/100</span>
-      </div>
-      <div class="review-summary agent-prose">${renderMd(card.summary || '')}</div>
-      ${findings ? `<details><summary>Findings (${(card.findings||[]).length})</summary><ul>${findings}</ul></details>` : ''}
-      ${recs ? `<details><summary>Recommendations (${(card.recommendations||[]).length})</summary><ul>${recs}</ul></details>` : ''}
-      ${card.updated_spec ? `<details class="review-updated-spec"><summary>Updated spec</summary><div class="agent-prose">${renderMd(card.updated_spec)}</div></details>` : ''}
-    </div>`;
-}
+// cardIcons / cardColors / buildReviewHtml / buildRetryHtml /
+// retryRun / respondToCard* MOVED to
+// /static/js/kernel_park_card.js, together with buildCardInnerHtml,
+// so the live path, the reload path and the GO thread all draw a
+// card the same way. This page provides PID, escapeHtml, renderMd.
 
 function renderAgentCard(card) {
   const el = document.createElement('div');
@@ -1414,8 +1186,20 @@ function renderAgentCard(card) {
     respondedHtml = `<div class="card-responded">✓ Responded</div>`;
   }
 
+  // A PARKED EXECUTOR gets its own body and its own buttons. The
+  // generic option buttons post to the card-response endpoint, which
+  // answers an AGENT's question; a plan approval goes to the kernel
+  // with the signed-in human's uid attached, and nothing else may
+  // approve one. Different authority, different handler.
+  if (ct === 'kernel_park') {
+    // Both renderers call the same function; see parkOptionsHtml.
+    optionsHtml = parkOptionsHtml(card); customHtml = '';
+  }
+
   const bodyHtml = ct === 'review'
     ? buildReviewHtml(card)
+    : ct === 'kernel_park'
+    ? buildParkHtml(card)
     : `<div class="card-title">${escapeHtml(card.title || '')}</div>
        <div class="card-body"><div class="agent-prose">${renderMd(card.body || '')}</div></div>`;
 
@@ -1425,13 +1209,14 @@ function renderAgentCard(card) {
         <span>${icon}</span>
         <span class="font-medium">${escapeHtml(card.agent_name || card.agent || 'Agent')}</span>
         <span>·</span>
-        <span class="font-mono">${escapeHtml(card.task_id || '')}</span>
+        <span class="font-mono">${escapeHtml(card.story_id || card.task_id || '')}</span>
       </div>
       ${bodyHtml}
       ${contextHtml}
       ${artifactsHtml}
       ${optionsHtml}
       ${customHtml}
+      ${buildRetryHtml(card)}
       ${respondedHtml}
     </div>`;
 
@@ -1439,48 +1224,27 @@ function renderAgentCard(card) {
   scrollBottom();
 }
 
-function respondToCard(taskId, optionId, value) {
-  // Grey out the card
-  const cardEl = document.querySelector(`[data-card-task="${taskId}"] .agent-card`);
-  if (cardEl) {
-    cardEl.classList.add('responded');
-    const optionsEl = cardEl.querySelector('.card-options');
-    if (optionsEl) optionsEl.innerHTML = `<div class="card-responded">✓ ${escapeHtml(value)}</div>`;
-    const customEl = cardEl.querySelector('.card-custom-input');
-    if (customEl) customEl.remove();
-  }
+// A RETRY BUTTON, on any card that names a run to retry. Stall cards and
+// git-engine cards both do: each is a failure whose cause is OUTSIDE the
+// kernel -- a credential, a permission -- so the person fixes it there
+// and this is how they say so. It clears the stall, the strike counter
+// and the engine's recorded error; it forces no state and passes no
+// gate. The endpoint carries the signed-in identity, because "the cause
+// is fixed" is a claim only a person can make.
 
-  // Show user's response as a bubble
-  appendBubble('human', `[Re: ${taskId}] ${value}`, currentUserName);
 
-  // Send via WebSocket
-  if (ws && ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify({
-      type: 'card_response',
-      task_id: taskId,
-      option_id: optionId,
-      value: value,
-    }));
-  }
-}
+// buildParkHtml / parkNotePlaceholder / parkOptionsHtml / decidePark
+// MOVED to /static/js/kernel_park_card.js, because the GO thread
+// renders the same card and copying two hundred lines works until
+// the first time somebody fixes one copy. This page provides the
+// three globals it needs: PID, escapeHtml, renderMd.
 
-function respondToCardCustom(taskId) {
-  const input = document.getElementById(`custom-${taskId}`);
-  if (!input || !input.value.trim()) return;
-  respondToCard(taskId, 'custom', input.value.trim());
-}
 
-function respondToCardReplan(taskId) {
-  const input = document.getElementById(`custom-${taskId}`);
-  if (!input || !input.value.trim()) {
-    showToast('Please type your answer before clicking Reply & Re-plan', 'info');
-    return;
-  }
-  respondToCard(taskId, 'replan', input.value.trim());
-}
-
-// Render stored cards on page load
-document.querySelectorAll('.card-container').forEach(el => {
+// Render stored cards. Wrapped in a function so "Load earlier" can re-run it on
+// prepended rows; a hydrated card has had its <script class="card-json"> removed,
+// so re-running over the whole container skips already-rendered cards (idempotent).
+function hydrateChatCards(root) {
+  (root || document).querySelectorAll('.card-container').forEach(el => {
   try {
     // Try script tag first (new format), fall back to data attribute (old format)
     const scriptEl = el.querySelector('script.card-json');
@@ -1532,8 +1296,21 @@ document.querySelectorAll('.card-container').forEach(el => {
       artifactsHtml = `<div class="card-artifacts">${items}</div>`;
     }
 
+    // A PARKED EXECUTOR, rendered from history. This is a SECOND copy
+    // of the card renderer -- the live one above handles a push, this
+    // one handles a reload -- and patching only the live path is why
+    // the approval card vanished on refresh.
+    if (ct === 'kernel_park') {
+      // The SAME function the live path uses. Two hand-written copies
+      // is exactly how the acceptance buttons came to be right here and
+      // wrong there.
+      optionsHtml = parkOptionsHtml(card); customHtml = '';
+    }
+
     const storedBodyHtml = ct === 'review'
       ? buildReviewHtml(card)
+      : ct === 'kernel_park'
+      ? buildParkHtml(card)
       : `<div class="card-title">${escapeHtml(card.title || '')}</div>
          <div class="card-body"><div class="agent-prose">${renderMd(card.body || '')}</div></div>`;
 
@@ -1541,13 +1318,42 @@ document.querySelectorAll('.card-container').forEach(el => {
       <div class="agent-card ${colorClass}${responded}">
         <div class="card-header"><span>${icon}</span><span class="font-medium">${escapeHtml(card.agent_name || 'Agent')}</span><span>·</span><span class="font-mono">${escapeHtml(card.task_id || '')}</span></div>
         ${storedBodyHtml}
-        ${contextHtml}${artifactsHtml}${optionsHtml}${customHtml}
+        ${contextHtml}${artifactsHtml}${optionsHtml}${customHtml}${buildRetryHtml(card)}
         ${card.responded ? '<div class="card-responded">✓ Responded</div>' : ''}
       </div>`;
   } catch (e) {
     el.textContent = 'Failed to render card';
   }
-});
+  });
+}
+hydrateChatCards();
+
+// ── "Load earlier" pagination: scroll anchoring + hydrate prepended rows ──
+// htmx swaps #load-earlier (outerHTML) with [next sentinel + older messages].
+// Capture the viewport geometry before the swap; after it, hydrate the newly
+// paged-in markdown + cards, then re-apply the inserted height so the reader
+// stays on the exact message they were reading (the container grew ABOVE the
+// viewport). Gated on our own sentinel so it never touches other htmx swaps.
+(function () {
+  let preScrollHeight = 0, preScrollTop = 0, pending = false;
+  document.body.addEventListener('htmx:beforeSwap', (evt) => {
+    if (evt.target && evt.target.id === 'load-earlier') {
+      preScrollHeight = messagesEl.scrollHeight;
+      preScrollTop = messagesEl.scrollTop;
+      pending = true;
+    }
+  });
+  document.body.addEventListener('htmx:afterSwap', () => {
+    if (!pending) return;  // not our swap
+    pending = false;
+    // Hydrate BEFORE measuring: markdown/card rendering changes row heights, so
+    // a delta taken pre-hydration would leave the viewport off by the difference.
+    hydrateChatMarkdown(messagesEl);
+    hydrateChatCards(messagesEl);
+    const inserted = messagesEl.scrollHeight - preScrollHeight;
+    messagesEl.scrollTop = preScrollTop + inserted;
+  });
+})();
 
 let lastSentContent = '';
 function retryLastMessage(btn) {
@@ -1559,8 +1365,15 @@ function retryLastMessage(btn) {
   }
 }
 
-function scrollBottom() {
-  messagesEl.scrollTop = messagesEl.scrollHeight;
+// Follow the conversation only if the reader is already near the bottom, so
+// live tokens/cards/system messages don't yank a reader who has scrolled up to
+// read history via "Load earlier". `force` overrides for reader-initiated jumps
+// (the user's own send, initial page load). Pinned-at-bottom — the common case —
+// is unchanged: nearBottom is true, so it still auto-scrolls exactly as before.
+function scrollBottom(force) {
+  const nearBottom =
+    (messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight) <= 80;
+  if (force || nearBottom) messagesEl.scrollTop = messagesEl.scrollHeight;
 }
 
 // ── Send ───────────────────────────────────────────────────────────────────
@@ -1575,7 +1388,7 @@ function sendMessage() {
   typingEl.classList.remove('hidden');
   inputEl.value = '';
   inputEl.style.height = 'auto';
-  scrollBottom();
+  scrollBottom(true); // reader-initiated: always jump to their own message
 }
 
 function handleKey(e) {
@@ -1782,7 +1595,7 @@ handleGatewayMessage = function(data) {
 
 setConnStatus('connecting');
 connect();
-scrollBottom();
+scrollBottom(true); // open at the newest message
 
 // ── Restore "agent is running" indicator on page load ─────────────────────
 // If the agent is mid-run when we load, the chat_run_state row tells us
@@ -1805,26 +1618,45 @@ scrollBottom();
 
 // addParticipant is now handled by submitAddParticipant() in the modal script above
 
+// ── Shared _flash-through-reload helper ────────────────────────────────────
+// Reload the current page with a message that base.html's shared _flash reader
+// pops into showToast() on the fresh page. Mirrors app/flash.py's server-side
+// convention (omits _flash_type on default 'success') so the two writers stay
+// consistent about what ends up in the URL. Used by the phase-banner action
+// handlers below when a state mutation needs the server to re-render the
+// phase-specific button set on reload — the navigation itself carries the
+// toast, so no artificial setTimeout delay is needed between the fetch and
+// the reload.
+function navigateWithFlash(message, flashType) {
+  const url = new URL(window.location.href);
+  url.searchParams.set('_flash', message);
+  if (flashType && flashType !== 'success') {
+    url.searchParams.set('_flash_type', flashType);
+  }
+  window.location.href = url.toString();
+}
+
 // ── Approval actions (Stage 3-d, 3-l) ──────────────────────────────────────
 async function approvePlan() {
-  const banner = document.getElementById('phase-banner-msg');
-  if (banner) { banner.textContent = 'Approving plan…'; banner.classList.remove('hidden'); }
   try {
     const resp = await fetch(`/goals/${PID}/stories/${CURRENT_STORY_ID}/plan/approve`, {
       method: 'POST', credentials: 'include',
     });
     const data = await resp.json();
     if (!resp.ok || !data.ok) {
-      if (banner) banner.innerHTML = `<span class="text-red-400">${data.user_message || data.error || 'failed'}</span>`;
+      if (data.error === 'execution_paused') {
+        showToast(data.user_message || 'Execution is paused.', 'warning');
+        return;
+      }
+      showToast(data.user_message || data.error || 'Approve plan failed', 'error');
       return;
     }
-    if (banner) banner.innerHTML =
-      `<span class="text-green-400">✓ Plan approved: ${data.task_count} tasks created` +
-      (data.plan_pushed ? ', plan pushed' : (data.push_error ? ', push failed' : '')) +
-      `</span>`;
-    setTimeout(() => window.location.reload(), 1200);
+    const n = data.task_count || 0;
+    const msg = `✓ Plan approved: ${n} task${n === 1 ? '' : 's'} created`
+      + (data.plan_pushed ? ', plan pushed' : (data.push_error ? ', push failed' : ''));
+    navigateWithFlash(msg, 'success');
   } catch (e) {
-    if (banner) banner.innerHTML = `<span class="text-red-400">${e.message}</span>`;
+    showToast(e.message || 'Approve plan failed', 'error');
   }
 }
 
@@ -1835,9 +1667,7 @@ async function approvePlan() {
 // stranded with no card. This re-fires it. Guarded server-side (no-op if a diff
 // review is already pending), so it's safe to call manually or auto on load.
 async function retryDiffReview(silent) {
-  const banner = document.getElementById('phase-banner-msg');
   const btn = document.getElementById('gen-diff-review-btn');
-  if (!silent && banner) { banner.textContent = 'Generating diff review…'; banner.classList.remove('hidden'); }
   if (btn) btn.disabled = true;
   try {
     const resp = await fetch(`/goals/${PID}/stories/${CURRENT_STORY_ID}/diff/retry`, {
@@ -1845,21 +1675,20 @@ async function retryDiffReview(silent) {
     });
     const data = await resp.json();
     if (!resp.ok || !data.ok) {
-      if (!silent && banner) banner.innerHTML = `<span class="text-red-400">${data.error || 'failed'}</span>`;
+      if (!silent) showToast(data.error || 'Diff review generation failed', 'error');
       if (btn) btn.disabled = false;
       return;
     }
     if (data.regenerated) {
-      if (banner) banner.innerHTML = `<span class="text-green-400">✓ Diff review ready</span>`;
-      setTimeout(() => window.location.reload(), 1000);
+      navigateWithFlash('✓ Diff review ready', 'success');
     } else if (!silent) {
-      if (banner) banner.innerHTML = `<span class="text-gray-400">${data.note || 'diff review already present'}</span>`;
+      showToast(data.note || 'Diff review already present', 'info');
       if (btn) btn.disabled = false;
     } else if (btn) {
       btn.disabled = false;
     }
   } catch (e) {
-    if (!silent && banner) banner.innerHTML = `<span class="text-red-400">${e.message}</span>`;
+    if (!silent) showToast(e.message || 'Diff review generation failed', 'error');
     if (btn) btn.disabled = false;
   }
 }
@@ -1874,40 +1703,42 @@ if (CURRENT_STORY_ID && INITIAL_PHASE === 'awaiting_review') {
 // ── Phase 4 Stage 5: pause / resume / replan / mark-done ─────────────
 
 async function pauseStory() {
-  const banner = document.getElementById('phase-banner-msg');
-  if (banner) { banner.textContent = 'Pausing…'; banner.classList.remove('hidden'); }
   try {
     const resp = await fetch(`/goals/${PID}/stories/${CURRENT_STORY_ID}/pause`, {
       method: 'POST', credentials: 'include',
     });
     const data = await resp.json();
     if (!resp.ok || !data.ok) {
-      if (banner) banner.innerHTML = `<span class="text-red-400">${data.user_message || data.error || data.detail || 'pause failed'}</span>`;
+      if (data.error === 'execution_paused') {
+        showToast(data.user_message || 'Execution is paused.', 'warning');
+        return;
+      }
+      showToast(data.user_message || data.error || data.detail || 'Pause failed', 'error');
       return;
     }
-    if (banner) banner.innerHTML = `<span class="text-amber-300">⏸ Paused</span>`;
-    setTimeout(() => window.location.reload(), 800);
+    navigateWithFlash('⏸ Paused', 'success');
   } catch (e) {
-    if (banner) banner.innerHTML = `<span class="text-red-400">${e.message}</span>`;
+    showToast(e.message || 'Pause failed', 'error');
   }
 }
 
 async function resumeStory() {
-  const banner = document.getElementById('phase-banner-msg');
-  if (banner) { banner.textContent = 'Resuming…'; banner.classList.remove('hidden'); }
   try {
     const resp = await fetch(`/goals/${PID}/stories/${CURRENT_STORY_ID}/resume`, {
       method: 'POST', credentials: 'include',
     });
     const data = await resp.json();
     if (!resp.ok || !data.ok) {
-      if (banner) banner.innerHTML = `<span class="text-red-400">${data.user_message || data.error || data.detail || 'resume failed'}</span>`;
+      if (data.error === 'execution_paused') {
+        showToast(data.user_message || 'Execution is paused.', 'warning');
+        return;
+      }
+      showToast(data.user_message || data.error || data.detail || 'Resume failed', 'error');
       return;
     }
-    if (banner) banner.innerHTML = `<span class="text-emerald-300">▶ Resumed</span>`;
-    setTimeout(() => window.location.reload(), 800);
+    navigateWithFlash('▶ Resumed', 'success');
   } catch (e) {
-    if (banner) banner.innerHTML = `<span class="text-red-400">${e.message}</span>`;
+    showToast(e.message || 'Resume failed', 'error');
   }
 }
 
@@ -1921,8 +1752,6 @@ async function replanStory() {
   if (!result) return;
   const feedback = result.reason;
 
-  const banner = document.getElementById('phase-banner-msg');
-  if (banner) { banner.textContent = 'Initiating replan…'; banner.classList.remove('hidden'); }
   try {
     const body = new URLSearchParams({ feedback });
     const resp = await fetch(`/goals/${PID}/stories/${CURRENT_STORY_ID}/replan`, {
@@ -1932,13 +1761,16 @@ async function replanStory() {
     });
     const data = await resp.json();
     if (!resp.ok || !data.ok) {
-      if (banner) banner.innerHTML = `<span class="text-red-400">${data.user_message || data.error || data.detail || 'replan failed'}</span>`;
+      if (data.error === 'execution_paused') {
+        showToast(data.user_message || 'Execution is paused.', 'warning');
+        return;
+      }
+      showToast(data.user_message || data.error || data.detail || 'Replan failed', 'error');
       return;
     }
-    if (banner) banner.innerHTML = `<span class="text-indigo-300">♻ Replan started: ${data.cancelled_pending || 0} pending tasks cancelled</span>`;
-    setTimeout(() => window.location.reload(), 1200);
+    navigateWithFlash(`♻ Replan started: ${data.cancelled_pending || 0} pending tasks cancelled`, 'success');
   } catch (e) {
-    if (banner) banner.innerHTML = `<span class="text-red-400">${e.message}</span>`;
+    showToast(e.message || 'Replan failed', 'error');
   }
 }
 
@@ -1948,8 +1780,6 @@ async function markStoryDone() {
     body: 'No more DAGs can be added afterwards.',
   });
   if (!result) return;
-  const banner = document.getElementById('phase-banner-msg');
-  if (banner) { banner.textContent = 'Marking done…'; banner.classList.remove('hidden'); }
   try {
     let resp = await fetch(`/goals/${PID}/stories/${CURRENT_STORY_ID}/mark-done`, {
       method: 'POST', credentials: 'include',
@@ -1962,7 +1792,7 @@ async function markStoryDone() {
         body: (data.reason || 'Uncommitted work will be discarded.')
               + '\n\nOK = mark done anyway (discard). Cancel = keep working.',
       });
-      if (!proceed) { if (banner) banner.classList.add('hidden'); return; }
+      if (!proceed) return;
       resp = await fetch(`/goals/${PID}/stories/${CURRENT_STORY_ID}/mark-done`, {
         method: 'POST', credentials: 'include',
         body: new URLSearchParams({ force: 'true' }),
@@ -1970,13 +1800,12 @@ async function markStoryDone() {
       data = await resp.json();
     }
     if (!resp.ok || !data.ok) {
-      if (banner) banner.innerHTML = `<span class="text-red-400">${data.error || data.detail || 'mark-done failed'}</span>`;
+      showToast(data.error || data.detail || 'Mark-done failed', 'error');
       return;
     }
-    if (banner) banner.innerHTML = `<span class="text-green-400">✓ Story marked done</span>`;
-    setTimeout(() => window.location.reload(), 1200);
+    navigateWithFlash('✓ Story marked done', 'success');
   } catch (e) {
-    if (banner) banner.innerHTML = `<span class="text-red-400">${e.message}</span>`;
+    showToast(e.message || 'Mark-done failed', 'error');
   }
 }
 
@@ -1996,7 +1825,6 @@ async function recoverAction(ev, action) {
   }
   const feedbackEl = card ? card.querySelector('input[name=feedback]') : null;
   const feedback = feedbackEl ? feedbackEl.value : '';
-  const banner = document.getElementById('phase-banner-msg');
   const body = new URLSearchParams({ action, feedback });
   try {
     const resp = await fetch(`/goals/${PID}/stories/${CURRENT_STORY_ID}/recover`, {
@@ -2018,23 +1846,21 @@ async function recoverAction(ev, action) {
       });
       const data2 = await resp2.json();
       if (!resp2.ok || !data2.ok) {
-        if (banner) { banner.classList.remove('hidden'); banner.innerHTML = `<span class="text-red-400">${data2.user_message || data2.error || data2.detail || (action + ' failed')}</span>`; }
+        showToast(data2.user_message || data2.error || data2.detail || (action + ' failed'), 'error');
         reenable();
         return;
       }
-      if (banner) { banner.classList.remove('hidden'); banner.innerHTML = `<span class="text-indigo-300">${action} started…</span>`; }
-      setTimeout(() => window.location.reload(), 1000);
+      navigateWithFlash(`${action} started…`, 'success');
       return;
     }
     if (!resp.ok || !data.ok) {
-      if (banner) { banner.classList.remove('hidden'); banner.innerHTML = `<span class="text-red-400">${data.user_message || data.error || data.detail || (action + ' failed')}</span>`; }
+      showToast(data.user_message || data.error || data.detail || (action + ' failed'), 'error');
       reenable();
       return;
     }
-    if (banner) { banner.classList.remove('hidden'); banner.innerHTML = `<span class="text-indigo-300">${action} started…</span>`; }
-    setTimeout(() => window.location.reload(), 1000);
+    navigateWithFlash(`${action} started…`, 'success');
   } catch (e) {
-    if (banner) { banner.classList.remove('hidden'); banner.innerHTML = `<span class="text-red-400">${e.message}</span>`; }
+    showToast(e.message || (action + ' failed'), 'error');
     reenable();
   }
 }
@@ -2076,292 +1902,15 @@ async function decideDiffAction(ev, approvalId, decision) {
       showToast('Decision failed: ' + (data.user_message || data.error || resp.statusText), 'error');
       return;
     }
-    setTimeout(() => window.location.reload(), 800);
+    navigateWithFlash(decision === 'approve' ? 'Diff approved' : 'Diff rejected', 'success');
   } catch (e) {
     showToast(e.message, 'error');
   }
 }
 function decideDiff() { return false; }  // form onsubmit no-op (we use buttons)
 
-// ── Workspace file viewer (Stage 1) ──────────────────────────────────────
-// Lives in the right-rail #workspace-panel. Only rendered when a story is
-// active for this thread (current_story is set + workspace_state='ready').
-(function setupWorkspacePanel() {
-  if (!CURRENT_STORY_ID) return;
-  const panel = document.getElementById('workspace-panel');
-  if (!panel) return;
-  const treeEl = document.getElementById('ws-tree');
-  const refreshBtn = document.getElementById('ws-refresh-btn');
-  const contentPane = document.getElementById('ws-content-pane');
-  const contentPath = document.getElementById('ws-content-path');
-  const contentMeta = document.getElementById('ws-content-meta');
-  const contentBody = document.getElementById('ws-content-body');
-
-  const TREE_URL = `/goals/${PID}/stories/${CURRENT_STORY_ID}/workspace/tree`;
-  const FILE_URL = `/goals/${PID}/stories/${CURRENT_STORY_ID}/workspace/file`;
-
-  // Map mime → highlight.js language hint
-  function langForMime(mime, path) {
-    const ext = (path.match(/\.([a-z0-9]+)$/i) || [])[1]?.toLowerCase() || '';
-    if (mime === 'text/markdown') return 'markdown';
-    if (mime === 'text/x-python') return 'python';
-    if (mime === 'text/javascript' || mime === 'application/json') return ext === 'json' ? 'json' : 'javascript';
-    if (mime === 'text/x-typescript') return ext.startsWith('ts') ? 'typescript' : 'javascript';
-    if (mime === 'text/x-yaml') return 'yaml';
-    if (mime === 'text/x-toml') return 'toml';
-    if (mime === 'text/x-shellscript') return 'bash';
-    if (mime === 'text/html') return 'html';
-    if (mime === 'text/css') return 'css';
-    if (mime === 'text/x-sql') return 'sql';
-    if (mime === 'text/x-go') return 'go';
-    if (mime === 'text/x-rust') return 'rust';
-    if (mime === 'text/x-c' || mime === 'text/x-c++') return mime.endsWith('++') ? 'cpp' : 'c';
-    if (mime === 'text/x-diff') return 'diff';
-    return '';
-  }
-
-  function fmtSize(bytes) {
-    if (bytes < 1024) return `${bytes} B`;
-    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-    return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
-  }
-
-  // Build a tree node structure from a flat entry list.
-  function buildTree(entries) {
-    const root = { name: '', children: new Map() };
-    for (const e of entries) {
-      const parts = e.path.split('/');
-      let cur = root;
-      for (let i = 0; i < parts.length; i++) {
-        const name = parts[i];
-        const isLeaf = i === parts.length - 1;
-        if (!cur.children.has(name)) {
-          cur.children.set(name, { name, children: new Map(), isFile: false });
-        }
-        const node = cur.children.get(name);
-        if (isLeaf) {
-          node.isFile = (e.type === 'file');
-          node.size = e.size;
-          node.path = e.path;
-        }
-        cur = node;
-      }
-    }
-    return root;
-  }
-
-  function renderTree(root) {
-    treeEl.innerHTML = '';
-    if (root.children.size === 0) {
-      treeEl.innerHTML = '<div class="text-gray-500 text-2xs italic px-2 py-1">No files in workspace yet.</div>';
-      return;
-    }
-    const list = document.createElement('ul');
-    list.className = 'space-y-0.5';
-    renderNode(root, list, 0);
-    treeEl.appendChild(list);
-  }
-
-  function renderNode(node, parentList, depth) {
-    // Sort: dirs first then files, both alphabetically.
-    const items = [...node.children.values()].sort((a, b) => {
-      if (a.isFile !== b.isFile) return a.isFile ? 1 : -1;
-      return a.name.localeCompare(b.name);
-    });
-    for (const child of items) {
-      const li = document.createElement('li');
-      li.style.paddingLeft = `${depth * 0.75}rem`;
-      if (child.isFile) {
-        const btn = document.createElement('button');
-        btn.className = 'block w-full text-left px-1 py-0.5 rounded hover:bg-surface text-gray-300 hover:text-gray-100 truncate';
-        btn.title = `${child.path} · ${fmtSize(child.size)}`;
-        btn.innerHTML = `<span class="text-gray-500">📄</span> ${child.name}`;
-        btn.dataset.path = child.path;
-        btn.dataset.size = child.size;
-        btn.onclick = () => openFile(child.path);
-        li.appendChild(btn);
-      } else {
-        const toggle = document.createElement('button');
-        toggle.className = 'block w-full text-left px-1 py-0.5 rounded hover:bg-surface text-gray-200 truncate';
-        toggle.innerHTML = `<span class="ws-caret">▾</span> <span class="text-indigo-400">📁</span> ${child.name}`;
-        li.appendChild(toggle);
-        const sublist = document.createElement('ul');
-        sublist.className = 'space-y-0.5';
-        renderNode(child, sublist, depth + 1);
-        li.appendChild(sublist);
-        toggle.onclick = () => {
-          const collapsed = sublist.classList.toggle('hidden');
-          toggle.querySelector('.ws-caret').textContent = collapsed ? '▸' : '▾';
-        };
-      }
-      parentList.appendChild(li);
-    }
-  }
-
-  async function refreshTree() {
-    treeEl.innerHTML = '<div class="text-gray-500 text-2xs italic px-2 py-1">Loading…</div>';
-    try {
-      const resp = await fetch(TREE_URL, { credentials: 'include' });
-      if (!resp.ok) throw new Error(`${resp.status} ${resp.statusText}`);
-      const data = await resp.json();
-      const root = buildTree(data.entries || []);
-      renderTree(root);
-      if (data.truncated) {
-        const warn = document.createElement('div');
-        warn.className = 'text-2xs text-amber-400 italic px-2 py-1';
-        warn.textContent = 'Tree truncated at 2000 entries.';
-        treeEl.appendChild(warn);
-      }
-    } catch (e) {
-      treeEl.innerHTML = `<div class="text-2xs text-red-400 px-2 py-1">Failed to load: ${e.message}</div>`;
-    }
-  }
-
-  async function openFile(relPath) {
-    contentPane.classList.remove('hidden');
-    contentPane.classList.add('flex');
-    document.getElementById('ws-resize-handle-y').classList.remove('hidden');
-    contentPath.textContent = relPath;
-    contentMeta.textContent = '';
-    contentBody.innerHTML = '<div class="text-gray-500 italic">Loading…</div>';
-    try {
-      const url = `${FILE_URL}?path=${encodeURIComponent(relPath)}`;
-      const resp = await fetch(url, { credentials: 'include' });
-      if (!resp.ok) {
-        const txt = await resp.text();
-        throw new Error(`${resp.status}: ${txt.slice(0, 200)}`);
-      }
-      const data = await resp.json();
-      contentMeta.textContent = `${fmtSize(data.size)}${data.truncated ? ' · truncated' : ''}`;
-      renderFileContent(data);
-    } catch (e) {
-      contentBody.innerHTML = `<div class="text-red-400">Failed to load: ${e.message}</div>`;
-    }
-  }
-
-  function renderFileContent(data) {
-    contentBody.innerHTML = '';
-    if (data.mime === 'application/octet-stream' || !data.content) {
-      const note = document.createElement('div');
-      note.className = 'text-gray-500 italic';
-      note.textContent = data.size === 0
-        ? '(empty file)'
-        : '(binary preview not available)';
-      contentBody.appendChild(note);
-      return;
-    }
-    if (data.mime === 'text/markdown') {
-      const wrap = document.createElement('div');
-      wrap.className = 'agent-prose';
-      wrap.innerHTML = renderMd(data.content);
-      contentBody.appendChild(wrap);
-      // Highlight any code blocks within the rendered markdown
-      wrap.querySelectorAll('pre code').forEach(block => {
-        try { hljs.highlightElement(block); } catch {}
-      });
-      return;
-    }
-    // Source code or text
-    const pre = document.createElement('pre');
-    pre.className = 'rounded-md text-xs overflow-x-auto m-0';
-    pre.style.background = '#0d1117';
-    pre.style.padding = '0.8em 1em';
-    const code = document.createElement('code');
-    const lang = langForMime(data.mime, data.path);
-    if (lang) code.className = `language-${lang}`;
-    code.textContent = data.content;
-    pre.appendChild(code);
-    contentBody.appendChild(pre);
-    try { hljs.highlightElement(code); } catch {}
-  }
-
-  function closeWsContent() {
-    contentPane.classList.add('hidden');
-    contentPane.classList.remove('flex');
-    document.getElementById('ws-resize-handle-y').classList.add('hidden');
-    contentBody.innerHTML = '';
-  }
-  window.closeWsContent = closeWsContent;
-
-  refreshBtn.onclick = refreshTree;
-  refreshTree();
-
-  // ── Resizers ──
-  // Persist sizes per (goal, story) in localStorage so they stick across reloads.
-  const SIZE_KEY = `ws-panel-sizes:${PID}:${CURRENT_STORY_ID}`;
-  function loadSizes() {
-    try { return JSON.parse(localStorage.getItem(SIZE_KEY) || '{}'); } catch { return {}; }
-  }
-  function saveSizes(s) {
-    try { localStorage.setItem(SIZE_KEY, JSON.stringify(s)); } catch {}
-  }
-  const sizes = loadSizes();
-  if (sizes.panelWidth) panel.style.width = sizes.panelWidth + 'px';
-  if (sizes.treeHeight) {
-    document.getElementById('ws-tree').style.flex = `0 0 ${sizes.treeHeight}px`;
-  }
-
-  // Horizontal resizer (panel width)
-  const handleX = document.getElementById('ws-resize-handle-x');
-  if (handleX) {
-    let startX = 0, startW = 0, dragging = false;
-    handleX.addEventListener('mousedown', (e) => {
-      dragging = true;
-      startX = e.clientX;
-      startW = panel.getBoundingClientRect().width;
-      document.body.style.cursor = 'col-resize';
-      document.body.style.userSelect = 'none';
-      e.preventDefault();
-    });
-    window.addEventListener('mousemove', (e) => {
-      if (!dragging) return;
-      // Drag left = grow panel (handle is on panel's left edge)
-      const next = Math.min(Math.max(startW + (startX - e.clientX), 240), Math.min(window.innerWidth - 320, 1200));
-      panel.style.width = next + 'px';
-    });
-    window.addEventListener('mouseup', () => {
-      if (!dragging) return;
-      dragging = false;
-      document.body.style.cursor = '';
-      document.body.style.userSelect = '';
-      const cur = loadSizes();
-      cur.panelWidth = Math.round(panel.getBoundingClientRect().width);
-      saveSizes(cur);
-    });
-  }
-
-  // Vertical resizer (tree height vs content pane height)
-  const handleY = document.getElementById('ws-resize-handle-y');
-  if (handleY) {
-    let startY = 0, startH = 0, dragging = false;
-    handleY.addEventListener('mousedown', (e) => {
-      dragging = true;
-      startY = e.clientY;
-      startH = treeEl.getBoundingClientRect().height;
-      document.body.style.cursor = 'row-resize';
-      document.body.style.userSelect = 'none';
-      e.preventDefault();
-    });
-    window.addEventListener('mousemove', (e) => {
-      if (!dragging) return;
-      const panelBody = document.getElementById('ws-panel-body');
-      const panelH = panelBody.getBoundingClientRect().height;
-      // Keep at least 64px of tree, at least 96px of content
-      const max = panelH - 96 - handleY.getBoundingClientRect().height - 28; // 28px header of content
-      const next = Math.min(Math.max(startH + (e.clientY - startY), 64), max);
-      treeEl.style.flex = `0 0 ${next}px`;
-    });
-    window.addEventListener('mouseup', () => {
-      if (!dragging) return;
-      dragging = false;
-      document.body.style.cursor = '';
-      document.body.style.userSelect = '';
-      const cur = loadSizes();
-      cur.treeHeight = Math.round(treeEl.getBoundingClientRect().height);
-      saveSizes(cur);
-    });
-  }
-})();
+// The workspace file viewer lives in /static/js/workspace_panel.js,
+// shared with the GO thread, which shows the same rail for an errand.
 
 // ── Plan-ready banner update ─────────────────────────────────────────────────
 // During the planning phase with no plan path the header shows a non-clickable

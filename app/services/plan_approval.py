@@ -36,11 +36,33 @@ _log = logging.getLogger(__name__)
 # Also accepted for transition/legacy safety: the interim `plan_<name>` filename in
 # the same stories/.../plans/ dir, and the pre-059 repo/docs/plans/ + workspace-root
 # docs/plans/ forms.
+# The clone root is `repos/<owner>__<name>` for every story now, but `repo` must stay
+# accepted forever: stories provisioned before the layout became universal still have
+# their plans there, and `resolve_plan_root` deliberately keeps a story on its recorded
+# root for life. Note `"repos/x".startswith("repo/")` is FALSE, so the old grammar did
+# not merely prefer the legacy shape — it rejected the new one outright.
+_REPO_ROOT = r"(?:repos/[A-Za-z0-9_.-]+|repo)"
 _PLAN_REF_RE = re.compile(
-    r"(?:repo/stories/[A-Za-z0-9_.-]+/plans/(?:cycle-\d+-|plan_)[A-Za-z0-9_.-]+\.md"
-    r"|repo/docs/plans/[A-Za-z0-9_.-]+\.md"
+    rf"(?:{_REPO_ROOT}/stories/[A-Za-z0-9_.-]+/plans/(?:cycle-\d+-|plan_)[A-Za-z0-9_.-]+\.md"
+    rf"|{_REPO_ROOT}/docs/plans/[A-Za-z0-9_.-]+\.md"
     r"|docs/plans/[A-Za-z0-9_.-]+\.md)",
 )
+
+
+def _strip_repo_root(path: str) -> str | None:
+    """Path relative to its clone root, or None if it sits under no clone root.
+
+    Accepts both shapes so one prefix test covers every story: the universal
+    `repos/<owner>__<name>/…` and the legacy `repo/…`. Returning the REMAINDER (rather
+    than a bool) is what lets callers test `stories/<id>/` without caring which.
+    """
+    if path.startswith("repo/"):
+        return path[len("repo/"):]
+    if path.startswith("repos/"):
+        _owner_name, _, tail = path[len("repos/"):].partition("/")
+        if _owner_name and tail:
+            return tail
+    return None
 
 
 def _is_plan_path(path: str, story_id: str | None = None) -> bool:
@@ -52,9 +74,10 @@ def _is_plan_path(path: str, story_id: str | None = None) -> bool:
     plan_ alike."""
     if not path.endswith(".md") or path.endswith("INDEX.md"):
         return False
-    if path.startswith("repo/stories/") and "/plans/" in path:
+    rest = _strip_repo_root(path)
+    if rest and rest.startswith("stories/") and "/plans/" in rest:
         return True
-    if path.startswith("repo/docs/plans/") or path.startswith("docs/plans/"):
+    if (rest and rest.startswith("docs/plans/")) or path.startswith("docs/plans/"):
         return True
     return False
 
@@ -73,11 +96,12 @@ def _plan_path_rank(path: str, story_id: str | None) -> int:
     fallback the most-recently-written plan wins regardless of convention — this
     rank only breaks exact-mtime ties and keeps the canonical convention on top.
     """
-    if path.startswith("repo/stories/") and "/plans/" in path:
-        if story_id and f"repo/stories/{story_id}/" in path:
+    rest = _strip_repo_root(path)
+    if rest and rest.startswith("stories/") and "/plans/" in rest:
+        if story_id and rest.startswith(f"stories/{story_id}/"):
             return 3  # this story's canonical subdir
         return 2      # another story's subdir (shared repo)
-    if path.startswith("repo/docs/plans/"):
+    if rest and rest.startswith("docs/plans/"):
         return 1      # prior convention, still accepted
     return 0          # docs/plans/ at workspace root (legacy)
 
@@ -148,16 +172,30 @@ async def _push_plan_to_repo(
     Returns (pushed, error_message). Errors are non-fatal — plan
     approval still succeeds.
     """
-    if not plan_path.startswith("repo/"):
+    # The clone dir is not always literally `repo/`: a multi-repo workspace uses
+    # `repos/<owner>__<name>/`. Hardcoding `repo/` meant a multi-repo story's approved
+    # plan was silently never committed or pushed ("not in repo/ — skipping push"),
+    # even though it was written exactly where the agent was told to write it.
+    #
+    # Read from the RECORDED plan path rather than re-derived from the grants: deriving
+    # it meant granting a repository that sorts earlier alphabetically silently moved
+    # where plans were expected, so this check would start rejecting the very path the
+    # agent had been told to write to. `validate_plan` resolves the root the same way,
+    # which is what keeps the gate and this commit in agreement.
+    from app.services.story_plan_root import resolve_plan_root
+    from app.database import get_pool as _get_pool
+    clone_root = await resolve_plan_root(_get_pool(), story_id)
+    prefix = f"{clone_root}/"
+    if not plan_path.startswith(prefix):
         msg = (
-            f"plan file at workspace root ({plan_path}); not in repo/ — "
-            f"skipping push. Move plans to repo/stories/<story_id>/plans/ "
+            f"plan file at workspace root ({plan_path}); not in {prefix} — "
+            f"skipping push. Move plans to {prefix}stories/<story_id>/plans/ "
             f"to enable."
         )
         _log.info("plan_approval: %s", msg)
         return False, msg
 
-    repo_relative_path = plan_path[len("repo/"):]
+    repo_relative_path = plan_path[len(prefix):]
 
     # Refresh the GitHub installation token inline so the credential
     # helper holds a fresh password right before push. The 50-min loop
@@ -212,6 +250,71 @@ async def _push_plan_to_repo(
         story_id, plan_path, push_err, sorted(result.keys()),
     )
     return False, push_err
+
+
+async def _copy_plan_to_other_write_repos(
+    *, instance_id: str, story_id: str, plan_path: str, plan_md: str,
+) -> None:
+    """Write the SAME plan content (and scope.md, if present) into every OTHER
+    write repo's own tree, at the same relative path.
+
+    Mirrors the VS Code extension's local-mode `copyPlanToOtherWriteRepos`
+    (2026-08-20): the assistant's own instruction-following for "copy the plan
+    into every write repo" proved unreliable across sessions (473eb1ee vs
+    c22f2501, same primary repo, two different plan locations) — asking it to
+    remember a SECOND copy step would reintroduce exactly that risk. This makes
+    it true by construction instead.
+
+    Best-effort: a copy failure is logged but never fails plan approval. Copies
+    are left UNCOMMITTED here, same as the extension does — they land in each
+    repo's own commit naturally when that repo's work is later committed and
+    pushed at the end of a normal execution cycle.
+    """
+    from app.services.story_plan_root import resolve_plan_root  # noqa: PLC0415
+    from app.services.story_workspace_layout import (  # noqa: PLC0415
+        resolve_workspace_clones, write_clones,
+    )
+    pool = get_pool()
+    clone_root = await resolve_plan_root(pool, story_id)
+    if not plan_path.startswith(f"{clone_root}/"):
+        return  # not a canonical in-repo plan path — nothing to mirror
+
+    clones = await resolve_workspace_clones(pool, story_id)
+    other_subdirs = [c["subdir"] for c in write_clones(clones) if c["subdir"] != clone_root]
+    if not other_subdirs:
+        return  # single-repo story — nothing to mirror into
+
+    repo_relative_plan_path = plan_path[len(clone_root) + 1:]
+    scope_rel = f"stories/{story_id}/scope.md"
+    scope_md: str | None = None
+    try:
+        result = await gateway_admin.call(
+            "shca.workspace.readFile",
+            {"agentId": instance_id, "storyId": story_id, "path": f"{clone_root}/{scope_rel}"},
+            timeout=30,
+        )
+        scope_md = (result.get("content") or "").replace("\x00", "") or None
+    except Exception:
+        pass  # scope.md may not exist yet (created optionally) — fine to skip
+
+    for subdir in other_subdirs:
+        for rel, content in ((repo_relative_plan_path, plan_md), (scope_rel, scope_md)):
+            if content is None:
+                continue
+            try:
+                await gateway_admin.call(
+                    "shca.workspace.writeFile",
+                    {
+                        "agentId": instance_id, "storyId": story_id,
+                        "path": f"{subdir}/{rel}", "content": content,
+                    },
+                    timeout=30,
+                )
+            except Exception as exc:
+                _log.warning(
+                    "plan_approval: couldn't mirror %s into %s (story=%s): %s",
+                    rel, subdir, story_id, exc,
+                )
 
 
 async def approve_plan(
@@ -385,6 +488,20 @@ async def approve_plan(
         instance_id=instance_id, story_id=story_id,
         plan_path=plan_path, version=ingest_result["version"],
     )
+
+    # 4b. Mirror the plan (+ scope.md) into every OTHER write repo (best-effort,
+    # multi-repo only — no-op for a single-repo story). Runs on EVERY approval,
+    # so a replan's cycle-02/03/… gets mirrored exactly like the first plan.
+    try:
+        await _copy_plan_to_other_write_repos(
+            instance_id=instance_id, story_id=story_id,
+            plan_path=plan_path, plan_md=plan_md,
+        )
+    except Exception:
+        _log.exception(
+            "plan_approval: mirroring plan to other write repos failed (story=%s)",
+            story_id,
+        )
 
     # 5. Trigger task controller wake so first task dispatches (trigger is async — await it).
     try:

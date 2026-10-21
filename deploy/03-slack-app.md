@@ -18,8 +18,8 @@ control-panel URL (for the Slack Request URLs) and an admin login.
 
 ## 3.1 Open the Slack setup in AgentOS
 As an admin: **Settings → Integrations → Slack**. This page:
-- Generates a ready-to-paste **app manifest** with the scopes, the six slash
-  commands, and your **live** Request URLs already filled in — the fastest way to
+- Generates a ready-to-paste **app manifest** with the scopes, every slash
+  command the app serves, and your **live** Request URLs already filled in — the fastest way to
   create the app correctly.
 - Is where you'll paste the app's credentials and install to your workspace (3.4).
 
@@ -31,25 +31,49 @@ As an admin: **Settings → Integrations → Slack**. This page:
 
 <details><summary>Prefer to configure by hand instead of the manifest?</summary>
 
-**Bot Token Scopes** (OAuth & Permissions → Scopes):
+> **Use the manifest if you can.** It is generated from the same registry the
+> app uses to handle commands and call Slack, so it cannot drift from the code.
+> This list matches it for this release; if the two ever differ, the manifest
+> from Settings → Integrations → Slack is right.
 
-| Scope | Why |
-|---|---|
-| `commands` | Run the slash commands (`/goal`, `/story`, `/task`, `/resources`, `/memory`, `/help`) |
-| `chat:write` | Post replies and notifications back into Slack |
-| `chat:write.public` | Post in channels the bot isn't a member of |
-| `users:read` | Map a Slack user to their AgentOS account |
-| `users:read.email` | Match the Slack user by email to the AgentOS login |
-| `im:write` | Send direct messages (private notifications) |
-| `app_mentions:read` | (Optional) let people @-mention the bot |
+**Bot Token Scopes** (OAuth & Permissions → Scopes), all 18:
+
+`app_mentions:read`, `channels:history`, `channels:join`, `channels:manage`,
+`channels:read`, `chat:write`, `chat:write.customize`, `commands`,
+`files:read`, `files:write`, `groups:history`, `groups:read`, `groups:write`,
+`im:history`, `im:read`, `im:write`, `users:read`, `users:read.email`
+
+They are derived from the Slack API methods the app calls. `channels:manage`,
+`groups:write` and the `history` scopes are what let each story get its own
+channel and its conversation reach the agents; a missing one shows up later as
+a story with no channel, not as an error here.
 
 **Slash commands** — Request URL `https://<YOUR_CONTROL_PANEL_URL>/channels/slack/commands`
-for each of: `/goal`, `/story`, `/task`, `/resources`, `/memory`, `/help`. Actions
-are subcommands parsed from the arguments (`/goal status`, `/story list`) — don't
-register them separately.
+for each of the eight:
+
+| Command | What it does |
+|---|---|
+| `/goal` | Goal summary, status, members, invitations, and execution control |
+| `/story` | List, create, transition, complete, and review stories |
+| `/run` | See and steer a story's execution (pause, resume, retry, cancel) |
+| `/park` | Answer the question an execution is waiting on |
+| `/errand` | Approve or decline the autonomous runs the GO proposes |
+| `/resources` | List, scan, and allocate goal resources |
+| `/memory` | Search Assistant memory, decisions, and task history |
+| `/help` | Show the list of commands |
+
+Actions are subcommands parsed from the arguments (`/goal status`,
+`/story review <id>`; `/<command> help` lists them) — don't register them
+separately.
+
+**Bot events** (Event Subscriptions → Subscribe to bot events): `app_mention`,
+`message.channels`, `message.groups`, `message.im`, `file_shared`,
+`member_joined_channel`, `member_left_channel`.
 
 **Interactivity & Shortcuts** → On → `https://<YOUR_CONTROL_PANEL_URL>/channels/slack/actions`
 **Event Subscriptions** → On → `https://<YOUR_CONTROL_PANEL_URL>/channels/slack/events`
+**OAuth & Permissions → Redirect URLs** → add `https://<YOUR_CONTROL_PANEL_URL>/channels/slack/oauth/callback`
+(without it, installing the app to the workspace fails with a redirect error).
 </details>
 
 > **Command suffix:** if you want suffixed commands (`/goal-prod` instead of

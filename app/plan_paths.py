@@ -165,7 +165,8 @@ async def list_prior_chains_on_branch(
              JOIN story_resources sr ON sr.story_id = s.id
             WHERE s.goal_id = $1
               AND sr.resource_id = $2
-              AND s.state IN ('done', 'approved', 'in_progress')
+              AND s.state IN ('done', 'approved', 'in_progress',
+                              'awaiting_merge')
             ORDER BY s.state, s.created_at""",
         goal_id, branch_resource_id,
     )

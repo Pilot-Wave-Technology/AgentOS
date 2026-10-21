@@ -55,6 +55,15 @@ class ChatConfig:
     # Dispatcher poll fallback (NOTIFY is primary; this catches missed signals).
     dispatch_poll_interval_s: int
 
+    # Compaction hold bounds (see chat_module/compaction_gate.py). The gateway's
+    # compaction-end event is a best-effort broadcast, so these bound how long a
+    # lost event can stall a thread. Observed real rounds: 30s–4min.
+    #   soft — past this, verify completion against the gateway's compactionCount
+    #          instead of trusting the event to still be coming.
+    #   max  — hard cap; release blind rather than hold forever.
+    compaction_soft_hold_s: int
+    compaction_max_hold_s: int
+
     # This process/instance id, written to messages.claimed_by.
     instance_id: str
 
@@ -82,6 +91,11 @@ def get_chat_config() -> ChatConfig:
         reaper_timeout_s=_env_int("CHAT_REAPER_TIMEOUT_S", 180),
         reaper_interval_s=_env_int("CHAT_REAPER_INTERVAL_S", 30),
         dispatch_poll_interval_s=_env_int("CHAT_DISPATCH_POLL_INTERVAL_S", 15),
+        # 5min soft / 15min hard: generous headroom over the ~4min worst-case
+        # real round, so a healthy slow compaction is never cut short, while a
+        # lost end-event costs minutes instead of "until the pod is recycled".
+        compaction_soft_hold_s=_env_int("CHAT_COMPACTION_SOFT_HOLD_S", 300),
+        compaction_max_hold_s=_env_int("CHAT_COMPACTION_MAX_HOLD_S", 900),
         instance_id=os.environ.get("CHAT_INSTANCE_ID")
         or f"{socket.gethostname()}:{os.getpid()}",
         gateway_id=os.environ.get("CHAT_GATEWAY_ID", "gw-default"),

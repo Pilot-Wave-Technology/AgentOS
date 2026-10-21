@@ -65,18 +65,23 @@
   </div>
   {% endif %}
 
-  {% if not can_edit %}
-  <!-- Read-only view: no form, no inputs -->
+  {% if not can_edit or is_runtime_instance %}
+  {# Read-only view: no form, no inputs. IA/RA instances are ALWAYS
+     read-only here, even for a platform admin — their config is
+     entirely inherited from the template and there is nothing a Save
+     here could ever do, so no edit control is rendered at all rather
+     than shown-but-inert (hide, don't disable). #}
   <div class="space-y-5">
     <div class="card p-5 space-y-3">
       <h2 class="text-xs font-semibold uppercase tracking-wider text-gray-500">Basics</h2>
-      <div class="grid grid-cols-3 gap-4 text-sm">
+      <div class="text-sm">
         <div><p class="text-xs text-gray-500 mb-0.5">Model</p><p class="font-mono text-gray-200">{{ agent.model.split("/")[-1] if agent.model and "/" in agent.model else (agent.model or 'Not Set') }}</p></div>
-        <div><p class="text-xs text-gray-500 mb-0.5">Max tokens</p><p class="text-gray-200">{{ agent.max_tokens or 'Not Set' }}</p></div>
-        <div><p class="text-xs text-gray-500 mb-0.5">Memory</p><p class="text-gray-200">{{ 'enabled' if agent.memory_enabled else 'disabled' }}</p></div>
       </div>
       {% if agent.notes %}
-      <div><p class="text-xs text-gray-500 mb-0.5">Notes</p><p class="text-gray-300 text-sm">{{ agent.notes }}</p></div>
+      <div>
+        <p class="text-xs text-gray-500 mb-0.5">Notes <span class="text-gray-600">(internal — doesn't affect agent behavior)</span></p>
+        <p class="text-gray-300 text-sm">{{ agent.notes }}</p>
+      </div>
       {% endif %}
     </div>
     <div class="card p-5 space-y-4">
@@ -128,18 +133,18 @@
       <div class="grid grid-cols-3 gap-3">
         <div>
           <label class="block text-xs text-gray-400 mb-1.5">Type</label>
-          <select name="type" onchange="updateTypeUI()" class="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm focus:outline-none focus:border-indigo-500">
-            {% for opt in [('SHCA','Assistant: Coordinator'), ('IA','IA: Worker'), ('GO','GO: Orchestrator'), ('RA','RA: Reviewer')] %}
-            <option value="{{ opt[0] }}" {% if agent.type == opt[0] %}selected{% endif %}>{{ opt[1] }}</option>
-            {% endfor %}
-          </select>
+          {# Fixed at creation — nothing downstream re-provisions an agent on
+             a type change, so this is read-only here (see update.py). #}
+          <div class="w-full px-3 py-2 bg-gray-800/50 border border-gray-800 rounded-lg text-sm text-gray-400">
+            {{ {'SHCA':'Assistant: Coordinator','IA':'IA: Worker','GO':'GO: Orchestrator','RA':'RA: Reviewer'}.get(agent.type, agent.type) }}
+          </div>
         </div>
         <div>
           <label class="block text-xs text-gray-400 mb-1.5">Scope</label>
-          <select name="scope" class="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm focus:outline-none focus:border-indigo-500">
-            <option value="task" {% if (agent.scope or 'task') == 'task' %}selected{% endif %}>Task</option>
-            <option value="goal" {% if agent.scope == 'goal' %}selected{% endif %}>Goal</option>
-          </select>
+          {# Fixed at creation — see Type note above. #}
+          <div class="w-full px-3 py-2 bg-gray-800/50 border border-gray-800 rounded-lg text-sm text-gray-400 capitalize">
+            {{ agent.scope or 'task' }}
+          </div>
         </div>
         <div>
           <label class="block text-xs text-gray-400 mb-1.5">Model</label>
@@ -151,22 +156,25 @@
         </div>
       </div>
 
-      <div class="grid grid-cols-2 gap-3">
-        <div>
-          <label class="block text-xs text-gray-400 mb-1.5">Max tokens <span class="text-gray-600">(optional)</span></label>
-          <input name="max_tokens" type="number" min="1" value="{{ agent.max_tokens or '' }}"
-            class="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm focus:outline-none focus:border-indigo-500" />
-        </div>
-        <div id="memory-section" class="flex items-end pb-1">
-          <label class="flex items-center gap-2 text-sm cursor-pointer select-none">
-            <input type="checkbox" name="memory_enabled" class="accent-indigo-500 w-4 h-4" {% if agent.memory_enabled %}checked{% endif %} />
-            <span class="text-gray-300">Enable memory</span>
-          </label>
-        </div>
-      </div>
+      {# Max tokens input removed (pending): agents.max_tokens is stored and
+         round-tripped through the API, but is never actually forwarded to
+         a gateway session — chat.py builds it into the goal_context dict,
+         but _AgentSession only ever reads agent_type back out of that dict
+         (see app/openclaw.py). Showing an editable "cap" here that silently
+         does nothing is worse than not showing it at all. Re-add once the
+         gateway session-create path actually enforces it. #}
+
+      {# "Enable memory" checkbox removed (pending), same dead end as
+         max_tokens above: agents.memory_enabled reaches goal_context via
+         chat.py but is never read back out of it. Worse, it's also
+         misleading — actual memory enablement is decided independently by
+         memory_v2/provisioning.py (agent_type == "SHCA" AND the global
+         memory_v2_user_memory_enabled setting), not by this per-agent
+         column at all. Re-add only if this column becomes the real gate. #}
 
       <div>
         <label class="block text-xs text-gray-400 mb-1.5">Notes <span class="text-gray-600">(internal)</span></label>
+        <p class="text-xs text-gray-600 mb-1.5">Free-text annotation for other admins — e.g. why this agent exists, or that it's deprecated. Purely informational: it is never read by the agent or the gateway and has no effect on behavior.</p>
         <textarea name="notes" rows="2"
           class="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm focus:outline-none focus:border-indigo-500 resize-none">{{ agent.notes or '' }}</textarea>
       </div>
@@ -204,15 +212,14 @@
     </div>
 
     <!-- Actions row -->
-    <div class="flex items-center justify-between pt-1">
-      {% if not is_runtime_instance %}
-      <button type="button" onclick="confirmDelete()"
-        class="btn btn-danger btn-sm">
-        Delete instance
-      </button>
-      {% else %}
-      <div></div>
-      {% endif %}
+    {# "Delete instance" button removed for now — decommission_agent() never
+       cleans up agent_contexts membership rows in goals this agent belongs
+       to (unlike teardown_goal_agents(), used on goal delete, which does).
+       Deleting a GO this way would also leave its goal without an
+       orchestrator with nothing to recreate it. Revisit once that cleanup
+       gap is closed; the underlying DELETE /api/v1/agents/{id} API and
+       decommission_agent() are untouched, just not exposed here. #}
+    <div class="flex items-center justify-end pt-1">
       <div class="flex items-center gap-3">
         <span id="save-error" class="hidden text-xs text-red-400"></span>
         <a href="/settings/agent-registry?view=instances" class="text-sm text-gray-500 hover:text-gray-300 transition-colors">Back</a>
@@ -230,19 +237,9 @@
 {% endblock %}
 
 {% block extra_js %}
-{% if can_edit %}
+{% if can_edit and not is_runtime_instance %}
 <script>
 const AGENT_ID = {{ agent.id | tojson }};
-
-function updateTypeUI() {
-  const type = document.querySelector('[name="type"]')?.value;
-  const memSection = document.getElementById('memory-section');
-  if (!memSection) return;
-  const isIA = type === 'IA';
-  memSection.style.display = isIA ? 'none' : '';
-  if (isIA) memSection.querySelector('input[name="memory_enabled"]').checked = false;
-}
-updateTypeUI();
 
 // Populate model select with live gateway models
 (async function fetchModels() {
@@ -292,17 +289,12 @@ async function saveInstance() {
   errEl.classList.add('hidden');
 
   const get = name => form.querySelector(`[name="${name}"]`)?.value?.trim() ?? null;
-  const maxTok = get('max_tokens');
   const toolsAllow = Array.from(form.querySelectorAll('.inst-tools-allow:checked')).map(el => el.value);
 
   const patch = {
     name:               get('name') || null,
     emoji:              get('emoji'),
-    type:               get('type') || null,
-    scope:              get('scope') || null,
     model:              get('model') || null,
-    max_tokens:         maxTok ? parseInt(maxTok, 10) : null,
-    memory_enabled:     form.querySelector('[name="memory_enabled"]')?.checked ?? null,
     notes:              get('notes'),
     base_system_prompt: get('base_system_prompt'),
     soul:               get('soul'),
@@ -334,26 +326,8 @@ async function saveInstance() {
   }
 }
 
-async function confirmDelete() {
-  const result = await window.confirmAction({
-    title: 'Delete this instance',
-    body: `This removes "${AGENT_ID}" from the gateway and registry.`,
-    phrase: `Delete ${AGENT_ID}`,
-    danger: true,
-  });
-  if (!result) return;
-  try {
-    const resp = await fetch(`/api/v1/agents/${AGENT_ID}`, { method: 'DELETE' });
-    if (resp.ok) {
-      window.location.href = '/settings/agent-registry?view=instances';
-    } else {
-      const data = await resp.json();
-      showToast(data.detail || 'Delete failed', 'error');
-    }
-  } catch (e) {
-    showToast('Delete failed: ' + e.message, 'error');
-  }
-}
+// confirmDelete() removed along with the "Delete instance" button — see
+// the comment above the actions row for why.
 </script>
 {% endif %}
 {% endblock %}

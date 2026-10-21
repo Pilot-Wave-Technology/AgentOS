@@ -102,10 +102,29 @@ class FanoutListener:
                    card_data, kind
             FROM messages WHERE id = $1
               AND kind <> 'system_inject'
-              AND NOT (kind = 'system_wake' AND sender = 'system' AND card_data IS NULL)
             """,
             message_id,
         )
+        # THE SYSTEM-WAKE FILTER MOVED OUT OF THE SQL, because it is not
+        # a property of the row -- it is a property of the THREAD.
+        #
+        # On an autonomous errand's own thread these rows ARE the
+        # conversation: the parks, the check-ins, the kernel's answers.
+        # GO is woken by them, acts, and reports; hiding them leaves a
+        # person watching work happen with no account of why, which is
+        # the black box the whole feature was meant not to be.
+        #
+        # Everywhere else -- a goal's main thread, an assistant's chat, a
+        # council -- the same rows are plumbing and burying the
+        # conversation in them would be a plain regression. So the test
+        # is the grant, read per thread, and revoking it makes the thread
+        # quiet again on the very next message.
+        if (row is not None and row["kind"] == "system_wake"
+                and row["sender"] == "system" and row["card_data"] is None):
+            from app.services.errand_thread_visibility import (
+                is_autonomous_errand_thread)
+            if not await is_autonomous_errand_thread(get_pool(), thread_id):
+                return
         if not row:
             # No row, or an internal turn: system_inject (context, rides next
             # turn) or a system-sender system_wake with no card (the memory

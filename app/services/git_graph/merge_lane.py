@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import json
 import logging
+import uuid
 from typing import Optional
 
 from app.database import get_pool
@@ -42,6 +43,19 @@ _log = logging.getLogger(__name__)
 _PR_PERMS = {"contents": "write", "metadata": "read", "pull_requests": "write"}
 
 
+# States a sibling node can sit in that mean "this merge group has not converged yet"
+# (research/MULTI_REPO_STORIES_PLAN.md §15.4). Deliberately the SMALL set of "still
+# actively being worked" states, not its complement, so a new state added to the
+# CHECK constraint later defaults to NOT blocking rather than silently freezing every
+# multi-repo group. PROTECTION_BLOCKED and ESCALATED are included: both mean "this
+# node itself still needs a human/engine action before its own state is trustworthy",
+# not "already settled" — same treatment merge_lane.py:153/lease.py:76 already give
+# ESCALATED elsewhere (counted as "live", not terminal).
+_GROUP_NOT_CONVERGED_STATES = (
+    "PLANNED", "BRANCHING", "BRANCH_CREATED", "IN_PROGRESS", "PROTECTION_BLOCKED", "ESCALATED",
+)
+
+
 async def enqueue_ready_merges(conn) -> int:
     """Producer step (spec §0/§5/§7): enqueue a node when its work is done (state
     READY) and its merge story is still live. NO pre-PR approval gate — the human
@@ -53,7 +67,20 @@ async def enqueue_ready_merges(conn) -> int:
     here. Idempotent: ON CONFLICT keeps the node's queue row (+ enqueue_seq, the FIFO key).
 
     (Retired the old `merge_approved_at IS NOT NULL` gate atomically with the
-    approve-button retirement — §5 review: repoint enqueue here or the lease goes dark.)"""
+    approve-button retirement — §5 review: repoint enqueue here or the lease goes dark.)
+
+    Multi-repo group-convergence gate (§15.4): a node whose merge GROUP still has a
+    sibling in `_GROUP_NOT_CONVERGED_STATES` is held at READY rather than enqueued —
+    a repo with no textual conflict of its own can otherwise reach QUEUED (and from
+    there open/merge its own PR) while a sibling repo in the SAME multi-write story
+    is still being worked, with nobody ever having looked at whether the two changes
+    are actually compatible. This is the ONLY chokepoint that needs the check: every
+    stage after QUEUED (promote_pending → run_grind_pass → run_detection_pass) is
+    strictly per-node/per-lease-slot with no path that re-enters QUEUED any other way
+    (the retired self-merge `_drain_repo`/`_recheck_conflicted` path had a second
+    re-queue point; it is dead code, not called from `engine._tick`). A single-node
+    group (the common single-repo case) has no sibling row at all, so the added
+    `NOT EXISTS` is always true for it — byte-identical to before."""
     # COALESCE trunk_branch to the repo default (git_repos.trunk_branch is NOT NULL)
     # so the queue row is NEVER NULL-trunk — a NULL would escape the lease index AND
     # be skipped by promote_pending forever (a silent strand).
@@ -64,9 +91,71 @@ async def enqueue_ready_merges(conn) -> int:
         "  AND s.merge_group_id = gmn.merge_group_id AND s.story_kind = 'merge' "
         "  AND s.state NOT IN ('cancelled', 'rejected') "
         "  AND n.state = 'READY' "
+        # D1 — AN ERRAND'S WORK NEVER LANDS IN TRUNK.
+        #
+        # An errand is allocated what a story is allocated: its own
+        # branch, and trunk too when it needs it, writable when the work
+        # needs that. It commits, it pushes its own branch, and the
+        # result is inspectable afterwards. What it never gets is a
+        # LANDING.
+        #
+        # Enforced HERE because this function's own docstring says it is
+        # "the ONLY chokepoint that needs the check" — every stage after
+        # QUEUED is per-node with no path back in. A node with any errand
+        # member is held at READY for ever, which is the correct resting
+        # state: the branch exists, the work is on it, nothing merges.
+        #
+        # NOT enforced by refusing errands a branch. That was the
+        # original design and it produced two defects and an empty
+        # workspace panel; the constraint belongs on the destination of
+        # the work, not on the work.
+        #
+        # AND THE RUN, NOT ONLY THE STORY. The assistant may run a story
+        # as an errand without the story changing shape, and the wake
+        # at DONE reads the RUN: it deletes the errand's branch. Reading
+        # only the story here, the engine then queued a merge of that
+        # deleted branch -- GitHub 404 on compare, node ESCALATED, a
+        # card asking a human to push it back (GOAL2 / e64f5e80). The
+        # story's LATEST run decides, so a story re-run as a story lands.
+        "  AND NOT EXISTS ( "
+        "    SELECT 1 FROM git_node_stories gns "
+        "    JOIN stories est ON est.id = gns.story_id "
+        "    WHERE gns.git_node_id = n.id AND (est.work_kind = 'errand' "
+        "      OR (SELECT e.kind FROM kernel.executions e "
+        "           WHERE e.story_id = est.id "
+        "           ORDER BY e.id DESC LIMIT 1) = 'errand') "
+        "  ) "
+        "  AND NOT EXISTS ( "
+        "    SELECT 1 FROM git_merge_group_nodes sib_gmn "
+        "    JOIN git_nodes sib_n ON sib_n.id = sib_gmn.git_node_id "
+        "    WHERE sib_gmn.merge_group_id = gmn.merge_group_id "
+        "      AND sib_n.id <> n.id "
+        f"      AND sib_n.state = ANY($1::text[]) "
+        "  ) "
         "RETURNING n.id AS node_id, n.git_repo_id, n.goal_id, "
-        "          COALESCE(n.trunk_branch, r.trunk_branch) AS trunk_branch"
+        "          COALESCE(n.trunk_branch, r.trunk_branch) AS trunk_branch",
+        list(_GROUP_NOT_CONVERGED_STATES),
     )
+    # Enqueue in intra-group `seq` order (multi-repo plan M2/L4). Within a merge group,
+    # `git_merge_group_nodes.seq` is the declared cross-repo landing order; enqueueing
+    # in that order makes each node's FIFO position (enqueue_seq) follow it, so repo A
+    # takes its lane slot before repo B when the story declared that ordering.
+    #
+    # ADVISORY, NOT A GATE: the lease is per (repo, trunk), so nodes in different repos
+    # hold different lanes and can still land out of order if a human merges B's PR
+    # first — the engine never merges, so it cannot enforce sequencing. Ordering the
+    # enqueue is the strongest honest guarantee available here. Nodes are ordered
+    # deterministically by (seq, node_id) so a tie never reorders between passes.
+    seq_by_node: dict[str, int] = {}
+    if rows:
+        for sr in await conn.fetch(
+            "SELECT git_node_id, min(seq) AS seq FROM git_merge_group_nodes "
+            "WHERE git_node_id = ANY($1::text[]) GROUP BY git_node_id",
+            [r["node_id"] for r in rows],
+        ):
+            seq_by_node[sr["git_node_id"]] = sr["seq"] or 0
+    rows = sorted(rows, key=lambda r: (seq_by_node.get(r["node_id"], 0), r["node_id"]))
+
     seen: set[str] = set()
     for r in rows:
         # The UPDATE...FROM join can emit a node more than once (a node in >1 group);
@@ -96,12 +185,12 @@ async def cancel_engine_stories_for_group(executor, merge_group_id: str) -> str:
     in-progress 'Integrate dev …' / 'Fix …' stories. `executor` may be a pool or a conn.
     Clears active_thread_id so the SHCA watchdog reaps the workspace. Idempotent.
 
-    PRECONDITION (relied on by all three call sites — _cancel_node, reap, _finalize_merged):
-    merge groups are SINGLE-NODE today (reconcile §6), so cancelling the whole group's
-    engine code stories when ONE node settles is correct. If groups ever become multi-
-    node, the per-node callers (_cancel_node/reap) must scope to the node's own stories,
-    and _finalize_merged's call must stay gated on whole-group-landed (remaining == 0) —
-    else a still-needed sibling node's diff story would be cancelled prematurely."""
+    SCOPE (multi-repo plan M2.4). Merge groups can now hold MORE THAN ONE node (a
+    multi-write story contributes one node per repo), so this whole-group form is only
+    correct when the whole group has settled. Use it ONLY from `_finalize_merged`,
+    which is gated on whole-group-landed (remaining == 0). Per-node callers must use
+    `cancel_engine_stories_for_node` instead, or they will cancel a sibling repo's
+    still-needed diff/fix story."""
     if not merge_group_id:
         return "UPDATE 0"
     return await executor.execute(
@@ -109,6 +198,182 @@ async def cancel_engine_stories_for_group(executor, merge_group_id: str) -> str:
         "WHERE created_by = 'engine' AND story_kind = 'code' AND merge_group_id = $1 "
         "  AND state NOT IN ('done', 'reviewed', 'cancelled', 'rejected')",
         merge_group_id,
+    )
+
+
+async def reject_merge_story_if_last_live_node(
+    conn, node_id: str, reason: str, *, terminal_state: str = "rejected",
+) -> bool:
+    """Tear down a node's merge story ONLY when no sibling node is still live.
+
+    Returns True if a merge story was terminalized, False if it was left open because
+    a sibling repo is still working.
+
+    WHY (multi-repo plan, review finding): a merge group used to hold exactly one node,
+    so "this node was cancelled" and "this group is finished" were the same statement.
+    With a multi-write story the group holds one node per repo, and terminalizing the
+    shared merge story because ONE repo was cancelled strands every sibling: the merge
+    story is the enqueue predicate (`enqueue_ready_merges` skips
+    cancelled/rejected merge stories), so the healthy repos are never queued again,
+    never open a PR, and never escalate — they simply stop, with no operator-visible
+    error and no self-heal path.
+
+    A node is "live" while it is neither MERGED nor ABANDONED. ESCALATED counts as live
+    on purpose: it is recoverable through the operator Retry route
+    (git_graph.git_retry_node), which resets the node to PLANNED and reactivates a
+    rejected merge story.
+
+    When a sibling IS still live the caller should tell somebody — see
+    `notify_merge_group_node_cancelled`. Correct-but-silent is the failure mode this
+    change would otherwise introduce: the story simply never completes, because
+    `_finalize_merged` requires EVERY node to be MERGED.
+    """
+    terminalized = False
+    for row in await conn.fetch(
+        "SELECT merge_group_id FROM git_merge_group_nodes WHERE git_node_id = $1",
+        node_id,
+    ):
+        gid = row["merge_group_id"]
+        live_siblings = await conn.fetchval(
+            "SELECT count(*) FROM git_merge_group_nodes gmn "
+            "  JOIN git_nodes n ON n.id = gmn.git_node_id "
+            " WHERE gmn.merge_group_id = $1 AND gmn.git_node_id <> $2 "
+            "   AND n.state NOT IN ('MERGED', 'ABANDONED')",
+            gid, node_id,
+        )
+        if live_siblings:
+            _log.info(
+                "git-engine: node %s cancelled but %d live sibling node(s) remain in "
+                "group %s — leaving the merge story OPEN so they can still land",
+                node_id, live_siblings, gid,
+            )
+            continue
+        await conn.execute(
+            "UPDATE stories SET state = $2, updated_at = now() "
+            "WHERE story_kind = 'merge' AND state NOT IN ('done', 'rejected', 'cancelled') "
+            "  AND merge_group_id = $1",
+            gid, terminal_state,
+        )
+        terminalized = True
+    return terminalized
+
+
+async def notify_merge_group_node_cancelled(
+    conn, node_id: str, reason: str,
+) -> list[tuple[str, str]]:
+    """Post a notice on the merge story's thread when ONE repo of a multi-repo story
+    was torn down but the merge story stayed open.
+
+    Without this the operator gets no signal at all: the board still shows the merge
+    story as open and the healthy repos keep working, while the story can in fact never
+    complete until the cancelled node is retried. Best-effort — a notification failure
+    must never break the teardown transaction it runs inside.
+
+    Returns the (thread_id, message_id) pairs it inserted. The caller must hand these to
+    `fan_out_cancel_notices` AFTER its transaction commits: the chat fan-out
+    (notify_new_message) takes its OWN pool connection, so firing it inside the
+    transaction would announce a message to every browser even if the teardown then
+    rolled back — and the broadcaster would find no such row.
+    """
+    inserted: list[tuple[str, str]] = []
+    try:
+        rows = await conn.fetch(
+            "SELECT s.id, s.thread_id, n.branch_name, r.owner, r.name "
+            "  FROM git_merge_group_nodes gmn "
+            "  JOIN stories s ON s.merge_group_id = gmn.merge_group_id "
+            "                AND s.story_kind = 'merge' "
+            "  JOIN git_nodes n ON n.id = gmn.git_node_id "
+            "  JOIN git_repos r ON r.id = n.git_repo_id "
+            " WHERE gmn.git_node_id = $1 "
+            "   AND s.state NOT IN ('done', 'cancelled', 'rejected')",
+            node_id,
+        )
+        for row in rows:
+            if not row["thread_id"]:
+                continue
+            body = (
+                f"### One repository was cancelled — the rest are still going\n\n"
+                f"**`{row['owner']}/{row['name']}`** (branch `{row['branch_name']}`) was "
+                f"torn down: {reason[:300]}\n\n"
+                f"The other repositories in this change are unaffected and will keep "
+                f"working toward their own pull requests. **This story cannot complete "
+                f"until this repository is recovered** — every repository has to land.\n\n"
+                f"Use **Retry** on the node in the Git panel once the cause is fixed, or "
+                f"cancel the remaining repositories if the whole change is being dropped."
+            )
+            msg_id = str(uuid.uuid4())
+            await conn.execute(
+                """INSERT INTO messages (id, thread_id, role, sender, content, created_at)
+                   VALUES ($1, $2, 'agent', 'git-engine', $3, NOW())""",
+                msg_id, row["thread_id"], body,
+            )
+            inserted.append((row["thread_id"], msg_id))
+            _log.info(
+                "git-engine: notified merge story %s that node %s was cancelled",
+                row["id"], node_id,
+            )
+    except Exception as exc:
+        _log.warning(
+            "git-engine: could not post merge-group cancel notice for node %s: %s",
+            node_id, exc,
+        )
+    return inserted
+
+
+async def fan_out_cancel_notices(pending: list[tuple[str, str]]) -> None:
+    """Push the cancel notices to open chat tabs. Call AFTER the teardown transaction
+    has COMMITTED — never inside it (see notify_merge_group_node_cancelled).
+
+    Without this the notice exists in the DB but no open tab learns of it until a manual
+    refresh, which is the same trap diff_review documents: a card that "only ever
+    appeared on refresh". Best-effort; the persisted row is the fallback.
+    """
+    if not pending:
+        return
+    try:
+        from app.chat_module.repository import notify_new_message
+        for thread_id, msg_id in pending:
+            await notify_new_message(thread_id, msg_id)
+    except Exception as exc:
+        _log.warning("git-engine: cancel-notice fan-out failed: %s", exc)
+
+
+async def cancel_engine_stories_for_node(
+    executor, node_id: str, merge_group_id: str = "",
+) -> str:
+    """Cancel non-terminal ENGINE diff/fix stories belonging to ONE node.
+
+    The per-node counterpart of `cancel_engine_stories_for_group`, for the callers
+    that tear down a single node (`_cancel_node`, `reap_deleted_goal_nodes`, the merge
+    cancel route). With multi-node merge groups, cancelling by group there would take
+    down a sibling repo's in-flight diff/fix story even though that repo is still
+    perfectly healthy.
+
+    `merge_group_id` is an optional LEGACY fallback: engine stories written before
+    `stories.git_node_id` existed have a NULL node, so they can only be found by
+    group. It is applied only when the group is single-node — otherwise the fallback
+    would reintroduce exactly the cross-repo clobbering this function exists to stop.
+    Clears active_thread_id so the SHCA watchdog reaps the workspace. Idempotent.
+    """
+    if not node_id:
+        return "UPDATE 0"
+
+    legacy_group = ""
+    if merge_group_id:
+        sibling_count = await executor.fetchval(
+            "SELECT count(*) FROM git_merge_group_nodes WHERE merge_group_id = $1",
+            merge_group_id,
+        )
+        if (sibling_count or 0) <= 1:
+            legacy_group = merge_group_id
+
+    return await executor.execute(
+        "UPDATE stories SET state = 'cancelled', active_thread_id = NULL, updated_at = now() "
+        "WHERE created_by = 'engine' AND story_kind = 'code' "
+        "  AND state NOT IN ('done', 'reviewed', 'cancelled', 'rejected') "
+        "  AND (git_node_id = $1 "
+        "       OR (git_node_id IS NULL AND $2 <> '' AND merge_group_id = $2))",
+        node_id, legacy_group,
     )
 
 
@@ -165,6 +430,8 @@ async def run_merge_pass(goal_id: Optional[str] = None) -> dict:
     g = " AND goal_id = $1" if goal_id else ""
     gn = " AND n.goal_id = $1" if goal_id else ""
     rows = await pool.fetch(
+        # sql: safe -- `g` and `gn` are literal ternaries two lines up,
+        # each either "" or a fragment binding $1.
         f"SELECT DISTINCT git_repo_id FROM git_merge_queue WHERE status = 'waiting'{g} "
         "UNION "
         "SELECT DISTINCT n.git_repo_id FROM git_nodes n "
@@ -455,11 +722,13 @@ async def _finalize_merged(
                 gid,
             )
             if (remaining or 0) == 0:
-                await conn.execute(
-                    "UPDATE stories SET state = 'done', updated_at = now() "
-                    "WHERE merge_group_id = $1 AND story_kind = 'merge' AND state <> 'done'",
-                    gid,
-                )
+                from app.services.story_state_ledger import (
+                    record_states_where)
+                await record_states_where(
+                    conn, "done",
+                    where=("merge_group_id = $1 AND story_kind = 'merge' "
+                           "AND state <> 'done'"),
+                    params=(gid,), action="merge_group_landed")
                 # The whole group has LANDED → any in-flight engine integrate/fix (diff)
                 # stories are now MOOT (the branch they were helping land is merged).
                 # Cancel them so they don't orphan in_progress. The CANCEL/reject paths
@@ -467,6 +736,67 @@ async def _finalize_merged(
                 # else a human-merged PR strands its integrate story (observed live:
                 # merge story 'done' but "Integrate dev into <branch>" stuck in_progress).
                 await cancel_engine_stories_for_group(conn, gid)
+        # A story whose every branch has landed has nothing left to discuss.
+        #
+        # Closed HERE, in the finalize transaction, so the conversation closes
+        # exactly when the work lands or not at all — a thread retired against
+        # a merge that then rolled back would be a conversation taken away for
+        # no reason, and one left open after the last branch landed is the
+        # clutter this exists to remove.
+        #
+        # Per STORY, not per node: `landed_stories_for_node` only closes a
+        # story with no live node anywhere, so a multi-repo change keeps its
+        # thread through the first two merges and closes on the third. Nothing
+        # is deleted — the conversation is the record of how the work was done.
+        from .story_threads import close_threads_for_landed
+        closed_threads = await close_threads_for_landed(conn, node_id)
+
+        # G5: the branch's job is done -- its commits are on trunk. Archive
+        # the engine's branch resource and drop its story links inside the
+        # same transaction as the finalize.
+        from .branches import cleanup_landed_branch
+        cleaned = await cleanup_landed_branch(conn, node_id)
+
+    # OUTSIDE the transaction, deliberately: a GitHub call inside it
+    # would hold row locks for a network round-trip. The commits are on
+    # trunk; deleting the ref is housekeeping.
+    #
+    # THIS NEVER ONCE WORKED, and said it had. It called `delete_ref`
+    # with the token it was handed -- which comes from `detect`, minted
+    # `_DETECT_PERMS` = contents:READ, because detection deliberately
+    # cannot write. GitHub answers 403, `delete_ref` returns False, and
+    # this ignored the return value and logged "deleted landed ref"
+    # regardless. Two hundred and one branches on the test remote, every
+    # merged one still there, and two hundred success lines in the log.
+    #
+    # `branch_cleanup` mints its OWN write-scoped token rather than
+    # widening the detect token: detection staying read-only is a
+    # property worth keeping, not an accident. It also carries the
+    # guards this had none of -- engine-cut branches only, never a
+    # trunk, never one another live node is still riding.
+    from .branch_cleanup import delete_merged_branch
+
+    # AND THE STORY RIDING IT MAY HAVE BEEN WAITING FOR THIS. A
+    # coding story parks between push and merge so the person can
+    # ask for one more thing while the tree is still there; the
+    # merge is what answers that park.
+    #
+    # OUTSIDE THE TRANSACTION, beside the branch cleanup and for the
+    # same reason -- it finishes a run, which is not work to do
+    # while holding the finalize row locks. Best-effort: the
+    # `sweep_landed` backstop finds anything this misses.
+    try:
+        from app.services.story_landing import on_node_landed
+        await on_node_landed(get_pool(), node_id)
+    except Exception:                                       # noqa: BLE001
+        _log.exception("finalize: landing release failed for %s — the "
+                       "sweep will retry", node_id)
+
+    outcome = await delete_merged_branch(get_pool(), node_id)
+    _log.info("finalize: branch cleanup for %s -> %s (archived %s "
+              "resource row(s)); closed %s story thread(s) %s", node_id, outcome,
+              (cleaned or {}).get("archived", 0), len(closed_threads),
+              [t[:8] for t in closed_threads] or "")
 
 
 async def _park(node_id: str, base_sha: str, reason: str) -> None:

@@ -25,6 +25,7 @@ import logging
 from app.database import get_pool
 
 from .dispatch import STORY_BRANCH_READY_CHANNEL, GIT_PR_OPENED_CHANNEL
+from .story_threads import threads_for_node
 
 log = logging.getLogger(__name__)
 
@@ -33,6 +34,18 @@ log = logging.getLogger(__name__)
 # human decides whether to cancel). Re-notify at most once per stall period.
 _STALL_SECONDS = 24 * 3600
 _STALL_HOURS = 24
+
+# Re-provision lock retry (2026-08-20 fix): a multi-write story's member repos get
+# their branches cut a few seconds apart (routine engine behaviour), each cut firing
+# its own NOTIFY for the SAME story. The per-story advisory lock used to be a
+# non-blocking try-lock whose failure path silently dropped the NOTIFY — so a 2nd/3rd
+# cut landing while the 1st cut's ~5s re-provision RPC was still in flight was lost
+# forever, with zero log line. Confirmed live on story e77e0b65: 2 of 3 write repos
+# permanently dropped, workspace_state stuck at 'ready'. Retrying a few times with a
+# short delay, bounded well past one provisioning attempt's typical duration, turns
+# that silent drop into a delayed-but-successful re-provision instead.
+_LOCK_RETRY_MAX_ATTEMPTS = 8
+_LOCK_RETRY_DELAY_S = 4
 
 
 class BranchReadyListener:
@@ -190,6 +203,40 @@ class BranchReadyListener:
         for r in diffs:
             await self._reprovision_story(r["goal_id"], r["story_id"])
 
+        # Multi-repo fix, piece 1c backstop (2026-08-20): 'ready' is a legitimate,
+        # common OUTCOME of a partial provision, not proof the job is done — see
+        # `is_write_repo_set_incomplete`'s docstring. The NOTIFY path (Component C)
+        # is supposed to catch a repo whose branch arrives late, but it's a
+        # non-durable signal and its retry (see _LOCK_RETRY_*) is still bounded, so
+        # this sweep is the last-resort net: it re-checks EVERY 'ready' operator
+        # story, not just ones the NOTIFY path never reached in time. Confirmed live
+        # gap (story e77e0b65): the try-lock used to drop this silently forever with
+        # no backstop at all, since this poll previously only looked at
+        # workspace_state='none'.
+        ready = await pool.fetch(
+            "SELECT DISTINCT s.id AS story_id, s.goal_id "
+            "FROM stories s "
+            "JOIN threads t ON t.id = s.active_thread_id "
+            "WHERE s.execution_mode = 'operator' "
+            "  AND s.active_thread_id <> '' "
+            "  AND s.workspace_state = 'ready' "
+            "  AND s.state NOT IN ('done', 'reviewed', 'cancelled', 'rejected') "
+            "LIMIT 50",
+        )
+        if ready:
+            from app.services.operator_provisioning import is_write_repo_set_incomplete
+            for r in ready:
+                try:
+                    if await is_write_repo_set_incomplete(pool, r["goal_id"], r["story_id"]):
+                        log.info(
+                            "git branch-ready: poll backstop found story=%s 'ready' "
+                            "but still missing repo(s) — retrying", r["story_id"])
+                        await self._reprovision_story(r["goal_id"], r["story_id"])
+                except Exception:
+                    log.exception(
+                        "git branch-ready: incomplete-write-repo-set check failed "
+                        "for story=%s", r["story_id"])
+
         await self._scan_pr_opened()
         await self._scan_stalled_lanes()
 
@@ -268,47 +315,45 @@ class BranchReadyListener:
             "branch": node["branch_name"],
         }
 
-        # Resolve the owner's persistent SHCA thread the SAME way story imports do
-        # (shca._ensure_persistent_user_goal_thread): the SLACK rotating thread if
-        # mapped, else the user's SHCA-AGENT thread for this goal (oldest). Matching
-        # import is critical — without the agent_id filter we'd grab an arbitrary older
-        # thread the user created (not their SHCA chat), landing the notice where they
-        # aren't looking. (active_thread_id is unusable: 'done' clears it, and the PR
-        # opens only once the member stories are done.)
-        thread_id = None
-        if assignee:
-            # 1) The Slack rotating thread if Slack is wired up.
-            thread_id = await pool.fetchval(
-                "SELECT thread_id FROM slack_user_goal_channels "
-                "WHERE goal_id = $1 AND user_uid = $2 AND archived_at IS NULL "
-                "  AND thread_id <> '' LIMIT 1",
-                goal_id, assignee,
-            )
-            # 2) Else the user's persistent SHCA thread for this goal, resolved LIVE via
-            #    agents.type='SHCA' — the SAME path as _ensure_persistent_user_goal_thread
-            #    (shca.py). The old lookup went through user_shca_configs, which is
-            #    DEPRECATED and empty for current SHCAs, so it resolved nothing and the
-            #    notice fell through to a bell-only with no chat card.
-            if not thread_id:
-                thread_id = await pool.fetchval(
-                    "SELECT t.id FROM threads t JOIN agents a ON a.id = t.agent_id "
-                    "WHERE t.goal_id = $1 AND t.created_by = $2 AND a.type = 'SHCA' "
-                    "ORDER BY t.created_at LIMIT 1",
-                    goal_id, assignee,
-                )
+        # THE THREADS OF THE STORIES THIS BRANCH CARRIES — see
+        # git_graph/story_threads.py for why this replaced a per-user lookup.
+        #
+        # The previous resolution asked for the assignee's SHCA thread in this
+        # goal, `ORDER BY created_at LIMIT 1`, and was right while a person had
+        # exactly one: "oldest" was "only". Stage K gave every story its own
+        # thread and that query silently became "the first story they ever
+        # opened here" — so every merge notice in the goal landed in one
+        # arbitrary conversation and never in the one being merged.
+        #
+        # A node can carry several member stories (a shared workstream lands
+        # everyone's work at once), so this is a LIST and all of them are told.
+        # A story spanning several repos gets one notice per node on its single
+        # thread, which is exactly what happened to it.
+        targets = await threads_for_node(pool, node_id)
 
-        if thread_id:
+        posted = False
+        if targets:
             from app.assistant_relay import post_system_card_to_thread
-            try:
-                await post_system_card_to_thread(
-                    thread_id=thread_id, goal_id=goal_id, card=card,
-                    content_markdown=content, notify_uid=assignee or "",
-                    notify_title="PR ready to merge", notify_type="git_pr_opened",
-                )
-            except Exception:
-                log.exception("git pr-opened: post to thread %s failed", thread_id)
-        elif assignee:
-            # No chat thread yet — still fire the in-app bell so the notice isn't lost.
+            for t in targets:
+                try:
+                    await post_system_card_to_thread(
+                        thread_id=t["thread_id"], goal_id=goal_id, card=card,
+                        content_markdown=content,
+                        notify_uid=t["uid"] or assignee or "",
+                        notify_title="PR ready to merge",
+                        notify_type="git_pr_opened",
+                    )
+                    posted = True
+                except Exception:
+                    log.exception("git pr-opened: post to thread %s failed",
+                                  t["thread_id"])
+
+        # The bell is the fallback for "nowhere to post", which is a real state:
+        # the story was never imported into an assistant, or its thread has
+        # already been closed because the work landed. It also covers every
+        # post failing. Losing the notice entirely is the only outcome that
+        # would be wrong.
+        if not posted and assignee:
             try:
                 from app.notifications import push_notification
                 await push_notification(
@@ -317,11 +362,14 @@ class BranchReadyListener:
                 )
             except Exception:
                 log.exception("git pr-opened: bell to %s failed", assignee)
-        else:
-            log.warning("git pr-opened: node %s has no assignee — notice not delivered",
-                        node_id)
-        log.info("git pr-opened: notified owner=%s thread=%s for node %s (PR #%s)",
-                 assignee or "(none)", (thread_id or "(none)"), node_id, node["pr_number"])
+        elif not posted:
+            log.warning("git pr-opened: node %s has no assignee and no story "
+                        "thread — notice not delivered", node_id)
+
+        log.info("git pr-opened: node %s (PR #%s) -> %s thread(s) %s; owner=%s",
+                 node_id, node["pr_number"], len(targets),
+                 [t["thread_id"][:8] for t in targets] or "(none)",
+                 assignee or "(none)")
 
     async def _scan_stalled_lanes(self) -> None:
         """Stall-escalation NOTIFICATION (§0/§10) — NO release. If a lease holder has
@@ -368,7 +416,7 @@ class BranchReadyListener:
 
     # ── shared re-provision (idempotent; the kickoff has its own 2-min guard) ───
 
-    async def _reprovision_story(self, goal_id: str, story_id: str) -> None:
+    async def _reprovision_story(self, goal_id: str, story_id: str, *, attempt: int = 1) -> None:
         pool = get_pool()
         # Serialize per-story across replicas + the NOTIFY/poll paths. control-panel
         # runs multiple instances, each LISTENing + polling; without this lock,
@@ -377,98 +425,148 @@ class BranchReadyListener:
         # on a dedicated connection for the duration of the re-provision only.
         lock_key = f"branch-ready:{story_id}"
         conn = await pool.acquire()
+        lock_acquired = False
         try:
             got = await conn.fetchval(
                 "SELECT pg_try_advisory_lock(hashtext($1)::bigint)", lock_key)
-            if not got:
-                return  # another handler/replica is already re-provisioning this story
-            # Deleted-goal guard (covers BOTH the poll scan and the NOTIFY path,
-            # since both funnel here): goal delete is soft (goals.status='deleted')
-            # and doesn't cascade to stories, so without this we'd re-provision a
-            # story assistant — new thread, SHCA bind, kickoff — for a dead goal.
-            row = await conn.fetchrow(
-                "SELECT s.active_thread_id, s.workspace_state, s.execution_mode, s.state, "
-                "       s.created_by, s.merge_group_id, s.assigned_to, s.story_kind, "
-                "       t.agent_id "
-                "FROM stories s LEFT JOIN threads t ON t.id = s.active_thread_id "
-                "WHERE s.id = $1 AND s.goal_id = $2 "
-                "  AND EXISTS (SELECT 1 FROM goals g WHERE g.id = s.goal_id AND g.status = 'active')",
-                story_id, goal_id,
-            )
-            if not row:
-                return
-            thread_id = row["active_thread_id"]
-            agent_id = row["agent_id"]
-
-            # Engine-spawned diff/fix story (created_by='engine', in a merge group,
-            # operator code) that is NOT yet bound to an SHCA → bind it to its
-            # ASSIGNEE's SHCA + kick off, mirroring the UI import sequence
-            # (provision_shca_thread_for_story → refresh_story_resources → kickoff).
-            # The grind loop spawns a DIFF story whenever the branch is behind trunk
-            # (the assistant integrates trunk + reconciles + tests — the engine no longer
-            # server-merges) and a FIX story when an open PR's required checks fail.
-            is_engine_diff = (
-                row["created_by"] == "engine" and row["merge_group_id"]
-                and (row["story_kind"] or "") == "code"
-            )
-            if is_engine_diff and not thread_id:
-                assignee = row["assigned_to"] or ""
-                if row["state"] in ("done", "reviewed", "cancelled", "rejected"):
-                    return  # already settled
-                if not assignee:
-                    log.warning(
-                        "git branch-ready: engine diff story=%s has no assignee — cannot "
-                        "dispatch (needs escalation; check the workstream owner)", story_id)
-                    return
-                from app.routers.assistant import (
-                    provision_assistant_thread_for_story, dispatch_story_kickoff_to_assistant)
-                try:
-                    t_id, a_id = await provision_assistant_thread_for_story(
-                        assignee, goal_id, story_id, engine_initiated=True)
-                except Exception:
-                    log.exception(
-                        "git branch-ready: binding engine diff story=%s failed", story_id)
-                    return
-                if not t_id or not a_id:
-                    return
-                try:
-                    from app.resource_provisioning import refresh_story_resources
-                    await refresh_story_resources(goal_id, story_id)
-                except Exception:
-                    log.warning(
-                        "git branch-ready: refresh_story_resources failed for engine "
-                        "diff story=%s", story_id)
-                ok = await dispatch_story_kickoff_to_assistant(
-                    goal_id, story_id, t_id, a_id, user_uid=assignee)
-                log.info("git branch-ready: dispatched engine diff story=%s ok=%s",
-                         story_id, ok)
-                return
-            # Only re-provision a story that was actually imported to an SHCA
-            # (thread + agent), is in operator mode, isn't already provisioned, and
-            # is still live. Everything else is a no-op (NOTIFY fires for every
-            # member of the cut node, incl. downstream stories not yet imported).
-            if not thread_id or not agent_id:
-                return
-            if (row["execution_mode"] or "") != "operator":
-                return
-            if row["workspace_state"] == "ready":
-                return
-            if row["state"] in ("done", "cancelled", "rejected"):
-                return
-            from app.routers.assistant import dispatch_story_kickoff_to_assistant
-            ok = await dispatch_story_kickoff_to_assistant(goal_id, story_id, thread_id, agent_id)
-            log.info("git branch-ready: re-provisioned story=%s ok=%s", story_id, ok)
+            lock_acquired = bool(got)
+            if lock_acquired:
+                # A bare `return` from inside this branch (the common case, e.g.
+                # "nothing to do for this story") must NOT trip the retry below — it
+                # only exists to unwind out of `_do_reprovision`, so the actual work
+                # lives in its own method rather than inline here.
+                await self._do_reprovision(conn, goal_id, story_id)
         except Exception:
             log.exception("git branch-ready: re-provision failed for story=%s", story_id)
         finally:
-            try:
-                await conn.execute("SELECT pg_advisory_unlock(hashtext($1)::bigint)", lock_key)
-            except Exception:
-                pass
+            if lock_acquired:
+                try:
+                    await conn.execute(
+                        "SELECT pg_advisory_unlock(hashtext($1)::bigint)", lock_key)
+                except Exception:
+                    pass
             try:
                 await pool.release(conn)
             except Exception:
                 pass
+        if not lock_acquired:
+            if attempt < _LOCK_RETRY_MAX_ATTEMPTS:
+                await asyncio.sleep(_LOCK_RETRY_DELAY_S)
+                await self._reprovision_story(goal_id, story_id, attempt=attempt + 1)
+            else:
+                log.warning(
+                    "git branch-ready: story=%s still locked after %d attempt(s) "
+                    "(~%ds) — giving up this NOTIFY; the poll backstop will retry "
+                    "if the write-repo set is still incomplete",
+                    story_id, attempt, attempt * _LOCK_RETRY_DELAY_S,
+                )
+
+    async def _do_reprovision(self, conn, goal_id: str, story_id: str) -> None:
+        """The actual re-provision work, run only once the per-story advisory lock
+        is held. Split out from `_reprovision_story` so its many early `return`s
+        (all meaning "nothing to do for this story") can't be mistaken by the
+        caller for "the lock was contended, retry" (see `_LOCK_RETRY_*`)."""
+        pool = get_pool()
+        # Deleted-goal guard (covers BOTH the poll scan and the NOTIFY path,
+        # since both funnel here): goal delete is soft (goals.status='deleted')
+        # and doesn't cascade to stories, so without this we'd re-provision a
+        # story assistant — new thread, SHCA bind, kickoff — for a dead goal.
+        row = await conn.fetchrow(
+            "SELECT s.active_thread_id, s.workspace_state, s.execution_mode, s.state, "
+            "       s.created_by, s.merge_group_id, s.assigned_to, s.story_kind, "
+            "       t.agent_id "
+            "FROM stories s LEFT JOIN threads t ON t.id = s.active_thread_id "
+            "WHERE s.id = $1 AND s.goal_id = $2 "
+            "  AND EXISTS (SELECT 1 FROM goals g WHERE g.id = s.goal_id AND g.status = 'active')",
+            story_id, goal_id,
+        )
+        if not row:
+            return
+        thread_id = row["active_thread_id"]
+        agent_id = row["agent_id"]
+
+        # Engine-spawned diff/fix story (created_by='engine', in a merge group,
+        # operator code) that is NOT yet bound to an SHCA → bind it to its
+        # ASSIGNEE's SHCA + kick off, mirroring the UI import sequence
+        # (provision_shca_thread_for_story → refresh_story_resources → kickoff).
+        # The grind loop spawns a DIFF story whenever the branch is behind trunk
+        # (the assistant integrates trunk + reconciles + tests — the engine no longer
+        # server-merges) and a FIX story when an open PR's required checks fail.
+        is_engine_diff = (
+            row["created_by"] == "engine" and row["merge_group_id"]
+            and (row["story_kind"] or "") == "code"
+            # Local Execution Mode: a local story is driven by the extension, never
+            # gateway-dispatched here — this branch runs BEFORE the general
+            # execution_mode guard below, so exclude non-operator here too.
+            and (row["execution_mode"] or "") == "operator"
+        )
+        if is_engine_diff and not thread_id:
+            assignee = row["assigned_to"] or ""
+            if row["state"] in ("done", "reviewed", "cancelled", "rejected"):
+                return  # already settled
+            if not assignee:
+                log.warning(
+                    "git branch-ready: engine diff story=%s has no assignee — cannot "
+                    "dispatch (needs escalation; check the workstream owner)", story_id)
+                return
+            from app.routers.assistant import (
+                provision_assistant_thread_for_story, dispatch_story_kickoff_to_assistant)
+            try:
+                t_id, a_id, assistant_busy = await provision_assistant_thread_for_story(
+                    assignee, goal_id, story_id, engine_initiated=True)
+            except Exception:
+                log.exception(
+                    "git branch-ready: binding engine diff story=%s failed", story_id)
+                return
+            if not t_id or not a_id:
+                return
+            if assistant_busy:
+                log.info(
+                    "git branch-ready: engine diff story=%s bound but NOT started — "
+                    "assignee=%s's assistant is already working on another story",
+                    story_id, assignee)
+                return
+            try:
+                from app.resource_provisioning import refresh_story_resources
+                await refresh_story_resources(goal_id, story_id)
+            except Exception:
+                log.warning(
+                    "git branch-ready: refresh_story_resources failed for engine "
+                    "diff story=%s", story_id)
+            ok = await dispatch_story_kickoff_to_assistant(
+                goal_id, story_id, t_id, a_id, user_uid=assignee)
+            log.info("git branch-ready: dispatched engine diff story=%s ok=%s",
+                     story_id, ok)
+            return
+        # Only re-provision a story that was actually imported to an SHCA
+        # (thread + agent), is in operator mode, isn't already provisioned, and
+        # is still live. Everything else is a no-op (NOTIFY fires for every
+        # member of the cut node, incl. downstream stories not yet imported).
+        if not thread_id or not agent_id:
+            return
+        if (row["execution_mode"] or "") != "operator":
+            return
+        if row["workspace_state"] == "ready":
+            # Multi-repo fix, piece 1c (research/MULTI_REPO_STORIES_PLAN.md §12.5):
+            # "ready" alone is NOT "this listener's job is done" for a multi-repo
+            # story. `provision_story_workspace` marks the workspace ready as soon
+            # as it clones whatever write repos have a live branch RIGHT NOW,
+            # skipping any that don't yet — a legitimate, common outcome, not an
+            # error. If a repo skipped that way is exactly the one whose branch
+            # this NOTIFY is for, returning here means NOTHING ever re-dispatches
+            # kickoff for it: dispatch_story_kickoff_to_assistant's own piece-1b
+            # guard (assistant.py) correctly defers kickoff for an incomplete set,
+            # but that deferral is only useful if something re-checks later — and
+            # this listener is that something. Skip the early return when the
+            # write-repo set is still incomplete; fall through to re-dispatch.
+            from app.services.operator_provisioning import is_write_repo_set_incomplete
+            if not await is_write_repo_set_incomplete(pool, goal_id, story_id):
+                return  # genuinely complete — nothing left for this listener to do
+        if row["state"] in ("done", "cancelled", "rejected"):
+            return
+        from app.routers.assistant import dispatch_story_kickoff_to_assistant
+        ok = await dispatch_story_kickoff_to_assistant(goal_id, story_id, thread_id, agent_id)
+        log.info("git branch-ready: re-provisioned story=%s ok=%s", story_id, ok)
 
 
 branch_ready_listener = BranchReadyListener()

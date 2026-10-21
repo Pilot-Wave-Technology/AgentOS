@@ -24,7 +24,7 @@ async def handle(
     if not command:
         from app.channels.slack.commands.registry import _cmd_prefix
         command = _cmd_prefix("story")
-    if not args:
+    if not (args or '').strip():
         return (
             f"Usage: /{command} review <root-task-id> [approve|reject] [feedback...]  "
             "— clear the pending Human review checkpoint. Defaults to approve."

@@ -3,13 +3,12 @@
 --
 
 
--- Dumped from database version 17.9
+-- Dumped from database version 17.10
 -- Dumped by pg_dump version 17.10
 
 SET statement_timeout = 0;
 SET lock_timeout = 0;
 SET idle_in_transaction_session_timeout = 0;
-SET transaction_timeout = 0;
 SET client_encoding = 'UTF8';
 SET standard_conforming_strings = on;
 SELECT pg_catalog.set_config('search_path', '', false);
@@ -19,10 +18,10 @@ SET client_min_messages = warning;
 SET row_security = off;
 
 --
--- Name: public; Type: SCHEMA; Schema: -; Owner: -
+-- Name: kernel; Type: SCHEMA; Schema: -; Owner: -
 --
 
--- *not* creating schema, since initdb creates it
+CREATE SCHEMA kernel;
 
 
 --
@@ -47,6 +46,480 @@ COMMENT ON EXTENSION pgcrypto IS 'cryptographic functions';
 
 
 --
+-- Name: acceptances_are_append_only(); Type: FUNCTION; Schema: kernel; Owner: -
+--
+
+CREATE FUNCTION kernel.acceptances_are_append_only() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    IF current_user = (SELECT tableowner FROM pg_tables
+                       WHERE schemaname = 'kernel'
+                         AND tablename = 'acceptances') THEN
+        RETURN COALESCE(NEW, OLD);
+
+END IF;
+
+RAISE EXCEPTION
+        'acceptances are append-only: a % would edit the only record of '
+        'why a refused story was finished.', TG_OP
+        USING ERRCODE = 'restrict_violation';
+
+END;
+
+$$;
+
+
+--
+-- Name: capability_within_ceiling(text[], text[]); Type: FUNCTION; Schema: kernel; Owner: -
+--
+
+CREATE FUNCTION kernel.capability_within_ceiling(verbs text[], ceiling text[]) RETURNS boolean
+    LANGUAGE sql IMMUTABLE
+    AS $$
+    SELECT NOT EXISTS (
+        SELECT 1 FROM unnest(coalesce(verbs, '{}')) AS v
+         WHERE NOT EXISTS (
+            SELECT 1 FROM unnest(coalesce(ceiling, '{}')) AS c
+             -- Exact, or a `service.*` family whose prefix this verb
+             -- carries. `left(c, -1)` drops the star and keeps the dot,
+             -- so `logs.*` covers `logs.read` and not `logsx.read`.
+             WHERE c = v OR (c LIKE '%.*' AND v LIKE left(c, -1) || '%')
+         )
+    );
+$$;
+
+
+--
+-- Name: check_generation_monotone(); Type: FUNCTION; Schema: kernel; Owner: -
+--
+
+CREATE FUNCTION kernel.check_generation_monotone() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    IF NEW.generation <= OLD.generation THEN
+        RAISE EXCEPTION 'generation must advance: current=%, proposed=%',
+            OLD.generation, NEW.generation;
+
+END IF;
+
+RETURN NEW;
+
+END;
+
+$$;
+
+
+--
+-- Name: check_step_journal_generation(); Type: FUNCTION; Schema: kernel; Owner: -
+--
+
+CREATE FUNCTION kernel.check_step_journal_generation() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+    current_gen INT;
+
+BEGIN
+    SELECT generation INTO current_gen
+    FROM executions
+    WHERE id = NEW.execution_id;
+
+IF NEW.generation <> current_gen THEN
+        RAISE EXCEPTION 'step_journal generation fence: row generation=%, execution generation=%',
+            NEW.generation, current_gen;
+
+END IF;
+
+RETURN NEW;
+
+END;
+
+$$;
+
+
+--
+-- Name: criteria_are_append_only(); Type: FUNCTION; Schema: kernel; Owner: -
+--
+
+CREATE FUNCTION kernel.criteria_are_append_only() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    IF current_user = (SELECT tableowner FROM pg_tables
+                       WHERE schemaname = 'kernel' AND tablename = 'criteria') THEN
+        RETURN COALESCE(NEW, OLD);
+
+END IF;
+
+RAISE EXCEPTION
+        'criteria are append-only: a % on criterion % would let the work '
+        'being checked redefine the check. Add a new criterion, or issue '
+        'a new contract.', TG_OP, COALESCE(OLD.id, NEW.id)
+        USING ERRCODE = 'restrict_violation';
+
+END;
+
+$$;
+
+
+--
+-- Name: env_deltas_are_append_only(); Type: FUNCTION; Schema: kernel; Owner: -
+--
+
+CREATE FUNCTION kernel.env_deltas_are_append_only() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    IF current_user = (SELECT tableowner FROM pg_tables
+                       WHERE schemaname = 'kernel' AND tablename = 'env_deltas') THEN
+        RETURN COALESCE(NEW, OLD);
+
+END IF;
+
+RAISE EXCEPTION
+        'env_deltas are append-only: a % would rewrite the record of an '
+        'environment the Verifier has to reproduce.', TG_OP
+        USING ERRCODE = 'restrict_violation';
+
+END;
+
+$$;
+
+
+--
+-- Name: leg_answers_only_its_own_close_out(); Type: FUNCTION; Schema: kernel; Owner: -
+--
+
+CREATE FUNCTION kernel.leg_answers_only_its_own_close_out() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    IF current_user = 'agentos_leg'
+       AND NEW.status = 'ANSWERED'
+       AND OLD.status IS DISTINCT FROM 'ANSWERED' THEN
+        IF NEW.declined IS NOT TRUE
+           OR NEW.verdict IS DISTINCT FROM 'declined'
+           OR NEW.answered_by IS DISTINCT FROM 'kernel' THEN
+            RAISE EXCEPTION
+                'the execution pod may not answer question %. Approving '
+                'is a person''s act (H8a); the only answer a leg writes '
+                'is its own cancel close-out, which is declined/'
+                '''declined''/''kernel'' and never %/%/%.',
+                NEW.id, COALESCE(NEW.declined::text, 'null'),
+                COALESCE(NEW.verdict, 'null'),
+                COALESCE(NEW.answered_by, 'null');
+        END IF;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: log_execution_transition(); Type: FUNCTION; Schema: kernel; Owner: -
+--
+
+CREATE FUNCTION kernel.log_execution_transition() RETURNS trigger
+    LANGUAGE plpgsql SECURITY DEFINER
+    SET search_path TO 'kernel', 'public'
+    AS $$
+BEGIN
+    -- Only real changes. An UPDATE that rewrites the same state is not a
+    -- transition and would bury the real ones in noise.
+    IF TG_OP = 'INSERT' THEN
+        INSERT INTO execution_transitions
+            (execution_id, from_state, to_state, generation, machine_version)
+        VALUES (NEW.id, NULL, NEW.state, NEW.generation, NEW.machine_version);
+
+ELSIF NEW.state IS DISTINCT FROM OLD.state THEN
+        INSERT INTO execution_transitions
+            (execution_id, from_state, to_state, generation, machine_version)
+        VALUES (NEW.id, OLD.state, NEW.state, NEW.generation, NEW.machine_version);
+
+END IF;
+
+RETURN NEW;
+
+END;
+
+$$;
+
+
+--
+-- Name: notify_assistant_card(); Type: FUNCTION; Schema: kernel; Owner: -
+--
+
+CREATE FUNCTION kernel.notify_assistant_card() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    PERFORM pg_notify('assistant_card', json_build_object(
+        'question_id', NEW.id,
+        'execution_id', NEW.execution_id,
+        'kind', NEW.kind,
+        'needs_human', NEW.kind = 'authorization'
+    )::text);
+
+RETURN NEW;
+
+END;
+
+$$;
+
+
+--
+-- Name: notify_assistant_state(); Type: FUNCTION; Schema: kernel; Owner: -
+--
+
+CREATE FUNCTION kernel.notify_assistant_state() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    IF NEW.state IS DISTINCT FROM OLD.state
+       AND NEW.state IN ('DONE', 'FAILED', 'CANCELLED', 'PARKED_COLD') THEN
+        PERFORM pg_notify('assistant_state', json_build_object(
+            'execution_id', NEW.id,
+            'goal_id', NEW.goal_id,
+            'state', NEW.state,
+            'was', OLD.state
+        )::text);
+
+END IF;
+
+RETURN NEW;
+
+END;
+
+$$;
+
+
+--
+-- Name: notify_execution_pending(); Type: FUNCTION; Schema: kernel; Owner: -
+--
+
+CREATE FUNCTION kernel.notify_execution_pending() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    IF NEW.state = 'PENDING' THEN
+        PERFORM pg_notify('execution_pending', json_build_object(
+            'execution_id', NEW.id,
+            'goal_id',      COALESCE(NEW.goal_id, ''),
+            'kind',         NEW.kind,
+            'domain',       NEW.domain
+        )::text);
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: notify_go_story_done(); Type: FUNCTION; Schema: kernel; Owner: -
+--
+
+CREATE FUNCTION kernel.notify_go_story_done() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    IF NEW.story_id IS NOT NULL AND (
+           (NEW.state = 'DONE'
+            AND OLD.state IS DISTINCT FROM 'DONE'
+            AND OLD.phase IS DISTINCT FROM 'review')
+        OR (NEW.phase = 'review' AND OLD.phase IS DISTINCT FROM 'review')
+       ) THEN
+        PERFORM pg_notify('go_story_done', json_build_object(
+            'goal', NEW.goal_id, 'story', NEW.story_id,
+            'execution', NEW.id)::text);
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: proposals_reclaim_fence_fn(); Type: FUNCTION; Schema: kernel; Owner: -
+--
+
+CREATE FUNCTION kernel.proposals_reclaim_fence_fn() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    IF NEW.reason_hash IS NOT NULL AND NEW.execution_id IS NOT NULL THEN
+        IF EXISTS (
+            SELECT 1 FROM proposals
+            WHERE execution_id = NEW.execution_id
+              AND reason_hash = NEW.reason_hash
+              AND status = 'REJECTED'
+        ) THEN
+            RAISE EXCEPTION 'proposals reclaim fence: unchanged reason set for execution_id=%, reason_hash=%',
+                NEW.execution_id, NEW.reason_hash;
+
+END IF;
+
+END IF;
+
+RETURN NEW;
+
+END;
+
+$$;
+
+
+--
+-- Name: reject_state_machine_mutation(); Type: FUNCTION; Schema: kernel; Owner: -
+--
+
+CREATE FUNCTION kernel.reject_state_machine_mutation() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    IF current_user = (SELECT tableowner FROM pg_tables
+                       WHERE schemaname = 'kernel'
+                         AND tablename = 'run_state_machine') THEN
+        RETURN COALESCE(NEW, OLD);
+
+END IF;
+
+RAISE EXCEPTION
+        'run_state_machine is immutable: % is refused. A machine version '
+        'must never mean two different things — executions.machine_version '
+        'names it by number. Add a new version instead.', TG_OP;
+
+END;
+
+$$;
+
+
+--
+-- Name: release_admission_slot(); Type: FUNCTION; Schema: kernel; Owner: -
+--
+
+CREATE FUNCTION kernel.release_admission_slot() RETURNS trigger
+    LANGUAGE plpgsql SECURITY DEFINER
+    SET search_path TO 'kernel', 'public'
+    AS $$
+DECLARE
+    terminal JSONB;
+
+BEGIN
+    IF NEW.state IS NOT DISTINCT FROM OLD.state THEN
+        RETURN NEW;
+
+END IF;
+
+SELECT terminal_states INTO terminal
+    FROM run_state_machine WHERE version = NEW.machine_version;
+
+-- An unknown machine version releases nothing. Refusing to guess is
+    -- correct here: releasing a slot for a run that is still working
+    -- would let a second run into a bucket that is genuinely full.
+    IF terminal IS NULL OR NOT (terminal ? NEW.state) THEN
+        RETURN NEW;
+
+END IF;
+
+UPDATE admission_slots
+    SET released_at = now()
+    WHERE execution_id = NEW.id AND released_at IS NULL;
+
+RETURN NEW;
+
+END;
+
+$$;
+
+
+--
+-- Name: results_are_append_only(); Type: FUNCTION; Schema: kernel; Owner: -
+--
+
+CREATE FUNCTION kernel.results_are_append_only() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    IF current_user = (SELECT tableowner FROM pg_tables
+                       WHERE schemaname = 'kernel'
+                         AND tablename = 'criterion_results') THEN
+        RETURN COALESCE(NEW, OLD);
+
+END IF;
+
+RAISE EXCEPTION
+        'criterion_results are append-only and Verifier-written: a % '
+        'would rewrite an adjudication. A second opinion is a second '
+        'row — that is what the flake quorum reads.', TG_OP
+        USING ERRCODE = 'restrict_violation';
+
+END;
+
+$$;
+
+
+--
+-- Name: verdicts_are_append_only(); Type: FUNCTION; Schema: kernel; Owner: -
+--
+
+CREATE FUNCTION kernel.verdicts_are_append_only() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    IF current_user = (SELECT tableowner FROM pg_tables
+                       WHERE schemaname = 'kernel' AND tablename = 'verdicts') THEN
+        RETURN COALESCE(NEW, OLD);
+    END IF;
+
+    -- The one permitted write: a first claim of the card, changing
+    -- nothing else.
+    IF TG_OP = 'UPDATE'
+       AND OLD.card_posted_at IS NULL
+       AND NEW.card_posted_at IS NOT NULL
+       AND to_jsonb(NEW) - 'card_posted_at'
+           = to_jsonb(OLD) - 'card_posted_at' THEN
+        RETURN NEW;
+    END IF;
+
+    RAISE EXCEPTION
+        'verdicts are append-only: a % would rewrite an adjudication '
+        'that a story was already told about. Re-adjudicating means a '
+        'new claim, with its own seq. (Setting card_posted_at once, from '
+        'NULL, and changing nothing else, is allowed.)', TG_OP
+        USING ERRCODE = 'restrict_violation';
+END;
+$$;
+
+
+--
+-- Name: worker_writes_selfcheck_only(); Type: FUNCTION; Schema: kernel; Owner: -
+--
+
+CREATE FUNCTION kernel.worker_writes_selfcheck_only() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    IF current_user IN ('agentos_worker', 'agentos_leg') THEN
+        IF NEW.written_by IS DISTINCT FROM 'selfcheck' THEN
+            RAISE EXCEPTION
+                '% may only write written_by=''selfcheck'', not %. '
+                'A verdict on the work is the Verifier''s to write; the '
+                'worker measuring its own claim is a self-check and must '
+                'say so.', current_user, COALESCE(NEW.written_by, 'null');
+        END IF;
+        IF NEW.claim_seq IS DISTINCT FROM 0 THEN
+            RAISE EXCEPTION
+                'a self-check is claim_seq 0, not %. A row at a later '
+                'claim_seq is evidence about an adjudicated claim, which '
+                'the worker does not produce.', COALESCE(NEW.claim_seq, -1);
+        END IF;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
 -- Name: council_notify_story_done(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -58,6 +531,67 @@ BEGIN
         'story_done',
         json_build_object('goal_id', NEW.goal_id, 'story_id', NEW.id)::text
     );
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: model_registry_notify(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.model_registry_notify() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    PERFORM pg_notify(
+        'model_registry_changed',
+        TG_TABLE_NAME || ':' || TG_OP
+    );
+    RETURN COALESCE(NEW, OLD);
+END;
+$$;
+
+
+--
+-- Name: notify_go_node_event(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.notify_go_node_event() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    IF NEW.state IS DISTINCT FROM OLD.state
+       AND NEW.state IN ('MERGED', 'CONFLICTED', 'ESCALATED',
+                         'PROTECTION_BLOCKED') THEN
+        PERFORM pg_notify('go_node_event', json_build_object(
+            'goal', NEW.goal_id, 'node', NEW.id,
+            'state', NEW.state)::text);
+    END IF;
+    -- A PR number appearing is the "a human must merge" moment.
+    IF NEW.pr_number IS NOT NULL AND OLD.pr_number IS NULL THEN
+        PERFORM pg_notify('go_node_event', json_build_object(
+            'goal', NEW.goal_id, 'node', NEW.id,
+            'state', 'PR_OPENED')::text);
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: notify_go_trunk_advance(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.notify_go_trunk_advance() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    IF NEW.trunk_sha IS DISTINCT FROM OLD.trunk_sha THEN
+        PERFORM pg_notify('go_trunk_advance', json_build_object(
+            'repo', NEW.git_repo_id, 'trunk', NEW.trunk_branch,
+            'sha', NEW.trunk_sha)::text);
+    END IF;
     RETURN NEW;
 END;
 $$;
@@ -105,6 +639,25 @@ CREATE FUNCTION public.refresh_mat_view(p_view_name text) RETURNS void
     AS $$
 BEGIN
   EXECUTE format('REFRESH MATERIALIZED VIEW CONCURRENTLY %I', p_view_name);
+END;
+$$;
+
+
+--
+-- Name: stories_stamp_completion(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.stories_stamp_completion() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    IF NEW.state IN ('done', 'reviewed')
+       AND COALESCE(OLD.state, '') NOT IN ('done', 'reviewed') THEN
+        NEW.completed_by_uid := COALESCE(NEW.completed_by_uid, NEW.assigned_to);
+        NEW.completed_at     := COALESCE(NEW.completed_at, now());
+        NEW.started_at       := COALESCE(NEW.started_at, NEW.created_at);
+    END IF;
+    RETURN NEW;
 END;
 $$;
 
@@ -182,6 +735,1422 @@ SET default_tablespace = '';
 SET default_table_access_method = heap;
 
 --
+-- Name: acceptances; Type: TABLE; Schema: kernel; Owner: -
+--
+
+CREATE TABLE kernel.acceptances (
+    id bigint NOT NULL,
+    execution_id bigint NOT NULL,
+    claim_seq bigint,
+    verdict_id bigint,
+    from_state text NOT NULL,
+    reason text NOT NULL,
+    accepted_by text NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT acceptance_has_a_reason CHECK ((length(btrim(reason)) >= 10)),
+    CONSTRAINT acceptance_has_an_author CHECK ((length(btrim(accepted_by)) > 0))
+);
+
+
+--
+-- Name: TABLE acceptances; Type: COMMENT; Schema: kernel; Owner: -
+--
+
+COMMENT ON TABLE kernel.acceptances IS 'A person finishing a story the Verifier refused, or never judged. Never a verdict: the verdict it overrides is left exactly as it is.';
+
+
+--
+-- Name: COLUMN acceptances.from_state; Type: COMMENT; Schema: kernel; Owner: -
+--
+
+COMMENT ON COLUMN kernel.acceptances.from_state IS 'The state the story was in when it was accepted. VERIFYING is the expected case; RUNNING and the parked states are the ones that motivated the feature.';
+
+
+--
+-- Name: acceptances_id_seq; Type: SEQUENCE; Schema: kernel; Owner: -
+--
+
+CREATE SEQUENCE kernel.acceptances_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: acceptances_id_seq; Type: SEQUENCE OWNED BY; Schema: kernel; Owner: -
+--
+
+ALTER SEQUENCE kernel.acceptances_id_seq OWNED BY kernel.acceptances.id;
+
+
+--
+-- Name: admission_buckets; Type: TABLE; Schema: kernel; Owner: -
+--
+
+CREATE TABLE kernel.admission_buckets (
+    goal_id text NOT NULL,
+    domain text NOT NULL,
+    kind text NOT NULL,
+    ceiling integer NOT NULL,
+    owner text NOT NULL,
+    CONSTRAINT admission_buckets_ceiling_check CHECK ((ceiling > 0))
+);
+
+
+--
+-- Name: admission_slots; Type: TABLE; Schema: kernel; Owner: -
+--
+
+CREATE TABLE kernel.admission_slots (
+    id bigint NOT NULL,
+    goal_id text NOT NULL,
+    domain text NOT NULL,
+    kind text NOT NULL,
+    ceiling integer NOT NULL,
+    slot_index integer NOT NULL,
+    execution_id bigint,
+    claimed_at timestamp with time zone,
+    released_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    owner text NOT NULL,
+    CONSTRAINT admission_slots_check CHECK ((slot_index < ceiling)),
+    CONSTRAINT admission_slots_slot_index_check CHECK ((slot_index >= 0))
+);
+
+
+--
+-- Name: admission_slots_id_seq; Type: SEQUENCE; Schema: kernel; Owner: -
+--
+
+CREATE SEQUENCE kernel.admission_slots_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: admission_slots_id_seq; Type: SEQUENCE OWNED BY; Schema: kernel; Owner: -
+--
+
+ALTER SEQUENCE kernel.admission_slots_id_seq OWNED BY kernel.admission_slots.id;
+
+
+--
+-- Name: alignment_flags; Type: TABLE; Schema: kernel; Owner: -
+--
+
+CREATE TABLE kernel.alignment_flags (
+    id bigint NOT NULL,
+    goal_id text NOT NULL,
+    subject_kind text NOT NULL,
+    subject_id text NOT NULL,
+    question text NOT NULL,
+    evidence jsonb NOT NULL,
+    fingerprint text NOT NULL,
+    raised_by text DEFAULT 'go'::text NOT NULL,
+    status text DEFAULT 'OPEN'::text NOT NULL,
+    outcome text,
+    note text,
+    resolved_by text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    resolved_at timestamp with time zone,
+    CONSTRAINT alignment_flags_evidence_present CHECK (((jsonb_typeof(evidence) = 'array'::text) AND (jsonb_array_length(evidence) > 0))),
+    CONSTRAINT alignment_flags_resolved_has_outcome CHECK (((status <> 'RESOLVED'::text) OR (outcome IS NOT NULL))),
+    CONSTRAINT alignment_flags_status CHECK ((status = ANY (ARRAY['OPEN'::text, 'RESOLVED'::text])))
+);
+
+
+--
+-- Name: alignment_flags_id_seq; Type: SEQUENCE; Schema: kernel; Owner: -
+--
+
+CREATE SEQUENCE kernel.alignment_flags_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: alignment_flags_id_seq; Type: SEQUENCE OWNED BY; Schema: kernel; Owner: -
+--
+
+ALTER SEQUENCE kernel.alignment_flags_id_seq OWNED BY kernel.alignment_flags.id;
+
+
+--
+-- Name: answers; Type: TABLE; Schema: kernel; Owner: -
+--
+
+CREATE TABLE kernel.answers (
+    id bigint NOT NULL,
+    execution_id bigint NOT NULL,
+    proposal_id bigint,
+    asked_by text DEFAULT ''::text NOT NULL,
+    question text NOT NULL,
+    answer text NOT NULL,
+    looked_at text DEFAULT ''::text NOT NULL,
+    held boolean DEFAULT false NOT NULL,
+    question_id bigint,
+    failed boolean DEFAULT false NOT NULL,
+    card_posted_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    hold_declined boolean DEFAULT false NOT NULL
+);
+
+
+--
+-- Name: answers_id_seq; Type: SEQUENCE; Schema: kernel; Owner: -
+--
+
+CREATE SEQUENCE kernel.answers_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: answers_id_seq; Type: SEQUENCE OWNED BY; Schema: kernel; Owner: -
+--
+
+ALTER SEQUENCE kernel.answers_id_seq OWNED BY kernel.answers.id;
+
+
+--
+-- Name: approvals_id_seq; Type: SEQUENCE; Schema: kernel; Owner: -
+--
+
+CREATE SEQUENCE kernel.approvals_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: artifact_manifest; Type: TABLE; Schema: kernel; Owner: -
+--
+
+CREATE TABLE kernel.artifact_manifest (
+    id bigint NOT NULL,
+    execution_id bigint,
+    artifact_id text NOT NULL,
+    role text NOT NULL,
+    name text NOT NULL,
+    media_type text DEFAULT 'text/plain'::text NOT NULL,
+    summary text DEFAULT ''::text NOT NULL,
+    supersedes text,
+    bytes bigint DEFAULT 0 NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    story_id text,
+    goal_id text,
+    CONSTRAINT artifact_manifest_name_present CHECK ((length(btrim(name)) > 0)),
+    CONSTRAINT artifact_manifest_one_owner CHECK ((num_nonnulls(execution_id, story_id) = 1)),
+    CONSTRAINT artifact_manifest_role_check CHECK ((role = ANY (ARRAY['report'::text, 'dataset'::text, 'method'::text, 'log'::text, 'figure'::text])))
+);
+
+
+--
+-- Name: artifact_manifest_id_seq; Type: SEQUENCE; Schema: kernel; Owner: -
+--
+
+CREATE SEQUENCE kernel.artifact_manifest_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: artifact_manifest_id_seq; Type: SEQUENCE OWNED BY; Schema: kernel; Owner: -
+--
+
+ALTER SEQUENCE kernel.artifact_manifest_id_seq OWNED BY kernel.artifact_manifest.id;
+
+
+--
+-- Name: assistant_requests; Type: TABLE; Schema: kernel; Owner: -
+--
+
+CREATE TABLE kernel.assistant_requests (
+    id bigint NOT NULL,
+    goal_id text NOT NULL,
+    actor_id text NOT NULL,
+    kind text NOT NULL,
+    body text NOT NULL,
+    execution_id bigint,
+    idempotency_key text NOT NULL,
+    status text DEFAULT 'PENDING'::text NOT NULL,
+    routed_at timestamp with time zone,
+    answered_at timestamp with time zone,
+    answer_text text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT assistant_requests_kind CHECK ((kind = ANY (ARRAY['story'::text, 'resource'::text, 'sequence'::text, 'question'::text, 'report'::text]))),
+    CONSTRAINT assistant_requests_status CHECK ((status = ANY (ARRAY['PENDING'::text, 'ROUTED'::text, 'ANSWERED'::text, 'REJECTED'::text])))
+);
+
+
+--
+-- Name: assistant_requests_id_seq; Type: SEQUENCE; Schema: kernel; Owner: -
+--
+
+CREATE SEQUENCE kernel.assistant_requests_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: assistant_requests_id_seq; Type: SEQUENCE OWNED BY; Schema: kernel; Owner: -
+--
+
+ALTER SEQUENCE kernel.assistant_requests_id_seq OWNED BY kernel.assistant_requests.id;
+
+
+--
+-- Name: capability_grants; Type: TABLE; Schema: kernel; Owner: -
+--
+
+CREATE TABLE kernel.capability_grants (
+    id bigint NOT NULL,
+    goal_id text NOT NULL,
+    story_id text,
+    resource_id text NOT NULL,
+    verbs text[] DEFAULT '{}'::text[] NOT NULL,
+    scope text DEFAULT ''::text NOT NULL,
+    ceiling text[] DEFAULT '{}'::text[] NOT NULL,
+    expires_at timestamp with time zone,
+    granted_by text DEFAULT ''::text NOT NULL,
+    revoked_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT capability_grants_has_verbs CHECK ((cardinality(verbs) > 0)),
+    CONSTRAINT capability_grants_within_ceiling CHECK (kernel.capability_within_ceiling(verbs, ceiling))
+);
+
+
+--
+-- Name: capability_grants_id_seq; Type: SEQUENCE; Schema: kernel; Owner: -
+--
+
+CREATE SEQUENCE kernel.capability_grants_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: capability_grants_id_seq; Type: SEQUENCE OWNED BY; Schema: kernel; Owner: -
+--
+
+ALTER SEQUENCE kernel.capability_grants_id_seq OWNED BY kernel.capability_grants.id;
+
+
+--
+-- Name: contracts; Type: TABLE; Schema: kernel; Owner: -
+--
+
+CREATE TABLE kernel.contracts (
+    id bigint NOT NULL,
+    goal_id text NOT NULL,
+    kind text NOT NULL,
+    domain text NOT NULL,
+    base_image text NOT NULL,
+    base_digest text,
+    workspace_spec jsonb DEFAULT '{}'::jsonb NOT NULL,
+    tool_allow jsonb,
+    budget jsonb DEFAULT '{}'::jsonb NOT NULL,
+    check_surface_hash text,
+    approved_at timestamp with time zone,
+    approved_by text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    supersedes bigint,
+    amendment text,
+    size text
+);
+
+
+--
+-- Name: COLUMN contracts.supersedes; Type: COMMENT; Schema: kernel; Owner: -
+--
+
+COMMENT ON COLUMN kernel.contracts.supersedes IS 'The contract version this replaces. An amendment issues a new row rather than editing criteria in place, so a verdict keyed to an earlier claim keeps naming criteria that still exist.';
+
+
+--
+-- Name: contracts_id_seq; Type: SEQUENCE; Schema: kernel; Owner: -
+--
+
+CREATE SEQUENCE kernel.contracts_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: contracts_id_seq; Type: SEQUENCE OWNED BY; Schema: kernel; Owner: -
+--
+
+ALTER SEQUENCE kernel.contracts_id_seq OWNED BY kernel.contracts.id;
+
+
+--
+-- Name: criteria; Type: TABLE; Schema: kernel; Owner: -
+--
+
+CREATE TABLE kernel.criteria (
+    id bigint NOT NULL,
+    contract_id bigint NOT NULL,
+    kind text NOT NULL,
+    spec jsonb NOT NULL,
+    held_out boolean DEFAULT false NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    label text DEFAULT 'unlabelled'::text NOT NULL,
+    CONSTRAINT criteria_label_check CHECK ((label = ANY (ARRAY['goal'::text, 'guard'::text, 'unlabelled'::text])))
+);
+
+
+--
+-- Name: COLUMN criteria.label; Type: COMMENT; Schema: kernel; Owner: -
+--
+
+COMMENT ON COLUMN kernel.criteria.label IS 'goal: must fail at approval and pass at verification. guard: must pass at both. unlabelled: written before F11, cannot be dry-run checked, reported as such.';
+
+
+--
+-- Name: criteria_id_seq; Type: SEQUENCE; Schema: kernel; Owner: -
+--
+
+CREATE SEQUENCE kernel.criteria_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: criteria_id_seq; Type: SEQUENCE OWNED BY; Schema: kernel; Owner: -
+--
+
+ALTER SEQUENCE kernel.criteria_id_seq OWNED BY kernel.criteria.id;
+
+
+--
+-- Name: criterion_baselines; Type: TABLE; Schema: kernel; Owner: -
+--
+
+CREATE TABLE kernel.criterion_baselines (
+    id bigint NOT NULL,
+    criterion_id bigint NOT NULL,
+    contract_id bigint NOT NULL,
+    execution_id bigint,
+    commit_sha text,
+    outcome text NOT NULL,
+    detail jsonb DEFAULT '{}'::jsonb NOT NULL,
+    promoted boolean DEFAULT false NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT baseline_outcome_is_four_valued CHECK ((outcome = ANY (ARRAY['pass'::text, 'fail'::text, 'flake'::text, 'error'::text])))
+);
+
+
+--
+-- Name: TABLE criterion_baselines; Type: COMMENT; Schema: kernel; Owner: -
+--
+
+COMMENT ON TABLE kernel.criterion_baselines IS 'What each criterion did against the tree as it stood at approval, before any work. A goal that passed here is a bug in the contract.';
+
+
+--
+-- Name: criterion_baselines_id_seq; Type: SEQUENCE; Schema: kernel; Owner: -
+--
+
+CREATE SEQUENCE kernel.criterion_baselines_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: criterion_baselines_id_seq; Type: SEQUENCE OWNED BY; Schema: kernel; Owner: -
+--
+
+ALTER SEQUENCE kernel.criterion_baselines_id_seq OWNED BY kernel.criterion_baselines.id;
+
+
+--
+-- Name: criterion_results; Type: TABLE; Schema: kernel; Owner: -
+--
+
+CREATE TABLE kernel.criterion_results (
+    id bigint NOT NULL,
+    criterion_id bigint NOT NULL,
+    execution_id bigint NOT NULL,
+    claim_seq bigint NOT NULL,
+    passes text NOT NULL,
+    detail jsonb DEFAULT '{}'::jsonb NOT NULL,
+    run_index integer DEFAULT 0 NOT NULL,
+    written_by text NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT criterion_results_passes_check CHECK ((passes = ANY (ARRAY['pass'::text, 'fail'::text, 'flake'::text, 'error'::text])))
+);
+
+
+--
+-- Name: criterion_results_id_seq; Type: SEQUENCE; Schema: kernel; Owner: -
+--
+
+CREATE SEQUENCE kernel.criterion_results_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: criterion_results_id_seq; Type: SEQUENCE OWNED BY; Schema: kernel; Owner: -
+--
+
+ALTER SEQUENCE kernel.criterion_results_id_seq OWNED BY kernel.criterion_results.id;
+
+
+--
+-- Name: directives; Type: TABLE; Schema: kernel; Owner: -
+--
+
+CREATE TABLE kernel.directives (
+    id bigint NOT NULL,
+    execution_id bigint NOT NULL,
+    kind text NOT NULL,
+    generation integer NOT NULL,
+    payload jsonb DEFAULT '{}'::jsonb NOT NULL,
+    status text DEFAULT 'PENDING'::text NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: directives_id_seq; Type: SEQUENCE; Schema: kernel; Owner: -
+--
+
+CREATE SEQUENCE kernel.directives_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: directives_id_seq; Type: SEQUENCE OWNED BY; Schema: kernel; Owner: -
+--
+
+ALTER SEQUENCE kernel.directives_id_seq OWNED BY kernel.directives.id;
+
+
+--
+-- Name: env_deltas; Type: TABLE; Schema: kernel; Owner: -
+--
+
+CREATE TABLE kernel.env_deltas (
+    id bigint NOT NULL,
+    execution_id bigint NOT NULL,
+    seq integer NOT NULL,
+    manager text NOT NULL,
+    packages jsonb DEFAULT '[]'::jsonb NOT NULL,
+    reproducible boolean DEFAULT true NOT NULL,
+    detail jsonb DEFAULT '{}'::jsonb NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: env_deltas_id_seq; Type: SEQUENCE; Schema: kernel; Owner: -
+--
+
+CREATE SEQUENCE kernel.env_deltas_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: env_deltas_id_seq; Type: SEQUENCE OWNED BY; Schema: kernel; Owner: -
+--
+
+ALTER SEQUENCE kernel.env_deltas_id_seq OWNED BY kernel.env_deltas.id;
+
+
+--
+-- Name: errand_proposals; Type: TABLE; Schema: kernel; Owner: -
+--
+
+CREATE TABLE kernel.errand_proposals (
+    id bigint NOT NULL,
+    goal_id text NOT NULL,
+    proposed_by text NOT NULL,
+    kind text DEFAULT 'errand'::text NOT NULL,
+    domain text DEFAULT 'ops'::text NOT NULL,
+    task text NOT NULL,
+    name text DEFAULT ''::text NOT NULL,
+    rationale text NOT NULL,
+    cron text DEFAULT '@once'::text NOT NULL,
+    max_runs integer,
+    expires_at timestamp with time zone,
+    state text DEFAULT 'PENDING'::text NOT NULL,
+    decided_by text,
+    decided_at timestamp with time zone,
+    decline_reason text,
+    schedule_id bigint,
+    card_posted_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    resources jsonb,
+    sandbox_size text,
+    CONSTRAINT errand_proposals_decision_is_attributable CHECK ((((state = 'PENDING'::text) = (decided_by IS NULL)) AND ((decided_by IS NULL) = (decided_at IS NULL)))),
+    CONSTRAINT errand_proposals_has_rationale CHECK ((length(btrim(rationale)) > 0)),
+    CONSTRAINT errand_proposals_has_task CHECK ((length(btrim(task)) > 0)),
+    CONSTRAINT errand_proposals_runs_are_positive CHECK (((max_runs IS NULL) OR (max_runs > 0))),
+    CONSTRAINT errand_proposals_state CHECK ((state = ANY (ARRAY['PENDING'::text, 'APPROVED'::text, 'DECLINED'::text])))
+);
+
+
+--
+-- Name: errand_proposals_id_seq; Type: SEQUENCE; Schema: kernel; Owner: -
+--
+
+CREATE SEQUENCE kernel.errand_proposals_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: errand_proposals_id_seq; Type: SEQUENCE OWNED BY; Schema: kernel; Owner: -
+--
+
+ALTER SEQUENCE kernel.errand_proposals_id_seq OWNED BY kernel.errand_proposals.id;
+
+
+--
+-- Name: errand_schedules; Type: TABLE; Schema: kernel; Owner: -
+--
+
+CREATE TABLE kernel.errand_schedules (
+    id bigint NOT NULL,
+    goal_id text NOT NULL,
+    kind text DEFAULT 'errand'::text NOT NULL,
+    domain text DEFAULT 'ops'::text NOT NULL,
+    task text NOT NULL,
+    name text DEFAULT ''::text NOT NULL,
+    cron text NOT NULL,
+    next_run_at timestamp with time zone,
+    last_run_at timestamp with time zone,
+    last_execution_id bigint,
+    run_count bigint DEFAULT 0 NOT NULL,
+    paused boolean DEFAULT false NOT NULL,
+    created_by text DEFAULT ''::text NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    story_id text,
+    max_runs integer,
+    expires_at timestamp with time zone,
+    retired_reason text,
+    approved_by text,
+    approved_at timestamp with time zone,
+    approved_plan_hash text,
+    driving_thread_id text,
+    proposed_by text,
+    rationale text,
+    revoked_at timestamp with time zone,
+    revoked_by text,
+    resources jsonb,
+    sandbox_size text,
+    CONSTRAINT errand_schedules_grant_is_attributable CHECK (((approved_by IS NULL) = (approved_at IS NULL))),
+    CONSTRAINT errand_schedules_has_cron CHECK ((length(btrim(cron)) > 0)),
+    CONSTRAINT errand_schedules_has_task CHECK ((length(btrim(task)) > 0)),
+    CONSTRAINT errand_schedules_sane_max_runs CHECK (((max_runs IS NULL) OR (max_runs > 0)))
+);
+
+
+--
+-- Name: errand_schedules_id_seq; Type: SEQUENCE; Schema: kernel; Owner: -
+--
+
+CREATE SEQUENCE kernel.errand_schedules_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: errand_schedules_id_seq; Type: SEQUENCE OWNED BY; Schema: kernel; Owner: -
+--
+
+ALTER SEQUENCE kernel.errand_schedules_id_seq OWNED BY kernel.errand_schedules.id;
+
+
+--
+-- Name: execution_checkpoints; Type: TABLE; Schema: kernel; Owner: -
+--
+
+CREATE TABLE kernel.execution_checkpoints (
+    id bigint NOT NULL,
+    execution_id bigint NOT NULL,
+    generation integer NOT NULL,
+    seq integer NOT NULL,
+    kind text NOT NULL,
+    data jsonb NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: execution_checkpoints_id_seq; Type: SEQUENCE; Schema: kernel; Owner: -
+--
+
+CREATE SEQUENCE kernel.execution_checkpoints_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: execution_checkpoints_id_seq; Type: SEQUENCE OWNED BY; Schema: kernel; Owner: -
+--
+
+ALTER SEQUENCE kernel.execution_checkpoints_id_seq OWNED BY kernel.execution_checkpoints.id;
+
+
+--
+-- Name: execution_jobs; Type: TABLE; Schema: kernel; Owner: -
+--
+
+CREATE TABLE kernel.execution_jobs (
+    execution_id bigint NOT NULL,
+    job_id text NOT NULL,
+    story_id text DEFAULT ''::text NOT NULL,
+    command text DEFAULT ''::text NOT NULL,
+    fingerprint text DEFAULT ''::text NOT NULL,
+    fingerprint_end text DEFAULT ''::text NOT NULL,
+    produced bigint DEFAULT 0 NOT NULL,
+    running boolean DEFAULT true NOT NULL,
+    exit_code integer,
+    ended text,
+    last_seen_at timestamp with time zone DEFAULT now() NOT NULL,
+    started_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: execution_leases; Type: TABLE; Schema: kernel; Owner: -
+--
+
+CREATE TABLE kernel.execution_leases (
+    id bigint NOT NULL,
+    execution_id bigint NOT NULL,
+    holder text NOT NULL,
+    generation integer NOT NULL,
+    heartbeat_at timestamp with time zone DEFAULT now() NOT NULL,
+    acquired_at timestamp with time zone DEFAULT now() NOT NULL,
+    released_at timestamp with time zone
+);
+
+
+--
+-- Name: execution_leases_id_seq; Type: SEQUENCE; Schema: kernel; Owner: -
+--
+
+CREATE SEQUENCE kernel.execution_leases_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: execution_leases_id_seq; Type: SEQUENCE OWNED BY; Schema: kernel; Owner: -
+--
+
+ALTER SEQUENCE kernel.execution_leases_id_seq OWNED BY kernel.execution_leases.id;
+
+
+--
+-- Name: execution_mounts; Type: TABLE; Schema: kernel; Owner: -
+--
+
+CREATE TABLE kernel.execution_mounts (
+    id bigint NOT NULL,
+    execution_id bigint NOT NULL,
+    at text NOT NULL,
+    binding text NOT NULL,
+    source text,
+    ref text,
+    writable boolean DEFAULT false NOT NULL,
+    kind text DEFAULT 'repo'::text NOT NULL,
+    resource_id text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT execution_mounts_at_relative CHECK ((at !~ '(^/|(^|/)\.\.(/|$))'::text)),
+    CONSTRAINT execution_mounts_binding CHECK ((binding = ANY (ARRAY['git'::text, 'copyin'::text, 'none'::text])))
+);
+
+
+--
+-- Name: execution_mounts_id_seq; Type: SEQUENCE; Schema: kernel; Owner: -
+--
+
+CREATE SEQUENCE kernel.execution_mounts_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: execution_mounts_id_seq; Type: SEQUENCE OWNED BY; Schema: kernel; Owner: -
+--
+
+ALTER SEQUENCE kernel.execution_mounts_id_seq OWNED BY kernel.execution_mounts.id;
+
+
+--
+-- Name: execution_transitions; Type: TABLE; Schema: kernel; Owner: -
+--
+
+CREATE TABLE kernel.execution_transitions (
+    id bigint NOT NULL,
+    execution_id bigint NOT NULL,
+    from_state text,
+    to_state text NOT NULL,
+    generation integer NOT NULL,
+    machine_version integer NOT NULL,
+    at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: execution_transitions_id_seq; Type: SEQUENCE; Schema: kernel; Owner: -
+--
+
+CREATE SEQUENCE kernel.execution_transitions_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: execution_transitions_id_seq; Type: SEQUENCE OWNED BY; Schema: kernel; Owner: -
+--
+
+ALTER SEQUENCE kernel.execution_transitions_id_seq OWNED BY kernel.execution_transitions.id;
+
+
+--
+-- Name: executions; Type: TABLE; Schema: kernel; Owner: -
+--
+
+CREATE TABLE kernel.executions (
+    id bigint NOT NULL,
+    kind text NOT NULL,
+    domain text NOT NULL,
+    state text DEFAULT 'PENDING'::text NOT NULL,
+    generation integer DEFAULT 0 NOT NULL,
+    spec_hash text,
+    machine_version integer DEFAULT 5 NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    goal_id text,
+    container_id text,
+    tokens_to_first_write bigint,
+    steps_to_first_write integer,
+    terminal_command text,
+    terminal_exit_code integer,
+    terminal_output text,
+    task text,
+    workspace_source text,
+    workspace_path text,
+    contract_id bigint,
+    context_at_first_write integer,
+    stall_reason text,
+    stalled_at timestamp with time zone,
+    story_id text,
+    verify_error_count integer DEFAULT 0 NOT NULL,
+    stall_card_note text,
+    driving_thread_id text,
+    workspace_host text,
+    executor_model text,
+    phase text,
+    phase_generation integer,
+    timings_profile text,
+    admission_owner text,
+    convergence_generation integer,
+    publish_error_count integer DEFAULT 0 NOT NULL,
+    CONSTRAINT executions_phase_check CHECK (((phase IS NULL) OR (phase = 'review'::text)))
+);
+
+
+--
+-- Name: COLUMN executions.tokens_to_first_write; Type: COMMENT; Schema: kernel; Owner: -
+--
+
+COMMENT ON COLUMN kernel.executions.tokens_to_first_write IS 'E5c: tokens spent, reasoning included, from the first step of the execution to the first story_commit. NULL until one happens. Written once and never updated — the FIRST write is the floor.';
+
+
+--
+-- Name: COLUMN executions.task; Type: COMMENT; Schema: kernel; Owner: -
+--
+
+COMMENT ON COLUMN kernel.executions.task IS 'H0w: the instruction the worker hands the model on leg 1. Written by the console today, by the mailbox intent once H1 lands.';
+
+
+--
+-- Name: COLUMN executions.context_at_first_write; Type: COMMENT; Schema: kernel; Owner: -
+--
+
+COMMENT ON COLUMN kernel.executions.context_at_first_write IS 'Peak input+cacheRead+cacheWrite on any single step from the first step of the execution to its first successful story_commit. What a leg must be able to HOLD to reach a first write, as against tokens_to_first_write, which is what reaching it COST.';
+
+
+--
+-- Name: COLUMN executions.stall_reason; Type: COMMENT; Schema: kernel; Owner: -
+--
+
+COMMENT ON COLUMN kernel.executions.stall_reason IS 'Why this execution is not progressing, when the cause is not the work: provider_unavailable, rate_limit, server_error. Cleared on the next successful leg. NULL is the normal case.';
+
+
+--
+-- Name: COLUMN executions.stalled_at; Type: COMMENT; Schema: kernel; Owner: -
+--
+
+COMMENT ON COLUMN kernel.executions.stalled_at IS 'When the current stall began. With stall_reason, this is what lets an operator tell a 40-second blip from an hour of downtime.';
+
+
+--
+-- Name: COLUMN executions.driving_thread_id; Type: COMMENT; Schema: kernel; Owner: -
+--
+
+COMMENT ON COLUMN kernel.executions.driving_thread_id IS 'I5b: the thread that OWNS this run when it is not the story''s newest. NULL means resolve the old way. Set for an autonomous errand to the approving human''s assistant thread, which makes them the ledger principal and puts the cards where they are watching.';
+
+
+--
+-- Name: COLUMN executions.workspace_host; Type: COMMENT; Schema: kernel; Owner: -
+--
+
+COMMENT ON COLUMN kernel.executions.workspace_host IS 'Address of the container holding this execution''s workspace. NULL means local to the reader. Written at dispatch by a pod-model driver; read by any process that must reach the tree without sharing a filesystem with it.';
+
+
+--
+-- Name: COLUMN executions.executor_model; Type: COMMENT; Schema: kernel; Owner: -
+--
+
+COMMENT ON COLUMN kernel.executions.executor_model IS 'The model this run''s legs use, resolved at dispatch from the story then the goal then the deployment default. Immutable for the life of the run by convention: nothing rewrites it.';
+
+
+--
+-- Name: COLUMN executions.timings_profile; Type: COMMENT; Schema: kernel; Owner: -
+--
+
+COMMENT ON COLUMN kernel.executions.timings_profile IS 'The timings profile this execution was dispatched under, stamped once and never re-read. NULL = production. A run carries the profile it started under so an expiry cannot split it mid-flight.';
+
+
+--
+-- Name: COLUMN executions.admission_owner; Type: COMMENT; Schema: kernel; Owner: -
+--
+
+COMMENT ON COLUMN kernel.executions.admission_owner IS 'Whose concurrency budget this run spends: ''go'' for an approved autonomous errand, ''assistant:<uid>'' otherwise. Written once by kernel/conductor/owner.py and never changed -- ownership that moved would release a slot into a bucket it never claimed one from.';
+
+
+--
+-- Name: COLUMN executions.convergence_generation; Type: COMMENT; Schema: kernel; Owner: -
+--
+
+COMMENT ON COLUMN kernel.executions.convergence_generation IS 'Generation at which the convergence budget was last reset by a person answering a park. NULL means never -- count from the phase mark. Set only when resolve_request carried a human_uid.';
+
+
+--
+-- Name: COLUMN executions.publish_error_count; Type: COMMENT; Schema: kernel; Owner: -
+--
+
+COMMENT ON COLUMN kernel.executions.publish_error_count IS 'Consecutive failures of publish_execution. Reset on a successful publish and by an operator retry. At PUBLISH_STRIKES (kernel/workspace/publish_failed.py) the run parks on an escalation instead of being told to try again.';
+
+
+--
+-- Name: executions_id_seq; Type: SEQUENCE; Schema: kernel; Owner: -
+--
+
+CREATE SEQUENCE kernel.executions_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: executions_id_seq; Type: SEQUENCE OWNED BY; Schema: kernel; Owner: -
+--
+
+ALTER SEQUENCE kernel.executions_id_seq OWNED BY kernel.executions.id;
+
+
+--
+-- Name: goal_resources_id_seq; Type: SEQUENCE; Schema: kernel; Owner: -
+--
+
+CREATE SEQUENCE kernel.goal_resources_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: projections; Type: TABLE; Schema: kernel; Owner: -
+--
+
+CREATE TABLE kernel.projections (
+    id bigint NOT NULL,
+    execution_id bigint,
+    goal_id text,
+    scope text NOT NULL,
+    key text NOT NULL,
+    value jsonb DEFAULT '{}'::jsonb NOT NULL,
+    observed_at timestamp with time zone DEFAULT now() NOT NULL,
+    observed_by text,
+    status text DEFAULT 'UNPROVEN'::text NOT NULL,
+    CONSTRAINT projections_check CHECK ((((scope = 'execution'::text) AND (execution_id IS NOT NULL) AND (goal_id IS NULL)) OR ((scope = 'goal'::text) AND (goal_id IS NOT NULL) AND (execution_id IS NULL)) OR ((scope = 'system'::text) AND (execution_id IS NULL) AND (goal_id IS NULL))))
+);
+
+
+--
+-- Name: projections_id_seq; Type: SEQUENCE; Schema: kernel; Owner: -
+--
+
+CREATE SEQUENCE kernel.projections_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: projections_id_seq; Type: SEQUENCE OWNED BY; Schema: kernel; Owner: -
+--
+
+ALTER SEQUENCE kernel.projections_id_seq OWNED BY kernel.projections.id;
+
+
+--
+-- Name: proposals; Type: TABLE; Schema: kernel; Owner: -
+--
+
+CREATE TABLE kernel.proposals (
+    id bigint NOT NULL,
+    actor_id text NOT NULL,
+    kind text NOT NULL,
+    idempotency_key text NOT NULL,
+    execution_id bigint NOT NULL,
+    payload jsonb DEFAULT '{}'::jsonb NOT NULL,
+    status text DEFAULT 'PENDING'::text NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    reason_hash text,
+    reason_set jsonb
+);
+
+
+--
+-- Name: proposals_id_seq; Type: SEQUENCE; Schema: kernel; Owner: -
+--
+
+CREATE SEQUENCE kernel.proposals_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: proposals_id_seq; Type: SEQUENCE OWNED BY; Schema: kernel; Owner: -
+--
+
+ALTER SEQUENCE kernel.proposals_id_seq OWNED BY kernel.proposals.id;
+
+
+--
+-- Name: provider_health; Type: TABLE; Schema: kernel; Owner: -
+--
+
+CREATE TABLE kernel.provider_health (
+    model text NOT NULL,
+    state text NOT NULL,
+    last_kind text,
+    opened_at timestamp with time zone,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT provider_health_state_check CHECK ((state = ANY (ARRAY['open'::text, 'closed'::text])))
+);
+
+
+--
+-- Name: TABLE provider_health; Type: COMMENT; Schema: kernel; Owner: -
+--
+
+COMMENT ON TABLE kernel.provider_health IS 'Cross-process view of whether a model provider is answering. Read by admission so a sustained outage stops new work being admitted rather than admitting it to stall. Rows are advisory and STALE ROWS MUST BE IGNORED: a worker killed mid-outage leaves state=open behind, and an open row nobody is refreshing must never block admission for ever.';
+
+
+--
+-- Name: COLUMN provider_health.updated_at; Type: COMMENT; Schema: kernel; Owner: -
+--
+
+COMMENT ON COLUMN kernel.provider_health.updated_at IS 'Heartbeat. Admission treats an open row older than its staleness bound as closed — failing OPEN (admitting) rather than closed, because the cost of admitting into an outage is a stall that resumes, and the cost of not admitting is a queue nobody drains.';
+
+
+--
+-- Name: questions; Type: TABLE; Schema: kernel; Owner: -
+--
+
+CREATE TABLE kernel.questions (
+    id bigint NOT NULL,
+    execution_id bigint NOT NULL,
+    kind text NOT NULL,
+    question_text text NOT NULL,
+    proposed_default text,
+    blocking_on text,
+    reversible boolean DEFAULT true NOT NULL,
+    answer_text text,
+    answered_by text,
+    answered_at timestamp with time zone,
+    batch_id text,
+    status text DEFAULT 'OPEN'::text NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    payload jsonb DEFAULT '{}'::jsonb NOT NULL,
+    content_hash text,
+    generation integer,
+    declined boolean DEFAULT false NOT NULL,
+    step_notes jsonb DEFAULT '[]'::jsonb NOT NULL,
+    verdict text,
+    checks jsonb DEFAULT '[]'::jsonb NOT NULL,
+    dryrun jsonb DEFAULT '{}'::jsonb NOT NULL,
+    card_posted_at timestamp with time zone,
+    CONSTRAINT questions_answer_present CHECK (((status <> 'ANSWERED'::text) OR (answer_text IS NOT NULL)))
+);
+
+
+--
+-- Name: COLUMN questions.verdict; Type: COMMENT; Schema: kernel; Owner: -
+--
+
+COMMENT ON COLUMN kernel.questions.verdict IS 'approve | revise | decline. `declined` remains the boolean the approval gate reads; this says which KIND of no it was, and revise keeps the story alive.';
+
+
+--
+-- Name: COLUMN questions.checks; Type: COMMENT; Schema: kernel; Owner: -
+--
+
+COMMENT ON COLUMN kernel.questions.checks IS 'Proposed criteria for a plan_approval: [{run, label}]. They become real criteria on a new contract version when the plan is approved, and never before.';
+
+
+--
+-- Name: COLUMN questions.dryrun; Type: COMMENT; Schema: kernel; Owner: -
+--
+
+COMMENT ON COLUMN kernel.questions.dryrun IS 'The result of running those checks against the pre-work tree: {status, commit, results:[{run, label, outcome, verdict, note}]}. Empty until the dry-run pass reaches it.';
+
+
+--
+-- Name: questions_id_seq; Type: SEQUENCE; Schema: kernel; Owner: -
+--
+
+CREATE SEQUENCE kernel.questions_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: questions_id_seq; Type: SEQUENCE OWNED BY; Schema: kernel; Owner: -
+--
+
+ALTER SEQUENCE kernel.questions_id_seq OWNED BY kernel.questions.id;
+
+
+--
+-- Name: reconcile_probes; Type: TABLE; Schema: kernel; Owner: -
+--
+
+CREATE TABLE kernel.reconcile_probes (
+    id bigint NOT NULL,
+    execution_id bigint NOT NULL,
+    probe_type text NOT NULL,
+    sent_at timestamp with time zone DEFAULT now() NOT NULL,
+    response_at timestamp with time zone,
+    result jsonb,
+    status text DEFAULT 'PENDING'::text NOT NULL
+);
+
+
+--
+-- Name: reconcile_probes_id_seq; Type: SEQUENCE; Schema: kernel; Owner: -
+--
+
+CREATE SEQUENCE kernel.reconcile_probes_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: reconcile_probes_id_seq; Type: SEQUENCE OWNED BY; Schema: kernel; Owner: -
+--
+
+ALTER SEQUENCE kernel.reconcile_probes_id_seq OWNED BY kernel.reconcile_probes.id;
+
+
+--
+-- Name: run_state_machine; Type: TABLE; Schema: kernel; Owner: -
+--
+
+CREATE TABLE kernel.run_state_machine (
+    version integer NOT NULL,
+    states jsonb NOT NULL,
+    transitions jsonb NOT NULL,
+    park_states jsonb DEFAULT '[]'::jsonb NOT NULL,
+    terminal_states jsonb DEFAULT '[]'::jsonb NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    is_fixture boolean DEFAULT false NOT NULL
+);
+
+
+--
+-- Name: COLUMN run_state_machine.is_fixture; Type: COMMENT; Schema: kernel; Owner: -
+--
+
+COMMENT ON COLUMN kernel.run_state_machine.is_fixture IS 'True for machines a test inserted. "The current machine" is the highest version with is_fixture = false; a fixture is visible to the run that names it and to nothing else.';
+
+
+--
+-- Name: standing_answers; Type: TABLE; Schema: kernel; Owner: -
+--
+
+CREATE TABLE kernel.standing_answers (
+    id bigint NOT NULL,
+    execution_id bigint NOT NULL,
+    question_kind text NOT NULL,
+    pattern text NOT NULL,
+    answer_text text NOT NULL,
+    created_by text NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: standing_answers_id_seq; Type: SEQUENCE; Schema: kernel; Owner: -
+--
+
+CREATE SEQUENCE kernel.standing_answers_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: standing_answers_id_seq; Type: SEQUENCE OWNED BY; Schema: kernel; Owner: -
+--
+
+ALTER SEQUENCE kernel.standing_answers_id_seq OWNED BY kernel.standing_answers.id;
+
+
+--
+-- Name: step_journal; Type: TABLE; Schema: kernel; Owner: -
+--
+
+CREATE TABLE kernel.step_journal (
+    id bigint NOT NULL,
+    execution_id bigint NOT NULL,
+    seq integer NOT NULL,
+    generation integer NOT NULL,
+    depth integer DEFAULT 0 NOT NULL,
+    tool text,
+    args jsonb,
+    result_ref text,
+    idempotency_key text NOT NULL,
+    ts timestamp with time zone DEFAULT now() NOT NULL,
+    cost jsonb,
+    model_text text
+);
+
+
+--
+-- Name: COLUMN step_journal.model_text; Type: COMMENT; Schema: kernel; Owner: -
+--
+
+COMMENT ON COLUMN kernel.step_journal.model_text IS 'Model narration accompanying this step. Evidence only — never an input to the progress clock or any predicate.';
+
+
+--
+-- Name: step_journal_id_seq; Type: SEQUENCE; Schema: kernel; Owner: -
+--
+
+CREATE SEQUENCE kernel.step_journal_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: step_journal_id_seq; Type: SEQUENCE OWNED BY; Schema: kernel; Owner: -
+--
+
+ALTER SEQUENCE kernel.step_journal_id_seq OWNED BY kernel.step_journal.id;
+
+
+--
+-- Name: story_resources_id_seq; Type: SEQUENCE; Schema: kernel; Owner: -
+--
+
+CREATE SEQUENCE kernel.story_resources_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: story_timings; Type: TABLE; Schema: kernel; Owner: -
+--
+
+CREATE TABLE kernel.story_timings (
+    story_id text NOT NULL,
+    profile text NOT NULL,
+    expires_at timestamp with time zone NOT NULL,
+    overrides jsonb DEFAULT '{}'::jsonb NOT NULL,
+    set_by text DEFAULT ''::text NOT NULL,
+    reason text DEFAULT ''::text NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT story_timings_profile_check CHECK ((profile = ANY (ARRAY['production'::text, 'compressed'::text])))
+);
+
+
+--
+-- Name: verdicts; Type: TABLE; Schema: kernel; Owner: -
+--
+
+CREATE TABLE kernel.verdicts (
+    id bigint NOT NULL,
+    execution_id bigint NOT NULL,
+    claim_seq bigint NOT NULL,
+    proposal_id bigint,
+    passed boolean NOT NULL,
+    refusal jsonb DEFAULT '[]'::jsonb NOT NULL,
+    generation integer DEFAULT 0 NOT NULL,
+    adjudicator text NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    parity jsonb DEFAULT '{}'::jsonb NOT NULL,
+    card_posted_at timestamp with time zone
+);
+
+
+--
+-- Name: verdict_parity; Type: VIEW; Schema: kernel; Owner: -
+--
+
+CREATE VIEW kernel.verdict_parity AS
+ SELECT count(*) AS verdicts,
+    count(*) FILTER (WHERE passed) AS passed,
+    count(*) FILTER (WHERE (NOT passed)) AS refused,
+    count(*) FILTER (WHERE (((parity ->> 'image_pinned'::text))::boolean IS NOT TRUE)) AS unpinned_image,
+    COALESCE(sum(((parity ->> 'env_skipped'::text))::integer), (0)::bigint) AS env_skipped,
+    COALESCE(sum(((parity ->> 'unrunnable'::text))::integer), (0)::bigint) AS unrunnable,
+    COALESCE(sum(((parity ->> 'criteria'::text))::integer), (0)::bigint) AS criteria,
+    round(((COALESCE(sum(((parity ->> 'unrunnable'::text))::integer), (0)::bigint))::numeric / (GREATEST(COALESCE(sum(((parity ->> 'criteria'::text))::integer), (0)::bigint), (1)::bigint))::numeric), 4) AS unrunnable_rate
+   FROM kernel.verdicts;
+
+
+--
+-- Name: verdicts_id_seq; Type: SEQUENCE; Schema: kernel; Owner: -
+--
+
+CREATE SEQUENCE kernel.verdicts_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: verdicts_id_seq; Type: SEQUENCE OWNED BY; Schema: kernel; Owner: -
+--
+
+ALTER SEQUENCE kernel.verdicts_id_seq OWNED BY kernel.verdicts.id;
+
+
+--
+-- Name: verification_state; Type: TABLE; Schema: kernel; Owner: -
+--
+
+CREATE TABLE kernel.verification_state (
+    execution_id bigint NOT NULL,
+    env_key text,
+    env_commit text,
+    building_key text,
+    building_since timestamp with time zone,
+    build_error text,
+    disruptions integer DEFAULT 0 NOT NULL,
+    checked_at timestamp with time zone,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    mounts_env jsonb,
+    built_at_generation integer
+);
+
+
+--
+-- Name: COLUMN verification_state.built_at_generation; Type: COMMENT; Schema: kernel; Owner: -
+--
+
+COMMENT ON COLUMN kernel.verification_state.built_at_generation IS 'The execution generation the environment on this volume was last built from scratch at. `rebuild.cold_due` forces a rebuild once the run is COLD_AFTER_GENERATIONS past it, so drift a manifest hash cannot see is bounded by rounds rather than by the life of the story. NULL = never recorded, which counts as due.';
+
+
+--
 -- Name: actors; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -194,13 +2163,6 @@ CREATE TABLE public.actors (
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     CONSTRAINT actors_type_check CHECK ((type = ANY (ARRAY['user'::text, 'agent'::text, 'system'::text])))
 );
-
-
---
--- Name: COLUMN actors.created_at; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON COLUMN public.actors.created_at IS 'Creation timestamp. NOTE: actors has no updated_at column — display_name is the only mutable field; mutation time is in ledger_events (AGENT_UPDATED).';
 
 
 --
@@ -222,6 +2184,7 @@ CREATE TABLE public.agent_configs (
     notes text DEFAULT ''::text NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     created_by text,
+    model_id text,
     CONSTRAINT agent_configs_scope_check CHECK ((scope = ANY (ARRAY['goal'::text, 'task'::text]))),
     CONSTRAINT agent_configs_type_check CHECK ((type = ANY (ARRAY['SHCA'::text, 'IA'::text, 'GO'::text, 'RA'::text, 'Platform'::text, 'PlatformResearch'::text, 'PlatformAssistant'::text])))
 );
@@ -275,13 +2238,6 @@ CREATE TABLE public.agent_files (
 
 
 --
--- Name: COLUMN agent_files.written_at; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON COLUMN public.agent_files.written_at IS 'Timestamp of the most recent write. Functions as updated_at. No separate created_at column — treat the agent row''s created_at as the file creation time for files written at provisioning.';
-
-
---
 -- Name: agent_gateway_bindings; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -320,6 +2276,7 @@ CREATE TABLE public.agent_instances (
     parent_task_id text,
     total_tokens jsonb DEFAULT '{}'::jsonb,
     owner_actor_id uuid,
+    model_id text,
     CONSTRAINT agent_instances_status_check CHECK ((status = ANY (ARRAY['active'::text, 'destroyed'::text])))
 );
 
@@ -443,7 +2400,7 @@ CREATE TABLE public.agents (
     name text NOT NULL,
     type text DEFAULT 'SHCA'::text NOT NULL,
     scope text DEFAULT 'task'::text NOT NULL,
-    model text DEFAULT 'google/gemini-2.5-flash'::text NOT NULL,
+    model text DEFAULT 'google/gemini-3.8-flash'::text NOT NULL,
     emoji text DEFAULT ''::text NOT NULL,
     base_system_prompt text DEFAULT ''::text NOT NULL,
     soul text DEFAULT ''::text NOT NULL,
@@ -469,6 +2426,7 @@ CREATE TABLE public.agents (
     is_template boolean DEFAULT false NOT NULL,
     template_id text,
     last_active_at timestamp with time zone,
+    model_id text,
     CONSTRAINT agents_scope_check CHECK ((scope = ANY (ARRAY['goal'::text, 'task'::text]))),
     CONSTRAINT agents_status_check CHECK ((status = ANY (ARRAY['active'::text, 'deleted'::text]))),
     CONSTRAINT agents_type_check CHECK ((type = ANY (ARRAY['SHCA'::text, 'IA'::text, 'GO'::text, 'RA'::text, 'Platform'::text, 'PlatformResearch'::text, 'PlatformAssistant'::text])))
@@ -490,20 +2448,6 @@ COMMENT ON COLUMN public.agents.soul IS 'DEPRECATED. Content now lives in agent_
 
 
 --
--- Name: COLUMN agents.gateway_agent_id; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON COLUMN public.agents.gateway_agent_id IS 'LEGACY DUPLICATE of agent_gateway_bindings.gateway_agent_id. The binding table is canonical; do not read this column for sync decisions.';
-
-
---
--- Name: COLUMN agents.workspace; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON COLUMN public.agents.workspace IS 'LEGACY DUPLICATE of agent_gateway_bindings.workspace. The binding table is canonical.';
-
-
---
 -- Name: COLUMN agents.creation_params; Type: COMMENT; Schema: public; Owner: -
 --
 
@@ -518,24 +2462,29 @@ COMMENT ON COLUMN public.agents.auto_created IS 'DEPRECATED. No downstream consu
 
 
 --
--- Name: COLUMN agents.gateway_synced_version; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON COLUMN public.agents.gateway_synced_version IS 'LEGACY DUPLICATE of agent_gateway_bindings.synced_config_version. Both are null-written on every update; the binding table is canonical. Pending deprecation once all readers are migrated.';
-
-
---
--- Name: COLUMN agents.gateway_synced_at; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON COLUMN public.agents.gateway_synced_at IS 'LEGACY DUPLICATE of agent_gateway_bindings.last_synced_at. Pending deprecation.';
-
-
---
 -- Name: COLUMN agents.is_template; Type: COMMENT; Schema: public; Owner: -
 --
 
 COMMENT ON COLUMN public.agents.is_template IS 'DEPRECATED. Use NOT EXISTS (SELECT 1 FROM templates WHERE templates.id = agents.id). Pending removal.';
+
+
+--
+-- Name: api_keys; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.api_keys (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    key_hash text NOT NULL,
+    key_prefix text NOT NULL,
+    owner_uid text NOT NULL,
+    actor_id uuid NOT NULL,
+    name text DEFAULT ''::text NOT NULL,
+    scopes text[] DEFAULT '{}'::text[] NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    last_used_at timestamp with time zone,
+    expires_at timestamp with time zone,
+    revoked_at timestamp with time zone
+);
 
 
 --
@@ -544,7 +2493,7 @@ COMMENT ON COLUMN public.agents.is_template IS 'DEPRECATED. Use NOT EXISTS (SELE
 
 CREATE TABLE public.approvals (
     id uuid NOT NULL,
-    story_id text NOT NULL,
+    story_id text,
     kind text NOT NULL,
     payload jsonb,
     payload_ref text,
@@ -555,8 +2504,18 @@ CREATE TABLE public.approvals (
     decision text,
     feedback text,
     timeout_at timestamp with time zone,
-    escalation_count integer DEFAULT 0 NOT NULL
+    escalation_count integer DEFAULT 0 NOT NULL,
+    subject_type text,
+    subject_id text,
+    approval_hash text
 );
+
+
+--
+-- Name: COLUMN approvals.approval_hash; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.approvals.approval_hash IS 'Binds the decision to the exact content approved; an amendment invalidates it.';
 
 
 --
@@ -644,7 +2603,52 @@ CREATE TABLE public.claude_phases (
     created_by text DEFAULT 'system'::text NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    model_id text,
     CONSTRAINT claude_phases_status_check CHECK ((status = ANY (ARRAY['active'::text, 'disabled'::text])))
+);
+
+
+--
+-- Name: council_finding_events; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.council_finding_events (
+    id text NOT NULL,
+    finding_id text NOT NULL,
+    run_id text DEFAULT ''::text NOT NULL,
+    kind text NOT NULL,
+    detail text DEFAULT ''::text NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT council_finding_events_kind_check CHECK ((kind = ANY (ARRAY['raised'::text, 'reaffirmed'::text, 'resolved'::text, 'go_response'::text])))
+);
+
+
+--
+-- Name: council_findings; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.council_findings (
+    id text NOT NULL,
+    goal_id text NOT NULL,
+    key text NOT NULL,
+    scope text DEFAULT 'goal'::text NOT NULL,
+    story_id text,
+    title text NOT NULL,
+    body text DEFAULT ''::text NOT NULL,
+    severity text DEFAULT 'medium'::text NOT NULL,
+    raised_by text DEFAULT ''::text NOT NULL,
+    first_run_id text NOT NULL,
+    last_run_id text NOT NULL,
+    times_seen integer DEFAULT 1 NOT NULL,
+    status text DEFAULT 'open'::text NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT council_findings_key_check CHECK ((key <> ''::text)),
+    CONSTRAINT council_findings_scope_check CHECK ((scope = ANY (ARRAY['goal'::text, 'story'::text]))),
+    CONSTRAINT council_findings_severity_check CHECK ((severity = ANY (ARRAY['high'::text, 'medium'::text, 'low'::text]))),
+    CONSTRAINT council_findings_status_check CHECK ((status = ANY (ARRAY['open'::text, 'resolved'::text, 'wont_fix'::text]))),
+    CONSTRAINT council_findings_times_seen_check CHECK ((times_seen > 0)),
+    CONSTRAINT council_findings_title_check CHECK ((title <> ''::text))
 );
 
 
@@ -728,7 +2732,33 @@ CREATE TABLE public.execution_pauses (
     reason text DEFAULT ''::text NOT NULL,
     paused_by text DEFAULT ''::text NOT NULL,
     paused_at timestamp with time zone DEFAULT now() NOT NULL,
-    CONSTRAINT execution_pauses_scope_check CHECK ((scope = ANY (ARRAY['system'::text, 'goal'::text, 'agent_instance'::text])))
+    CONSTRAINT execution_pauses_scope_check CHECK ((scope = ANY (ARRAY['system'::text, 'goal'::text, 'agent_instance'::text, 'story'::text])))
+);
+
+
+--
+-- Name: ext_auth_codes; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.ext_auth_codes (
+    code text NOT NULL,
+    uid text NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    expires_at timestamp with time zone NOT NULL,
+    used_at timestamp with time zone
+);
+
+
+--
+-- Name: ext_sessions; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.ext_sessions (
+    handle text NOT NULL,
+    uid text NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    last_used_at timestamp with time zone,
+    revoked_at timestamp with time zone
 );
 
 
@@ -823,6 +2853,28 @@ ALTER SEQUENCE public.git_merge_queue_enqueue_seq_seq OWNED BY public.git_merge_
 
 
 --
+-- Name: git_node_landings; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.git_node_landings (
+    git_node_id text NOT NULL,
+    cycle integer NOT NULL,
+    branch_name text NOT NULL,
+    base_sha text,
+    pr_number integer,
+    merge_commit_sha text,
+    landed_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: TABLE git_node_landings; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.git_node_landings IS 'One row per completed landing of a node. Written when a node is reopened for another cycle, because reopening clears the columns that say what the previous round was. The PK makes reopening idempotent: a second attempt at the same cycle conflicts rather than double-counting.';
+
+
+--
 -- Name: git_node_stories; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -860,9 +2912,38 @@ CREATE TABLE public.git_nodes (
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     trunk_branch text,
     pr_opened_notified_at timestamp with time zone,
+    pr_card_posted_at timestamp with time zone,
+    error_card_posted_at timestamp with time zone,
+    error_card_error text,
+    branch_deleted_at timestamp with time zone,
+    branch_cleanup_error text,
+    branch_cleanup_tries integer DEFAULT 0 NOT NULL,
+    final_sha text,
+    cycle integer DEFAULT 1 NOT NULL,
     CONSTRAINT git_nodes_mergeable_check CHECK ((mergeable = ANY (ARRAY['yes'::text, 'no'::text, 'unknown'::text]))),
     CONSTRAINT git_nodes_state_check CHECK ((state = ANY (ARRAY['PLANNED'::text, 'BRANCHING'::text, 'BRANCH_CREATED'::text, 'IN_PROGRESS'::text, 'READY'::text, 'QUEUED'::text, 'SYNCING'::text, 'MERGEABLE'::text, 'MERGING'::text, 'MERGED'::text, 'CONFLICTED'::text, 'ABANDONED'::text, 'PROTECTION_BLOCKED'::text, 'ESCALATED'::text])))
 );
+
+
+--
+-- Name: COLUMN git_nodes.error_card_error; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.git_nodes.error_card_error IS 'The last_error text already announced in the story thread. The card poster re-posts when last_error differs from this, so a new failure is seen and a persistent one does not repeat.';
+
+
+--
+-- Name: COLUMN git_nodes.final_sha; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.git_nodes.final_sha IS 'HEAD of branch_name as it was immediately before the ref was deleted. Errands only today. Reachable by SHA until GitHub collects it; the artifacts are the durable record.';
+
+
+--
+-- Name: COLUMN git_nodes.cycle; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.git_nodes.cycle IS 'Which round of work this node is carrying. 1 is the original; incremented when a person asks for more work after the previous round merged. The branch name does NOT change -- one feature branch per story.';
 
 
 --
@@ -994,6 +3075,33 @@ ALTER SEQUENCE public.go_memory_id_seq OWNED BY public.go_memory.id;
 
 
 --
+-- Name: go_wake_log; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.go_wake_log (
+    id bigint NOT NULL,
+    goal_id text NOT NULL,
+    kind text NOT NULL,
+    ref text NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: go_wake_log_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+ALTER TABLE public.go_wake_log ALTER COLUMN id ADD GENERATED ALWAYS AS IDENTITY (
+    SEQUENCE NAME public.go_wake_log_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1
+);
+
+
+--
 -- Name: goal_agent_contexts; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -1036,7 +3144,9 @@ CREATE TABLE public.goal_decisions (
     rationale text DEFAULT ''::text,
     decided_by text DEFAULT ''::text,
     story_id text DEFAULT ''::text,
-    created_at timestamp with time zone DEFAULT now()
+    created_at timestamp with time zone DEFAULT now(),
+    supersedes_id text,
+    retired_at timestamp with time zone
 );
 
 
@@ -1126,8 +3236,16 @@ CREATE TABLE public.goal_resources (
     summary_stale boolean DEFAULT true,
     source_resource_id text DEFAULT ''::text,
     role text DEFAULT 'feature'::text NOT NULL,
-    git_repo_id text
+    git_repo_id text,
+    default_writable boolean DEFAULT false NOT NULL
 );
+
+
+--
+-- Name: COLUMN goal_resources.default_writable; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.goal_resources.default_writable IS 'May any story in this goal EVER write this? A grant cannot exceed it.';
 
 
 --
@@ -1192,8 +3310,35 @@ CREATE TABLE public.goals (
     weightage_recomputed_at timestamp with time zone,
     council_thread_id text DEFAULT ''::text,
     security_thread_id text DEFAULT ''::text,
+    brief text DEFAULT ''::text NOT NULL,
+    brief_updated timestamp with time zone,
+    sandbox_base_image text,
+    executor_model text,
+    verifier_model text,
+    sandbox_size text,
     CONSTRAINT goals_status_check CHECK ((status = ANY (ARRAY['active'::text, 'deleted'::text])))
 );
+
+
+--
+-- Name: COLUMN goals.sandbox_base_image; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.goals.sandbox_base_image IS 'Base image new contracts in this goal inherit. NULL = the deployment default (AGENTOS_SANDBOX_BASE_IMAGE). A contract''s own base_image/base_digest still wins.';
+
+
+--
+-- Name: COLUMN goals.executor_model; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.goals.executor_model IS 'Model every story in this goal runs its legs on unless the story overrides it. NULL = the deployment default. Validated against kernel.harness.models.registry.SUPPORTED where it is set, not here.';
+
+
+--
+-- Name: COLUMN goals.verifier_model; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.goals.verifier_model IS 'Model the verifier''s assessor judges this goal''s work with. Goal-level only: which model judges is a property of the goal''s standards, not of one story. NULL = the deployment default.';
 
 
 --
@@ -1241,6 +3386,23 @@ CREATE TABLE public.join_requests (
 
 
 --
+-- Name: ledger_blobs; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.ledger_blobs (
+    blob_id uuid DEFAULT gen_random_uuid() NOT NULL,
+    sha256 text NOT NULL,
+    size_bytes bigint NOT NULL,
+    content_type text NOT NULL,
+    storage_backend text NOT NULL,
+    data bytea,
+    gcs_uri text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT ledger_blobs_storage_backend_check CHECK ((storage_backend = ANY (ARRAY['inline'::text, 'gcs'::text])))
+);
+
+
+--
 -- Name: ledger_events; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -1266,9 +3428,16 @@ CREATE TABLE public.ledger_events (
     payload jsonb NOT NULL,
     extensions jsonb DEFAULT '{}'::jsonb NOT NULL,
     idempotency_key text,
-    CONSTRAINT ledger_events_actor_type_check CHECK ((actor_type = ANY (ARRAY['human'::text, 'shca'::text, 'independent_agent'::text, 'system'::text, 'goal_orchestrator'::text]))),
+    CONSTRAINT ledger_events_actor_type_check CHECK ((actor_type = ANY (ARRAY['human'::text, 'shca'::text, 'independent_agent'::text, 'system'::text, 'goal_orchestrator'::text, 'executor'::text, 'verifier'::text]))),
     CONSTRAINT ledger_events_classification_check CHECK ((classification = ANY (ARRAY['normal'::text, 'sensitive'::text, 'restricted'::text])))
 );
+
+
+--
+-- Name: COLUMN ledger_events.on_behalf_of; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.ledger_events.on_behalf_of IS 'The principal this act was performed for — the human whose assistant thread owns the work. Set for every kernel-emitted event so executor and verifier activity traces back to a person.';
 
 
 --
@@ -1276,30 +3445,92 @@ CREATE TABLE public.ledger_events (
 --
 
 CREATE VIEW public.ledger_events_resolved AS
- SELECT e.event_id,
-    e.event_type,
-    e."timestamp" AS occurred_at,
-    e.actor_id,
-    e.actor_type AS event_actor_type,
+ WITH base AS (
+         SELECT e.event_id,
+            e.event_type,
+            e.envelope_version,
+            e.event_version,
+            e."timestamp",
+            e.sequence_number,
+            e.actor_id,
+            e.actor_type,
+            e.on_behalf_of,
+            e.correlation_id,
+            e.causation_ids,
+            e.context_task_id,
+            e.context_goal_id,
+            e.context_team_id,
+            e.context_conversation_id,
+            e.classification,
+            e.integrity_hash,
+            e.previous_hash,
+            e.payload,
+            e.extensions,
+            e.idempotency_key,
+            COALESCE((e.payload ->> 'actor_uid'::text), (e.payload ->> 'triggered_by_uid'::text), (e.payload ->> 'owner_uid'::text), (e.payload ->> 'assigned_user_id'::text), (e.payload ->> 'created_by'::text), (e.payload ->> 'added_by'::text), (e.payload ->> 'triggered_by'::text), (e.payload ->> 'uid'::text)) AS payload_uid
+           FROM public.ledger_events e
+        )
+ SELECT b.event_id,
+    b.event_type,
+    b."timestamp" AS occurred_at,
+    b.sequence_number,
+    b.actor_id,
+    b.actor_type AS event_actor_type,
     a.type AS actor_registry_type,
     a.display_name AS actor_display_name,
     (a.id IS NOT NULL) AS actor_registered,
         CASE
             WHEN (a.id IS NULL) THEN NULL::boolean
-            WHEN ((e.actor_type = 'human'::text) AND (a.type = 'user'::text)) THEN true
-            WHEN ((e.actor_type = 'system'::text) AND (a.type = 'system'::text)) THEN true
-            WHEN ((e.actor_type = ANY (ARRAY['shca'::text, 'independent_agent'::text, 'goal_orchestrator'::text])) AND (a.type = 'agent'::text)) THEN true
+            WHEN ((b.actor_type = 'human'::text) AND (a.type = 'user'::text)) THEN true
+            WHEN ((b.actor_type = 'system'::text) AND (a.type = 'system'::text)) THEN true
+            WHEN ((b.actor_type = ANY (ARRAY['shca'::text, 'independent_agent'::text, 'goal_orchestrator'::text, 'executor'::text, 'verifier'::text])) AND (a.type = 'agent'::text)) THEN true
             ELSE false
         END AS type_consistent,
-    e.on_behalf_of,
+    NULLIF(COALESCE(NULLIF(b.context_task_id, ''::text),
+        CASE
+            WHEN (b.payload ? 'execution_id'::text) THEN ('exec:'::text || (b.payload ->> 'execution_id'::text))
+            ELSE NULL::text
+        END), ''::text) AS actor_instance,
+    b.on_behalf_of,
     obo.type AS on_behalf_of_type,
     obo.display_name AS on_behalf_of_display_name,
-    e.context_goal_id,
-    e.context_task_id,
-    e.correlation_id
-   FROM ((public.ledger_events e
-     LEFT JOIN public.actors a ON ((a.id = e.actor_id)))
-     LEFT JOIN public.actors obo ON ((obo.id = e.on_behalf_of)));
+    COALESCE(
+        CASE
+            WHEN (b.actor_type = 'human'::text) THEN b.actor_id
+            ELSE NULL::uuid
+        END, b.on_behalf_of, pu.id) AS principal_actor_id,
+    COALESCE(
+        CASE
+            WHEN (b.actor_type = 'human'::text) THEN a.uid
+            ELSE NULL::text
+        END, obo.uid, b.payload_uid) AS principal_uid,
+    COALESCE(
+        CASE
+            WHEN (b.actor_type = 'human'::text) THEN a.display_name
+            ELSE NULL::text
+        END, obo.display_name, pu.display_name) AS principal_display_name,
+    (COALESCE(
+        CASE
+            WHEN (b.actor_type = 'human'::text) THEN b.actor_id
+            ELSE NULL::uuid
+        END, b.on_behalf_of, pu.id) IS NOT NULL) AS has_principal,
+    b.context_goal_id,
+    b.context_task_id,
+    b.context_conversation_id,
+    b.correlation_id,
+    b.payload,
+    (b.extensions ->> 'envelope_digest'::text) AS envelope_digest
+   FROM (((base b
+     LEFT JOIN public.actors a ON ((a.id = b.actor_id)))
+     LEFT JOIN public.actors obo ON ((obo.id = b.on_behalf_of)))
+     LEFT JOIN public.actors pu ON (((pu.type = 'user'::text) AND (pu.uid = b.payload_uid))));
+
+
+--
+-- Name: VIEW ledger_events_resolved; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON VIEW public.ledger_events_resolved IS 'The ledger with attribution normalised. principal_actor_id / principal_uid identify the PERSON (ids, never names — two people can share a display name). actor_instance identifies which running executor or verifier acted, since actor_id names only the kind.';
 
 
 --
@@ -1319,6 +3550,59 @@ CREATE SEQUENCE public.ledger_events_sequence_number_seq
 --
 
 ALTER SEQUENCE public.ledger_events_sequence_number_seq OWNED BY public.ledger_events.sequence_number;
+
+
+--
+-- Name: local_check_results; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.local_check_results (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    story_id text NOT NULL,
+    cycle integer NOT NULL,
+    mount text DEFAULT ''::text NOT NULL,
+    run text NOT NULL,
+    label text DEFAULT 'unlabelled'::text NOT NULL,
+    passed boolean NOT NULL,
+    head_sha text NOT NULL,
+    detail text DEFAULT ''::text NOT NULL,
+    reported_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: local_push_refusals; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.local_push_refusals (
+    story_id text NOT NULL,
+    kind text NOT NULL,
+    detail_hash text NOT NULL,
+    streak integer DEFAULT 1 NOT NULL,
+    last_error text DEFAULT ''::text NOT NULL,
+    first_at timestamp with time zone DEFAULT now() NOT NULL,
+    last_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: loop_heartbeats; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.loop_heartbeats (
+    loop_name text NOT NULL,
+    instance_id text NOT NULL,
+    component text,
+    build_sha text,
+    last_tick_at timestamp with time zone DEFAULT now() NOT NULL,
+    expected_interval_s numeric,
+    tick_count bigint DEFAULT 0 NOT NULL,
+    work_count bigint DEFAULT 0 NOT NULL,
+    last_error text,
+    last_error_at timestamp with time zone,
+    error_count bigint DEFAULT 0 NOT NULL,
+    started_at timestamp with time zone DEFAULT now() NOT NULL
+);
 
 
 --
@@ -1375,6 +3659,8 @@ CREATE TABLE public.messages (
     token_count integer DEFAULT 0 NOT NULL,
     card_data jsonb,
     search_vector tsvector,
+    platform text,
+    external_message_id text,
     status text DEFAULT 'done'::text NOT NULL,
     kind text DEFAULT 'user'::text NOT NULL,
     idempotency_key text,
@@ -1384,11 +3670,45 @@ CREATE TABLE public.messages (
     claimed_at timestamp with time zone,
     reply_to_message_id text,
     error text,
-    platform text,
-    external_message_id text,
+    reap_attempts integer DEFAULT 0 NOT NULL,
     CONSTRAINT messages_kind_chk CHECK ((kind = ANY (ARRAY['user'::text, 'system_wake'::text, 'system_inject'::text]))),
     CONSTRAINT messages_role_check CHECK ((role = ANY (ARRAY['human'::text, 'agent'::text]))),
     CONSTRAINT messages_status_chk CHECK ((status = ANY (ARRAY['queued'::text, 'processing'::text, 'done'::text, 'failed'::text])))
+);
+
+
+--
+-- Name: misc_model_settings; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.misc_model_settings (
+    purpose_key text NOT NULL,
+    model_id text NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: model_aliases; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.model_aliases (
+    alias text NOT NULL,
+    model_id text NOT NULL,
+    source text NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: model_context_windows; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.model_context_windows (
+    model_id text NOT NULL,
+    tokens integer NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT model_context_windows_tokens_check CHECK ((tokens > 0))
 );
 
 
@@ -1408,7 +3728,8 @@ CREATE TABLE public.model_pricing (
     cache_write_rate numeric(12,8) DEFAULT 0 NOT NULL,
     thinking_rate numeric(12,8),
     effective_from timestamp with time zone DEFAULT now() NOT NULL,
-    created_at timestamp with time zone DEFAULT now() NOT NULL
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    model_id text
 );
 
 
@@ -1429,6 +3750,103 @@ CREATE SEQUENCE public.model_pricing_id_seq
 --
 
 ALTER SEQUENCE public.model_pricing_id_seq OWNED BY public.model_pricing.id;
+
+
+--
+-- Name: model_provider_registry; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.model_provider_registry (
+    name text NOT NULL,
+    config jsonb NOT NULL,
+    status text DEFAULT 'active'::text NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT model_provider_registry_status_check CHECK ((status = ANY (ARRAY['active'::text, 'disabled'::text])))
+);
+
+
+--
+-- Name: model_providers; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.model_providers (
+    id text NOT NULL,
+    label text NOT NULL,
+    kind text DEFAULT 'native'::text NOT NULL,
+    base_url text,
+    api_key_source text,
+    api_type text,
+    runtime_status text DEFAULT 'provisioned'::text NOT NULL,
+    status text DEFAULT 'active'::text NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    secret_project text,
+    secret_id text,
+    secret_version text DEFAULT 'latest'::text NOT NULL,
+    credential_status text DEFAULT 'unknown'::text NOT NULL,
+    credential_error text,
+    credential_checked_at timestamp with time zone,
+    CONSTRAINT model_providers_credential_status_check CHECK ((credential_status = ANY (ARRAY['unknown'::text, 'healthy'::text, 'unhealthy'::text, 'revoked'::text]))),
+    CONSTRAINT model_providers_kind_check CHECK ((kind = ANY (ARRAY['native'::text, 'synthetic_origin'::text]))),
+    CONSTRAINT model_providers_runtime_status_check CHECK ((runtime_status = ANY (ARRAY['provisioned'::text, 'not_provisioned'::text]))),
+    CONSTRAINT model_providers_status_check CHECK ((status = ANY (ARRAY['active'::text, 'disabled'::text])))
+);
+
+
+--
+-- Name: model_registry; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.model_registry (
+    id text NOT NULL,
+    label text NOT NULL,
+    provider text NOT NULL,
+    tier text NOT NULL,
+    context_window integer NOT NULL,
+    upstream_id text,
+    status text DEFAULT 'active'::text NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT model_registry_status_check CHECK ((status = ANY (ARRAY['active'::text, 'disabled'::text])))
+);
+
+
+--
+-- Name: model_tags; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.model_tags (
+    model_id text NOT NULL,
+    tag_name text NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: models; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.models (
+    id text NOT NULL,
+    provider_id text NOT NULL,
+    model_name text NOT NULL,
+    wire_id text GENERATED ALWAYS AS (((provider_id || '/'::text) || model_name)) STORED,
+    label text NOT NULL,
+    tier text NOT NULL,
+    context_window integer NOT NULL,
+    max_output_tokens integer,
+    gateway_params jsonb DEFAULT '{}'::jsonb NOT NULL,
+    status text DEFAULT 'active'::text NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    provider_shorthand text,
+    available_context_windows integer[] DEFAULT '{}'::integer[] NOT NULL,
+    gateway_reachable boolean,
+    gateway_checked_at timestamp with time zone,
+    CONSTRAINT models_shorthand_required_when_windows_nonempty CHECK (((cardinality(available_context_windows) = 0) OR (provider_shorthand IS NOT NULL))),
+    CONSTRAINT models_status_check CHECK ((status = ANY (ARRAY['active'::text, 'disabled'::text])))
+);
 
 
 --
@@ -1477,14 +3895,88 @@ CREATE TABLE public.stories (
     merge_group_id text,
     merge_approved_by text,
     merge_approved_at timestamp with time zone,
-    is_active_focus boolean DEFAULT false NOT NULL,
     story_weight integer,
+    is_active_focus boolean DEFAULT false NOT NULL,
     workspace_provision_attempts integer DEFAULT 0 NOT NULL,
-    CONSTRAINT stories_execution_mode_check CHECK ((execution_mode = ANY (ARRAY['ia_dispatch'::text, 'operator'::text]))),
-    CONSTRAINT stories_state_check CHECK ((state = ANY (ARRAY['proposed'::text, 'accepted'::text, 'in_progress'::text, 'blocked'::text, 'done'::text, 'reviewed'::text, 'rejected'::text, 'cancelled'::text]))),
+    git_node_id text,
+    checked_out_to_uid text,
+    checked_out_at timestamp with time zone,
+    checkout_session_id text,
+    checkout_expires_at timestamp with time zone,
+    pending_plan_md text,
+    pending_plan_path text,
+    land_together boolean DEFAULT false NOT NULL,
+    workspace_kind text DEFAULT 'clone'::text NOT NULL,
+    knowledge jsonb DEFAULT '[]'::jsonb NOT NULL,
+    work_kind text,
+    executor_model text,
+    sandbox_size text,
+    short_title text,
+    local_memory_consolidated_at timestamp with time zone,
+    completed_by_uid text,
+    CONSTRAINT stories_execution_mode_check CHECK ((execution_mode = ANY (ARRAY['ia_dispatch'::text, 'operator'::text, 'local'::text]))),
+    CONSTRAINT stories_priority_valid CHECK ((priority = ANY (ARRAY['low'::text, 'medium'::text, 'high'::text, 'critical'::text]))),
+    CONSTRAINT stories_state_check CHECK ((state = ANY (ARRAY['proposed'::text, 'accepted'::text, 'in_progress'::text, 'blocked'::text, 'awaiting_merge'::text, 'done'::text, 'reviewed'::text, 'rejected'::text, 'cancelled'::text]))),
     CONSTRAINT stories_story_kind_chk CHECK ((story_kind = ANY (ARRAY['code'::text, 'merge'::text]))),
+    CONSTRAINT stories_work_kind_chk CHECK (((work_kind IS NULL) OR (work_kind = ANY (ARRAY['story'::text, 'errand'::text])))),
     CONSTRAINT stories_workspace_state_check CHECK ((workspace_state = ANY (ARRAY['none'::text, 'cloning'::text, 'provisioning'::text, 'ready'::text, 'failed'::text, 'deleting'::text, 'deleted'::text])))
 );
+
+
+--
+-- Name: COLUMN stories.git_node_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.stories.git_node_id IS 'Engine-authored diff/fix stories: the git_nodes.id they belong to. NULL for human/GO stories (their node membership is git_node_stories). Lets per-node cancels avoid clobbering sibling repos in a multi-node merge group.';
+
+
+--
+-- Name: COLUMN stories.land_together; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.stories.land_together IS 'Join the in-repo dependency''s branch instead of cutting a fresh one from trunk. Default false = one branch per story.';
+
+
+--
+-- Name: COLUMN stories.workspace_kind; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.stories.workspace_kind IS 'clone = repos checked out into the gateway workspace (operator); docs = story dir holds documents and plans only, work happens in the executor sandbox (kernel assistant). Set by provision_story_workspace.';
+
+
+--
+-- Name: COLUMN stories.executor_model; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.stories.executor_model IS 'Overrides the goal for this story''s legs. NULL = inherit. Has no effect on a run already dispatched -- executions.executor_model is frozen at dispatch.';
+
+
+--
+-- Name: COLUMN stories.short_title; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.stories.short_title IS 'Up to six words naming this story for the UI thread list. A LABEL, never an identifier -- stories.id addresses a story everywhere. Unique per goal, case-insensitively. NULL on anything created before 2026-09-23, where readers fall back to the first words of title.';
+
+
+--
+-- Name: COLUMN stories.local_memory_consolidated_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.stories.local_memory_consolidated_at IS 'When a local session last reported that it consolidated this story''s assistant memory. The gateway story-complete flush is suppressed only when this is set; otherwise it runs as the fallback. Cleared on a new local checkout.';
+
+
+--
+-- Name: COLUMN stories.completed_by_uid; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.stories.completed_by_uid IS 'The assignee at the moment the story first reached done. Frozen: reassigning a finished story does not move its credit. Stamped by trg_stories_stamp_completion, never by application code.';
+
+
+--
+-- Name: CONSTRAINT stories_priority_valid ON stories; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON CONSTRAINT stories_priority_valid ON public.stories IS 'Priority is scored (low 1, medium 3, high 5, critical 8), so an unrecognised spelling costs the story owner points. Writers normalise through app/services/story_priority.normalize_priority.';
 
 
 --
@@ -1543,10 +4035,18 @@ CREATE TABLE public.tasks (
     gate_payload jsonb,
     diff_review_via_gate boolean DEFAULT false NOT NULL,
     stall_redispatch_count integer DEFAULT 0 NOT NULL,
+    repo_subdir text,
     CONSTRAINT tasks_priority_check CHECK ((priority = ANY (ARRAY['low'::text, 'medium'::text, 'high'::text, 'critical'::text]))),
     CONSTRAINT tasks_state_check CHECK ((state = ANY (ARRAY['pending'::text, 'ready'::text, 'dispatching'::text, 'in_progress'::text, 'blocked'::text, 'halted'::text, 'automated_review'::text, 'awaiting_approval'::text, 'approved'::text, 'rejected'::text, 'done'::text, 'failed'::text, 'cancelled'::text, 'proposed'::text, 'accepted'::text]))),
     CONSTRAINT tasks_status_check CHECK ((status = ANY (ARRAY['active'::text, 'deleted'::text])))
 );
+
+
+--
+-- Name: COLUMN tasks.repo_subdir; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.tasks.repo_subdir IS 'Workspace-relative repo checkout this task works in (e.g. repos/acme__web, or the legacy single-repo "repo"). Set from the plan DAG''s `repo:` field. NULL on single-repo stories and on tasks created before multi-repo support.';
 
 
 --
@@ -1569,7 +4069,10 @@ CREATE TABLE public.token_calls (
     cache_write_tokens integer DEFAULT 0 NOT NULL,
     record_type text DEFAULT 'call'::text NOT NULL,
     num_turns integer,
-    story_id text
+    story_id text,
+    role text,
+    execution_id bigint,
+    dedupe_key text
 );
 
 
@@ -1824,6 +4327,167 @@ CREATE MATERIALIZED VIEW public.mv_cost_by_task AS
 
 
 --
+-- Name: threads; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.threads (
+    id text NOT NULL,
+    goal_id text NOT NULL,
+    agent_id text DEFAULT ''::text NOT NULL,
+    task_id text,
+    correlation_id uuid,
+    created_by text NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    title text DEFAULT 'New conversation'::text NOT NULL,
+    instance_id text,
+    status text DEFAULT 'open'::text NOT NULL,
+    participants text[] DEFAULT '{}'::text[],
+    left_goal_at timestamp with time zone,
+    story_id text
+);
+
+
+--
+-- Name: v_token_calls_priced; Type: VIEW; Schema: public; Owner: -
+--
+
+CREATE VIEW public.v_token_calls_priced AS
+ WITH normalised AS (
+         SELECT t.id,
+            t.recorded_at,
+            t.goal_id,
+            t.story_id,
+            t.execution_id,
+            t.role,
+            t.agent_id,
+            t.session_key,
+            t.run_id,
+            regexp_replace(t.provider, '-[^-]+-[0-9]+[km]$'::text, ''::text) AS provider,
+            regexp_replace(regexp_replace(t.model, '-[0-9]+[km]$'::text, ''::text), '-[0-9]{8}$'::text, ''::text) AS model,
+            t.input_tokens AS inp,
+            t.output_tokens AS outp,
+            COALESCE(t.thinking_tokens, 0) AS thinking,
+            COALESCE(t.cache_read_tokens, 0) AS cache_read,
+            COALESCE(t.cache_write_tokens, 0) AS cache_write
+           FROM public.token_calls t
+          WHERE (t.record_type = 'call'::text)
+        )
+ SELECT n.id,
+    n.recorded_at,
+    n.goal_id,
+    n.story_id,
+    n.execution_id,
+    n.role,
+    n.agent_id,
+    n.session_key,
+    n.run_id,
+    n.provider,
+    n.model,
+    n.inp,
+    n.outp,
+    n.thinking,
+    n.cache_read,
+    n.cache_write,
+    (((n.inp + n.outp) + n.cache_read) + n.cache_write) AS tokens,
+        CASE
+            WHEN (p.id IS NULL) THEN NULL::numeric
+            ELSE (((((((n.inp)::numeric * p.input_rate) + (((n.outp - n.thinking))::numeric * p.output_rate)) + ((n.thinking)::numeric * COALESCE(p.thinking_rate, p.output_rate))) + ((n.cache_read)::numeric * p.cache_read_rate)) + ((n.cache_write)::numeric * p.cache_write_rate)) / 1000000.0)
+        END AS cost,
+    (p.id IS NOT NULL) AS priced
+   FROM (normalised n
+     LEFT JOIN LATERAL ( SELECT mp.id,
+            mp.input_rate,
+            mp.output_rate,
+            mp.cache_read_rate,
+            mp.cache_write_rate,
+            mp.thinking_rate
+           FROM public.model_pricing mp
+          WHERE ((mp.provider = n.provider) AND (mp.model = n.model) AND (mp.effective_from <= n.recorded_at))
+          ORDER BY mp.effective_from DESC
+         LIMIT 1) p ON (true));
+
+
+--
+-- Name: VIEW v_token_calls_priced; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON VIEW public.v_token_calls_priced IS 'Canonical priced cost ledger. One definition of the pricing formula; new cost views must read this rather than re-deriving it.';
+
+
+--
+-- Name: v_cost_attributed; Type: VIEW; Schema: public; Owner: -
+--
+
+CREATE VIEW public.v_cost_attributed AS
+ SELECT p.id,
+    p.recorded_at,
+    p.goal_id,
+    p.story_id,
+    p.execution_id,
+    p.role,
+    p.agent_id,
+    p.session_key,
+    p.run_id,
+    p.provider,
+    p.model,
+    p.inp,
+    p.outp,
+    p.thinking,
+    p.cache_read,
+    p.cache_write,
+    p.tokens,
+    p.cost,
+    p.priced,
+    COALESCE(s.thread_id, "substring"(p.session_key, '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'::text)) AS thread_id,
+        CASE
+            WHEN (p.role IS NOT NULL) THEN p.role
+            WHEN (p.agent_id ~ '^go-'::text) THEN 'orchestrator'::text
+            WHEN (p.agent_id ~~* '%assistant%'::text) THEN 'assistant'::text
+            WHEN (p.agent_id IS NULL) THEN 'other'::text
+            ELSE 'other'::text
+        END AS spender
+   FROM (public.v_token_calls_priced p
+     LEFT JOIN LATERAL ( SELECT th.id AS thread_id
+           FROM public.threads th
+          WHERE ((p.story_id IS NOT NULL) AND (th.story_id = p.story_id))
+          ORDER BY th.created_at DESC
+         LIMIT 1) s ON (true));
+
+
+--
+-- Name: VIEW v_cost_attributed; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON VIEW public.v_cost_attributed IS 'The priced ledger, resolved to a thread and to a named spender. thread_id NULL means spend no single conversation owns.';
+
+
+--
+-- Name: mv_cost_by_thread; Type: MATERIALIZED VIEW; Schema: public; Owner: -
+--
+
+CREATE MATERIALIZED VIEW public.mv_cost_by_thread AS
+ SELECT upper(a.goal_id) AS goal_id,
+    a.thread_id,
+    a.spender AS role,
+    max(t.title) AS thread_title,
+    max(COALESCE(a.story_id, t.story_id)) AS story_id,
+    max(st.title) AS story_title,
+    count(*) AS calls,
+    sum(a.tokens) AS tokens,
+    sum(a.inp) AS input_tokens,
+    sum(a.outp) AS output_tokens,
+    sum(a.cache_read) AS cache_read_tokens,
+    sum(a.cost) AS cost,
+    count(*) FILTER (WHERE (NOT a.priced)) AS unpriced_calls
+   FROM ((public.v_cost_attributed a
+     LEFT JOIN public.threads t ON ((t.id = a.thread_id)))
+     LEFT JOIN public.stories st ON ((st.id = COALESCE(a.story_id, t.story_id))))
+  WHERE ((a.thread_id IS NOT NULL) AND (a.recorded_at >= (now() - '90 days'::interval)))
+  GROUP BY (upper(a.goal_id)), a.thread_id, a.spender
+  WITH NO DATA;
+
+
+--
 -- Name: mv_cost_daily; Type: MATERIALIZED VIEW; Schema: public; Owner: -
 --
 
@@ -2055,7 +4719,8 @@ CREATE TABLE public.platform_channel_bindings (
     current_story_id text,
     archived_at timestamp with time zone,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
-    updated_at timestamp with time zone DEFAULT now() NOT NULL
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    channel_name text
 );
 
 
@@ -2074,6 +4739,7 @@ CREATE TABLE public.platform_integrations (
     status text DEFAULT 'active'::text NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    client_id text,
     redirect_uri text,
     credentials_data text,
     config jsonb DEFAULT '{}'::jsonb NOT NULL,
@@ -2403,6 +5069,224 @@ UNION ALL
 
 
 --
+-- Name: mv_taximeter_v2; Type: MATERIALIZED VIEW; Schema: public; Owner: -
+--
+
+CREATE MATERIALIZED VIEW public.mv_taximeter_v2 AS
+ WITH active_goal AS (
+         SELECT goals.id
+           FROM public.goals
+          WHERE (goals.status = 'active'::text)
+        ), owned_story AS (
+         SELECT s.id,
+            s.goal_id,
+            COALESCE(NULLIF(s.completed_by_uid, ''::text), NULLIF(s.assigned_to, ''::text)) AS uid,
+            s.state,
+            s.story_kind,
+            COALESCE(s.work_kind, 'story'::text) AS work_kind,
+            s.priority,
+            s.started_at,
+            s.completed_at,
+            s.merge_approved_at
+           FROM (public.stories s
+             JOIN active_goal g ON ((g.id = s.goal_id)))
+          WHERE (COALESCE(NULLIF(s.completed_by_uid, ''::text), NULLIF(s.assigned_to, ''::text)) IS NOT NULL)
+        ), work_item AS (
+         SELECT owned_story.uid,
+            owned_story.goal_id,
+            owned_story.priority,
+            owned_story.started_at,
+            owned_story.completed_at,
+            owned_story.id AS story_id
+           FROM owned_story
+          WHERE ((owned_story.state = ANY (ARRAY['done'::text, 'reviewed'::text])) AND (COALESCE(owned_story.story_kind, ''::text) <> 'merge'::text) AND (owned_story.work_kind <> 'errand'::text) AND (owned_story.completed_at IS NOT NULL))
+        ), errand_run AS (
+         SELECT o.uid,
+            o.goal_id,
+            o.priority,
+            e.created_at AS started_at,
+            e.updated_at AS completed_at,
+            e.id AS execution_id
+           FROM (kernel.executions e
+             JOIN owned_story o ON ((o.id = e.story_id)))
+          WHERE ((e.kind = 'errand'::text) AND (e.state = 'DONE'::text))
+        ), item AS (
+         SELECT work_item.uid,
+            work_item.goal_id,
+            work_item.priority,
+            work_item.started_at,
+            work_item.completed_at,
+            work_item.story_id,
+            NULL::bigint AS execution_id
+           FROM work_item
+        UNION ALL
+         SELECT errand_run.uid,
+            errand_run.goal_id,
+            errand_run.priority,
+            errand_run.started_at,
+            errand_run.completed_at,
+            NULL::text AS story_id,
+            errand_run.execution_id
+           FROM errand_run
+        ), priced_item AS (
+         SELECT i.uid,
+            i.goal_id,
+            i.priority,
+            i.started_at,
+            i.completed_at,
+            i.story_id,
+            i.execution_id,
+                CASE lower(replace(replace(replace(COALESCE(i.priority, ''::text), ' '::text, ''::text), chr(9), ''::text), chr(10), ''::text))
+                    WHEN 'low'::text THEN 1
+                    WHEN 'medium'::text THEN 3
+                    WHEN 'high'::text THEN 5
+                    WHEN 'critical'::text THEN 8
+                    ELSE 3
+                END AS points
+           FROM item i
+        ), call_cost AS (
+         SELECT tc.story_id,
+            tc.execution_id,
+                CASE
+                    WHEN (mp.id IS NOT NULL) THEN (((((((tc.input_tokens)::numeric * mp.input_rate) + (((tc.output_tokens - tc.thinking_tokens))::numeric * mp.output_rate)) + ((tc.thinking_tokens)::numeric * COALESCE(mp.thinking_rate, mp.output_rate))) + ((tc.cache_read_tokens)::numeric * mp.cache_read_rate)) + ((tc.cache_write_tokens)::numeric * mp.cache_write_rate)) / 1000000.0)
+                    ELSE NULL::numeric
+                END AS cost
+           FROM (public.token_calls tc
+             LEFT JOIN LATERAL ( SELECT model_pricing.id,
+                    model_pricing.provider,
+                    model_pricing.model,
+                    model_pricing.provider_label,
+                    model_pricing.notes,
+                    model_pricing.input_rate,
+                    model_pricing.output_rate,
+                    model_pricing.cache_read_rate,
+                    model_pricing.cache_write_rate,
+                    model_pricing.thinking_rate,
+                    model_pricing.effective_from,
+                    model_pricing.created_at,
+                    model_pricing.model_id
+                   FROM public.model_pricing
+                  WHERE ((model_pricing.provider = regexp_replace(tc.provider, '-[^-]+-[0-9]+[km]$'::text, ''::text)) AND (model_pricing.model = regexp_replace(regexp_replace(tc.model, '-[0-9]+[km]$'::text, ''::text), '-[0-9]{8}$'::text, ''::text)) AND (model_pricing.effective_from <= tc.recorded_at))
+                  ORDER BY model_pricing.effective_from DESC
+                 LIMIT 1) mp ON (true))
+          WHERE (tc.record_type = 'call'::text)
+        ), item_cost AS (
+         SELECT p.uid,
+            p.goal_id,
+            p.points,
+            p.completed_at,
+            COALESCE(( SELECT sum(c.cost) AS sum
+                   FROM call_cost c
+                  WHERE (((p.story_id IS NOT NULL) AND (c.story_id = p.story_id)) OR ((p.execution_id IS NOT NULL) AND (c.execution_id = p.execution_id)))), (0)::numeric) AS cost
+           FROM priced_item p
+        )
+ SELECT o.uid,
+    o.goal_id,
+    ('decision:'::text || q.kind) AS metric_key,
+    (date_trunc('week'::text, q.answered_at))::date AS week_start,
+    (count(*))::numeric AS value
+   FROM ((kernel.questions q
+     JOIN kernel.executions e ON ((e.id = q.execution_id)))
+     JOIN owned_story o ON ((o.id = e.story_id)))
+  WHERE (q.answered_at IS NOT NULL)
+  GROUP BY o.uid, o.goal_id, ('decision:'::text || q.kind), ((date_trunc('week'::text, q.answered_at))::date)
+UNION ALL
+ SELECT o.uid,
+    o.goal_id,
+    ('decision:'::text || p.kind) AS metric_key,
+    (date_trunc('week'::text, p.created_at))::date AS week_start,
+    (count(*))::numeric AS value
+   FROM ((kernel.proposals p
+     JOIN kernel.executions e ON ((e.id = p.execution_id)))
+     JOIN owned_story o ON ((o.id = e.story_id)))
+  WHERE (p.kind = ANY (ARRAY['hold'::text, 'cancel'::text, 'steer'::text, 'ask'::text]))
+  GROUP BY o.uid, o.goal_id, ('decision:'::text || p.kind), ((date_trunc('week'::text, p.created_at))::date)
+UNION ALL
+ SELECT o.uid,
+    o.goal_id,
+    'decision:local_plan'::text AS metric_key,
+    (date_trunc('week'::text, le."timestamp"))::date AS week_start,
+    (count(*))::numeric AS value
+   FROM (public.ledger_events le
+     JOIN owned_story o ON ((o.id = (le.payload ->> 'story_id'::text))))
+  WHERE (le.event_type = 'local_plan.decided'::text)
+  GROUP BY o.uid, o.goal_id, 'decision:local_plan'::text, ((date_trunc('week'::text, le."timestamp"))::date)
+UNION ALL
+ SELECT o.uid,
+    o.goal_id,
+    'decision:merge'::text AS metric_key,
+    (date_trunc('week'::text, o.merge_approved_at))::date AS week_start,
+    (count(*))::numeric AS value
+   FROM owned_story o
+  WHERE ((o.merge_approved_at IS NOT NULL) AND (COALESCE(o.story_kind, ''::text) = 'merge'::text))
+  GROUP BY o.uid, o.goal_id, 'decision:merge'::text, ((date_trunc('week'::text, o.merge_approved_at))::date)
+UNION ALL
+ SELECT u.uid,
+    le.context_goal_id AS goal_id,
+    ('steward:'::text || le.event_type) AS metric_key,
+    (date_trunc('week'::text, le."timestamp"))::date AS week_start,
+    (count(*))::numeric AS value
+   FROM ((public.ledger_events le
+     JOIN public.users u ON ((u.actor_id = le.actor_id)))
+     JOIN active_goal g ON ((g.id = le.context_goal_id)))
+  WHERE ((le.actor_type = 'human'::text) AND (le.event_type = ANY (ARRAY['goal.created'::text, 'goal.member_added'::text, 'goal.member_removed'::text, 'goal.member_role_changed'::text, 'story.created'::text])))
+  GROUP BY u.uid, le.context_goal_id, ('steward:'::text || le.event_type), ((date_trunc('week'::text, le."timestamp"))::date)
+UNION ALL
+ SELECT priced_item.uid,
+    priced_item.goal_id,
+    'items'::text AS metric_key,
+    (date_trunc('week'::text, priced_item.completed_at))::date AS week_start,
+    (count(*))::numeric AS value
+   FROM priced_item
+  GROUP BY priced_item.uid, priced_item.goal_id, 'items'::text, ((date_trunc('week'::text, priced_item.completed_at))::date)
+UNION ALL
+ SELECT priced_item.uid,
+    priced_item.goal_id,
+    'priority_points'::text AS metric_key,
+    (date_trunc('week'::text, priced_item.completed_at))::date AS week_start,
+    (sum(priced_item.points))::numeric AS value
+   FROM priced_item
+  GROUP BY priced_item.uid, priced_item.goal_id, 'priority_points'::text, ((date_trunc('week'::text, priced_item.completed_at))::date)
+UNION ALL
+ SELECT priced_item.uid,
+    priced_item.goal_id,
+    'cycle_hours_sum'::text AS metric_key,
+    (date_trunc('week'::text, priced_item.completed_at))::date AS week_start,
+    sum((EXTRACT(epoch FROM (priced_item.completed_at - priced_item.started_at)) / 3600.0)) AS value
+   FROM priced_item
+  WHERE ((priced_item.started_at IS NOT NULL) AND (priced_item.completed_at IS NOT NULL) AND (priced_item.completed_at >= priced_item.started_at))
+  GROUP BY priced_item.uid, priced_item.goal_id, 'cycle_hours_sum'::text, ((date_trunc('week'::text, priced_item.completed_at))::date)
+UNION ALL
+ SELECT priced_item.uid,
+    priced_item.goal_id,
+    'cycle_hours_count'::text AS metric_key,
+    (date_trunc('week'::text, priced_item.completed_at))::date AS week_start,
+    (count(*))::numeric AS value
+   FROM priced_item
+  WHERE ((priced_item.started_at IS NOT NULL) AND (priced_item.completed_at IS NOT NULL) AND (priced_item.completed_at >= priced_item.started_at))
+  GROUP BY priced_item.uid, priced_item.goal_id, 'cycle_hours_count'::text, ((date_trunc('week'::text, priced_item.completed_at))::date)
+UNION ALL
+ SELECT item_cost.uid,
+    item_cost.goal_id,
+    'cost_usd'::text AS metric_key,
+    (date_trunc('week'::text, item_cost.completed_at))::date AS week_start,
+    sum(item_cost.cost) AS value
+   FROM item_cost
+  WHERE (item_cost.cost > (0)::numeric)
+  GROUP BY item_cost.uid, item_cost.goal_id, 'cost_usd'::text, ((date_trunc('week'::text, item_cost.completed_at))::date)
+UNION ALL
+ SELECT item_cost.uid,
+    item_cost.goal_id,
+    'cost_points'::text AS metric_key,
+    (date_trunc('week'::text, item_cost.completed_at))::date AS week_start,
+    (sum(item_cost.points))::numeric AS value
+   FROM item_cost
+  WHERE (item_cost.cost > (0)::numeric)
+  GROUP BY item_cost.uid, item_cost.goal_id, 'cost_points'::text, ((date_trunc('week'::text, item_cost.completed_at))::date)
+  WITH NO DATA;
+
+
+--
 -- Name: notifications; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -2457,8 +5341,27 @@ CREATE TABLE public.plan_versions (
     status text DEFAULT 'proposed'::text NOT NULL,
     approved_at timestamp with time zone,
     approved_by text,
-    created_at timestamp with time zone DEFAULT now() NOT NULL
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    content_hash text DEFAULT ''::text,
+    plan_json jsonb,
+    plan_hash text,
+    cycle integer,
+    kind text DEFAULT 'work'::text NOT NULL
 );
+
+
+--
+-- Name: COLUMN plan_versions.plan_json; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.plan_versions.plan_json IS 'A kernel-shaped plan: {steps, rationale, checks}. Written by the LOCAL lane. The operator lane writes task_dag instead; a row has one or the other, never both.';
+
+
+--
+-- Name: COLUMN plan_versions.plan_hash; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.plan_versions.plan_hash IS 'kernel.harness.park_approval.plan_hash over (steps, rationale, checks). An approval binds to this, so an edited plan cannot inherit a verdict.';
 
 
 --
@@ -2596,6 +5499,33 @@ CREATE TABLE public.platform_schedule_state (
     last_deepdive_at timestamp with time zone,
     discovery_enabled boolean
 );
+
+
+--
+-- Name: platform_settings; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.platform_settings (
+    key text NOT NULL,
+    value boolean,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_by text DEFAULT ''::text NOT NULL,
+    value_int integer
+);
+
+
+--
+-- Name: TABLE platform_settings; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.platform_settings IS 'Platform-wide operator switches, one row per key. The value is here; the history of who changed it is in the ledger.';
+
+
+--
+-- Name: COLUMN platform_settings.value_int; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.platform_settings.value_int IS 'The numeric setting, for keys that are a number rather than a switch. NULL for every boolean switch.';
 
 
 --
@@ -2766,6 +5696,42 @@ CREATE TABLE public.resource_links (
 --
 
 COMMENT ON TABLE public.resource_links IS 'DEPRECATED (2026-06-16): zero rows, zero writers. Its purpose (linking resources at any level) is already covered by goal_resources (goal scope), story_resources (story scope), and task_resource_deps (task scope). See docs/story-integration/REDESIGN.md §4.2.';
+
+
+--
+-- Name: resource_publishes; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.resource_publishes (
+    id bigint NOT NULL,
+    resource_id text NOT NULL,
+    goal_id text NOT NULL,
+    story_id text,
+    execution_id bigint,
+    filename text NOT NULL,
+    content bytea NOT NULL,
+    note text DEFAULT ''::text NOT NULL,
+    status text DEFAULT 'pending'::text NOT NULL,
+    error text,
+    published_uri text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    published_at timestamp with time zone,
+    CONSTRAINT resource_publishes_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'published'::text, 'failed'::text])))
+);
+
+
+--
+-- Name: resource_publishes_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+ALTER TABLE public.resource_publishes ALTER COLUMN id ADD GENERATED ALWAYS AS IDENTITY (
+    SEQUENCE NAME public.resource_publishes_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1
+);
 
 
 --
@@ -2941,10 +5907,11 @@ CREATE TABLE public.shca_templates (
     id text NOT NULL,
     name text NOT NULL,
     description text DEFAULT ''::text NOT NULL,
-    model text DEFAULT 'google/gemini-2.5-flash'::text NOT NULL,
+    model text DEFAULT 'google/gemini-3.8-flash'::text NOT NULL,
     created_by text NOT NULL,
     status text DEFAULT 'active'::text NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
+    model_id text,
     CONSTRAINT shca_templates_status_check CHECK ((status = ANY (ARRAY['active'::text, 'archived'::text])))
 );
 
@@ -3202,17 +6169,49 @@ COMMENT ON TABLE public.story_claude_execution_contexts IS 'DEPRECATED (2026-06-
 
 
 --
+-- Name: story_repo_trunks; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.story_repo_trunks (
+    story_id text NOT NULL,
+    resource_id text NOT NULL,
+    trunk_branch text NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
 -- Name: story_resources; Type: TABLE; Schema: public; Owner: -
 --
 
 CREATE TABLE public.story_resources (
     story_id text NOT NULL,
     resource_id text NOT NULL,
-    relation text DEFAULT 'needs'::text NOT NULL,
+    relation text NOT NULL,
     notes text DEFAULT ''::text,
     created_at timestamp with time zone DEFAULT now(),
+    goal_id text,
+    at text,
+    binding text,
+    ref text,
+    kind text,
+    granted_by text,
     CONSTRAINT story_resources_relation_check CHECK ((relation = ANY (ARRAY['needs'::text, 'produces'::text, 'modifies'::text])))
 );
+
+
+--
+-- Name: COLUMN story_resources.relation; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.story_resources.relation IS 'needs = read-only. produces/modifies = the story may write it. Bounded by goal_resources.default_writable.';
+
+
+--
+-- Name: COLUMN story_resources.at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.story_resources.at IS 'Mount path inside the workspace, e.g. repos/api.';
 
 
 --
@@ -3227,8 +6226,64 @@ CREATE TABLE public.story_reviews (
     review_text text,
     reviewer_agent_id text,
     run_id text,
-    reviewed_at timestamp with time zone DEFAULT now() NOT NULL
+    reviewed_at timestamp with time zone DEFAULT now() NOT NULL,
+    verdict text,
+    delivered_at timestamp with time zone
 );
+
+
+--
+-- Name: COLUMN story_reviews.verdict; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.story_reviews.verdict IS 'approve | partial | revise | code_not_reviewed | incomplete | not_produced | skipped_errand | skipped_merge | skipped_diff. The three skipped_* values record a story that reached reviewed without a review, which is a different fact from one that earned it.';
+
+
+--
+-- Name: COLUMN story_reviews.delivered_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.story_reviews.delivered_at IS 'When this review was handed to the GO and the orchestrator channel. Claimed with a conditional UPDATE so that a pg_notify broadcast read by several control-plane instances delivers exactly once.';
+
+
+--
+-- Name: story_workspace_nodes; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.story_workspace_nodes (
+    story_id text NOT NULL,
+    git_repo_id text NOT NULL,
+    branch_name text NOT NULL,
+    subdir text NOT NULL,
+    is_write boolean DEFAULT true NOT NULL,
+    repo_owner text DEFAULT ''::text NOT NULL,
+    repo_name text DEFAULT ''::text NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    is_primary boolean DEFAULT false NOT NULL,
+    trunk_branch text DEFAULT ''::text NOT NULL
+);
+
+
+--
+-- Name: COLUMN story_workspace_nodes.repo_owner; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.story_workspace_nodes.repo_owner IS 'GitHub owner of the cloned repo, recorded at provision time. DELIBERATE 2NF exception: depends on git_repo_id (part of the PK) rather than the whole key. Kept because git_repos has no row for a read-only context repo that never enters the git engine, so the normalized join would lose those repos'' identity. Written once with repo_name from the same clone descriptor; never updated in place.';
+
+
+--
+-- Name: COLUMN story_workspace_nodes.repo_name; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.story_workspace_nodes.repo_name IS 'GitHub repo name, recorded at provision time. See repo_owner for the 2NF rationale.';
+
+
+--
+-- Name: COLUMN story_workspace_nodes.trunk_branch; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.story_workspace_nodes.trunk_branch IS 'The trunk branch this clone was cut from, per (story, repo, branch). Written by workspace_trunks.annotate_trunks; served to the local lane as `trunk` and used as the review''s diff base. '''' means none recorded.';
 
 
 --
@@ -3241,6 +6296,17 @@ CREATE TABLE public.story_workspaces (
     current_branch_name text,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: tags; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.tags (
+    name text NOT NULL,
+    description text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
 );
 
 
@@ -3324,13 +6390,6 @@ CREATE TABLE public.template_files (
 
 
 --
--- Name: COLUMN template_files.updated_at; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON COLUMN public.template_files.updated_at IS 'Timestamp of the most recent content write. No separate created_at column — check template_history for the earliest version containing this filename to establish creation time.';
-
-
---
 -- Name: template_history; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -3385,7 +6444,7 @@ CREATE TABLE public.templates (
     type text NOT NULL,
     name text NOT NULL,
     description text DEFAULT ''::text NOT NULL,
-    model text DEFAULT 'google/gemini-2.5-flash'::text NOT NULL,
+    model text DEFAULT 'google/gemini-3.8-flash'::text NOT NULL,
     emoji text DEFAULT ''::text NOT NULL,
     tools_allow text[] DEFAULT '{}'::text[] NOT NULL,
     tools_deny text[] DEFAULT '{}'::text[] NOT NULL,
@@ -3398,6 +6457,7 @@ CREATE TABLE public.templates (
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     parent_template_id text,
     owner_actor_id uuid,
+    model_id text,
     CONSTRAINT templates_status_check CHECK ((status = ANY (ARRAY['active'::text, 'deprecated'::text]))),
     CONSTRAINT templates_type_check CHECK ((type = ANY (ARRAY['SHCA'::text, 'IA'::text, 'GO'::text, 'RA'::text, 'Platform'::text, 'PlatformResearch'::text, 'PlatformAssistant'::text])))
 );
@@ -3414,26 +6474,6 @@ CREATE TABLE public.thread_participants (
     last_read_message_id text,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL
-);
-
-
---
--- Name: threads; Type: TABLE; Schema: public; Owner: -
---
-
-CREATE TABLE public.threads (
-    id text NOT NULL,
-    goal_id text NOT NULL,
-    agent_id text DEFAULT ''::text NOT NULL,
-    task_id text,
-    correlation_id uuid,
-    created_by text NOT NULL,
-    created_at timestamp with time zone DEFAULT now() NOT NULL,
-    title text DEFAULT 'New conversation'::text NOT NULL,
-    instance_id text,
-    status text DEFAULT 'open'::text NOT NULL,
-    participants text[] DEFAULT '{}'::text[],
-    left_goal_at timestamp with time zone
 );
 
 
@@ -3640,6 +6680,50 @@ CREATE TABLE public.user_tour_progress (
 
 
 --
+-- Name: v_cost_reconciliation; Type: VIEW; Schema: public; Owner: -
+--
+
+CREATE VIEW public.v_cost_reconciliation AS
+ SELECT upper(goal_id) AS goal_id,
+    sum(cost) AS total_cost,
+    sum(cost) FILTER (WHERE (thread_id IS NOT NULL)) AS attributed_cost,
+    sum(cost) FILTER (WHERE (thread_id IS NULL)) AS unattributed_cost,
+    sum(cost) FILTER (WHERE (spender = 'assistant'::text)) AS assistant_cost,
+    sum(cost) FILTER (WHERE (spender = 'orchestrator'::text)) AS orchestrator_cost,
+    sum(cost) FILTER (WHERE (spender = 'executor'::text)) AS executor_cost,
+    sum(cost) FILTER (WHERE (spender = 'verifier'::text)) AS verifier_cost,
+    sum(cost) FILTER (WHERE (spender = 'other'::text)) AS other_cost,
+    sum(tokens) AS tokens,
+    count(*) FILTER (WHERE (NOT priced)) AS unpriced_calls,
+    sum(tokens) FILTER (WHERE (NOT priced)) AS unpriced_tokens
+   FROM public.v_cost_attributed
+  WHERE (goal_id IS NOT NULL)
+  GROUP BY (upper(goal_id));
+
+
+--
+-- Name: VIEW v_cost_reconciliation; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON VIEW public.v_cost_reconciliation IS 'Per goal: attributed + unattributed = total, spenders = total, and what could not be priced. The check that the cost page adds up.';
+
+
+--
+-- Name: v_model_pricing_coverage; Type: VIEW; Schema: public; Owner: -
+--
+
+CREATE VIEW public.v_model_pricing_coverage AS
+ SELECT id AS model_id,
+    label,
+    status,
+    (EXISTS ( SELECT 1
+           FROM public.model_pricing p
+          WHERE ((p.provider = m.provider_id) AND (p.model = m.model_name)))) AS priced
+   FROM public.models m
+  WHERE (status = 'active'::text);
+
+
+--
 -- Name: webhook_deliveries; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -3668,6 +6752,195 @@ CREATE SEQUENCE public.webhook_deliveries_id_seq
 --
 
 ALTER SEQUENCE public.webhook_deliveries_id_seq OWNED BY public.webhook_deliveries.id;
+
+
+--
+-- Name: acceptances id; Type: DEFAULT; Schema: kernel; Owner: -
+--
+
+ALTER TABLE ONLY kernel.acceptances ALTER COLUMN id SET DEFAULT nextval('kernel.acceptances_id_seq'::regclass);
+
+
+--
+-- Name: admission_slots id; Type: DEFAULT; Schema: kernel; Owner: -
+--
+
+ALTER TABLE ONLY kernel.admission_slots ALTER COLUMN id SET DEFAULT nextval('kernel.admission_slots_id_seq'::regclass);
+
+
+--
+-- Name: alignment_flags id; Type: DEFAULT; Schema: kernel; Owner: -
+--
+
+ALTER TABLE ONLY kernel.alignment_flags ALTER COLUMN id SET DEFAULT nextval('kernel.alignment_flags_id_seq'::regclass);
+
+
+--
+-- Name: answers id; Type: DEFAULT; Schema: kernel; Owner: -
+--
+
+ALTER TABLE ONLY kernel.answers ALTER COLUMN id SET DEFAULT nextval('kernel.answers_id_seq'::regclass);
+
+
+--
+-- Name: artifact_manifest id; Type: DEFAULT; Schema: kernel; Owner: -
+--
+
+ALTER TABLE ONLY kernel.artifact_manifest ALTER COLUMN id SET DEFAULT nextval('kernel.artifact_manifest_id_seq'::regclass);
+
+
+--
+-- Name: assistant_requests id; Type: DEFAULT; Schema: kernel; Owner: -
+--
+
+ALTER TABLE ONLY kernel.assistant_requests ALTER COLUMN id SET DEFAULT nextval('kernel.assistant_requests_id_seq'::regclass);
+
+
+--
+-- Name: capability_grants id; Type: DEFAULT; Schema: kernel; Owner: -
+--
+
+ALTER TABLE ONLY kernel.capability_grants ALTER COLUMN id SET DEFAULT nextval('kernel.capability_grants_id_seq'::regclass);
+
+
+--
+-- Name: contracts id; Type: DEFAULT; Schema: kernel; Owner: -
+--
+
+ALTER TABLE ONLY kernel.contracts ALTER COLUMN id SET DEFAULT nextval('kernel.contracts_id_seq'::regclass);
+
+
+--
+-- Name: criteria id; Type: DEFAULT; Schema: kernel; Owner: -
+--
+
+ALTER TABLE ONLY kernel.criteria ALTER COLUMN id SET DEFAULT nextval('kernel.criteria_id_seq'::regclass);
+
+
+--
+-- Name: criterion_baselines id; Type: DEFAULT; Schema: kernel; Owner: -
+--
+
+ALTER TABLE ONLY kernel.criterion_baselines ALTER COLUMN id SET DEFAULT nextval('kernel.criterion_baselines_id_seq'::regclass);
+
+
+--
+-- Name: criterion_results id; Type: DEFAULT; Schema: kernel; Owner: -
+--
+
+ALTER TABLE ONLY kernel.criterion_results ALTER COLUMN id SET DEFAULT nextval('kernel.criterion_results_id_seq'::regclass);
+
+
+--
+-- Name: directives id; Type: DEFAULT; Schema: kernel; Owner: -
+--
+
+ALTER TABLE ONLY kernel.directives ALTER COLUMN id SET DEFAULT nextval('kernel.directives_id_seq'::regclass);
+
+
+--
+-- Name: env_deltas id; Type: DEFAULT; Schema: kernel; Owner: -
+--
+
+ALTER TABLE ONLY kernel.env_deltas ALTER COLUMN id SET DEFAULT nextval('kernel.env_deltas_id_seq'::regclass);
+
+
+--
+-- Name: errand_proposals id; Type: DEFAULT; Schema: kernel; Owner: -
+--
+
+ALTER TABLE ONLY kernel.errand_proposals ALTER COLUMN id SET DEFAULT nextval('kernel.errand_proposals_id_seq'::regclass);
+
+
+--
+-- Name: errand_schedules id; Type: DEFAULT; Schema: kernel; Owner: -
+--
+
+ALTER TABLE ONLY kernel.errand_schedules ALTER COLUMN id SET DEFAULT nextval('kernel.errand_schedules_id_seq'::regclass);
+
+
+--
+-- Name: execution_checkpoints id; Type: DEFAULT; Schema: kernel; Owner: -
+--
+
+ALTER TABLE ONLY kernel.execution_checkpoints ALTER COLUMN id SET DEFAULT nextval('kernel.execution_checkpoints_id_seq'::regclass);
+
+
+--
+-- Name: execution_leases id; Type: DEFAULT; Schema: kernel; Owner: -
+--
+
+ALTER TABLE ONLY kernel.execution_leases ALTER COLUMN id SET DEFAULT nextval('kernel.execution_leases_id_seq'::regclass);
+
+
+--
+-- Name: execution_mounts id; Type: DEFAULT; Schema: kernel; Owner: -
+--
+
+ALTER TABLE ONLY kernel.execution_mounts ALTER COLUMN id SET DEFAULT nextval('kernel.execution_mounts_id_seq'::regclass);
+
+
+--
+-- Name: execution_transitions id; Type: DEFAULT; Schema: kernel; Owner: -
+--
+
+ALTER TABLE ONLY kernel.execution_transitions ALTER COLUMN id SET DEFAULT nextval('kernel.execution_transitions_id_seq'::regclass);
+
+
+--
+-- Name: executions id; Type: DEFAULT; Schema: kernel; Owner: -
+--
+
+ALTER TABLE ONLY kernel.executions ALTER COLUMN id SET DEFAULT nextval('kernel.executions_id_seq'::regclass);
+
+
+--
+-- Name: projections id; Type: DEFAULT; Schema: kernel; Owner: -
+--
+
+ALTER TABLE ONLY kernel.projections ALTER COLUMN id SET DEFAULT nextval('kernel.projections_id_seq'::regclass);
+
+
+--
+-- Name: proposals id; Type: DEFAULT; Schema: kernel; Owner: -
+--
+
+ALTER TABLE ONLY kernel.proposals ALTER COLUMN id SET DEFAULT nextval('kernel.proposals_id_seq'::regclass);
+
+
+--
+-- Name: questions id; Type: DEFAULT; Schema: kernel; Owner: -
+--
+
+ALTER TABLE ONLY kernel.questions ALTER COLUMN id SET DEFAULT nextval('kernel.questions_id_seq'::regclass);
+
+
+--
+-- Name: reconcile_probes id; Type: DEFAULT; Schema: kernel; Owner: -
+--
+
+ALTER TABLE ONLY kernel.reconcile_probes ALTER COLUMN id SET DEFAULT nextval('kernel.reconcile_probes_id_seq'::regclass);
+
+
+--
+-- Name: standing_answers id; Type: DEFAULT; Schema: kernel; Owner: -
+--
+
+ALTER TABLE ONLY kernel.standing_answers ALTER COLUMN id SET DEFAULT nextval('kernel.standing_answers_id_seq'::regclass);
+
+
+--
+-- Name: step_journal id; Type: DEFAULT; Schema: kernel; Owner: -
+--
+
+ALTER TABLE ONLY kernel.step_journal ALTER COLUMN id SET DEFAULT nextval('kernel.step_journal_id_seq'::regclass);
+
+
+--
+-- Name: verdicts id; Type: DEFAULT; Schema: kernel; Owner: -
+--
+
+ALTER TABLE ONLY kernel.verdicts ALTER COLUMN id SET DEFAULT nextval('kernel.verdicts_id_seq'::regclass);
 
 
 --
@@ -3745,6 +7018,278 @@ ALTER TABLE ONLY public.tool_versions ALTER COLUMN id SET DEFAULT nextval('publi
 --
 
 ALTER TABLE ONLY public.webhook_deliveries ALTER COLUMN id SET DEFAULT nextval('public.webhook_deliveries_id_seq'::regclass);
+
+
+--
+-- Name: acceptances acceptances_pkey; Type: CONSTRAINT; Schema: kernel; Owner: -
+--
+
+ALTER TABLE ONLY kernel.acceptances
+    ADD CONSTRAINT acceptances_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: admission_buckets admission_buckets_owner_pkey; Type: CONSTRAINT; Schema: kernel; Owner: -
+--
+
+ALTER TABLE ONLY kernel.admission_buckets
+    ADD CONSTRAINT admission_buckets_owner_pkey PRIMARY KEY (goal_id, owner);
+
+
+--
+-- Name: admission_slots admission_slots_pkey; Type: CONSTRAINT; Schema: kernel; Owner: -
+--
+
+ALTER TABLE ONLY kernel.admission_slots
+    ADD CONSTRAINT admission_slots_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: alignment_flags alignment_flags_pkey; Type: CONSTRAINT; Schema: kernel; Owner: -
+--
+
+ALTER TABLE ONLY kernel.alignment_flags
+    ADD CONSTRAINT alignment_flags_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: answers answers_pkey; Type: CONSTRAINT; Schema: kernel; Owner: -
+--
+
+ALTER TABLE ONLY kernel.answers
+    ADD CONSTRAINT answers_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: artifact_manifest artifact_manifest_once_per_execution; Type: CONSTRAINT; Schema: kernel; Owner: -
+--
+
+ALTER TABLE ONLY kernel.artifact_manifest
+    ADD CONSTRAINT artifact_manifest_once_per_execution UNIQUE (execution_id, artifact_id);
+
+
+--
+-- Name: artifact_manifest artifact_manifest_pkey; Type: CONSTRAINT; Schema: kernel; Owner: -
+--
+
+ALTER TABLE ONLY kernel.artifact_manifest
+    ADD CONSTRAINT artifact_manifest_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: assistant_requests assistant_requests_pkey; Type: CONSTRAINT; Schema: kernel; Owner: -
+--
+
+ALTER TABLE ONLY kernel.assistant_requests
+    ADD CONSTRAINT assistant_requests_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: capability_grants capability_grants_pkey; Type: CONSTRAINT; Schema: kernel; Owner: -
+--
+
+ALTER TABLE ONLY kernel.capability_grants
+    ADD CONSTRAINT capability_grants_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: contracts contracts_pkey; Type: CONSTRAINT; Schema: kernel; Owner: -
+--
+
+ALTER TABLE ONLY kernel.contracts
+    ADD CONSTRAINT contracts_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: criteria criteria_pkey; Type: CONSTRAINT; Schema: kernel; Owner: -
+--
+
+ALTER TABLE ONLY kernel.criteria
+    ADD CONSTRAINT criteria_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: criterion_baselines criterion_baselines_pkey; Type: CONSTRAINT; Schema: kernel; Owner: -
+--
+
+ALTER TABLE ONLY kernel.criterion_baselines
+    ADD CONSTRAINT criterion_baselines_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: criterion_results criterion_results_pkey; Type: CONSTRAINT; Schema: kernel; Owner: -
+--
+
+ALTER TABLE ONLY kernel.criterion_results
+    ADD CONSTRAINT criterion_results_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: directives directives_pkey; Type: CONSTRAINT; Schema: kernel; Owner: -
+--
+
+ALTER TABLE ONLY kernel.directives
+    ADD CONSTRAINT directives_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: env_deltas env_deltas_pkey; Type: CONSTRAINT; Schema: kernel; Owner: -
+--
+
+ALTER TABLE ONLY kernel.env_deltas
+    ADD CONSTRAINT env_deltas_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: errand_proposals errand_proposals_pkey; Type: CONSTRAINT; Schema: kernel; Owner: -
+--
+
+ALTER TABLE ONLY kernel.errand_proposals
+    ADD CONSTRAINT errand_proposals_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: errand_schedules errand_schedules_pkey; Type: CONSTRAINT; Schema: kernel; Owner: -
+--
+
+ALTER TABLE ONLY kernel.errand_schedules
+    ADD CONSTRAINT errand_schedules_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: execution_checkpoints execution_checkpoints_pkey; Type: CONSTRAINT; Schema: kernel; Owner: -
+--
+
+ALTER TABLE ONLY kernel.execution_checkpoints
+    ADD CONSTRAINT execution_checkpoints_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: execution_jobs execution_jobs_pkey; Type: CONSTRAINT; Schema: kernel; Owner: -
+--
+
+ALTER TABLE ONLY kernel.execution_jobs
+    ADD CONSTRAINT execution_jobs_pkey PRIMARY KEY (execution_id, job_id);
+
+
+--
+-- Name: execution_leases execution_leases_pkey; Type: CONSTRAINT; Schema: kernel; Owner: -
+--
+
+ALTER TABLE ONLY kernel.execution_leases
+    ADD CONSTRAINT execution_leases_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: execution_mounts execution_mounts_pkey; Type: CONSTRAINT; Schema: kernel; Owner: -
+--
+
+ALTER TABLE ONLY kernel.execution_mounts
+    ADD CONSTRAINT execution_mounts_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: execution_transitions execution_transitions_pkey; Type: CONSTRAINT; Schema: kernel; Owner: -
+--
+
+ALTER TABLE ONLY kernel.execution_transitions
+    ADD CONSTRAINT execution_transitions_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: executions executions_pkey; Type: CONSTRAINT; Schema: kernel; Owner: -
+--
+
+ALTER TABLE ONLY kernel.executions
+    ADD CONSTRAINT executions_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: projections projections_pkey; Type: CONSTRAINT; Schema: kernel; Owner: -
+--
+
+ALTER TABLE ONLY kernel.projections
+    ADD CONSTRAINT projections_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: proposals proposals_pkey; Type: CONSTRAINT; Schema: kernel; Owner: -
+--
+
+ALTER TABLE ONLY kernel.proposals
+    ADD CONSTRAINT proposals_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: provider_health provider_health_pkey; Type: CONSTRAINT; Schema: kernel; Owner: -
+--
+
+ALTER TABLE ONLY kernel.provider_health
+    ADD CONSTRAINT provider_health_pkey PRIMARY KEY (model);
+
+
+--
+-- Name: questions questions_pkey; Type: CONSTRAINT; Schema: kernel; Owner: -
+--
+
+ALTER TABLE ONLY kernel.questions
+    ADD CONSTRAINT questions_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: reconcile_probes reconcile_probes_pkey; Type: CONSTRAINT; Schema: kernel; Owner: -
+--
+
+ALTER TABLE ONLY kernel.reconcile_probes
+    ADD CONSTRAINT reconcile_probes_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: run_state_machine run_state_machine_pkey; Type: CONSTRAINT; Schema: kernel; Owner: -
+--
+
+ALTER TABLE ONLY kernel.run_state_machine
+    ADD CONSTRAINT run_state_machine_pkey PRIMARY KEY (version);
+
+
+--
+-- Name: standing_answers standing_answers_pkey; Type: CONSTRAINT; Schema: kernel; Owner: -
+--
+
+ALTER TABLE ONLY kernel.standing_answers
+    ADD CONSTRAINT standing_answers_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: step_journal step_journal_pkey; Type: CONSTRAINT; Schema: kernel; Owner: -
+--
+
+ALTER TABLE ONLY kernel.step_journal
+    ADD CONSTRAINT step_journal_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: story_timings story_timings_pkey; Type: CONSTRAINT; Schema: kernel; Owner: -
+--
+
+ALTER TABLE ONLY kernel.story_timings
+    ADD CONSTRAINT story_timings_pkey PRIMARY KEY (story_id);
+
+
+--
+-- Name: verdicts verdicts_pkey; Type: CONSTRAINT; Schema: kernel; Owner: -
+--
+
+ALTER TABLE ONLY kernel.verdicts
+    ADD CONSTRAINT verdicts_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: verification_state verification_state_pkey; Type: CONSTRAINT; Schema: kernel; Owner: -
+--
+
+ALTER TABLE ONLY kernel.verification_state
+    ADD CONSTRAINT verification_state_pkey PRIMARY KEY (execution_id);
 
 
 --
@@ -3868,6 +7413,22 @@ ALTER TABLE ONLY public.agents
 
 
 --
+-- Name: api_keys api_keys_key_hash_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.api_keys
+    ADD CONSTRAINT api_keys_key_hash_key UNIQUE (key_hash);
+
+
+--
+-- Name: api_keys api_keys_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.api_keys
+    ADD CONSTRAINT api_keys_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: approvals approvals_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -3924,6 +7485,22 @@ ALTER TABLE ONLY public.claude_phases
 
 
 --
+-- Name: council_finding_events council_finding_events_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.council_finding_events
+    ADD CONSTRAINT council_finding_events_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: council_findings council_findings_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.council_findings
+    ADD CONSTRAINT council_findings_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: council_review_runs council_review_runs_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -3964,6 +7541,22 @@ ALTER TABLE ONLY public.execution_pauses
 
 
 --
+-- Name: ext_auth_codes ext_auth_codes_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.ext_auth_codes
+    ADD CONSTRAINT ext_auth_codes_pkey PRIMARY KEY (code);
+
+
+--
+-- Name: ext_sessions ext_sessions_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.ext_sessions
+    ADD CONSTRAINT ext_sessions_pkey PRIMARY KEY (handle);
+
+
+--
 -- Name: gateway_cache gateway_cache_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -4001,6 +7594,14 @@ ALTER TABLE ONLY public.git_merge_groups
 
 ALTER TABLE ONLY public.git_merge_queue
     ADD CONSTRAINT git_merge_queue_pkey PRIMARY KEY (node_id);
+
+
+--
+-- Name: git_node_landings git_node_landings_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.git_node_landings
+    ADD CONSTRAINT git_node_landings_pkey PRIMARY KEY (git_node_id, cycle);
 
 
 --
@@ -4065,6 +7666,22 @@ ALTER TABLE ONLY public.go_conversation_summaries
 
 ALTER TABLE ONLY public.go_memory
     ADD CONSTRAINT go_memory_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: go_wake_log go_wake_log_goal_id_kind_ref_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.go_wake_log
+    ADD CONSTRAINT go_wake_log_goal_id_kind_ref_key UNIQUE (goal_id, kind, ref);
+
+
+--
+-- Name: go_wake_log go_wake_log_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.go_wake_log
+    ADD CONSTRAINT go_wake_log_pkey PRIMARY KEY (id);
 
 
 --
@@ -4172,6 +7789,22 @@ ALTER TABLE ONLY public.join_requests
 
 
 --
+-- Name: ledger_blobs ledger_blobs_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.ledger_blobs
+    ADD CONSTRAINT ledger_blobs_pkey PRIMARY KEY (blob_id);
+
+
+--
+-- Name: ledger_blobs ledger_blobs_sha256_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.ledger_blobs
+    ADD CONSTRAINT ledger_blobs_sha256_key UNIQUE (sha256);
+
+
+--
 -- Name: ledger_events ledger_events_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -4185,6 +7818,30 @@ ALTER TABLE ONLY public.ledger_events
 
 ALTER TABLE ONLY public.ledger_events
     ADD CONSTRAINT ledger_events_sequence_number_key UNIQUE (sequence_number);
+
+
+--
+-- Name: local_check_results local_check_results_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.local_check_results
+    ADD CONSTRAINT local_check_results_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: local_push_refusals local_push_refusals_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.local_push_refusals
+    ADD CONSTRAINT local_push_refusals_pkey PRIMARY KEY (story_id, kind);
+
+
+--
+-- Name: loop_heartbeats loop_heartbeats_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.loop_heartbeats
+    ADD CONSTRAINT loop_heartbeats_pkey PRIMARY KEY (loop_name, instance_id);
 
 
 --
@@ -4220,11 +7877,83 @@ ALTER TABLE ONLY public.messages
 
 
 --
+-- Name: misc_model_settings misc_model_settings_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.misc_model_settings
+    ADD CONSTRAINT misc_model_settings_pkey PRIMARY KEY (purpose_key);
+
+
+--
+-- Name: model_aliases model_aliases_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.model_aliases
+    ADD CONSTRAINT model_aliases_pkey PRIMARY KEY (alias);
+
+
+--
+-- Name: model_context_windows model_context_windows_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.model_context_windows
+    ADD CONSTRAINT model_context_windows_pkey PRIMARY KEY (model_id, tokens);
+
+
+--
 -- Name: model_pricing model_pricing_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.model_pricing
     ADD CONSTRAINT model_pricing_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: model_provider_registry model_provider_registry_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.model_provider_registry
+    ADD CONSTRAINT model_provider_registry_pkey PRIMARY KEY (name);
+
+
+--
+-- Name: model_providers model_providers_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.model_providers
+    ADD CONSTRAINT model_providers_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: model_registry model_registry_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.model_registry
+    ADD CONSTRAINT model_registry_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: model_tags model_tags_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.model_tags
+    ADD CONSTRAINT model_tags_pkey PRIMARY KEY (model_id, tag_name);
+
+
+--
+-- Name: models models_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.models
+    ADD CONSTRAINT models_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: models models_wire_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.models
+    ADD CONSTRAINT models_wire_id_key UNIQUE (wire_id);
 
 
 --
@@ -4380,6 +8109,14 @@ ALTER TABLE ONLY public.platform_schedule_state
 
 
 --
+-- Name: platform_settings platform_settings_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.platform_settings
+    ADD CONSTRAINT platform_settings_pkey PRIMARY KEY (key);
+
+
+--
 -- Name: platform_suggestions platform_suggestions_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -4457,6 +8194,14 @@ ALTER TABLE ONLY public.resource_events
 
 ALTER TABLE ONLY public.resource_links
     ADD CONSTRAINT resource_links_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: resource_publishes resource_publishes_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.resource_publishes
+    ADD CONSTRAINT resource_publishes_pkey PRIMARY KEY (id);
 
 
 --
@@ -4652,6 +8397,14 @@ ALTER TABLE ONLY public.story_claude_execution_contexts
 
 
 --
+-- Name: story_repo_trunks story_repo_trunks_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.story_repo_trunks
+    ADD CONSTRAINT story_repo_trunks_pkey PRIMARY KEY (story_id, resource_id, trunk_branch);
+
+
+--
 -- Name: story_resources story_resources_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -4676,11 +8429,27 @@ ALTER TABLE ONLY public.story_reviews
 
 
 --
+-- Name: story_workspace_nodes story_workspace_nodes_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.story_workspace_nodes
+    ADD CONSTRAINT story_workspace_nodes_pkey PRIMARY KEY (story_id, git_repo_id, branch_name);
+
+
+--
 -- Name: story_workspaces story_workspaces_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.story_workspaces
     ADD CONSTRAINT story_workspaces_pkey PRIMARY KEY (story_id);
+
+
+--
+-- Name: tags tags_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tags
+    ADD CONSTRAINT tags_pkey PRIMARY KEY (name);
 
 
 --
@@ -4940,6 +8709,461 @@ ALTER TABLE ONLY public.webhook_deliveries
 
 
 --
+-- Name: acceptances_by_execution; Type: INDEX; Schema: kernel; Owner: -
+--
+
+CREATE INDEX acceptances_by_execution ON kernel.acceptances USING btree (execution_id);
+
+
+--
+-- Name: admission_buckets_by_owner; Type: INDEX; Schema: kernel; Owner: -
+--
+
+CREATE UNIQUE INDEX admission_buckets_by_owner ON kernel.admission_buckets USING btree (goal_id, owner);
+
+
+--
+-- Name: admission_slots_by_owner; Type: INDEX; Schema: kernel; Owner: -
+--
+
+CREATE UNIQUE INDEX admission_slots_by_owner ON kernel.admission_slots USING btree (goal_id, owner, slot_index);
+
+
+--
+-- Name: admission_slots_free; Type: INDEX; Schema: kernel; Owner: -
+--
+
+CREATE INDEX admission_slots_free ON kernel.admission_slots USING btree (goal_id, domain, kind) WHERE ((execution_id IS NULL) OR (released_at IS NOT NULL));
+
+
+--
+-- Name: admission_slots_free_by_owner; Type: INDEX; Schema: kernel; Owner: -
+--
+
+CREATE INDEX admission_slots_free_by_owner ON kernel.admission_slots USING btree (goal_id, owner) WHERE ((execution_id IS NULL) OR (released_at IS NOT NULL));
+
+
+--
+-- Name: admission_slots_one_per_execution; Type: INDEX; Schema: kernel; Owner: -
+--
+
+CREATE UNIQUE INDEX admission_slots_one_per_execution ON kernel.admission_slots USING btree (execution_id) WHERE ((execution_id IS NOT NULL) AND (released_at IS NULL));
+
+
+--
+-- Name: alignment_flags_one_open; Type: INDEX; Schema: kernel; Owner: -
+--
+
+CREATE UNIQUE INDEX alignment_flags_one_open ON kernel.alignment_flags USING btree (goal_id, fingerprint) WHERE (status = 'OPEN'::text);
+
+
+--
+-- Name: alignment_flags_open; Type: INDEX; Schema: kernel; Owner: -
+--
+
+CREATE INDEX alignment_flags_open ON kernel.alignment_flags USING btree (goal_id, created_at DESC) WHERE (status = 'OPEN'::text);
+
+
+--
+-- Name: answers_execution_idx; Type: INDEX; Schema: kernel; Owner: -
+--
+
+CREATE INDEX answers_execution_idx ON kernel.answers USING btree (execution_id, id);
+
+
+--
+-- Name: answers_proposal_idx; Type: INDEX; Schema: kernel; Owner: -
+--
+
+CREATE INDEX answers_proposal_idx ON kernel.answers USING btree (proposal_id) WHERE (proposal_id IS NOT NULL);
+
+
+--
+-- Name: answers_undelivered_idx; Type: INDEX; Schema: kernel; Owner: -
+--
+
+CREATE INDEX answers_undelivered_idx ON kernel.answers USING btree (id) WHERE (card_posted_at IS NULL);
+
+
+--
+-- Name: artifact_manifest_execution_idx; Type: INDEX; Schema: kernel; Owner: -
+--
+
+CREATE INDEX artifact_manifest_execution_idx ON kernel.artifact_manifest USING btree (execution_id, created_at DESC);
+
+
+--
+-- Name: artifact_manifest_goal_idx; Type: INDEX; Schema: kernel; Owner: -
+--
+
+CREATE INDEX artifact_manifest_goal_idx ON kernel.artifact_manifest USING btree (goal_id, created_at DESC) WHERE (goal_id IS NOT NULL);
+
+
+--
+-- Name: artifact_manifest_once_per_story; Type: INDEX; Schema: kernel; Owner: -
+--
+
+CREATE UNIQUE INDEX artifact_manifest_once_per_story ON kernel.artifact_manifest USING btree (story_id, artifact_id) WHERE (story_id IS NOT NULL);
+
+
+--
+-- Name: artifact_manifest_role_idx; Type: INDEX; Schema: kernel; Owner: -
+--
+
+CREATE INDEX artifact_manifest_role_idx ON kernel.artifact_manifest USING btree (role, created_at DESC);
+
+
+--
+-- Name: artifact_manifest_story_idx; Type: INDEX; Schema: kernel; Owner: -
+--
+
+CREATE INDEX artifact_manifest_story_idx ON kernel.artifact_manifest USING btree (story_id, created_at DESC) WHERE (story_id IS NOT NULL);
+
+
+--
+-- Name: artifact_manifest_supersedes_idx; Type: INDEX; Schema: kernel; Owner: -
+--
+
+CREATE INDEX artifact_manifest_supersedes_idx ON kernel.artifact_manifest USING btree (supersedes) WHERE (supersedes IS NOT NULL);
+
+
+--
+-- Name: assistant_requests_idem; Type: INDEX; Schema: kernel; Owner: -
+--
+
+CREATE UNIQUE INDEX assistant_requests_idem ON kernel.assistant_requests USING btree (idempotency_key);
+
+
+--
+-- Name: assistant_requests_pending; Type: INDEX; Schema: kernel; Owner: -
+--
+
+CREATE INDEX assistant_requests_pending ON kernel.assistant_requests USING btree (goal_id, created_at) WHERE (status = 'PENDING'::text);
+
+
+--
+-- Name: capability_grants_live_idx; Type: INDEX; Schema: kernel; Owner: -
+--
+
+CREATE INDEX capability_grants_live_idx ON kernel.capability_grants USING btree (goal_id, story_id, resource_id) WHERE (revoked_at IS NULL);
+
+
+--
+-- Name: checkpoints_unique; Type: INDEX; Schema: kernel; Owner: -
+--
+
+CREATE UNIQUE INDEX checkpoints_unique ON kernel.execution_checkpoints USING btree (execution_id, generation, seq);
+
+
+--
+-- Name: contracts_goal; Type: INDEX; Schema: kernel; Owner: -
+--
+
+CREATE INDEX contracts_goal ON kernel.contracts USING btree (goal_id, id);
+
+
+--
+-- Name: contracts_supersedes; Type: INDEX; Schema: kernel; Owner: -
+--
+
+CREATE INDEX contracts_supersedes ON kernel.contracts USING btree (supersedes) WHERE (supersedes IS NOT NULL);
+
+
+--
+-- Name: criteria_contract; Type: INDEX; Schema: kernel; Owner: -
+--
+
+CREATE INDEX criteria_contract ON kernel.criteria USING btree (contract_id, id);
+
+
+--
+-- Name: criterion_baselines_by_contract; Type: INDEX; Schema: kernel; Owner: -
+--
+
+CREATE INDEX criterion_baselines_by_contract ON kernel.criterion_baselines USING btree (contract_id);
+
+
+--
+-- Name: criterion_baselines_one_per_criterion; Type: INDEX; Schema: kernel; Owner: -
+--
+
+CREATE UNIQUE INDEX criterion_baselines_one_per_criterion ON kernel.criterion_baselines USING btree (criterion_id);
+
+
+--
+-- Name: criterion_results_claim; Type: INDEX; Schema: kernel; Owner: -
+--
+
+CREATE INDEX criterion_results_claim ON kernel.criterion_results USING btree (execution_id, claim_seq, criterion_id);
+
+
+--
+-- Name: criterion_results_one_per_run; Type: INDEX; Schema: kernel; Owner: -
+--
+
+CREATE UNIQUE INDEX criterion_results_one_per_run ON kernel.criterion_results USING btree (criterion_id, execution_id, claim_seq, run_index);
+
+
+--
+-- Name: directives_execution_pending; Type: INDEX; Schema: kernel; Owner: -
+--
+
+CREATE INDEX directives_execution_pending ON kernel.directives USING btree (execution_id) WHERE (status = 'PENDING'::text);
+
+
+--
+-- Name: env_deltas_execution; Type: INDEX; Schema: kernel; Owner: -
+--
+
+CREATE INDEX env_deltas_execution ON kernel.env_deltas USING btree (execution_id, id);
+
+
+--
+-- Name: env_deltas_order; Type: INDEX; Schema: kernel; Owner: -
+--
+
+CREATE UNIQUE INDEX env_deltas_order ON kernel.env_deltas USING btree (execution_id, seq);
+
+
+--
+-- Name: errand_proposals_open; Type: INDEX; Schema: kernel; Owner: -
+--
+
+CREATE INDEX errand_proposals_open ON kernel.errand_proposals USING btree (goal_id, created_at) WHERE (state = 'PENDING'::text);
+
+
+--
+-- Name: errand_proposals_unposted; Type: INDEX; Schema: kernel; Owner: -
+--
+
+CREATE INDEX errand_proposals_unposted ON kernel.errand_proposals USING btree (created_at) WHERE ((card_posted_at IS NULL) AND (state = 'PENDING'::text));
+
+
+--
+-- Name: errand_schedules_due_idx; Type: INDEX; Schema: kernel; Owner: -
+--
+
+CREATE INDEX errand_schedules_due_idx ON kernel.errand_schedules USING btree (next_run_at) WHERE ((paused = false) AND (next_run_at IS NOT NULL));
+
+
+--
+-- Name: errand_schedules_live_grant_idx; Type: INDEX; Schema: kernel; Owner: -
+--
+
+CREATE INDEX errand_schedules_live_grant_idx ON kernel.errand_schedules USING btree (goal_id, story_id) WHERE ((approved_by IS NOT NULL) AND (revoked_at IS NULL));
+
+
+--
+-- Name: execution_jobs_evidence_idx; Type: INDEX; Schema: kernel; Owner: -
+--
+
+CREATE INDEX execution_jobs_evidence_idx ON kernel.execution_jobs USING btree (story_id, fingerprint) WHERE ((story_id <> ''::text) AND (fingerprint <> ''::text));
+
+
+--
+-- Name: execution_jobs_running_idx; Type: INDEX; Schema: kernel; Owner: -
+--
+
+CREATE INDEX execution_jobs_running_idx ON kernel.execution_jobs USING btree (execution_id, running);
+
+
+--
+-- Name: execution_leases_one_live; Type: INDEX; Schema: kernel; Owner: -
+--
+
+CREATE UNIQUE INDEX execution_leases_one_live ON kernel.execution_leases USING btree (execution_id) WHERE (released_at IS NULL);
+
+
+--
+-- Name: execution_mounts_at; Type: INDEX; Schema: kernel; Owner: -
+--
+
+CREATE UNIQUE INDEX execution_mounts_at ON kernel.execution_mounts USING btree (execution_id, at);
+
+
+--
+-- Name: execution_transitions_execution; Type: INDEX; Schema: kernel; Owner: -
+--
+
+CREATE INDEX execution_transitions_execution ON kernel.execution_transitions USING btree (execution_id, id);
+
+
+--
+-- Name: executions_one_live_per_story; Type: INDEX; Schema: kernel; Owner: -
+--
+
+CREATE UNIQUE INDEX executions_one_live_per_story ON kernel.executions USING btree (story_id) WHERE ((story_id IS NOT NULL) AND (state <> ALL (ARRAY['DONE'::text, 'FAILED'::text, 'CANCELLED'::text, 'ABANDONED'::text])));
+
+
+--
+-- Name: INDEX executions_one_live_per_story; Type: COMMENT; Schema: kernel; Owner: -
+--
+
+COMMENT ON INDEX kernel.executions_one_live_per_story IS 'At most one non-terminal execution per story. A second dispatch fails at INSERT rather than quietly consuming an admission slot and running the same story twice in two pods.';
+
+
+--
+-- Name: executions_pending_by_goal; Type: INDEX; Schema: kernel; Owner: -
+--
+
+CREATE INDEX executions_pending_by_goal ON kernel.executions USING btree (goal_id, created_at, id) WHERE (state = 'PENDING'::text);
+
+
+--
+-- Name: executions_pending_fifo; Type: INDEX; Schema: kernel; Owner: -
+--
+
+CREATE INDEX executions_pending_fifo ON kernel.executions USING btree (created_at, id) WHERE (state = 'PENDING'::text);
+
+
+--
+-- Name: executions_phase_live; Type: INDEX; Schema: kernel; Owner: -
+--
+
+CREATE INDEX executions_phase_live ON kernel.executions USING btree (phase) WHERE (phase IS NOT NULL);
+
+
+--
+-- Name: executions_running_claimable; Type: INDEX; Schema: kernel; Owner: -
+--
+
+CREATE INDEX executions_running_claimable ON kernel.executions USING btree (goal_id, id) WHERE ((state = 'RUNNING'::text) AND (container_id IS NOT NULL));
+
+
+--
+-- Name: executions_story; Type: INDEX; Schema: kernel; Owner: -
+--
+
+CREATE INDEX executions_story ON kernel.executions USING btree (goal_id, story_id) WHERE (story_id IS NOT NULL);
+
+
+--
+-- Name: executions_terminal_recent; Type: INDEX; Schema: kernel; Owner: -
+--
+
+CREATE INDEX executions_terminal_recent ON kernel.executions USING btree (updated_at DESC) WHERE (state = ANY (ARRAY['DONE'::text, 'FAILED'::text, 'CANCELLED'::text]));
+
+
+--
+-- Name: executions_verifying; Type: INDEX; Schema: kernel; Owner: -
+--
+
+CREATE INDEX executions_verifying ON kernel.executions USING btree (id) WHERE (state = 'VERIFYING'::text);
+
+
+--
+-- Name: executions_waiting_age; Type: INDEX; Schema: kernel; Owner: -
+--
+
+CREATE INDEX executions_waiting_age ON kernel.executions USING btree (created_at) WHERE (state = ANY (ARRAY['PENDING'::text, 'ADMITTED'::text]));
+
+
+--
+-- Name: executions_with_container; Type: INDEX; Schema: kernel; Owner: -
+--
+
+CREATE INDEX executions_with_container ON kernel.executions USING btree (container_id) WHERE (container_id IS NOT NULL);
+
+
+--
+-- Name: projections_scope_key; Type: INDEX; Schema: kernel; Owner: -
+--
+
+CREATE UNIQUE INDEX projections_scope_key ON kernel.projections USING btree (scope, key, execution_id, goal_id) NULLS NOT DISTINCT;
+
+
+--
+-- Name: proposals_idempotency; Type: INDEX; Schema: kernel; Owner: -
+--
+
+CREATE UNIQUE INDEX proposals_idempotency ON kernel.proposals USING btree (actor_id, execution_id, idempotency_key);
+
+
+--
+-- Name: questions_execution_open; Type: INDEX; Schema: kernel; Owner: -
+--
+
+CREATE INDEX questions_execution_open ON kernel.questions USING btree (execution_id) WHERE (status = 'OPEN'::text);
+
+
+--
+-- Name: questions_one_open; Type: INDEX; Schema: kernel; Owner: -
+--
+
+CREATE UNIQUE INDEX questions_one_open ON kernel.questions USING btree (execution_id) WHERE (status = 'OPEN'::text);
+
+
+--
+-- Name: questions_undelivered_idx; Type: INDEX; Schema: kernel; Owner: -
+--
+
+CREATE INDEX questions_undelivered_idx ON kernel.questions USING btree (id) WHERE ((status = 'OPEN'::text) AND (card_posted_at IS NULL));
+
+
+--
+-- Name: reconcile_probes_pending; Type: INDEX; Schema: kernel; Owner: -
+--
+
+CREATE INDEX reconcile_probes_pending ON kernel.reconcile_probes USING btree (execution_id) WHERE (status = 'PENDING'::text);
+
+
+--
+-- Name: standing_answers_unique; Type: INDEX; Schema: kernel; Owner: -
+--
+
+CREATE UNIQUE INDEX standing_answers_unique ON kernel.standing_answers USING btree (execution_id, question_kind, pattern);
+
+
+--
+-- Name: step_journal_idempotency_unique; Type: INDEX; Schema: kernel; Owner: -
+--
+
+CREATE UNIQUE INDEX step_journal_idempotency_unique ON kernel.step_journal USING btree (execution_id, idempotency_key);
+
+
+--
+-- Name: step_journal_seq_unique; Type: INDEX; Schema: kernel; Owner: -
+--
+
+CREATE UNIQUE INDEX step_journal_seq_unique ON kernel.step_journal USING btree (execution_id, seq);
+
+
+--
+-- Name: story_timings_live_idx; Type: INDEX; Schema: kernel; Owner: -
+--
+
+CREATE INDEX story_timings_live_idx ON kernel.story_timings USING btree (story_id, expires_at);
+
+
+--
+-- Name: verdicts_execution; Type: INDEX; Schema: kernel; Owner: -
+--
+
+CREATE INDEX verdicts_execution ON kernel.verdicts USING btree (execution_id, id);
+
+
+--
+-- Name: verdicts_one_per_claim; Type: INDEX; Schema: kernel; Owner: -
+--
+
+CREATE UNIQUE INDEX verdicts_one_per_claim ON kernel.verdicts USING btree (execution_id, claim_seq);
+
+
+--
+-- Name: verdicts_undelivered_idx; Type: INDEX; Schema: kernel; Owner: -
+--
+
+CREATE INDEX verdicts_undelivered_idx ON kernel.verdicts USING btree (id) WHERE (card_posted_at IS NULL);
+
+
+--
+-- Name: verification_state_building_idx; Type: INDEX; Schema: kernel; Owner: -
+--
+
+CREATE INDEX verification_state_building_idx ON kernel.verification_state USING btree (building_since) WHERE (building_key IS NOT NULL);
+
+
+--
 -- Name: agent_instances_one_active_per_thread_uq; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -4996,6 +9220,34 @@ CREATE INDEX agents_template_id_idx ON public.agents USING btree (template_id);
 
 
 --
+-- Name: council_finding_events_finding_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX council_finding_events_finding_idx ON public.council_finding_events USING btree (finding_id, created_at);
+
+
+--
+-- Name: council_findings_goal_key; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX council_findings_goal_key ON public.council_findings USING btree (goal_id, key);
+
+
+--
+-- Name: council_findings_open_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX council_findings_open_idx ON public.council_findings USING btree (goal_id, status, severity);
+
+
+--
+-- Name: council_findings_story_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX council_findings_story_idx ON public.council_findings USING btree (story_id) WHERE (story_id IS NOT NULL);
+
+
+--
 -- Name: council_runs_active_dedup; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -5045,10 +9297,24 @@ CREATE INDEX git_merge_queue_scan ON public.git_merge_queue USING btree (git_rep
 
 
 --
+-- Name: git_node_landings_by_node; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX git_node_landings_by_node ON public.git_node_landings USING btree (git_node_id, cycle DESC);
+
+
+--
 -- Name: git_node_stories_story; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX git_node_stories_story ON public.git_node_stories USING btree (story_id);
+
+
+--
+-- Name: git_nodes_branch_cleanup_pending; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX git_nodes_branch_cleanup_pending ON public.git_nodes USING btree (branch_cleanup_tries) WHERE ((branch_deleted_at IS NULL) AND (branch_cleanup_tries > 0));
 
 
 --
@@ -5084,6 +9350,13 @@ CREATE INDEX git_webhook_events_repo ON public.git_webhook_events USING btree (g
 --
 
 CREATE INDEX git_webhook_events_undelivered ON public.git_webhook_events USING btree (received_at) WHERE (delivered = false);
+
+
+--
+-- Name: goal_decisions_live; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX goal_decisions_live ON public.goal_decisions USING btree (goal_id, created_at DESC) WHERE (retired_at IS NULL);
 
 
 --
@@ -5199,6 +9472,20 @@ CREATE INDEX idx_agents_owner ON public.agents USING btree (owner_actor_id) WHER
 
 
 --
+-- Name: idx_api_keys_hash; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_api_keys_hash ON public.api_keys USING btree (key_hash) WHERE (revoked_at IS NULL);
+
+
+--
+-- Name: idx_api_keys_owner; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_api_keys_owner ON public.api_keys USING btree (owner_uid);
+
+
+--
 -- Name: idx_approvals_pending; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -5238,6 +9525,20 @@ CREATE INDEX idx_checkpoints_story ON public.checkpoints USING btree (story_id);
 --
 
 CREATE INDEX idx_claude_phases_status ON public.claude_phases USING btree (status) WHERE (status = 'active'::text);
+
+
+--
+-- Name: idx_ext_auth_codes_expiry; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_ext_auth_codes_expiry ON public.ext_auth_codes USING btree (expires_at);
+
+
+--
+-- Name: idx_ext_sessions_uid; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_ext_sessions_uid ON public.ext_sessions USING btree (uid) WHERE (revoked_at IS NULL);
 
 
 --
@@ -5528,6 +9829,13 @@ CREATE INDEX idx_pcb_goal ON public.platform_channel_bindings USING btree (goal_
 
 
 --
+-- Name: idx_pcb_goal_live; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_pcb_goal_live ON public.platform_channel_bindings USING btree (goal_id) WHERE (archived_at IS NULL);
+
+
+--
 -- Name: idx_pcb_thread; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -5647,6 +9955,13 @@ CREATE INDEX idx_resource_links_resource ON public.resource_links USING btree (g
 
 
 --
+-- Name: idx_resource_publishes_pending; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_resource_publishes_pending ON public.resource_publishes USING btree (status) WHERE (status = 'pending'::text);
+
+
+--
 -- Name: idx_resource_summaries_goal; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -5752,6 +10067,20 @@ CREATE INDEX idx_stories_assigned ON public.stories USING btree (assigned_to, st
 
 
 --
+-- Name: idx_stories_checked_out; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_stories_checked_out ON public.stories USING btree (checked_out_to_uid) WHERE (checked_out_to_uid IS NOT NULL);
+
+
+--
+-- Name: idx_stories_checkout_expiry; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_stories_checkout_expiry ON public.stories USING btree (checkout_expires_at) WHERE (checkout_expires_at IS NOT NULL);
+
+
+--
 -- Name: idx_stories_current_phase; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -5812,6 +10141,13 @@ CREATE UNIQUE INDEX idx_story_branches_active_name ON public.story_branches USIN
 --
 
 CREATE INDEX idx_story_branches_story ON public.story_branches USING btree (story_id);
+
+
+--
+-- Name: idx_story_repo_trunks_resource; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_story_repo_trunks_resource ON public.story_repo_trunks USING btree (resource_id, trunk_branch);
 
 
 --
@@ -6018,6 +10354,13 @@ CREATE INDEX idx_threads_goal_agent ON public.threads USING btree (goal_id, agen
 
 
 --
+-- Name: idx_threads_story; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_threads_story ON public.threads USING btree (story_id) WHERE (story_id IS NOT NULL);
+
+
+--
 -- Name: idx_token_calls_call_recorded_at; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -6067,6 +10410,62 @@ CREATE INDEX idx_workspace_files_latest ON public.agent_workspace_files USING bt
 
 
 --
+-- Name: ledger_events_conversation_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ledger_events_conversation_idx ON public.ledger_events USING btree (context_conversation_id, "timestamp" DESC) WHERE (context_conversation_id IS NOT NULL);
+
+
+--
+-- Name: ledger_events_on_behalf_of_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ledger_events_on_behalf_of_idx ON public.ledger_events USING btree (on_behalf_of, "timestamp" DESC) WHERE (on_behalf_of IS NOT NULL);
+
+
+--
+-- Name: local_check_results_by_cycle; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX local_check_results_by_cycle ON public.local_check_results USING btree (story_id, cycle, head_sha);
+
+
+--
+-- Name: local_check_results_one_per_run; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX local_check_results_one_per_run ON public.local_check_results USING btree (story_id, cycle, mount, run, head_sha);
+
+
+--
+-- Name: loop_heartbeats_last_tick_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX loop_heartbeats_last_tick_idx ON public.loop_heartbeats USING btree (last_tick_at);
+
+
+--
+-- Name: loop_heartbeats_name_sha_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX loop_heartbeats_name_sha_idx ON public.loop_heartbeats USING btree (loop_name, build_sha);
+
+
+--
+-- Name: model_aliases_model_id_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX model_aliases_model_id_idx ON public.model_aliases USING btree (model_id);
+
+
+--
+-- Name: model_context_windows_model_id_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX model_context_windows_model_id_idx ON public.model_context_windows USING btree (model_id);
+
+
+--
 -- Name: model_pricing_lookup_idx; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -6074,10 +10473,59 @@ CREATE INDEX model_pricing_lookup_idx ON public.model_pricing USING btree (provi
 
 
 --
+-- Name: model_pricing_model_id_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX model_pricing_model_id_idx ON public.model_pricing USING btree (model_id);
+
+
+--
 -- Name: model_pricing_unique_idx; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE UNIQUE INDEX model_pricing_unique_idx ON public.model_pricing USING btree (provider, model, effective_from);
+
+
+--
+-- Name: model_provider_registry_status_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX model_provider_registry_status_idx ON public.model_provider_registry USING btree (status);
+
+
+--
+-- Name: model_providers_status_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX model_providers_status_idx ON public.model_providers USING btree (status);
+
+
+--
+-- Name: model_registry_status_provider_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX model_registry_status_provider_idx ON public.model_registry USING btree (status, provider);
+
+
+--
+-- Name: model_tags_model_id_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX model_tags_model_id_idx ON public.model_tags USING btree (model_id);
+
+
+--
+-- Name: models_provider_shorthand_unique; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX models_provider_shorthand_unique ON public.models USING btree (provider_id, provider_shorthand) WHERE (provider_shorthand IS NOT NULL);
+
+
+--
+-- Name: models_status_provider_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX models_status_provider_idx ON public.models USING btree (status, provider_id);
 
 
 --
@@ -6106,6 +10554,20 @@ CREATE UNIQUE INDEX mv_cost_by_story_pk ON public.mv_cost_by_story USING btree (
 --
 
 CREATE UNIQUE INDEX mv_cost_by_task_pk ON public.mv_cost_by_task USING btree (row_num);
+
+
+--
+-- Name: mv_cost_by_thread_goal_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX mv_cost_by_thread_goal_idx ON public.mv_cost_by_thread USING btree (goal_id);
+
+
+--
+-- Name: mv_cost_by_thread_uidx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX mv_cost_by_thread_uidx ON public.mv_cost_by_thread USING btree (thread_id, role);
 
 
 --
@@ -6193,6 +10655,20 @@ CREATE UNIQUE INDEX mv_taximeter_human_activity_pk ON public.mv_taximeter_human_
 
 
 --
+-- Name: mv_taximeter_v2_key; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX mv_taximeter_v2_key ON public.mv_taximeter_v2 USING btree (uid, goal_id, metric_key, week_start);
+
+
+--
+-- Name: mv_taximeter_v2_week; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX mv_taximeter_v2_week ON public.mv_taximeter_v2 USING btree (week_start);
+
+
+--
 -- Name: mv_token_calls_priced_goal_id; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -6218,6 +10694,13 @@ CREATE UNIQUE INDEX mv_token_calls_priced_row_num ON public.mv_token_calls_price
 --
 
 CREATE INDEX mv_token_calls_priced_session_key ON public.mv_token_calls_priced USING btree (session_key);
+
+
+--
+-- Name: plan_versions_story_cycle; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX plan_versions_story_cycle ON public.plan_versions USING btree (story_id, cycle DESC) WHERE (kind = 'work'::text);
 
 
 --
@@ -6403,6 +10886,41 @@ CREATE INDEX skills_status_idx ON public.skills USING btree (status);
 
 
 --
+-- Name: stories_awaiting_merge; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX stories_awaiting_merge ON public.stories USING btree (updated_at) WHERE (state = 'awaiting_merge'::text);
+
+
+--
+-- Name: stories_git_node_id_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX stories_git_node_id_idx ON public.stories USING btree (git_node_id) WHERE (git_node_id IS NOT NULL);
+
+
+--
+-- Name: stories_knowledge_gin; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX stories_knowledge_gin ON public.stories USING gin (knowledge);
+
+
+--
+-- Name: stories_short_title_per_goal; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX stories_short_title_per_goal ON public.stories USING btree (goal_id, lower(short_title)) WHERE (short_title IS NOT NULL);
+
+
+--
+-- Name: stories_work_kind_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX stories_work_kind_idx ON public.stories USING btree (goal_id, work_kind) WHERE (work_kind IS NOT NULL);
+
+
+--
 -- Name: story_reviews_goal_idx; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -6414,6 +10932,20 @@ CREATE INDEX story_reviews_goal_idx ON public.story_reviews USING btree (goal_id
 --
 
 CREATE INDEX story_reviews_story_idx ON public.story_reviews USING btree (story_id, reviewed_at DESC);
+
+
+--
+-- Name: story_workspace_nodes_one_primary; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX story_workspace_nodes_one_primary ON public.story_workspace_nodes USING btree (story_id) WHERE is_primary;
+
+
+--
+-- Name: story_workspace_nodes_repo_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX story_workspace_nodes_repo_idx ON public.story_workspace_nodes USING btree (git_repo_id);
 
 
 --
@@ -6466,6 +10998,20 @@ CREATE INDEX token_calls_agent_time_idx ON public.token_calls USING btree (agent
 
 
 --
+-- Name: token_calls_dedupe_key_uidx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX token_calls_dedupe_key_uidx ON public.token_calls USING btree (dedupe_key) WHERE (dedupe_key IS NOT NULL);
+
+
+--
+-- Name: token_calls_execution_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX token_calls_execution_idx ON public.token_calls USING btree (execution_id) WHERE (execution_id IS NOT NULL);
+
+
+--
 -- Name: token_calls_goal_time_idx; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -6484,6 +11030,13 @@ CREATE INDEX token_calls_goal_upper_time_idx ON public.token_calls USING btree (
 --
 
 CREATE INDEX token_calls_model_time_idx ON public.token_calls USING btree (provider, model, recorded_at DESC);
+
+
+--
+-- Name: token_calls_role_time_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX token_calls_role_time_idx ON public.token_calls USING btree (role, recorded_at DESC) WHERE (role IS NOT NULL);
 
 
 --
@@ -6571,10 +11124,150 @@ CREATE UNIQUE INDEX uq_idempotency ON public.ledger_events USING btree (idempote
 
 
 --
+-- Name: uq_pcb_thread_live; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX uq_pcb_thread_live ON public.platform_channel_bindings USING btree (integration_id, thread_id) WHERE ((archived_at IS NULL) AND (thread_id IS NOT NULL));
+
+
+--
 -- Name: uq_platform_channel_bindings_goal_integration_channel; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE UNIQUE INDEX uq_platform_channel_bindings_goal_integration_channel ON public.platform_channel_bindings USING btree (goal_id, integration_id, external_channel_id);
+
+
+--
+-- Name: acceptances acceptances_no_edit; Type: TRIGGER; Schema: kernel; Owner: -
+--
+
+CREATE TRIGGER acceptances_no_edit BEFORE DELETE OR UPDATE ON kernel.acceptances FOR EACH ROW EXECUTE FUNCTION kernel.acceptances_are_append_only();
+
+
+--
+-- Name: criteria criteria_no_edit; Type: TRIGGER; Schema: kernel; Owner: -
+--
+
+CREATE TRIGGER criteria_no_edit BEFORE DELETE OR UPDATE ON kernel.criteria FOR EACH ROW EXECUTE FUNCTION kernel.criteria_are_append_only();
+
+
+--
+-- Name: criterion_results criterion_results_no_edit; Type: TRIGGER; Schema: kernel; Owner: -
+--
+
+CREATE TRIGGER criterion_results_no_edit BEFORE DELETE OR UPDATE ON kernel.criterion_results FOR EACH ROW EXECUTE FUNCTION kernel.results_are_append_only();
+
+
+--
+-- Name: env_deltas env_deltas_no_edit; Type: TRIGGER; Schema: kernel; Owner: -
+--
+
+CREATE TRIGGER env_deltas_no_edit BEFORE DELETE OR UPDATE ON kernel.env_deltas FOR EACH ROW EXECUTE FUNCTION kernel.env_deltas_are_append_only();
+
+
+--
+-- Name: executions execution_pending_notify; Type: TRIGGER; Schema: kernel; Owner: -
+--
+
+CREATE TRIGGER execution_pending_notify AFTER INSERT ON kernel.executions FOR EACH ROW EXECUTE FUNCTION kernel.notify_execution_pending();
+
+
+--
+-- Name: executions executions_log_transition; Type: TRIGGER; Schema: kernel; Owner: -
+--
+
+CREATE TRIGGER executions_log_transition AFTER INSERT OR UPDATE OF state ON kernel.executions FOR EACH ROW EXECUTE FUNCTION kernel.log_execution_transition();
+
+
+--
+-- Name: executions executions_notify_assistant; Type: TRIGGER; Schema: kernel; Owner: -
+--
+
+CREATE TRIGGER executions_notify_assistant AFTER UPDATE OF state ON kernel.executions FOR EACH ROW EXECUTE FUNCTION kernel.notify_assistant_state();
+
+
+--
+-- Name: executions executions_release_slot; Type: TRIGGER; Schema: kernel; Owner: -
+--
+
+CREATE TRIGGER executions_release_slot AFTER UPDATE OF state ON kernel.executions FOR EACH ROW EXECUTE FUNCTION kernel.release_admission_slot();
+
+
+--
+-- Name: executions generation_monotone; Type: TRIGGER; Schema: kernel; Owner: -
+--
+
+CREATE TRIGGER generation_monotone BEFORE UPDATE OF generation ON kernel.executions FOR EACH ROW EXECUTE FUNCTION kernel.check_generation_monotone();
+
+
+--
+-- Name: proposals proposals_reclaim_fence; Type: TRIGGER; Schema: kernel; Owner: -
+--
+
+CREATE TRIGGER proposals_reclaim_fence BEFORE INSERT ON kernel.proposals FOR EACH ROW EXECUTE FUNCTION kernel.proposals_reclaim_fence_fn();
+
+
+--
+-- Name: questions questions_notify_assistant; Type: TRIGGER; Schema: kernel; Owner: -
+--
+
+CREATE TRIGGER questions_notify_assistant AFTER INSERT ON kernel.questions FOR EACH ROW EXECUTE FUNCTION kernel.notify_assistant_card();
+
+
+--
+-- Name: run_state_machine state_machine_immutable; Type: TRIGGER; Schema: kernel; Owner: -
+--
+
+CREATE TRIGGER state_machine_immutable BEFORE DELETE OR UPDATE ON kernel.run_state_machine FOR EACH ROW EXECUTE FUNCTION kernel.reject_state_machine_mutation();
+
+
+--
+-- Name: step_journal step_journal_generation_fence; Type: TRIGGER; Schema: kernel; Owner: -
+--
+
+CREATE TRIGGER step_journal_generation_fence BEFORE INSERT ON kernel.step_journal FOR EACH ROW EXECUTE FUNCTION kernel.check_step_journal_generation();
+
+
+--
+-- Name: executions trg_go_story_done; Type: TRIGGER; Schema: kernel; Owner: -
+--
+
+CREATE TRIGGER trg_go_story_done AFTER UPDATE ON kernel.executions FOR EACH ROW EXECUTE FUNCTION kernel.notify_go_story_done();
+
+
+--
+-- Name: questions trg_leg_close_out_only; Type: TRIGGER; Schema: kernel; Owner: -
+--
+
+CREATE TRIGGER trg_leg_close_out_only BEFORE UPDATE ON kernel.questions FOR EACH ROW EXECUTE FUNCTION kernel.leg_answers_only_its_own_close_out();
+
+
+--
+-- Name: criterion_results trg_worker_selfcheck_only; Type: TRIGGER; Schema: kernel; Owner: -
+--
+
+CREATE TRIGGER trg_worker_selfcheck_only BEFORE INSERT ON kernel.criterion_results FOR EACH ROW EXECUTE FUNCTION kernel.worker_writes_selfcheck_only();
+
+
+--
+-- Name: verdicts verdicts_no_edit; Type: TRIGGER; Schema: kernel; Owner: -
+--
+
+CREATE TRIGGER verdicts_no_edit BEFORE DELETE OR UPDATE ON kernel.verdicts FOR EACH ROW EXECUTE FUNCTION kernel.verdicts_are_append_only();
+
+
+--
+-- Name: model_provider_registry model_provider_registry_notify_trg; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER model_provider_registry_notify_trg AFTER INSERT OR DELETE OR UPDATE ON public.model_provider_registry FOR EACH ROW EXECUTE FUNCTION public.model_registry_notify();
+
+
+--
+-- Name: model_registry model_registry_notify_trg; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER model_registry_notify_trg AFTER INSERT OR DELETE OR UPDATE ON public.model_registry FOR EACH ROW EXECUTE FUNCTION public.model_registry_notify();
 
 
 --
@@ -6589,6 +11282,20 @@ CREATE TRIGGER stories_notify_story_done AFTER UPDATE OF state ON public.stories
 --
 
 CREATE TRIGGER trg_activity_fts BEFORE INSERT OR UPDATE ON public.task_activity FOR EACH ROW EXECUTE FUNCTION public.update_activity_search_vector();
+
+
+--
+-- Name: git_nodes trg_go_node_event; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_go_node_event AFTER UPDATE ON public.git_nodes FOR EACH ROW EXECUTE FUNCTION public.notify_go_node_event();
+
+
+--
+-- Name: git_repo_trunks trg_go_trunk_advance; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_go_trunk_advance AFTER UPDATE ON public.git_repo_trunks FOR EACH ROW EXECUTE FUNCTION public.notify_go_trunk_advance();
 
 
 --
@@ -6620,10 +11327,281 @@ CREATE TRIGGER trg_no_update BEFORE UPDATE ON public.ledger_events FOR EACH ROW 
 
 
 --
+-- Name: stories trg_stories_stamp_completion; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_stories_stamp_completion BEFORE UPDATE ON public.stories FOR EACH ROW EXECUTE FUNCTION public.stories_stamp_completion();
+
+
+--
 -- Name: tasks trg_tasks_fts; Type: TRIGGER; Schema: public; Owner: -
 --
 
 CREATE TRIGGER trg_tasks_fts BEFORE INSERT OR UPDATE ON public.tasks FOR EACH ROW EXECUTE FUNCTION public.update_tasks_search_vector();
+
+
+--
+-- Name: acceptances acceptances_execution_id_fkey; Type: FK CONSTRAINT; Schema: kernel; Owner: -
+--
+
+ALTER TABLE ONLY kernel.acceptances
+    ADD CONSTRAINT acceptances_execution_id_fkey FOREIGN KEY (execution_id) REFERENCES kernel.executions(id) ON DELETE CASCADE;
+
+
+--
+-- Name: acceptances acceptances_verdict_id_fkey; Type: FK CONSTRAINT; Schema: kernel; Owner: -
+--
+
+ALTER TABLE ONLY kernel.acceptances
+    ADD CONSTRAINT acceptances_verdict_id_fkey FOREIGN KEY (verdict_id) REFERENCES kernel.verdicts(id);
+
+
+--
+-- Name: admission_slots admission_slots_bucket_fkey; Type: FK CONSTRAINT; Schema: kernel; Owner: -
+--
+
+ALTER TABLE ONLY kernel.admission_slots
+    ADD CONSTRAINT admission_slots_bucket_fkey FOREIGN KEY (goal_id, owner) REFERENCES kernel.admission_buckets(goal_id, owner);
+
+
+--
+-- Name: admission_slots admission_slots_execution_id_fkey; Type: FK CONSTRAINT; Schema: kernel; Owner: -
+--
+
+ALTER TABLE ONLY kernel.admission_slots
+    ADD CONSTRAINT admission_slots_execution_id_fkey FOREIGN KEY (execution_id) REFERENCES kernel.executions(id);
+
+
+--
+-- Name: answers answers_execution_id_fkey; Type: FK CONSTRAINT; Schema: kernel; Owner: -
+--
+
+ALTER TABLE ONLY kernel.answers
+    ADD CONSTRAINT answers_execution_id_fkey FOREIGN KEY (execution_id) REFERENCES kernel.executions(id);
+
+
+--
+-- Name: artifact_manifest artifact_manifest_execution_id_fkey; Type: FK CONSTRAINT; Schema: kernel; Owner: -
+--
+
+ALTER TABLE ONLY kernel.artifact_manifest
+    ADD CONSTRAINT artifact_manifest_execution_id_fkey FOREIGN KEY (execution_id) REFERENCES kernel.executions(id);
+
+
+--
+-- Name: artifact_manifest artifact_manifest_story_id_fkey; Type: FK CONSTRAINT; Schema: kernel; Owner: -
+--
+
+ALTER TABLE ONLY kernel.artifact_manifest
+    ADD CONSTRAINT artifact_manifest_story_id_fkey FOREIGN KEY (story_id) REFERENCES public.stories(id) ON DELETE CASCADE;
+
+
+--
+-- Name: assistant_requests assistant_requests_execution_id_fkey; Type: FK CONSTRAINT; Schema: kernel; Owner: -
+--
+
+ALTER TABLE ONLY kernel.assistant_requests
+    ADD CONSTRAINT assistant_requests_execution_id_fkey FOREIGN KEY (execution_id) REFERENCES kernel.executions(id) ON DELETE SET NULL;
+
+
+--
+-- Name: execution_checkpoints checkpoints_execution_id_fkey; Type: FK CONSTRAINT; Schema: kernel; Owner: -
+--
+
+ALTER TABLE ONLY kernel.execution_checkpoints
+    ADD CONSTRAINT checkpoints_execution_id_fkey FOREIGN KEY (execution_id) REFERENCES kernel.executions(id);
+
+
+--
+-- Name: contracts contracts_supersedes_fkey; Type: FK CONSTRAINT; Schema: kernel; Owner: -
+--
+
+ALTER TABLE ONLY kernel.contracts
+    ADD CONSTRAINT contracts_supersedes_fkey FOREIGN KEY (supersedes) REFERENCES kernel.contracts(id);
+
+
+--
+-- Name: criteria criteria_contract_id_fkey; Type: FK CONSTRAINT; Schema: kernel; Owner: -
+--
+
+ALTER TABLE ONLY kernel.criteria
+    ADD CONSTRAINT criteria_contract_id_fkey FOREIGN KEY (contract_id) REFERENCES kernel.contracts(id);
+
+
+--
+-- Name: criterion_baselines criterion_baselines_contract_id_fkey; Type: FK CONSTRAINT; Schema: kernel; Owner: -
+--
+
+ALTER TABLE ONLY kernel.criterion_baselines
+    ADD CONSTRAINT criterion_baselines_contract_id_fkey FOREIGN KEY (contract_id) REFERENCES kernel.contracts(id) ON DELETE CASCADE;
+
+
+--
+-- Name: criterion_baselines criterion_baselines_criterion_id_fkey; Type: FK CONSTRAINT; Schema: kernel; Owner: -
+--
+
+ALTER TABLE ONLY kernel.criterion_baselines
+    ADD CONSTRAINT criterion_baselines_criterion_id_fkey FOREIGN KEY (criterion_id) REFERENCES kernel.criteria(id) ON DELETE CASCADE;
+
+
+--
+-- Name: criterion_baselines criterion_baselines_execution_id_fkey; Type: FK CONSTRAINT; Schema: kernel; Owner: -
+--
+
+ALTER TABLE ONLY kernel.criterion_baselines
+    ADD CONSTRAINT criterion_baselines_execution_id_fkey FOREIGN KEY (execution_id) REFERENCES kernel.executions(id) ON DELETE SET NULL;
+
+
+--
+-- Name: criterion_results criterion_results_criterion_id_fkey; Type: FK CONSTRAINT; Schema: kernel; Owner: -
+--
+
+ALTER TABLE ONLY kernel.criterion_results
+    ADD CONSTRAINT criterion_results_criterion_id_fkey FOREIGN KEY (criterion_id) REFERENCES kernel.criteria(id);
+
+
+--
+-- Name: criterion_results criterion_results_execution_id_fkey; Type: FK CONSTRAINT; Schema: kernel; Owner: -
+--
+
+ALTER TABLE ONLY kernel.criterion_results
+    ADD CONSTRAINT criterion_results_execution_id_fkey FOREIGN KEY (execution_id) REFERENCES kernel.executions(id);
+
+
+--
+-- Name: directives directives_execution_id_fkey; Type: FK CONSTRAINT; Schema: kernel; Owner: -
+--
+
+ALTER TABLE ONLY kernel.directives
+    ADD CONSTRAINT directives_execution_id_fkey FOREIGN KEY (execution_id) REFERENCES kernel.executions(id);
+
+
+--
+-- Name: env_deltas env_deltas_execution_id_fkey; Type: FK CONSTRAINT; Schema: kernel; Owner: -
+--
+
+ALTER TABLE ONLY kernel.env_deltas
+    ADD CONSTRAINT env_deltas_execution_id_fkey FOREIGN KEY (execution_id) REFERENCES kernel.executions(id);
+
+
+--
+-- Name: execution_jobs execution_jobs_execution_id_fkey; Type: FK CONSTRAINT; Schema: kernel; Owner: -
+--
+
+ALTER TABLE ONLY kernel.execution_jobs
+    ADD CONSTRAINT execution_jobs_execution_id_fkey FOREIGN KEY (execution_id) REFERENCES kernel.executions(id) ON DELETE CASCADE;
+
+
+--
+-- Name: execution_leases execution_leases_execution_id_fkey; Type: FK CONSTRAINT; Schema: kernel; Owner: -
+--
+
+ALTER TABLE ONLY kernel.execution_leases
+    ADD CONSTRAINT execution_leases_execution_id_fkey FOREIGN KEY (execution_id) REFERENCES kernel.executions(id);
+
+
+--
+-- Name: execution_mounts execution_mounts_execution_id_fkey; Type: FK CONSTRAINT; Schema: kernel; Owner: -
+--
+
+ALTER TABLE ONLY kernel.execution_mounts
+    ADD CONSTRAINT execution_mounts_execution_id_fkey FOREIGN KEY (execution_id) REFERENCES kernel.executions(id) ON DELETE CASCADE;
+
+
+--
+-- Name: execution_transitions execution_transitions_execution_id_fkey; Type: FK CONSTRAINT; Schema: kernel; Owner: -
+--
+
+ALTER TABLE ONLY kernel.execution_transitions
+    ADD CONSTRAINT execution_transitions_execution_id_fkey FOREIGN KEY (execution_id) REFERENCES kernel.executions(id) ON DELETE CASCADE;
+
+
+--
+-- Name: executions executions_contract_id_fkey; Type: FK CONSTRAINT; Schema: kernel; Owner: -
+--
+
+ALTER TABLE ONLY kernel.executions
+    ADD CONSTRAINT executions_contract_id_fkey FOREIGN KEY (contract_id) REFERENCES kernel.contracts(id);
+
+
+--
+-- Name: executions executions_machine_version_fkey; Type: FK CONSTRAINT; Schema: kernel; Owner: -
+--
+
+ALTER TABLE ONLY kernel.executions
+    ADD CONSTRAINT executions_machine_version_fkey FOREIGN KEY (machine_version) REFERENCES kernel.run_state_machine(version);
+
+
+--
+-- Name: projections projections_execution_id_fkey; Type: FK CONSTRAINT; Schema: kernel; Owner: -
+--
+
+ALTER TABLE ONLY kernel.projections
+    ADD CONSTRAINT projections_execution_id_fkey FOREIGN KEY (execution_id) REFERENCES kernel.executions(id);
+
+
+--
+-- Name: proposals proposals_execution_id_fkey; Type: FK CONSTRAINT; Schema: kernel; Owner: -
+--
+
+ALTER TABLE ONLY kernel.proposals
+    ADD CONSTRAINT proposals_execution_id_fkey FOREIGN KEY (execution_id) REFERENCES kernel.executions(id);
+
+
+--
+-- Name: questions questions_execution_id_fkey; Type: FK CONSTRAINT; Schema: kernel; Owner: -
+--
+
+ALTER TABLE ONLY kernel.questions
+    ADD CONSTRAINT questions_execution_id_fkey FOREIGN KEY (execution_id) REFERENCES kernel.executions(id);
+
+
+--
+-- Name: reconcile_probes reconcile_probes_execution_id_fkey; Type: FK CONSTRAINT; Schema: kernel; Owner: -
+--
+
+ALTER TABLE ONLY kernel.reconcile_probes
+    ADD CONSTRAINT reconcile_probes_execution_id_fkey FOREIGN KEY (execution_id) REFERENCES kernel.executions(id);
+
+
+--
+-- Name: standing_answers standing_answers_execution_id_fkey; Type: FK CONSTRAINT; Schema: kernel; Owner: -
+--
+
+ALTER TABLE ONLY kernel.standing_answers
+    ADD CONSTRAINT standing_answers_execution_id_fkey FOREIGN KEY (execution_id) REFERENCES kernel.executions(id);
+
+
+--
+-- Name: step_journal step_journal_execution_id_fkey; Type: FK CONSTRAINT; Schema: kernel; Owner: -
+--
+
+ALTER TABLE ONLY kernel.step_journal
+    ADD CONSTRAINT step_journal_execution_id_fkey FOREIGN KEY (execution_id) REFERENCES kernel.executions(id);
+
+
+--
+-- Name: verdicts verdicts_execution_id_fkey; Type: FK CONSTRAINT; Schema: kernel; Owner: -
+--
+
+ALTER TABLE ONLY kernel.verdicts
+    ADD CONSTRAINT verdicts_execution_id_fkey FOREIGN KEY (execution_id) REFERENCES kernel.executions(id);
+
+
+--
+-- Name: verdicts verdicts_proposal_id_fkey; Type: FK CONSTRAINT; Schema: kernel; Owner: -
+--
+
+ALTER TABLE ONLY kernel.verdicts
+    ADD CONSTRAINT verdicts_proposal_id_fkey FOREIGN KEY (proposal_id) REFERENCES kernel.proposals(id);
+
+
+--
+-- Name: verification_state verification_state_execution_id_fkey; Type: FK CONSTRAINT; Schema: kernel; Owner: -
+--
+
+ALTER TABLE ONLY kernel.verification_state
+    ADD CONSTRAINT verification_state_execution_id_fkey FOREIGN KEY (execution_id) REFERENCES kernel.executions(id) ON DELETE CASCADE;
 
 
 --
@@ -6632,6 +11610,14 @@ CREATE TRIGGER trg_tasks_fts BEFORE INSERT OR UPDATE ON public.tasks FOR EACH RO
 
 ALTER TABLE ONLY public.agent_configs
     ADD CONSTRAINT agent_configs_agent_id_fkey FOREIGN KEY (agent_id) REFERENCES public.agents(id);
+
+
+--
+-- Name: agent_configs agent_configs_model_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.agent_configs
+    ADD CONSTRAINT agent_configs_model_id_fkey FOREIGN KEY (model_id) REFERENCES public.models(wire_id) ON DELETE SET NULL;
 
 
 --
@@ -6683,6 +11669,14 @@ ALTER TABLE ONLY public.agent_gateway_bindings
 
 
 --
+-- Name: agent_instances agent_instances_model_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.agent_instances
+    ADD CONSTRAINT agent_instances_model_id_fkey FOREIGN KEY (model_id) REFERENCES public.models(wire_id) ON DELETE SET NULL;
+
+
+--
 -- Name: agent_instances agent_instances_task_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -6704,6 +11698,14 @@ ALTER TABLE ONLY public.agent_instances
 
 ALTER TABLE ONLY public.agent_sync_log
     ADD CONSTRAINT agent_sync_log_agent_id_fkey FOREIGN KEY (agent_id) REFERENCES public.agents(id);
+
+
+--
+-- Name: agents agents_model_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.agents
+    ADD CONSTRAINT agents_model_id_fkey FOREIGN KEY (model_id) REFERENCES public.models(wire_id) ON DELETE SET NULL;
 
 
 --
@@ -6736,6 +11738,30 @@ ALTER TABLE ONLY public.chain_head
 
 ALTER TABLE ONLY public.checkpoints
     ADD CONSTRAINT checkpoints_story_id_fkey FOREIGN KEY (story_id) REFERENCES public.stories(id);
+
+
+--
+-- Name: claude_phases claude_phases_model_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.claude_phases
+    ADD CONSTRAINT claude_phases_model_id_fkey FOREIGN KEY (model_id) REFERENCES public.models(wire_id) ON DELETE SET NULL;
+
+
+--
+-- Name: council_finding_events council_finding_events_finding_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.council_finding_events
+    ADD CONSTRAINT council_finding_events_finding_id_fkey FOREIGN KEY (finding_id) REFERENCES public.council_findings(id) ON DELETE CASCADE;
+
+
+--
+-- Name: council_findings council_findings_goal_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.council_findings
+    ADD CONSTRAINT council_findings_goal_id_fkey FOREIGN KEY (goal_id) REFERENCES public.goals(id) ON DELETE CASCADE;
 
 
 --
@@ -6792,6 +11818,14 @@ ALTER TABLE ONLY public.git_merge_groups
 
 ALTER TABLE ONLY public.git_merge_queue
     ADD CONSTRAINT git_merge_queue_node_id_fkey FOREIGN KEY (node_id) REFERENCES public.git_nodes(id) ON DELETE CASCADE;
+
+
+--
+-- Name: git_node_landings git_node_landings_git_node_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.git_node_landings
+    ADD CONSTRAINT git_node_landings_git_node_id_fkey FOREIGN KEY (git_node_id) REFERENCES public.git_nodes(id) ON DELETE CASCADE;
 
 
 --
@@ -7003,11 +12037,75 @@ ALTER TABLE ONLY public.join_requests
 
 
 --
+-- Name: local_check_results local_check_results_story_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.local_check_results
+    ADD CONSTRAINT local_check_results_story_id_fkey FOREIGN KEY (story_id) REFERENCES public.stories(id) ON DELETE CASCADE;
+
+
+--
+-- Name: local_push_refusals local_push_refusals_story_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.local_push_refusals
+    ADD CONSTRAINT local_push_refusals_story_id_fkey FOREIGN KEY (story_id) REFERENCES public.stories(id) ON DELETE CASCADE;
+
+
+--
 -- Name: messages messages_thread_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.messages
     ADD CONSTRAINT messages_thread_id_fkey FOREIGN KEY (thread_id) REFERENCES public.threads(id);
+
+
+--
+-- Name: model_aliases model_aliases_model_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.model_aliases
+    ADD CONSTRAINT model_aliases_model_id_fkey FOREIGN KEY (model_id) REFERENCES public.models(wire_id) ON DELETE CASCADE;
+
+
+--
+-- Name: model_context_windows model_context_windows_model_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.model_context_windows
+    ADD CONSTRAINT model_context_windows_model_id_fkey FOREIGN KEY (model_id) REFERENCES public.models(id);
+
+
+--
+-- Name: model_pricing model_pricing_model_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.model_pricing
+    ADD CONSTRAINT model_pricing_model_id_fkey FOREIGN KEY (model_id) REFERENCES public.models(id);
+
+
+--
+-- Name: model_tags model_tags_model_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.model_tags
+    ADD CONSTRAINT model_tags_model_id_fkey FOREIGN KEY (model_id) REFERENCES public.models(id);
+
+
+--
+-- Name: model_tags model_tags_tag_name_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.model_tags
+    ADD CONSTRAINT model_tags_tag_name_fkey FOREIGN KEY (tag_name) REFERENCES public.tags(name);
+
+
+--
+-- Name: models models_provider_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.models
+    ADD CONSTRAINT models_provider_id_fkey FOREIGN KEY (provider_id) REFERENCES public.model_providers(id);
 
 
 --
@@ -7123,6 +12221,14 @@ ALTER TABLE ONLY public.resource_links
 
 
 --
+-- Name: resource_publishes resource_publishes_resource_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.resource_publishes
+    ADD CONSTRAINT resource_publishes_resource_id_fkey FOREIGN KEY (resource_id) REFERENCES public.goal_resources(id);
+
+
+--
 -- Name: resource_renders resource_renders_resource_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -7168,6 +12274,14 @@ ALTER TABLE ONLY public.security_review_stages
 
 ALTER TABLE ONLY public.shca_template_files
     ADD CONSTRAINT shca_template_files_template_id_fkey FOREIGN KEY (template_id) REFERENCES public.shca_templates(id);
+
+
+--
+-- Name: shca_templates shca_templates_model_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.shca_templates
+    ADD CONSTRAINT shca_templates_model_id_fkey FOREIGN KEY (model_id) REFERENCES public.models(wire_id) ON DELETE SET NULL;
 
 
 --
@@ -7259,11 +12373,27 @@ ALTER TABLE ONLY public.story_claude_execution_contexts
 
 
 --
+-- Name: story_repo_trunks story_repo_trunks_story_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.story_repo_trunks
+    ADD CONSTRAINT story_repo_trunks_story_id_fkey FOREIGN KEY (story_id) REFERENCES public.stories(id);
+
+
+--
 -- Name: story_resources story_resources_story_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.story_resources
     ADD CONSTRAINT story_resources_story_id_fkey FOREIGN KEY (story_id) REFERENCES public.stories(id);
+
+
+--
+-- Name: story_workspace_nodes story_workspace_nodes_story_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.story_workspace_nodes
+    ADD CONSTRAINT story_workspace_nodes_story_id_fkey FOREIGN KEY (story_id) REFERENCES public.stories(id) ON DELETE CASCADE;
 
 
 --
@@ -7368,6 +12498,14 @@ ALTER TABLE ONLY public.template_tool_profiles
 
 ALTER TABLE ONLY public.template_tool_profiles
     ADD CONSTRAINT template_tool_profiles_template_id_fkey FOREIGN KEY (template_id) REFERENCES public.templates(id) ON DELETE CASCADE;
+
+
+--
+-- Name: templates templates_model_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.templates
+    ADD CONSTRAINT templates_model_id_fkey FOREIGN KEY (model_id) REFERENCES public.models(wire_id) ON DELETE SET NULL;
 
 
 --

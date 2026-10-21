@@ -20,6 +20,7 @@ import time
 from contextlib import asynccontextmanager, nullcontext
 from typing import Callable, Optional
 
+from app import local_dev
 from app.database import get_pool
 from app.github_tokens import generate_installation_token
 
@@ -170,8 +171,20 @@ def _goal_resources_to_rows(goal_res_rows) -> list[dict]:
                 "access_level": "read-write",
                 "constraints": None,
                 "branch": gr.get("branch_name") or ("" if _gitgraph else gr.get("default_branch")) or "",
+                # WHERE THAT REF CAME FROM, which decides whether the
+                # lanes may overrule it. A `branch_name` is a GRANT --
+                # the engine's feature branch, the story's actual place
+                # to commit. Anything else is the `default_branch`
+                # fallback above, i.e. GitHub's `main`, which a goal
+                # with declared lanes must never be told to commit to.
+                "ref_is_fallback": not (gr.get("branch_name") or ""),
                 "repo_name": gr.get("repo_name") or "",
                 "repo_owner": gr.get("repo_owner") or "",
+                # A LANE IS NOT A WORKING REF, and the renderer has to be
+                # able to tell. Carried from `goal_resources.role`; empty
+                # on the story-scoped path, which never selects it and
+                # never renders a lane anyway.
+                "role": (gr.get("role") or ""),
                 "paths": [],
             })
         elif kind in ("document", "file"):
@@ -307,6 +320,8 @@ async def generate_resources_md(
     story_id: Optional[str] = None,
     documents: Optional[list[dict]] = None,
     repo_precloned: bool = False,
+    clones: Optional[list[dict]] = None,
+    no_checkout: bool = False,
 ) -> str:
     """
     Build the RESOURCES.md content for an agent in a goal.
@@ -317,6 +332,12 @@ async def generate_resources_md(
     A self-clone (into `repos/`) would be invisible to the commit/diff-review gate,
     which only reads `repo/`. `False` (IA / general SHCA): the agent self-clones
     into `repos/`.
+
+    `clones` (multi-repo, plan M6.7): the story's clone set from
+    `operator_provisioning._clone_descriptors`. With more than one entry the layout
+    guidance switches from the single `repo/` checkout to the per-repo
+    `repos/<owner>__<name>/` layout, and marks which repos are writable. Omitted or
+    single ⇒ the single-repo wording is emitted verbatim, unchanged.
 
     Scope precedence:
       - task_id → story_resources (inherited) ∪ task_resource_deps
@@ -410,17 +431,31 @@ async def generate_resources_md(
                         gr.id, gr.name, gr.kind, gr.uri,
                         gr.repo_owner, gr.repo_name, gr.branch_name,
                         gr.clone_url, gr.default_branch, gr.parent_id,
-                        gr.human_context, gr.metadata,
+                        gr.human_context, gr.metadata, gr.role,
                         sr.relation, sr.notes AS sr_notes
                    FROM story_resources sr
                    JOIN goal_resources gr ON gr.id = sr.resource_id
                   WHERE sr.story_id = $1 AND gr.status = 'active'
-                    -- NEVER surface the repo's TRUNK designation (role='trunk' branch
-                    -- resource) as a story working ref. It exists only so the engine
-                    -- knows the trunk; rendering it gives the assistant a writable `dev`
-                    -- and it commits straight to trunk (bypassing the branch/PR/merge
-                    -- model). The assistant works ONLY on its role='feature' branch.
-                    AND NOT (gr.kind = 'branch' AND gr.role = 'trunk')
+                    -- A TRUNK GRANT IS RENDERED, AS A LANE. It used to be
+                    -- excluded outright, for a reason that was real: as a
+                    -- working ref it reads "branch (mandatory): dev" and the
+                    -- assistant commits straight to trunk, bypassing
+                    -- branch/PR/merge. The exclusion was the wrong instrument.
+                    --
+                    -- WHAT IT COST, measured on KER20 story 7eca8fda: the
+                    -- story's ONLY grants are its two trunk lanes -- which is
+                    -- the normal shape, because `mounts.story_resources`
+                    -- resolves a lane grant to the story's own engine-cut
+                    -- branch and the engine therefore need not grant one --
+                    -- so the query excluded everything the story had and the
+                    -- file read, in full: "No resources have been assigned to
+                    -- this agent."
+                    --
+                    -- `role` is selected instead, and a trunk row renders as a
+                    -- `lane` block that says in as many words it is not a
+                    -- branch to check out and commit on. The hazard the
+                    -- exclusion guarded against lived in the WORDING, and the
+                    -- wording is what changed.
                   ORDER BY gr.id,
                            (COALESCE(sr.notes, '') <> '') DESC,
                            sr.relation
@@ -483,10 +518,16 @@ async def generate_resources_md(
             ]
             if new_resource_ids:
                 added = await pool.fetch(
+                    # `role` HERE TOO. A task-level addition of a
+                    # trunk-lane resource reaches the renderer through
+                    # this query and no other; without the column it
+                    # arrives with role='' and renders as
+                    # "branch (mandatory): cal_backend" -- the
+                    # commit-on-trunk hazard, by the one door left open.
                     """SELECT id, name, kind, uri,
                               repo_owner, repo_name, branch_name,
                               clone_url, default_branch, parent_id,
-                              human_context, metadata
+                              human_context, metadata, role
                          FROM goal_resources
                         WHERE id = ANY($1) AND status = 'active'""",
                     new_resource_ids,
@@ -551,14 +592,26 @@ async def generate_resources_md(
     else:
         # No task_id or story_id — goal-scoped (SHCA general mode, GO).
         # Read ALL resource kinds from goal_resources.
+        # LANES ARE INCLUDED HERE, and excluding them was the bug.
+        #
+        # The story-scoped path above drops `role='trunk'` rows for a
+        # real reason: a lane rendered as a working ref hands the
+        # assistant a writable trunk and it commits straight to it. This
+        # path is the GOAL's file -- the GO's own context -- and the GO
+        # checks nothing out, so there is no writable-ref hazard to
+        # guard against. Copying the guard here removed the lane as
+        # INFORMATION: a goal could carry `cal_backend` and
+        # `cal_frontend` and its own resource file mentioned neither,
+        # while the lane a story lands on is exactly the thing the GO
+        # has to choose and grant.
+        #
+        # `role` is carried through so the renderer can label a lane as
+        # a lane rather than as one more branch to work on.
         goal_res_rows = await pool.fetch(
             """SELECT id, name, kind, uri, repo_owner, repo_name, branch_name,
-                      clone_url, default_branch, human_context, metadata
+                      clone_url, default_branch, human_context, metadata, role
                FROM goal_resources
                WHERE goal_id = $1 AND status = 'active'
-                 -- Same trunk-designation guard as the story-scoped path: never render
-                 -- a role='trunk' branch as a writable working ref.
-                 AND NOT (kind = 'branch' AND role = 'trunk')
                ORDER BY kind, name""",
             goal_id,
         )
@@ -632,6 +685,8 @@ async def generate_resources_md(
     for d in documents or []:
         entries.append(_build_document_entry(d))
 
+    _attach_lanes(entries)
+
     if not entries:
         return "# Resources\n\nNo resources have been assigned to this agent.\n"
 
@@ -650,8 +705,26 @@ async def generate_resources_md(
         if shca_row:
             git_author = shca_row["name"]
 
-    has_repo = any(e["kind"] == "repo" for e in entries)
+    # A lane is a repository too, for everything below: the Git Setup block
+    # and the git rules. A goal whose only git rows are lanes would
+    # otherwise get a resource file with no git instructions in it.
+    has_repo = any(e["kind"] in ("repo", "lane") for e in entries)
     has_documents = any(e["kind"] == "doc" for e in entries)
+
+    # If the caller did not hand us the clone set, recover it from what provisioning
+    # actually cloned. This matters for the REFRESH paths: RESOURCES.md is regenerated
+    # whenever documents or grants change, and without this a multi-repo workspace
+    # would silently get the single-repo "the repo is at repo/" text written back over
+    # it — pointing the assistant at a directory that does not exist.
+    if repo_precloned and story_id and clones is None and not no_checkout:
+        # Non-strict: an un-migrated DB or a legacy story both mean "no recorded layout",
+        # and the single-repo wording is the correct document in both cases. `or None`
+        # keeps the existing contract — callers below branch on `clones is None`, so an
+        # empty list must collapse to None rather than render an empty repo table.
+        from app.services.story_workspace_layout import (  # noqa: PLC0415
+            resolve_workspace_clones,
+        )
+        clones = await resolve_workspace_clones(pool, story_id) or None
 
     # ── Assemble the document ──
     lines: list[str] = ["# Resources", ""]
@@ -671,10 +744,17 @@ async def generate_resources_md(
         lines.extend(_render_resource_block(e))
         lines.append("")
 
-    if has_repo and github_token:
-        lines.append(_git_setup_section(github_token, git_author, repo_precloned=repo_precloned))
+    # No checkout means nothing to authenticate — a Git Setup block here would
+    # hand credentials to a workspace with no repository to use them on.
+    if has_repo and github_token and not no_checkout:
+        lines.append(_git_setup_section(
+            github_token, git_author, repo_precloned=repo_precloned, clones=clones,
+        ))
 
-    lines.append(_rules_section(has_repo=has_repo, has_documents=has_documents, repo_precloned=repo_precloned))
+    lines.append(_rules_section(
+        has_repo=has_repo, has_documents=has_documents,
+        repo_precloned=repo_precloned, clones=clones, no_checkout=no_checkout,
+    ))
     return "\n".join(lines)
 
 
@@ -709,19 +789,38 @@ def _build_resource_entry(
         repo_name = r.get("repo_name") or ""
         address = f"{owner}/{repo_name}" if owner and repo_name else clone_url
         branch = r.get("branch") or ""
-        credential = "git credential helper pre-configured (token rotates ~50 min)" if github_token else "no github token provisioned"
+        # Under brokering nothing rotates and nothing is stored — saying the token
+        # "rotates ~50 min" would imply a refresh cycle that no longer runs (M5.4).
+        if _git_credential_brokering_active():
+            credential = "issued automatically per git operation (nothing stored)"
+        elif github_token:
+            credential = "git credential helper pre-configured (token rotates ~50 min)"
+        else:
+            credential = "no github token provisioned"
         denied = sorted(
             set(r.get("protected_branches") or [])
             | set((r.get("constraints") or {}).get("denied_branches", []))
         )
         if denied:
             detail_lines.append(f"- **denied branches (never push):** {', '.join(denied)}")
+        # A LANE IS NOT A WORKING REF, and rendering it as one is how the
+        # reader gets told to commit on trunk. `role='trunk'` means this
+        # branch is one of the goal's trunk LANES -- what a story is
+        # GRANTED and lands ON -- so it gets its own entry kind and says
+        # so. The story-scoped path never selects `role` (and excludes
+        # trunk rows outright), so it never produces one of these.
+        is_lane = (r.get("role") or "") == "trunk" and bool(branch)
         return {
-            "kind": "repo",
-            "name": name,
+            "kind": "lane" if is_lane else "repo",
+            # A lane row's display name is the REPO name (set in
+            # `_goal_resources_to_rows`), so a repo and its two lanes
+            # rendered as three blocks with one heading between them.
+            "name": f"{name} @ {branch}" if is_lane else name,
             "address": address,
             "access": access_level + default_flag,
-            "working_ref": branch,
+            "working_ref": "" if is_lane else branch,
+            "ref_is_fallback": bool(r.get("ref_is_fallback", True)),
+            "lane": branch if is_lane else "",
             "credential": credential,
             "go_note": note,
             "detail_lines": detail_lines,
@@ -845,13 +944,76 @@ def _format_bytes(n: int) -> str:
 
 # ── Rendering: summary table + detail blocks ─────────────────────────────────
 
+def _disambiguate_headings(entries: list[dict]) -> None:
+    """One heading per thing.
+
+    A story working both lanes of a repository holds two engine-cut
+    branches OF THAT REPOSITORY, and both rendered as
+    "## repo - multi_agent_dummy_repo" with contradictory
+    "branch (mandatory)" lines and nothing to tell them apart. The
+    display name is the repo's, by design -- `_goal_resources_to_rows`
+    strips the "repo:branch" form so the branch is stated once, on its
+    own line -- which is right until there are two of them.
+    """
+    by_address: dict = {}
+    for e in entries:
+        if (e.get("kind") == "repo" and e.get("working_ref")
+                and not e.get("ref_is_fallback", True)):
+            by_address.setdefault(e["address"], []).append(e)
+    for shared in by_address.values():
+        if len(shared) > 1:
+            for e in shared:
+                e["name"] = f"{e['name']} @ {e['working_ref']}"
+
+
+def _attach_lanes(entries: list[dict]) -> None:
+    """Tell each repo block which of this goal's trunk lanes it carries.
+
+    ONE REPOSITORY CAN CARRY SEVERAL TRUNK LANES IN ONE GOAL -- a backend
+    branch and a frontend branch of one app -- and the lane a story lands
+    on is the trunk resource it was granted. Without this the repo block
+    reads "branch (mandatory): none assigned. Stop and ask ... the GO":
+    addressed to the GO, in the GO's own file, about lanes the same file
+    was not showing it.
+
+    Matched on `address` (owner/name, else the clone URL), which the repo
+    row and its lane rows build identically.
+    """
+    lanes: dict[str, list[str]] = {}
+    for e in entries:
+        if e.get("kind") == "lane" and e.get("lane"):
+            lanes.setdefault(e["address"], []).append(e["lane"])
+    _disambiguate_headings(entries)
+    for e in entries:
+        if e.get("kind") != "repo":
+            continue
+        e["lanes"] = lanes.get(e["address"], [])
+        # AND THE REPO STOPS CLAIMING A BRANCH -- but ONLY where the
+        # branch it claims is the `default_branch` fallback. Observed
+        # rendering `branch (mandatory): main` on a goal whose two lanes
+        # are `cal_backend` and `cal_frontend`, suppressed only by the
+        # `gitgraph_enabled` flag; a flag is not what should decide
+        # whether a file tells its reader to commit to trunk.
+        #
+        # A GRANTED BRANCH IS NOT A FALLBACK, and clearing one is how
+        # the first version of this broke the story path: the entry for
+        # `feat/KER20-1cbc7b3e-cal_frontend` -- the engine-cut branch the
+        # story exists to commit to -- shares its address with the lane
+        # rows, so it was matched and its mandatory-branch line replaced
+        # by a list of lanes it must NOT commit to.
+        if e["lanes"] and e.get("ref_is_fallback", True):
+            e["working_ref"] = ""
+
+
 def _summary_table(entries: list[dict]) -> list[str]:
     """Build the summary table rows. One line per resource."""
     header = "| Type    | Name | Address | Access | Working ref |"
     divider = "|---------|------|---------|--------|-------------|"
     out = [header, divider]
     for e in entries:
-        ref = e.get("working_ref") or "—"
+        # A lane has no working ref by design; showing the lane name keeps
+        # the column readable, and the Type column already says which it is.
+        ref = e.get("working_ref") or e.get("lane") or "—"
         name = e["name"].replace("|", "\\|")
         addr = e["address"].replace("|", "\\|")
         access = e["access"].replace("|", "\\|")
@@ -864,7 +1026,9 @@ def _render_resource_block(e: dict) -> list[str]:
 
     Field order is fixed so the agent can rely on position when scanning:
       1. address  (labelled per-kind: "clone" / "location" / "uri")
-      2. branch (mandatory)  — repos only, if a working ref is assigned
+      2. branch (mandatory) — repos only, when a working ref is assigned;
+         a repo with declared trunk LANES lists those instead, because a
+         lane is granted per story and no branch belongs to the repo
       3. access
       4. credential
       5. any kind-specific detail bullets (size, denied branches, etc.)
@@ -873,10 +1037,31 @@ def _render_resource_block(e: dict) -> list[str]:
     kind = e["kind"]
     out = [f"## {kind} — {e['name']}"]
 
-    if kind == "repo":
+    if kind == "lane":
         out.append(f"- **clone:** {e.get('clone_url') or e['address']}")
+        out.append(
+            f"- **trunk lane:** `{e['lane']}` — a lane this goal works on in "
+            f"{e['address']}. Stories branch from it and land back on it, and "
+            f"a story lands on the lane it was GRANTED. Not a branch to check "
+            f"out and commit on."
+        )
+    elif kind == "repo":
+        out.append(f"- **clone:** {e.get('clone_url') or e['address']}")
+        # PLAIN PRECEDENCE, and the order is the whole point. A GRANTED
+        # branch is where this reader commits and outranks everything;
+        # `_attach_lanes` has already cleared a ref that was only the
+        # `default_branch` fallback, so reaching the lanes here means
+        # there genuinely is no branch of this reader's own.
         if e.get("working_ref"):
             out.append(f"- **branch (mandatory):** `{e['working_ref']}` — checkout and commit on this branch only. Never create a new branch or switch to another branch.")
+        elif e.get("lanes"):
+            out.append(
+                "- **trunk lanes:** "
+                + ", ".join(f"`{b}`" for b in e["lanes"])
+                + " — the lanes this goal works on in this repository. A story "
+                  "lands on the lane it is GRANTED, so there is no repo-wide "
+                  "branch to commit on; grant the lane instead."
+            )
         else:
             out.append("- **branch (mandatory):** none assigned. Stop and ask the human (via your assistant) or the GO to provision one — never create one yourself.")
     elif kind == "gcp_environment":
@@ -948,34 +1133,89 @@ def _render_resource_block(e: dict) -> list[str]:
     return out
 
 
-def _git_setup_section(github_token: str, author_name: str = "", repo_precloned: bool = False) -> str:
-    """Generate setup section with git credential helper embedded in RESOURCES.md.
+def _git_credential_brokering_active() -> bool:
+    """True when story workspaces get CP-brokered git credentials (plan M5).
 
-    The git author is set to the SHCA that initiated the task — all commits
-    from any agent in the pipeline are attributed to the project manager.
-
-    `repo_precloned=True` (operator/claude-code story workspaces): the repo is ALREADY
-    checked out at `repo/` by the control panel, so instruct the agent to work there and
-    NOT clone — a second checkout is invisible to the commit/diff-review gate (which only
-    reads `repo/`). `False` (IA / general SHCA): the agent self-clones into `repos/`.
+    Deliberately mirrors operator_provisioning._git_credential_broker_url()'s
+    conditions rather than importing it, to avoid a circular import — but the two must
+    change together: if this says "brokered" while provisioning installs the inline
+    helper, RESOURCES.md tells the agent there is no token when in fact there is one
+    (and vice versa, which is worse — the agent would look for a section that is gone).
     """
-    name = author_name or "agent"
-    # Sanitize for git config (no quotes, no special chars)
-    safe_name = name.replace('"', '').replace("'", "").strip()
-    email = safe_name.lower().replace(" ", "-").replace("'", "") + "@noreply.agents"
-    creds = f"""
-## Git Setup (run ONCE at start of session)
+    from app.config import get_settings as _get_settings
+    settings = _get_settings()
+    return bool(
+        settings.git_credential_broker_enabled
+        and (settings.control_panel_public_url or "").strip()
+    )
 
-Run these commands to configure git credentials and author identity:
 
-```bash
-git config --global credential.helper '!f() {{ echo "username=x-access-token"; echo "password={github_token}"; }}; f'
-git config --global user.name "{safe_name}"
-git config --global user.email "{email}"
-```
+def _repo_precloned_layout_section(clones: Optional[list[dict]] = None) -> str:
+    """Workspace-layout guidance for a pre-cloned (operator) story workspace.
+
+    Extracted so both credential modes emit identical layout rules — only the
+    credential wording differs between them.
+
+    Multi-repo (plan M6.7): with more than one clone the single-`repo/` wording is
+    replaced by a per-repo table. Getting this wrong is not cosmetic — an assistant
+    told "the repo is at repo/" in a workspace that has no `repo/` directory fails its
+    first git command, and one told a read-only context repo is writable will try to
+    push to a repo the story was never granted.
+    """
+    if clones:
+        write_dirs = [c["subdir"] for c in clones if c.get("is_write")]
+        rows = "\n".join(
+            f"| `{c['subdir']}/` | {c['repo_owner']}/{c['repo_name']} | `{c['branch_name']}` "
+            f"| {'**write** — commit here' if c.get('is_write') else 'read-only — never commit'} |"
+            for c in clones
+        )
+        primary = write_dirs[0] if write_dirs else clones[0]["subdir"]
+        # One shape for every RECORDED story, single-repo included — the layout no
+        # longer branches on repo count, so neither may the docs. Two sentences still
+        # vary, and both are DERIVED rather than assumed:
+        #   - the heading, because "spans 1 repositories" is nonsense; and
+        #   - the "no top-level `repo/`" claim, which is FALSE for a story recorded at
+        #     `repo/` before the layout became universal. Asserting it there would send
+        #     the assistant looking past a directory that does exist — the mirror of
+        #     the failure this function exists to prevent.
+        # A story with NO recorded clones is legacy and falls through to the block below.
+        _heading = (
+            "## Workspace layout"
+            if len(clones) == 1
+            else f"## Workspace layout — this story spans {len(clones)} repositories"
+        )
+        _no_top_level = (
+            "" if any(c["subdir"] == "repo" for c in clones)
+            else " There is **no top-level `repo/` directory**."
+        )
+        return f"""
+{_heading}
+
+Your working directory (`cwd`) is the **story workspace root**.{_no_top_level} Each
+repository is its own git checkout:
+
+| Directory | Repository | Branch | Access |
+|---|---|---|---|
+{rows}
+
+- `docs/` — workspace scratch (notes, decisions). NOT committed to git.
+- `RESOURCES.md`, `IDENTITY.md`, `CLAUDE.md` — read-only workspace files at the root.
+
+**Rules for multi-repo work:**
+
+- `cd` into a repository's directory before running git — each is a separate checkout
+  with its own branch and its own history.
+- Commit ONLY inside directories marked **write**. A read-only repository is cloned so
+  you can read its code for context; edits there are never reviewed and never land.
+- Plans and scope live in your primary write repo:
+  `{primary}/stories/<story_id>/plans/…` and `{primary}/stories/<story_id>/scope.md`.
+- ⚠️ **Do NOT `git clone`** — every repository you have access to is already checked
+  out above. A extra checkout is invisible to the commit/diff-review gate, so any work
+  in it is silently lost.
+- Each repository lands separately (its own pull request). Keep each repo's commits
+  self-consistent rather than assuming they merge together at one instant.
 """
-    if repo_precloned:
-        return creds + """
+    return """
 ## Workspace layout — work INSIDE `repo/`, never outside it
 
 Your working directory (`cwd`) is the **story workspace root**. It contains:
@@ -990,8 +1230,136 @@ Your working directory (`cwd`) is the **story workspace root**. It contains:
 ⚠️ **Do NOT `git clone`** — the repo is already at `repo/`. A second checkout (under
 `repos/`, `~/`, or anywhere else) is invisible to the commit/diff-review gate, which reads
 ONLY `repo/`, so any work outside `repo/` is silently lost. Keep every file you create or
-edit under `repo/`. These credentials are session-scoped; if git auth fails, re-read
-RESOURCES.md for a fresh token.
+edit under `repo/`.
+"""
+
+
+def _git_setup_section(
+    github_token: str, author_name: str = "", repo_precloned: bool = False,
+    clones: Optional[list[dict]] = None,
+) -> str:
+    """Generate setup section with git credential helper embedded in RESOURCES.md.
+
+    The git author is set to the SHCA that initiated the task — all commits
+    from any agent in the pipeline are attributed to the project manager.
+
+    `repo_precloned=True` (operator/claude-code story workspaces): the repo is ALREADY
+    checked out at `repo/` by the control panel, so instruct the agent to work there and
+    NOT clone — a second checkout is invisible to the commit/diff-review gate (which only
+    reads `repo/`). `False` (IA / general SHCA): the agent self-clones into `repos/`.
+
+    `--global` vs `--local`: in production each agent's Claude Code session runs in its
+    own isolated per-agent environment, so `--global` only ever touches that one
+    throwaway environment — harmless. The native local dev stack (local_dev.py,
+    LOCAL_SERVER=true) runs Claude Code as a real subprocess directly on the
+    developer's own machine with NO isolation; a `--global` git config or credential
+    helper written there overwrites the *developer's own* real git identity and
+    installs a helper that leaks this story's short-lived GitHub token into every git
+    operation on their machine, including their own unrelated pushes/pulls. Discovered
+    live: it happened. `--local` scopes both to just the repo the agent is working in,
+    which is exactly as effective for the story's own commits/pushes and never touches
+    anything outside it.
+    """
+    name = author_name or "agent"
+    # Sanitize for git config (no quotes, no special chars)
+    safe_name = name.replace('"', '').replace("'", "").strip()
+    email = safe_name.lower().replace(" ", "-").replace("'", "") + "@noreply.agents"
+
+    if repo_precloned:
+        # BROKERED CREDENTIALS (plan M5.4). When the control panel installs callback
+        # credential helpers, the gateway has ALREADY configured every clone at
+        # provisioning time — there is no token to read and nothing for the agent to
+        # run. Telling it to "run the Git Setup commands" would send it after a
+        # section that no longer exists, and re-running them would overwrite the
+        # working helper with a dead inline token. This must stay in lockstep with
+        # _git_credential_broker_url() in operator_provisioning.
+        if _git_credential_brokering_active():
+            return """
+## Git Setup — nothing to do
+
+Git is **already authenticated** in every repo in this workspace. Credentials are
+fetched automatically, per operation, by a helper the control panel installed at
+provisioning time.
+
+- Just run `git` normally (`git add`, `git commit`, `git push`) inside a repo dir.
+- There is **no token** in this file and none to refresh.
+- Do **NOT** run `git config credential.helper` — it would replace the working
+  helper and break authentication for the rest of the story.
+- If a git command ever fails with an auth error, report it; do not try to fix
+  credentials yourself.
+""" + _repo_precloned_layout_section(clones)
+
+        if local_dev.is_local_server():
+            # repo/ already exists at this point -- target it explicitly with -C
+            # rather than --global, since cwd here is the workspace root, not repo/.
+            creds = f"""
+## Git Setup (run ONCE at start of session)
+
+Run these commands to configure git credentials and author identity — scoped to
+`repo/` only (local dev: no machine-wide git config):
+
+```bash
+git -C repo config --local credential.helper '!f() {{ echo "username=x-access-token"; echo "password={github_token}"; }}; f'
+git -C repo config --local user.name "{safe_name}"
+git -C repo config --local user.email "{email}"
+```
+"""
+        else:
+            creds = f"""
+## Git Setup (run ONCE at start of session)
+
+Run these commands to configure git credentials and author identity:
+
+```bash
+git config --global credential.helper '!f() {{ echo "username=x-access-token"; echo "password={github_token}"; }}; f'
+git config --global user.name "{safe_name}"
+git config --global user.email "{email}"
+```
+"""
+        # Inline-token mode only: the embedded token expires, so the agent needs the
+        # re-read instruction. Under brokering there is nothing to re-read, which is
+        # why this sentence lives here and not in the shared layout section.
+        return creds + _repo_precloned_layout_section(clones) + (
+            "\nThese credentials are session-scoped; if git auth fails, re-read "
+            "RESOURCES.md for a fresh token.\n"
+        )
+    if local_dev.is_local_server():
+        # No repo exists yet at session start (unlike repo_precloned), so there is
+        # nothing to -C into until after the first clone -- credential setup moves
+        # from "once at start" to "once per repo, right after cloning it".
+        return f"""
+## Git Setup
+
+Clone repos into the `repos/` directory in your workspace, then configure git
+credentials and author identity — scoped to that repo only (local dev: no
+machine-wide git config):
+
+```bash
+mkdir -p repos
+# For each repo, check if already cloned before cloning again:
+# [ -d repos/<name> ] || git clone <uri> repos/<name>
+git -C repos/<name> config --local credential.helper '!f() {{ echo "username=x-access-token"; echo "password={github_token}"; }}; f'
+git -C repos/<name> config --local user.name "{safe_name}"
+git -C repos/<name> config --local user.email "{email}"
+# If already cloned, re-apply the commands above (credentials are session-scoped) and pull:
+# git -C repos/<name> pull
+```
+
+**Important:** Always clone into `repos/` (workspace-relative), NOT `~/repos/`.
+Re-run the config commands above for EVERY repo you clone — each is scoped
+independently. These credentials are session-scoped. If git auth fails,
+re-read RESOURCES.md for refreshed credentials.
+"""
+    creds = f"""
+## Git Setup (run ONCE at start of session)
+
+Run these commands to configure git credentials and author identity:
+
+```bash
+git config --global credential.helper '!f() {{ echo "username=x-access-token"; echo "password={github_token}"; }}; f'
+git config --global user.name "{safe_name}"
+git config --global user.email "{email}"
+```
 """
     return creds + """
 Then clone repos into the `repos/` directory in your workspace:
@@ -1009,22 +1377,97 @@ These credentials are session-scoped. If git auth fails, re-read RESOURCES.md fo
 """
 
 
-def _rules_section(has_repo: bool = False, has_documents: bool = False, repo_precloned: bool = False) -> str:
+def _rules_section(
+    has_repo: bool = False, has_documents: bool = False, repo_precloned: bool = False,
+    clones: Optional[list[dict]] = None, no_checkout: bool = False,
+) -> str:
     """Generate the rules section based on what resource types are present."""
     rules = ["", "## Rules", ""]
+    # Must agree with _git_setup_section — the rules and the section they reference
+    # have to describe the same credential mode.
+    _brokered = _git_credential_brokering_active()
 
-    if has_repo:
-        if repo_precloned:
+    if has_repo and no_checkout:
+        # Stage K. A kernel assistant's workspace has no checkout in it and is
+        # not supposed to acquire one: the executor holds the tree. Every rule
+        # below this point tells the reader either to `cd` into a clone or to
+        # make one, and both are wrong here — the first names a directory that
+        # does not exist, the second creates the stale second copy the whole
+        # change exists to remove.
+        rules.append(
+            "- The repositories above are granted to this STORY, not checked out "
+            "here. There is no clone in this workspace and there must not be one."
+        )
+        rules.append(
+            "- Read the code with the `workspace` tool: it reads the executor's "
+            "tree, which is the one actually being changed. A copy here would "
+            "stop being true at the executor's first commit."
+        )
+        rules.append(
+            "- Do NOT run `git` and do NOT `git clone`. The executor commits; "
+            "you read, decide, and answer."
+        )
+    elif has_repo:
+        # Clone-driven, not count-driven: a single-repo story is checked out under
+        # `repos/<owner>__<name>/` like every other, so telling it to work in `repo/`
+        # would name a directory that does not exist. The `elif` below now serves ONLY
+        # legacy workspaces (no recorded clones), which really are at `repo/`.
+        if repo_precloned and clones:
+            _write_dirs = [c["subdir"] for c in clones if c.get("is_write")]
+            _read_dirs = [c["subdir"] for c in clones if not c.get("is_write")]
+            rules.append(
+                "- Your `cwd` is the story workspace root; "
+                + (
+                    f"this story spans {len(clones)} repositories, each already "
+                    "checked out in its own directory"
+                    if len(clones) > 1 else
+                    "this story's repository is already checked out in its own directory"
+                )
+                + " (see Workspace layout)."
+                # Only true when nothing is recorded at the legacy root.
+                + ("" if any(c["subdir"] == "repo" for c in clones)
+                   else " There is NO top-level `repo/`.")
+            )
+            rules.append(
+                "- Commit ONLY inside: "
+                + ", ".join(f"`{d}/`" for d in _write_dirs)
+                + (
+                    ". Read-only (never commit): "
+                    + ", ".join(f"`{d}/`" for d in _read_dirs)
+                    if _read_dirs else "."
+                )
+            )
+            rules.append("- `cd` into a repository before running git — each is a separate checkout with its own branch.")
+            rules.append("- Do NOT `git clone` — every repo you have access to is already checked out. An extra checkout is invisible to the review gate.")
+            # Same credential wording as the single-repo branch — see M5.4.
+            if _brokered:
+                rules.append("- Git is already authenticated in every repo — just run `git`. Do NOT run `git config credential.helper`; it would break authentication.")
+            else:
+                rules.append("- Run the **Git Setup** commands ONCE (they configure the credential helper + author identity used when you commit).")
+            rules.append("- Each repository is already on its correct branch. Stay on it for all commits — do NOT run `git checkout -b`, do NOT switch branches. If you need a different branch, ask the GO via your assistant — the GO owns branch creation.")
+            rules.append("- Each repository lands as its own pull request, merged independently. Keep every repo's commits self-consistent — do not assume they all land at the same moment.")
+        elif repo_precloned:
             rules.append("- Your `cwd` is the story workspace root; the repo is **already checked out at `repo/`** under it. Keep EVERY file you create or edit (source, plans, scope) under `repo/` — the commit/diff-review gate reads only `repo/`, so anything outside it is silently lost.")
             rules.append("- Do NOT `git clone` — the repo is already there. A second checkout (under `repos/`, `~/`, anywhere) is invisible to the review gate.")
-            rules.append("- Run the **Git Setup** commands ONCE (they configure the credential helper + author identity used when you commit).")
+            # Under brokered credentials there is no Git Setup step to run — the
+            # helper is installed at provisioning time and re-running any git config
+            # would replace it with a dead one (plan M5.4).
+            if _brokered:
+                rules.append("- Git is already authenticated in every repo — just run `git`. Do NOT run `git config credential.helper`; it would break authentication.")
+            else:
+                rules.append("- Run the **Git Setup** commands ONCE (they configure the credential helper + author identity used when you commit).")
             rules.append("- You are already on the correct branch (`branch (mandatory)`). Stay on it for all commits — do NOT run `git checkout -b`, do NOT switch branches. If you need a different branch, ask the GO via your assistant — the GO owns branch creation.")
         else:
             rules.append("- Run the **Git Setup** commands ONCE before cloning.")
             rules.append("- Clone each repo into `repos/<repo-name>/` (workspace-relative, never `~/repos/`). If it's already cloned, `git -C repos/<repo-name> pull` instead of re-cloning.")
             rules.append("- **Follow the `branch (mandatory)` field for each repo.** Checkout that branch immediately after cloning and stay on it for all commits. Do NOT run `git checkout -b`, do NOT switch to any other branch. If you need a different branch, ask the GO via your assistant — the GO owns branch creation.")
         rules.append("- Never push to `main`, `master`, `production`, or any branch listed under `denied branches`.")
-        rules.append("- If git auth fails, credentials rotated — re-read RESOURCES.md for the fresh token and re-run the Git Setup commands.")
+        if _brokered and repo_precloned:
+            # There is no token in RESOURCES.md to re-read and no setup to re-run;
+            # an auth failure here is a real fault, not a rotation the agent can fix.
+            rules.append("- If git auth fails, report it — do NOT try to fix credentials yourself. There is no token in RESOURCES.md and no Git Setup to re-run.")
+        else:
+            rules.append("- If git auth fails, credentials rotated — re-read RESOURCES.md for the fresh token and re-run the Git Setup commands.")
         rules.append("- Commit frequently with clear messages.")
 
     if has_documents:

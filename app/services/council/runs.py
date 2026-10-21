@@ -7,6 +7,7 @@ from uuid import uuid4
 import asyncpg
 
 from app.database import get_pool
+from app.models.story import is_engine_git_story
 
 log = logging.getLogger(__name__)
 
@@ -103,6 +104,7 @@ async def enqueue_run(
 
     gh_id = uuid4().hex
     pr_id = uuid4().hex
+    story_id_stage = uuid4().hex
     conv_id = uuid4().hex
     await pool.execute(
         "INSERT INTO council_review_stages (id, run_id, goal_id, stage, status, depends_on) "
@@ -115,23 +117,24 @@ async def enqueue_run(
         pr_id, run_id, goal_id,
     )
 
-    # Interim story reviews are part of the goal run (NOT separate runs), so the
-    # convener can synthesize them. Snapshot the eligible in_progress/blocked
-    # stories at trigger time — one 'story' stage each. The dispatcher runs these
-    # before the convener; the convener depends on them.
-    eligible = await pool.fetch(
-        "SELECT id, state FROM stories "
-        "WHERE goal_id = $1 AND state IN ('in_progress', 'blocked') "
-        "AND last_reviewed_state IS DISTINCT FROM state",
-        goal_id,
+    # ONE story stage per run, with story_id NULL — not one per story.
+    #
+    # The per-story fan-out this replaces created N gateway agents for an
+    # N-story goal, and each of them read a gateway workspace through
+    # `shca_instance_id` to do it. Pod-executed stories have no such
+    # workspace, so those reviewers judged against empty documents. The
+    # single stage reads `stories` and `story_reviews` instead, which
+    # outlive every substrate change, and costs one agent whatever the
+    # goal's size.
+    #
+    # NULL story_id is safe against `council_stages_unique`: it indexes
+    # COALESCE(story_id, ''), so this is a singleton per run exactly the
+    # way goal_health and convener are.
+    await pool.execute(
+        "INSERT INTO council_review_stages (id, run_id, goal_id, stage, status, depends_on) "
+        "VALUES ($1, $2, $3, 'story', 'pending', '{}')",
+        story_id_stage, run_id, goal_id,
     )
-    for s in eligible:
-        await pool.execute(
-            "INSERT INTO council_review_stages "
-            "(id, run_id, goal_id, stage, story_id, reviewed_state, status, depends_on) "
-            "VALUES ($1, $2, $3, 'story', $4, $5, 'pending', '{}')",
-            uuid4().hex, run_id, goal_id, s["id"], s["state"],
-        )
 
     await pool.execute(
         "INSERT INTO council_review_stages (id, run_id, goal_id, stage, status, depends_on) "
@@ -139,8 +142,7 @@ async def enqueue_run(
         conv_id, run_id, goal_id,
     )
     await _wake_dispatcher(pool)
-    log.info("council: enqueued run=%s goal=%s (%d interim story stage(s))",
-             run_id, goal_id, len(eligible))
+    log.info("council: enqueued run=%s goal=%s (4 stages)", run_id, goal_id)
     return {"created": True, "run_id": run_id, "status": "pending"}
 
 
@@ -173,8 +175,25 @@ async def enqueue_story_review(
         "SELECT created_by, story_kind, merge_group_id FROM stories WHERE id = $1",
         story_id,
     )
-    if meta and (meta["created_by"] == "engine" or meta["story_kind"] == "merge"
-                 or meta["merge_group_id"] is not None):
+    # THE FINAL REVIEW RUNS IN THE POD NOW, so the council must not also
+    # queue one. Two reviewers would produce two rows upserting over each
+    # other on (story_id, reviewed_state) -- the last writer winning, at
+    # random, between a reviewer that read the workspace and one that
+    # read a bundle rebuilt from the database.
+    #
+    # ONLY THE FINAL REVIEW. Interim reviews of an `in_progress` or
+    # `blocked` story are a different thing: the goal council produces
+    # them and the convener consumes them, and nothing about this change
+    # touches that.
+    from kernel.worker.finish import in_pod_review_enabled
+
+    if reviewed_state == "done" and in_pod_review_enabled():
+        return {"created": False, "run_id": None,
+                "reason": "the final story review runs in the execution "
+                          "pod; the council no longer queues one"}
+
+    if meta and is_engine_git_story(meta):
+        log.info("council: story=%s is an engine git story — skipping review", story_id)
         return {"created": False, "run_id": None,
                 "reason": "engine-authored git story — not council-reviewed"}
 
@@ -226,27 +245,53 @@ async def enqueue_story_review(
     return {"created": True, "run_id": run_id, "status": "pending"}
 
 
-async def enqueue_eligible_story_reviews(goal_id: str) -> int:
-    """Interim story reviews via the goal review: enqueue a review for every
-    in_progress/blocked story whose CURRENT state hasn't been reviewed yet.
+async def force_run(goal_id: str, created_by: str | None = None) -> dict:
+    """Start a council review of this goal NOW, clearing whatever is in the way.
 
-    Eligibility = state IN (in_progress, blocked) AND last_reviewed_state IS
-    DISTINCT FROM state. The (story,state) dedup in enqueue_story_review prevents
-    duplicate in-flight runs, and last_reviewed_state stops re-reviewing a story
-    that hasn't moved since its last interim review. Returns the count enqueued.
+    FOR TESTING, AND NARROWLY. Two separate things stop an ordinary
+    `enqueue_run`, and both are correct in production:
+
+      * `council_runs_active_per_goal` — one active run per goal, so a
+        second click does not duplicate work.
+      * `council_runs_single_running` — one running run across ALL goals,
+        so the council never contends with itself for the gateway.
+
+    The second is what makes "review this goal now" unusable for testing:
+    a run wedged on some OTHER goal blocks the one you actually want, and
+    from the caller's side it looks like the trigger is broken.
+
+    So this cancels the goal's own active run and any run holding the
+    global slot, then enqueues. CANCELS, NOT DELETES: the rows stay, their
+    status becomes 'failed' with a reason naming who did it, and the
+    findings those runs recorded stay in the ledger where the next run
+    will pick them up as already-open. A forced run is a visible event in
+    the history, not a gap in it.
     """
     pool = get_pool()
-    rows = await pool.fetch(
-        "SELECT id, state FROM stories "
-        "WHERE goal_id = $1 AND state IN ('in_progress', 'blocked') "
-        "AND last_reviewed_state IS DISTINCT FROM state",
+
+    cancelled = await pool.execute(
+        "UPDATE council_review_runs SET status = 'failed', finished_at = NOW() "
+        "WHERE status IN ('pending', 'running') AND (goal_id = $1 OR status = 'running')",
         goal_id,
     )
-    n = 0
-    for r in rows:
-        res = await enqueue_story_review(goal_id, r["id"], r["state"], trigger="goal_review")
-        if res.get("created"):
-            n += 1
+    n = int((cancelled or "UPDATE 0").rsplit(" ", 1)[-1] or 0)
+
+    # Stages of a cancelled run would otherwise sit 'running' for ever and
+    # keep their gateway reviewers alive; the deadline sweep would collect
+    # them eventually, but a forced run should not leave that behind.
+    await pool.execute(
+        "UPDATE council_review_stages SET status = 'failed', "
+        "error = COALESCE(NULLIF(error, ''), 'superseded by a forced run'), "
+        "finished_at = NOW() "
+        "WHERE status NOT IN ('done', 'failed') "
+        "AND run_id IN (SELECT id FROM council_review_runs "
+        "                WHERE status = 'failed' AND finished_at > NOW() - interval '5 seconds')",
+    )
+
     if n:
-        log.info("council: enqueued %d interim story review(s) for goal=%s", n, goal_id)
-    return n
+        log.warning("council: force_run on %s cancelled %d in-flight run(s) "
+                    "(requested by %s)", goal_id, n, created_by or "unknown")
+
+    result = await enqueue_run(goal_id, created_by=created_by, trigger="manual")
+    result["cancelled_runs"] = n
+    return result

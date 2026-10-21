@@ -13,6 +13,7 @@ import logging
 import uuid
 from typing import Optional
 
+from app import local_dev
 from app.agent_types import ASSISTANT, to_db_agent_type
 from app.database import get_pool
 from app.ledger.journal import append_event, generate_event_id
@@ -666,7 +667,7 @@ async def configure_user_assistant(
                 agent_id=agent_id,
                 display_name=display_name,
                 gateway_agent_id=agent_id,
-                workspace=f"~/.openclaw/workspace-{agent_id}",
+                workspace=local_dev.agent_workspace_path(agent_id),
                 model=chosen_model,
                 agent_type=_DB_AGENT_TYPE,  # DB constant, see agent_types.py
                 scope="goal",
@@ -733,6 +734,24 @@ async def configure_user_assistant(
 # eliminated the cross-user hazard of writing user files to a shared template.
 
 
+# ── which template a new assistant is built from ─────────────────────
+#
+# Was "default-shca" inline: 24 tools including `exec` and `custom_git`
+# with push, and sixteen skills of which twelve were deprecated. That is
+# the assistant the kernel refactor replaces -- it does real work
+# directly, which is the one thing the new one must not do.
+#
+# NAMED, not inline, because it is the only line that decides what every
+# user gets and it was previously invisible to anyone grepping for the
+# template they were actually running.
+#
+# Switching it does NOT migrate anybody. get_user_assistant_agent_id
+# returns the OLDEST ACTIVE assistant, so a user who already has one
+# keeps it and never sees this. Retiring the old row is a separate,
+# deliberate act.
+DEFAULT_ASSISTANT_TEMPLATE = "kernel-assistant"
+
+
 async def ensure_user_assistant(
     user_uid: str,
     user_actor_id: uuid.UUID,
@@ -753,11 +772,12 @@ async def ensure_user_assistant(
     if existing_id:
         return {"agent_id": existing_id, "created": False}
 
-    # Auto-create from default template
-    template_id = "default-shca"
+    # Auto-create from the default template.
+    template_id = DEFAULT_ASSISTANT_TEMPLATE
     template = await get_assistant_template(template_id)
     if not template:
-        _log.warning("ASSISTANT_PROVISION: default-shca template not found — skipping auto-create for %s", user_uid)
+        _log.warning("ASSISTANT_PROVISION: %s template not found — skipping "
+                     "auto-create for %s", template_id, user_uid)
         return {"agent_id": "", "created": False}
 
     # Generate agent ID from display name

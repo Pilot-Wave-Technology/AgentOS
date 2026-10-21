@@ -3,7 +3,7 @@
   "type": "RA",
   "name": "Progress Reviewer",
   "description": "Reports movement since the last review: created/completed stories, blocked (with duration), stalled work, and pace.",
-  "model": "google-flash-200k/gemini-2.5-flash-200k",
+  "model": "google-flash38-1m/gemini-3.8-flash-1m",
   "emoji": "📈",
   "tools_allow": [
     "read",

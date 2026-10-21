@@ -120,7 +120,10 @@ async def handle_pre_integration_gate(gate: dict, pool) -> None:
     # Call the gateway workspace.mergePreview RPC.
     # This RPC runs on the OpenClaw VM in the story's existing workspace (the same
     # shared workspace all claude-code-phase tasks use — coder already cloned the repo).
-    preview = await _call_merge_preview_rpc(session_key, source_branch, target_branch, github_token, repo_url)
+    preview = await _call_merge_preview_rpc(
+        session_key, source_branch, target_branch, github_token, repo_url,
+        story_id=story_id,
+    )
 
     if preview is None:
         _log.error("pre_integration: mergePreview RPC failed for gate %s — failing gate", task_id)
@@ -351,6 +354,7 @@ async def _call_merge_preview_rpc(
     target_branch: str,
     github_token: str | None = None,
     repo_url: str = "",
+    story_id: str = "",
 ) -> dict | None:
     """Call the OpenClaw workspace.mergePreview admin RPC.
 
@@ -361,6 +365,13 @@ async def _call_merge_preview_rpc(
 
     github_token authenticates the fetch (Claude session credential helper is only
     active during agent turns, not during server-side RPC execution).
+
+    `story_id` MUST be a parameter: it is sent in the RPC params below, and was
+    previously read from the caller's scope where it does not exist — a NameError
+    raised while BUILDING the params, swallowed by the `except Exception` at the
+    bottom, which then logged "RPC failed" for an RPC that was never issued. The
+    caller treats a None return as a hard gate failure, so every pre-integration
+    merge gate failed. Keep it explicit.
     """
     try:
         from app.openclaw import gateway_admin  # noqa: PLC0415

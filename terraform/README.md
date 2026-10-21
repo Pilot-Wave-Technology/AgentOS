@@ -1,13 +1,18 @@
 # AgentOS control plane — Terraform (Stage ②)
 
 This stack is **Stage ②** of the deploy. It provisions the control-plane plumbing
-in your GCP project: APIs, the Serverless VPC connector (on the gateway's VPC),
-buckets, and the Cloud Run service(s) + task-runner job.
+in your GCP project: APIs, Cloud SQL (instance, `control_panel` database,
+`app_user`/`migrate_user` and their DSN secrets), the image registry, the
+Serverless VPC connector (on the gateway's VPC), buckets, the Cloud Run
+service(s) + task-runner job, and the GKE cluster every executor runs on, with
+its node pools, identities, the pods' login password and every grant the
+conductor needs. **One apply sets up the database and the cluster
+together.**
 
-It does **not** create service accounts, secrets, or the database — those are
-made **first** by `../prerequisites.sh` (see below). Terraform only **reads** the
-Cloud SQL instance (data source) and **references** the secrets/SAs that already
-exist.
+It does **not** create service accounts or the non-database secrets — those are
+made **first** by `../prerequisites.sh` (see below) and only referenced here.
+It does not apply in-database GRANTS either: they need a connection, and the
+build's migrate step applies them (migration 0003).
 
 > Full, step-by-step walkthrough: **[`../deploy/README.md`](../deploy/README.md)**.
 > This file is the terraform-specific reference.
@@ -26,29 +31,30 @@ terraform.tfvars.example the file you copy + edit
 locals.tf               derives names, the env-var map, the secret references
 main.tf                 enables APIs, wires the modules
 outputs.tf              service URL, SA, DB conn, next steps
+adopt-existing.sh       imports a database/registry made outside terraform
+                        (an interrupted apply, or an older prerequisites.sh)
 modules/
   network/              Serverless VPC connector (attaches to the gateway's VPC)
-  database/             READS the existing Cloud SQL instance via a data source
-                        (the instance + control_panel db + app/migrate users +
-                        DSN secrets are created by prerequisites.sh, not here)
+  database/             Cloud SQL instance + control_panel db + app/migrate
+                        logins + the three DSN secrets
   storage/              resource bucket (archive bucket comes from the gateway)
-  secrets/              no-op placeholder (all secrets are created by prerequisites.sh)
+  secrets/              no-op placeholder (non-DB secrets come from prerequisites.sh)
   cloud_run/            the service(s) + task-runner job
+  execution_plane/      GKE cluster, pools, identities, the pods'
+                        login + sqlproxy key, conductor secret grants
 ```
 
-## Service profile
-- `service_profile = "split"` (default) — separate web / council-worker /
-  git-engine / management services (better isolation + independent scaling).
-- `service_profile = "single"` — ONE Cloud Run service runs the combined
-  `app.single` entrypoint with every worker co-located (dispatchers are DB-lock
-  guarded, so it's safe). Cheaper: 1 always-on instance vs 4.
+## Services
+Five Cloud Run services from one image — web, council-worker, git-engine,
+management and scheduler (the background loops: one instance, CPU always on) —
+each isolated and independently scalable.
 
 ## Apply order
 ```bash
-# 0. FIRST — service accounts + ALL secrets + Cloud SQL (instance, control_panel
-#    db, app_user/migrate_user, DSN secrets). Run from the repo root, once.
+# 0. FIRST — service accounts + every non-database secret. Run from the repo
+#    root, once.
 cd ..
-./prerequisites.sh <PROJECT_ID> <REGION>
+./prerequisites.sh <PROJECT_ID> <REGION>   # non-default name_prefix: NAME_PREFIX=<prefix> ./prerequisites.sh …
 cd terraform
 
 # then the terraform stack
@@ -57,8 +63,11 @@ terraform init
 terraform apply
 ```
 Then (see [`../deploy/README.md`](../deploy/README.md) for detail):
-1. **Secrets are already created + filled** by `prerequisites.sh`. Overwrite any
-   external secret you left blank later with
+1. **Secrets are already created + filled** by `prerequisites.sh` (it stops with
+   exit 2 if a required one — `gemini-api-key`, `anthropic-api-key`,
+   `firebase-service-account`, `github-app-key` — is blank). Re-running it never
+   replaces an existing version. Overwrite any external secret you left blank
+   later with
    [`../deploy/06-fill-in-secrets.md`](../deploy/06-fill-in-secrets.md):
    `printf %s "<value>" | ../set-secret.sh <name>` — never raw
    `gcloud secrets versions add`. Multi-line secrets (Firebase JSON, GitHub App
@@ -67,10 +76,13 @@ Then (see [`../deploy/README.md`](../deploy/README.md) for detail):
 2. **Build + deploy the image** — Cloud Build (see
    [`../deploy/07-build-and-deploy.md`](../deploy/07-build-and-deploy.md)) builds,
    runs migrations (which seed templates/skills/tools and grant `app_user`), and
-   deploys the real image. Terraform ignores image changes so the two don't fight.
+   replaces the placeholder images this apply created with the real one.
+   Terraform ignores image changes so the two don't fight. The build also
+   creates the execution plane's namespace, service accounts and conductor.
 3. **Gateway link** — the OpenClaw VM (`agent_os_openclaw` branch) is deployed in
-   **Stage ①**, *before* this stack. Paste its `openclaw_ws_url` output into
-   `terraform.tfvars` here.
+   **Stage ①**, *before* this stack. Nothing to copy for the link: this stack
+   reads the gateway's reserved address (`<name_prefix>-gateway-ip`) and derives
+   the URL. `openclaw_ws_url` is an override only.
 4. Visit the `service_url` output and log in as `bootstrap_admin_email`.
 
 For the GitHub App setup see

@@ -12,6 +12,14 @@ copy-paste commands working and guarantees nothing secret is ever committed
 | **gcloud** | Google Cloud CLI | <https://cloud.google.com/sdk/docs/install> |
 | **terraform** | Create cloud infra | <https://developer.hashicorp.com/terraform/install> |
 | **git** | Get the code | <https://git-scm.com/downloads> |
+| **kubectl** + **gke-gcloud-auth-plugin** | Reach the GKE cluster (preflight, readiness checks) | `gcloud components install kubectl gke-gcloud-auth-plugin` |
+| **Python 3** | `publish-extension.sh` and a few helper scripts | <https://www.python.org/downloads/> |
+| **openssl** | `prerequisites.sh` generates the internal keys with it | Nothing to install: built into macOS/Linux, and on Windows it comes with Git for Windows (Git Bash) |
+| **bash** | Every script in this guide is bash | macOS/Linux: built in. Windows: **Git Bash** or **WSL** |
+
+**On Windows, run every command in this guide in Git Bash**, not PowerShell or
+Command Prompt: they cannot see Git Bash's tools (`openssl version` fails there
+even though it is installed).
 
 (Full step-by-step, incl. `gcloud auth login`, is in `00-prerequisites.md`.)
 
@@ -76,8 +84,9 @@ different things need to read it — give each the right credential:
 ## F. Handy: how to watch things while deploying
 - **Cloud Build** (platform build, gateway rebuild): `gcloud builds submit …`
   streams live; otherwise
-  `gcloud builds list --ongoing --region <REGION>` then
-  `gcloud builds log <BUILD_ID> --region <REGION> --stream`.
+  `gcloud builds list --ongoing` then
+  `gcloud builds log <BUILD_ID> --stream`. (No `--region`: a `gcloud builds
+  submit` without `--region` is a global build, and a regional list hides it.)
 - **Gateway first boot**: `gcloud compute instances tail-serial-port-output
   agentos-gateway --zone <zone>`; it's **ready** when you see
   `openclaw-gateway@18789: active` and `gateway provision complete … (failed=0)`.
@@ -85,7 +94,8 @@ different things need to read it — give each the right credential:
 ---
 
 ### ✅ Ready to start when
-- [ ] `gcloud`, `terraform`, `git` installed
+- [ ] `gcloud`, `terraform`, `git`, `kubectl` + `gke-gcloud-auth-plugin`,
+      Python 3, `openssl` and a bash shell (Git Bash/WSL on Windows) installed
 - [ ] Both branches cloned as `agentos-openclaw/` and `agentos-platform/`
 - [ ] You know where `firebase-sa.json`, `github-app-key.pem`, `secrets.env` will go
 - [ ] (Private fork) git auth sorted for laptop + `GATEWAY_REPO_TOKEN` + Cloud Build

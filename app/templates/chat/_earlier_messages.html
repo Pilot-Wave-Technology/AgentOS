@@ -1,0 +1,10 @@
+{# Response body for the assistant/IA chat "load earlier" endpoint.
+
+   Replaces the #load-earlier sentinel via hx-swap="outerHTML". Order matters:
+   the next sentinel comes FIRST so it stays at the top of the scroll container,
+   then the older messages ascending beneath it. Reuses chat/_message.html so the
+   paged-in rows are byte-identical to the full page render. #}
+{% if has_older %}{% with before_id = oldest_message_id %}{% include "_shared/load_earlier.html" %}{% endwith %}{% else %}
+<div class="py-2 text-center text-2xs text-gray-600">Beginning of conversation</div>
+{% endif %}
+{% for msg in messages %}{% include "chat/_message.html" %}{% endfor %}

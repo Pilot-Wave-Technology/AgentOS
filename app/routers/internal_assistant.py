@@ -1048,6 +1048,16 @@ async def tool_progress(story_id: str, request: Request) -> JSONResponse:
     tool = (body.get("tool") or "").strip() or "unknown"
     task_id = (body.get("task_id") or "").strip()
     tool_input = body.get("input") or {}
+    if tool == "unknown":
+        # Either the hook's jq extraction failed (missing/empty tool_name in
+        # Claude's PostToolUse stdin) or claude-tool-progress.sh fell back to
+        # its no-jq literal. Logging the raw body is the only way to tell
+        # which without reproducing live — the uvicorn access log only shows
+        # method/status, never the payload.
+        _log.warning(
+            "tool_progress: got tool='unknown' for story=%s — raw body=%r",
+            story_id, body,
+        )
 
     pool = get_pool()
     story = await pool.fetchrow(
@@ -1147,6 +1157,22 @@ _PLANNING_PHASES = frozenset({
     "awaiting_plan_approval",
     "awaiting_next",  # interim between push and next planning turn
     "awaiting_review",  # diff is being reviewed; no further writes
+    # THE WORK IS SUBMITTED. `submitting` means the claim is in and the
+    # extension is pushing; `awaiting_merge` means it is on a branch with
+    # a pull request open. A source edit in either would be a change the
+    # person merging never saw, so the boundary refuses it -- the way
+    # back is "ask for more work", which starts a new plan.
+    "submitting",
+    "awaiting_merge",
+    # AND AFTER THE MERGE. `awaiting_closeout` means every lane is in and
+    # a person is deciding whether the story is finished. An edit there
+    # would be a change to code already on trunk, outside any plan and
+    # outside the pull request that carried it.
+    "awaiting_closeout",
+    # `integrating` is the platform taking the trunk into the branch. A
+    # source edit mid-merge is the one way to lose work that was already
+    # agreed to.
+    "integrating",
 })
 
 
@@ -1269,8 +1295,19 @@ async def validate_plan(request: Request) -> JSONResponse:
     # relative path "stories/X/plans/Y.md", which gateway readFile then
     # resolved to <ws>/stories/X/stories/X/plans/Y.md — not found.
     import os.path as _osp
+    import re as _re_abscheck
     abs_path = file_path.replace("\\", "/")
-    if not abs_path.startswith("/") and cwd:
+    # An absolute path needs no cwd-prepending -- but "absolute" isn't just
+    # POSIX's leading "/". Claude Code running natively on Windows (our local
+    # dev setup; the deployed gateway VM is always Ubuntu, so this never
+    # matters in prod) sends drive-letter paths like "D:/Projects/...".
+    # Missing that case here made this treat an already-absolute Windows path
+    # as relative and prepend cwd anyway, producing a doubled, garbage path
+    # (".../stories/X/D:/Projects/.../stories/X/...") that could never match
+    # the "repo/stories/<id>/plans/" check below -- silently rejecting every
+    # real plan write validated from a Windows Claude Code session.
+    _is_absolute = abs_path.startswith("/") or bool(_re_abscheck.match(r"^[A-Za-z]:/", abs_path))
+    if not _is_absolute and cwd:
         abs_path = _osp.normpath(f"{cwd.rstrip('/')}/{abs_path}").replace("\\", "/")
     canonical_plan_path: Optional[str] = None
     if expected_story_id:
@@ -1426,11 +1463,51 @@ async def validate_plan(request: Request) -> JSONResponse:
     # never see it — and canonical comes out as 'plans/...' (missing the
     # repo/stories/<id>/ prefix). Reject with the exact absolute path so Claude
     # corrects on the FIRST write instead of a silent phantom + later retry.
+    # The clone dir is NOT always literally `repo/` — a multi-repo workspace has
+    # `repos/<owner>__<name>/` instead, and hardcoding `repo/` here rejected the exact
+    # path provisioning's own CLAUDE.md tells the agent to write to. Resolve it.
+    # Resolved from the RECORDED plan path where the story already has one, so the
+    # directory the agent is told to use cannot move under it. Deriving this from the
+    # repository grants meant granting a repo that sorts earlier alphabetically changed
+    # the expected location mid-story, and this gate would then reject the exact path
+    # provisioning's own CLAUDE.md had told the agent to write to. `plan_approval` reads
+    # it the same way, which is what keeps this gate and the commit in agreement.
+    _plan_root = "repo"
+    # 2026-08-20: every WRITE repo now gets its own copy of the plan (not just
+    # the canonical root above), so a sibling write repo's own
+    # stories/<id>/plans/ must also pass this gate — otherwise the copy this
+    # feature asks the agent to make gets rejected by the very validator that's
+    # supposed to enforce where plans belong. `_plan_root` stays the single
+    # frozen root `plan_approval`/`resolve_plan_root` agree on for the
+    # CANONICAL submitted plan; `_other_write_roots` only widens WHERE a write
+    # is allowed to land, never which copy is authoritative.
+    _other_write_roots: list[str] = []
+    if expected_story_id:
+        try:
+            from app.services.story_plan_root import resolve_plan_root
+            _plan_root = await resolve_plan_root(get_pool(), expected_story_id)
+        except Exception as _exc:
+            _log.debug("validate_plan: plan-root lookup failed (%s)", _exc)
+        try:
+            from app.services.story_workspace_layout import resolve_workspace_clones, write_clones
+            _clones = await resolve_workspace_clones(get_pool(), expected_story_id)
+            _other_write_roots = [
+                c["subdir"] for c in write_clones(_clones) if c["subdir"] != _plan_root
+            ]
+        except Exception as _exc:
+            _log.debug("validate_plan: write-repo lookup failed (%s)", _exc)
+    _allowed_plan_roots = [_plan_root, *_other_write_roots]
     if plan_match and expected_story_id and (
         not canonical_plan_path
-        or not canonical_plan_path.startswith(f"repo/stories/{expected_story_id}/plans/")
+        or not any(
+            canonical_plan_path.startswith(f"{root}/stories/{expected_story_id}/plans/")
+            for root in _allowed_plan_roots
+        )
     ):
-        target = f"$CLAUDE_PROJECT_DIR/repo/stories/{expected_story_id}/plans/cycle-NN-<slug>.md"
+        target = (
+            f"$CLAUDE_PROJECT_DIR/{_plan_root}/stories/{expected_story_id}"
+            f"/plans/cycle-NN-<slug>.md"
+        )
         return _log_and_return(
             JSONResponse(
                 status_code=400,
@@ -1439,7 +1516,7 @@ async def validate_plan(request: Request) -> JSONResponse:
                     "error": (
                         f"plan written outside this story's repo: '{file_path}' resolved "
                         f"to '{canonical_plan_path or norm_path}', not under "
-                        f"repo/stories/{expected_story_id}/plans/. This usually means the "
+                        f"{_plan_root}/stories/{expected_story_id}/plans/. This usually means the "
                         f"path was anchored at the agent-workspace root instead of the "
                         f"story workspace. Write to this EXACT absolute path:\n  {target}"
                     ),
@@ -1461,8 +1538,29 @@ async def validate_plan(request: Request) -> JSONResponse:
     phases = await cp_svc.list_phases(only_active=True)
     allowed = {p["name"] for p in phases}
 
+    # Multi-repo (plan M4.3): validate `repo:` against the story's actual write repos,
+    # so the planner is told at WRITE time that a task is missing or misnames its repo
+    # — rather than the plan passing the hook and failing later at DAG ingest, after
+    # the human has already approved it.
+    repo_aliases: dict = {}
+    if expected_story_id:
+        try:
+            from app.services.dag_ingest import _resolve_story_repo_aliases
+            _, repo_aliases = await _resolve_story_repo_aliases(
+                get_pool(), expected_story_id,
+            )
+        except Exception as exc:
+            # Fail OPEN, consistent with the phase-gate above: a lookup problem must
+            # not block a legitimate plan write.
+            _log.debug(
+                "validate_plan: repo alias lookup failed for story=%s (%s) — "
+                "skipping repo validation", expected_story_id, exc,
+            )
+
     try:
-        parse_dag_from_markdown(content, allowed_phases=allowed)
+        parse_dag_from_markdown(
+            content, allowed_phases=allowed, repo_aliases=repo_aliases,
+        )
     except DagParseError as exc:
         return _log_and_return(
             JSONResponse(

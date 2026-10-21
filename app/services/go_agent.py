@@ -13,6 +13,7 @@ import uuid
 from datetime import datetime
 from typing import Optional
 
+from app import local_dev
 from app.database import get_pool
 from app.openclaw import gateway_admin
 from app.ledger.journal import append_event
@@ -24,70 +25,12 @@ _log = logging.getLogger(__name__)
 
 # ── GO Tools — what the GO agent is allowed to use on OpenClaw ───────────────
 
-GO_TOOLS_ALLOW = [
-    "web_search",
-    "web_fetch",
-    "read",                  # Read text files (md, txt, json, csv, code) from workspace
-    "write",                 # Write to MEMORY.md, memory/<date>.md (memory_v2)
-    "edit",                  # Edit MEMORY.md (memory_v2 curation)
-    "pdf",                   # Native PDF analysis (Gemini vision)
-    "image",                 # JPG/PNG/GIF/WebP analysis (vision)
-    # memory_v2: native memory-core plugin tools (vector + BM25 over
-    # MEMORY.md + memory/*.md). memory_save removed — writes go through
-    # write/edit on the workspace files directly.
-    "memory_search",
-    "memory_get",
-    "task_status",
-    "task_activity",
-    "task_report",
-    "message_assistant",
-    "resource_list",
-    "resource_summary",
-    "resource_scan",
-    "resource_read",
-    "story_list",
-    "story_detail",
-    "story_update",
-    "create_story",
-    "update_story",
-    "cancel_story",
-    "reply_assistant",
-    # create_branch removed: the Git Engine owns all branch creation/merging
-    # (git_graph_go_template_engine_model migration). The GO declares story deps;
-    # the engine derives + cuts branches. This constant is the fallback used
-    # when the GO template row's tools_allow is empty (go_agent.py resolve path)
-    # and is also recorded in the AGENT_PROVISIONED ledger payload, so keep it
-    # in sync with the template. Tool names are the prefix-free set (the pwt_
-    # prefix was removed — see rename_pwt_tool_names migration).
-    "grant_resource",
-    "revoke_resource",
-    "list_allocations",
-    "record_decision",
-    "list_decisions",
-    "critical_path",
-    "register_resource",
-    "sessions_list",
-]
+# G7: GO_TOOLS_ALLOW / GO_TOOLS_DENY are GONE. They were a second
+# allowlist that had drifted from the template row, and a fallback
+# that silently masked a missing template. The templates row is the
+# single authority; a missing or empty row is a loud error at the
+# use site.
 
-GO_TOOLS_DENY: list[str] = [
-    # No shell, no repo writes. GO uses resource_summary /
-    # resource_read / resource_scan to inspect registered repos
-    # at the file level; for anything deeper (running a script, walking
-    # a folder tree, comparing branches), it delegates by creating a
-    # task for an IA work agent. write/edit are allowed (workspace-scoped)
-    # so GO can update its own MEMORY.md / memory/<date>.md files —
-    # the repo lives behind resource_*, not behind write/edit.
-    "exec", "process", "apply_patch",
-    "shell", "browser", "canvas",
-    # Task creation — GO never creates tasks. The human's SHCA does that
-    # after accepting the story. Blocked at the tool level AND in the
-    # go-action parser (see go_response.py _FORBIDDEN_ACTIONS).
-    "create_task",
-    "update_task",
-    "reassign_task",
-    # Agent spawning — GO doesn't spawn agents directly
-    "sessions_spawn",
-]
 
 # ── SOUL.md — static, written once on agent creation ────────────────────────
 
@@ -382,7 +325,10 @@ When the team agrees on a decision (tech choice, architecture, approach), use `r
 
 # ── Agent creation ──────────────────────────────────────────────────────────
 
-GO_TEMPLATE_ID = "go"
+# G7: new goals provision the redesigned GO. Existing go-<goal> agents
+# are NOT migrated -- agents.update is a no-op for model+tools, so an old
+# goal keeps its old GO until the agent is recreated deliberately.
+GO_TEMPLATE_ID = "go-v2"
 
 
 async def create_go_for_goal(
@@ -408,23 +354,35 @@ async def create_go_for_goal(
     `agent_id` and `gateway_agent_id` are the same lowercase
     `go-<goal_id>` string (gateway lowercases ids anyway).
     """
-    from app.llm_models import DEFAULT_GO_MODEL, is_supported, label_for
-    if not model or not is_supported(model):
+    from app.llm_models import DEFAULT_GO_MODEL, is_supported
+    from app.services.model_registry.dropdowns import is_model_registered_v2
+
+    pool = get_pool()
+    if not model or not (
+        is_supported(model)
+        or await is_model_registered_v2(pool, model)
+    ):
         if model:
             _log.warning(
                 "create_go_for_goal: unsupported model %r — falling back to default",
                 model,
             )
         model = DEFAULT_GO_MODEL
-    model_label = label_for(model)
 
     gw_agent_id = f"go-{goal_id}".lower()
-    workspace_path = f"~/.openclaw/workspace-{gw_agent_id}"
+    workspace_path = local_dev.agent_workspace_path(gw_agent_id)
     display_name = f"GO — {goal_name}"
 
-    pool = get_pool()
-
     # Never provision a GO for a deleted goal (stale trigger / race after delete).
+    #
+    # IT RETURNS AN AGENT ID EVEN THOUGH IT PROVISIONS NOTHING, and
+    # every caller has to treat that as a failure rather than a result.
+    # One did not: goal creation read the id, wrote it onto the goal,
+    # and produced a goal pointing at an agent that was never created
+    # (`Agent go-catv8 not found in DB`, running the gateway's default
+    # model because no instance row carried the chosen one). The shape
+    # is kept because callers legitimately need to tell "skipped"
+    # apart from "failed"; what changed is that they now check.
     from app.services.goal_guard import goal_is_dead
     if await goal_is_dead(goal_id, pool):
         _log.info("create_go_for_goal: goal %s is deleted — skipping GO provisioning", goal_id)
@@ -502,8 +460,13 @@ async def create_go_for_goal(
     # Tools come from the template row so admin edits via /templates UI
     # take effect on every new instance. Run through the registry resolver so
     # profile expansions and cancellations are applied — same path as provision.py.
-    raw_tools_allow = list(tmpl["tools_allow"] or []) or GO_TOOLS_ALLOW
-    raw_tools_deny = list(tmpl["tools_deny"] or []) or GO_TOOLS_DENY
+    raw_tools_allow = list(tmpl["tools_allow"] or [])
+    raw_tools_deny = list(tmpl["tools_deny"] or [])
+    if not raw_tools_allow:
+        raise RuntimeError(
+            f"template {GO_TEMPLATE_ID!r} has an empty tools_allow -- "
+            f"refusing to provision a GO with no tools rather than "
+            f"falling back to a constant that can drift")
     try:
         from app.services.tool_registry import get_template_profiles, resolve_tool_allowlist
         profiles = await get_template_profiles(pool, tmpl["id"])
@@ -530,6 +493,23 @@ async def create_go_for_goal(
 
     from app.openclaw import GatewayError
     from app.config import get_settings as _get_settings
+    from app.services.model_registry.gateway_sync import sync_gateway_model_catalog
+
+    # Force the gateway's model catalog AND provider auth config fresh
+    # before this agent's first message. Without this, a model added/
+    # edited within the last REFRESH_INTERVAL_MS (5 min — the
+    # model-registry plugin's self-heal poll in agent_os_openclaw) can still
+    # be missing from the gateway's live catalog at the exact moment a
+    # brand-new GO tries to use it — and even once "known", a
+    # dynamically-registered provider has no auth config on the gateway
+    # at all until `sync_gateway_model_catalog`'s `config.patch` step runs
+    # (see its docstring: `resolve_providers` only feeds model
+    # availability, never the persisted `models.providers.*` auth config
+    # `model-auth.ts` actually reads). Soft-fail throughout: a stale
+    # catalog/auth-config here just means the agent falls back, same as
+    # before this call existed.
+    await sync_gateway_model_catalog()
+
     _log.info(
         "GO provisioning: calling gateway agents.create for %s (gateway=%s)",
         gw_agent_id, _get_settings().openclaw_ws_url,
@@ -587,15 +567,19 @@ async def create_go_for_goal(
 
     # 3. Compose per-instance IDENTITY.md. Goal name / objective / deadline
     # are NOT baked in — they live in the per-turn `## Goal` context block
-    # (build_go_context) so edits are picked up immediately.
+    # (build_go_context) so edits are picked up immediately. Model is
+    # likewise NOT baked in here (it used to be, as a static label, but
+    # that went stale the moment the model changed post-creation since
+    # nothing ever rewrites this file) — it's rendered live in the same
+    # context block instead, read from `agents.model` every turn.
     identity_md = (
         f"# Identity\n\n"
         f"**Name:** Goal Orchestrator\n"
-        f"**Type:** AI Project Manager & Technical Advisor\n"
-        f"**Model:** {model_label}\n\n"
-        "Goal name, objective, deadline, priority, and status are rendered "
-        "live in the `## Goal` block of your per-turn context. Read them "
-        "there — never cache them. They can change at any time.\n"
+        f"**Type:** AI Project Manager & Technical Advisor\n\n"
+        "Goal name, objective, deadline, priority, status, and current "
+        "model are rendered live in the `## Goal` block of your per-turn "
+        "context. Read them there — never cache them. They can change at "
+        "any time.\n"
     )
 
     # 4. Push files (template content + per-instance IDENTITY.md).
@@ -611,7 +595,14 @@ async def create_go_for_goal(
         await gateway_admin.set_agent_file(gw_agent_id, filename, content)
 
     # 5. Push every applicable skill into <workspace>/skills/<name>/SKILL.md.
+    #
+    # G7: NOT for go-v2, which has zero skills by design -- everything is
+    # in two prompt files, because "sometimes the models do not tend to
+    # load the skill files properly" is the constraint the redesign was
+    # built around. The three old GO skills folded into AGENTS.md.
     pushed_skills: list[str] = []
+    if GO_TEMPLATE_ID == "go-v2":
+        applicable_skills = []
     for skill in applicable_skills:
         try:
             await gateway_admin.set_agent_skill(
@@ -647,7 +638,7 @@ async def create_go_for_goal(
                     "model": model,
                     "gateway_agent_id": gw_agent_id,
                     "goal_id": goal_id,
-                    "tools_allow": GO_TOOLS_ALLOW,
+                    "tools_allow": raw_tools_allow,
                     "skills_pushed": pushed_skills,
                 },
                 actor_id=creator_actor_id,
@@ -730,8 +721,17 @@ async def create_go_for_goal(
 
 # ── Context assembly (injected into GO session on every trigger) ────────────
 
-async def build_go_context(goal_id: str) -> str:
+async def build_go_context(goal_id: str,
+                           thread_id: str | None = None) -> str:
     """Assemble a SLIM dynamic context block for GO's session.
+
+    `thread_id` IS OPTIONAL AND ADDS ONE SECTION. A GO thread opened
+    for an autonomous errand needs to know WHICH errand it is in --
+    the gateway gives each thread its own session, so the first turn
+    of a new errand thread has no transcript to infer it from. A
+    thread with no story attached (the main goal conversation, which
+    is every turn the GO takes today) gets exactly the block it got
+    before.
 
     Includes ONLY goal identity + team roster — everything else the GO
     needs (tasks, resources, memory, recent history, state doc) is
@@ -741,6 +741,10 @@ async def build_go_context(goal_id: str) -> str:
 
     What stays here (live DB lookups, per-turn freshness needed):
       - Goal identity: name, id, objective, description
+      - Current model: read from `agents.model` every turn rather than
+        baked into IDENTITY.md, so a post-creation model change (via
+        change_agent_model, which never touches IDENTITY.md) is reflected
+        immediately instead of the agent misreporting a stale model
       - Team roster: who is part of this goal (changes mid-session
         when admins add/remove members)
 
@@ -754,98 +758,75 @@ async def build_go_context(goal_id: str) -> str:
       - Orchestrator channel recap (separate concern)
     """
     pool = get_pool()
+    gw_agent_id = f"go-{goal_id}".lower()
     async with pool.acquire() as conn:
         goal = await conn.fetchrow("SELECT * FROM goals WHERE id = $1", goal_id)
         if not goal:
             return ""
 
-        team_block = await _build_team_roster(conn, goal_id)
+        agent_row = await conn.fetchrow(
+            "SELECT model FROM agents WHERE id = $1", gw_agent_id,
+        )
+        from app.services.go_thread_scope import errand_block
+        thread_block = await errand_block(conn, goal_id, thread_id)
 
-    description = goal.get("description", "") or goal.get("objective", "") or ""
-    desc_line = f"**Description:** {description}\n" if description and description != goal.get("objective", "") else ""
+    from app.llm_models import label_for
+    model_line = f"**Model:** {label_for(agent_row['model'])}\n" if agent_row and agent_row["model"] else ""
 
+    # ── WHAT IS NO LONGER SHOUTED ON EVERY MESSAGE ───────────────────
+    #
+    # The objective, the description and the team roster used to be
+    # rendered here and prepended to the user's text. Three problems,
+    # and the third is the one that decided it:
+    #
+    #   SIZE AT REAL SCALE. A 3,000-character description is ~750
+    #   tokens; a twenty-person roster with open tasks is ~1,050. The
+    #   one-person goals this was written against hid both.
+    #
+    #   IT IS NOT CONTEXT, IT IS TRANSCRIPT. Prepended to the USER
+    #   MESSAGE, so every copy is written into the session for ever.
+    #   Forty turns is ~74,000 tokens of the same table -- more than a
+    #   100K window -- and compaction arrives that much sooner.
+    #
+    #   IT WAS ALREADY ASKABLE. `goal_state` returns the objective AND
+    #   the description (kernel/go/state.py:137). The roster was the
+    #   only fact with no tool, which is the whole reason it had to
+    #   travel on the message; `goal_members` now answers it.
+    #
+    # WHAT STAYS is what a tool CALL needs before it can be made: the
+    # id, so GO can address anything at all, and the name, so it knows
+    # which goal it is in without spending a round trip to find out.
+    # Plus the model, which is read live because a post-creation change
+    # never rewrites IDENTITY.md.
+    #
+    # THE POINTER IS NOT DECORATION. Removing a fact GO used to be
+    # handed only works if it goes and fetches it, so the block says
+    # which tool answers which question. `AGENTS.md` carries the hard
+    # rule -- never name a member you have not read.
     return f"""\
 ## Goal
 
 **Id:** {goal_id}
 **Name:** {goal.get('name', '')}
-**Objective:** {goal.get('objective', '') or 'Not set'}
-{desc_line}
-{team_block}
-"""
-
-
-async def _build_trunk_branch_map(conn, goal_id: str) -> str:
-    """Per-repo trunk branches — the agent's source/merge target per repo.
-
-    For each registered repo resource, resolve its trunk:
-      - If a kind='branch' resource exists with role='trunk' and
-        parent_id pointing at this repo, that branch_name is the trunk.
-      - Otherwise the repo's default_branch (typically 'main') is the
-        trunk, with no agent-specific override.
-
-    Empty result = no repo resources registered yet (this block is
-    skipped so the GO doesn't see a stub heading with nothing under
-    it).
-    """
-    repos = await conn.fetch("""
-        SELECT id, name, repo_owner, repo_name, default_branch
-          FROM goal_resources
-         WHERE goal_id = $1 AND kind = 'repo' AND status = 'active'
-         ORDER BY name
-    """, goal_id)
-    if not repos:
-        return ""
-
-    trunks = await conn.fetch("""
-        SELECT parent_id, branch_name
-          FROM goal_resources
-         WHERE goal_id = $1 AND kind = 'branch' AND role = 'trunk'
-           AND status = 'active'
-    """, goal_id)
-    trunk_by_repo: dict[str, str] = {
-        t["parent_id"]: t["branch_name"] for t in trunks if t.get("parent_id")
-    }
-
-    lines = [
-        "## Working trunks (per repo)",
-        "",
-        "Where agents work for each repo: the **trunk** is the branch you cut "
-        "feature branches from and merge them back into. Review-story titles "
-        "should target the trunk, NOT necessarily `main`.",
-        "",
-        "| Repo | Trunk (agents) | Default (GitHub) |",
-        "|------|----------------|------------------|",
-    ]
-    has_explicit_trunk = False
-    for r in repos:
-        explicit = trunk_by_repo.get(r["id"], "")
-        if explicit:
-            has_explicit_trunk = True
-            trunk = explicit
-            note = ""
-        else:
-            trunk = r.get("default_branch") or "main"
-            note = " *(no trunk registered — falling back to default)*"
-        lines.append(
-            f"| {r['name']} | `{trunk}`{note} | `{r.get('default_branch') or 'main'}` |"
-        )
-
-    if has_explicit_trunk:
-        lines.append("")
-        lines.append(
-            "> When creating coding stories: pass the trunk branch resource id to "
-            "`create_branch` so feature branches are cut from the trunk. "
-            "When creating the paired review story, title it "
-            "`Review & merge feat/<slug> → <trunk>` and target the trunk in the "
-            "description — NOT `main` — unless the human explicitly says otherwise."
-        )
-
-    return "\n".join(lines)
+{model_line}
+Objective, description and the board: call `goal_state`.
+Team, roles and who may approve: call `goal_members`.
+{thread_block}"""
 
 
 async def _build_team_roster(conn, goal_id: str) -> str:
-    """Build always-current team roster from goal_members + users."""
+    """The roster as markdown. NO LONGER IN THE PER-TURN CONTEXT.
+
+    Kept because the shape is useful and something may yet want to
+    render a roster for a person -- but `build_go_context` no longer
+    calls it. It was prepended to every message to GO, which put a
+    copy in the transcript per turn: ~1,050 tokens on a twenty-person
+    goal, forty times over, for a table that changes rarely.
+
+    `kernel/go/members.py::goal_members` is what GO uses now, and it
+    deliberately drops the per-member open-task subquery below --
+    that is what made this block change on every task transition.
+    """
     members = await conn.fetch("""
         SELECT
             gm.uid, gm.role, gm.added_at,
@@ -890,108 +871,5 @@ async def _build_team_roster(conn, goal_id: str) -> str:
     lines.append("")
     lines.append("> This roster is **always current**. If a new member appears, welcome them.")
     lines.append("> If a member has left, check if they had active tasks that need reassignment.")
-
-    return "\n".join(lines)
-
-
-async def _build_task_snapshot(conn, goal_id: str) -> str:
-    """Build current stories + tasks snapshot for GO context.
-
-    Queries the stories table (separate from tasks) and the tasks table.
-    """
-    # Stories from stories table
-    stories = await conn.fetch("""
-        SELECT id, title, state, assigned_to, priority, depends_on,
-               blocked_reason, result_summary, progress_summary
-        FROM stories
-        WHERE goal_id = $1 AND state != 'cancelled'
-        ORDER BY
-            CASE state
-                WHEN 'in_progress' THEN 1 WHEN 'blocked' THEN 2
-                WHEN 'proposed' THEN 3 WHEN 'accepted' THEN 4
-                WHEN 'done' THEN 5 ELSE 6
-            END, created_at
-    """, goal_id)
-
-    # Tasks from tasks table
-    tasks = await conn.fetch("""
-        SELECT id, title, state, story_id, parent_task_id, blocked_reason
-        FROM tasks
-        WHERE goal_id = $1 AND status = 'active'
-        AND state NOT IN ('done', 'approved', 'cancelled')
-        ORDER BY created_at
-    """, goal_id)
-
-    # Task counts per story
-    task_count_rows = await conn.fetch("""
-        SELECT story_id,
-               count(*) AS total,
-               count(*) FILTER (WHERE state IN ('done', 'approved')) AS done
-        FROM tasks
-        WHERE goal_id = $1 AND status = 'active' AND story_id != ''
-        GROUP BY story_id
-    """, goal_id)
-    task_counts = {r["story_id"]: (r["total"], r["done"]) for r in task_count_rows}
-
-    if not stories and not tasks:
-        return "No stories or tasks yet."
-
-    lines = []
-
-    if stories:
-        lines.append("## Stories")
-        for s in stories:
-            deps = s["depends_on"] or []
-            dep_str = f" (depends on: {', '.join(deps)})" if deps else ""
-            blocked = f" — BLOCKED: {s['blocked_reason']}" if s["blocked_reason"] else ""
-            assignee = s["assigned_to"] or "unassigned"
-            total, done = task_counts.get(s["id"], (0, 0))
-            progress = f" | tasks: {done}/{total}" if total else ""
-            lines.append(
-                f"- **{s['id']}** [{s['state']}] {s['title']} "
-                f"(assigned: {assignee}, priority: {s['priority']}{progress}){dep_str}{blocked}"
-            )
-            if s["state"] == "done" and s["result_summary"]:
-                lines.append(f"  Result: {s['result_summary'][:200]}")
-        lines.append("")
-
-    active_tasks = [t for t in tasks]
-    if active_tasks:
-        lines.append("## Active Tasks")
-        for t in active_tasks:
-            blocked = f" — BLOCKED: {t['blocked_reason']}" if t.get("blocked_reason") else ""
-            story = f" (story: {t['story_id']})" if t.get("story_id") else ""
-            lines.append(f"- **{t['id']}** [{t['state']}] {t['title']}{story}{blocked}")
-
-    return "\n".join(lines)
-
-
-async def _build_resource_snapshot(conn, goal_id: str) -> str:
-    """Build current resource snapshot from goal_resources table."""
-    resources = await conn.fetch("""
-        SELECT id, kind, name, uri, locked_by, locked_for, status,
-               source_task_id, human_context, last_summary_at
-        FROM goal_resources
-        WHERE goal_id = $1 AND status = 'active'
-        ORDER BY kind, name
-    """, goal_id)
-
-    if not resources:
-        return "No resources registered yet. Members can add repos, branches, and documents via the Resources page."
-
-    lines = [
-        "Use `resource_summary(resource_id=...)` to read a resource's summary.",
-        "Use `resource_read(resource_id=..., path=...)` to read a specific file from a repo/branch.",
-        "",
-    ]
-    for r in resources:
-        lock = ""
-        if r["locked_by"]:
-            lock = f" [LOCKED by {r['locked_by']} for {r['locked_for']}]"
-        source = f" (from task {r['source_task_id']})" if r["source_task_id"] else ""
-        summary_status = "summary available" if r.get("last_summary_at") else "no summary yet"
-        lines.append(f"- **{r['name']}** (id: `{r['id']}`, kind: {r['kind']}, {summary_status}){lock}{source}")
-        if r["human_context"]:
-            lines.append(f"  Context: {r['human_context'][:150]}")
 
     return "\n".join(lines)

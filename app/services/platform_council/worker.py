@@ -1,6 +1,10 @@
 """Platform Research Council v2 — subagent spawn/dispatch + reaping.
 
-Two shapes of subagent, both type 'PlatformResearch', gemini-2.5-flash-1m:
+Two shapes of subagent, both type 'PlatformResearch'. The model is NOT
+set here -- it comes from the `research-model` / `research-tool`
+templates, which moved to Gemini 3.8 Flash at 1M on 2026-10-18. This
+line said `gemini-2.5-flash-1m` until 2026-10-19, which was the kind
+of stale docstring that gets believed over the database.
 
   PRODUCERS  (research-model, research-tool) — WARM, reused across runs under a
     stable gateway id (`research-model` / `research-tool`). On a cold spawn we
@@ -21,6 +25,7 @@ from __future__ import annotations
 
 import logging
 
+from app import local_dev
 from app.config import get_settings
 from app.database import get_pool
 from app.openclaw import gateway_admin, GatewayError
@@ -179,7 +184,7 @@ async def spawn_producer(kind: str, run_id: str | None = None,
 
     pool = get_pool()
     instance_id = producer_instance_id(kind)
-    workspace = f"~/.openclaw/workspace-{instance_id}"
+    workspace = local_dev.agent_workspace_path(instance_id)
     session_key = f"agent:{instance_id}:platform-{kind}"
 
     tmpl = await pool.fetchrow(
@@ -262,7 +267,7 @@ async def spawn_discovery(trigger: str = "manual") -> dict:
     import uuid as _uuid
     pool = get_pool()
     instance_id = DISCOVERY_INSTANCE
-    workspace = f"~/.openclaw/workspace-{instance_id}"
+    workspace = local_dev.agent_workspace_path(instance_id)
     session_key = f"agent:{instance_id}:platform-discovery"
 
     tmpl = await pool.fetchrow(
@@ -368,7 +373,7 @@ async def spawn_reviewer(findings: list[dict], label: str) -> dict:
 
     pool = get_pool()
     instance_id = reviewer_instance_id(label)
-    workspace = f"~/.openclaw/workspace-{instance_id}"
+    workspace = local_dev.agent_workspace_path(instance_id)
     session_key = f"agent:{instance_id}:platform-review"
     branch = env_branch()
     needs_repo = any(f.get("category") in REVIEW_NEEDS_REPO for f in findings)

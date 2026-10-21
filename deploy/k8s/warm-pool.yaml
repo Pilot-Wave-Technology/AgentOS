@@ -1,0 +1,127 @@
+# Warm capacity: placeholders that hold a node open until a story wants it.
+#
+# ── PREREQUISITE: THIS ENVIRONMENT'S POOLS MUST BE MIGRATED ─────────────
+#
+# The selectors below name ${ENV_NAME}, so applying this to an
+# environment whose nodes do not carry `agentos.io/env` gives you
+# placeholders that are Pending for ever -- reserving nothing, while
+# looking like warm capacity exists.
+#
+# The env key is not optional here the way it is on a story pod. A
+# placeholder holds ONE SPECIFIC MACHINE open, and on a cluster running
+# more than one environment a placeholder carrying only the class can
+# hold the OTHER environment's node -- which is worse than no
+# placeholder at all: it spends their money to reserve capacity our
+# stories cannot use, and is invisible from both sides.
+#
+# gke_standard_pools.sh prints the render command for this, and only
+# reaches that point once the environment's pools are fully labelled.
+#
+# ── WHY min-nodes IS NOT ENOUGH ─────────────────────────────────────────
+#
+# `--min-nodes=N` on a pool is a floor on the TOTAL number of nodes, not
+# on the number of IDLE ones. With min=1 and one story running, the pool
+# is at its floor and the autoscaler is satisfied; the next story finds
+# no room, goes Pending, and waits one to two minutes for a machine.
+# Nothing about min-nodes keeps a slot free.
+#
+# ── WHAT A PAUSE POD DOES INSTEAD ───────────────────────────────────────
+#
+#   1. It sits on a node holding a story's worth of CPU and memory, doing
+#      nothing. Negative priority, so it outranks nothing.
+#   2. A real story arrives, outranks it, and the scheduler EVICTS it and
+#      places the story there. Seconds, not minutes.
+#   3. The evicted placeholder is now Pending, so the autoscaler
+#      provisions a node for it.
+#   4. The placeholder lands on the new node and the warm slot is back --
+#      all of steps 3 and 4 off the story's critical path.
+#
+# That self-replenishment is the whole point, and it is the only
+# mechanism here that provides it.
+#
+# ── THE REQUEST MUST MATCH A STORY'S, OR THIS RESERVES NOTHING ──────────
+#
+# A placeholder asking for 100m holds 100m. The numbers below are one
+# tier's POD TOTAL from kernel/sizes.py -- sandbox plus the worker's
+# fixed 500m/2Gi plus cloud-sql-proxy's 250m/512Mi -- so evicting one
+# frees exactly the room the story needs. When sizes.py moves, these
+# move with it, and a test asserts they agree.
+#
+# ── NO `agentos.io/kind: execution` LABEL, DELIBERATELY ─────────────────
+#
+# Execution pods carry that label and an anti-affinity rule refusing any
+# node that already has one. A placeholder wearing it would make itself
+# the very obstacle it exists to remove: the scheduler would see an
+# execution pod on the node and refuse to place the story there, rather
+# than preempting. It reserves resources; it is not an execution.
+#
+# ── WHY NOT ON `large` ──────────────────────────────────────────────────
+#
+# One placeholder on e2-standard-16 is ~$281/month, 43% of what the warm
+# tier would otherwise cost, for the rung that runs least often. A
+# two-minute wait on a job that then runs for twenty is noise, and
+# nobody is watching it start. Add one if large turns out to be hourly.
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: warm-placeholder
+# NEGATIVE, and that is what makes preemption work: every real workload
+# has priority 0 or above, so any of them outranks a placeholder without
+# anyone having to give stories a priority class of their own.
+value: -10
+globalDefault: false
+preemptionPolicy: Never
+description: >-
+  Holds a node open so a story can start immediately. Evicted by any
+  real workload; the autoscaler then replaces the node behind it.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: warm-small
+  namespace: ${NAMESPACE}
+  labels: {app: warm-small, managed-by: kernel}
+spec:
+  replicas: 2
+  selector:
+    matchLabels: {app: warm-small}
+  template:
+    metadata:
+      labels: {app: warm-small}
+    spec:
+      priorityClassName: warm-placeholder
+      nodeSelector: {agentos.io/node-class: small, agentos.io/env: "${ENV_NAME}"}
+      # ZERO GRACE. A placeholder has no state and nothing to flush;
+      # every second here is a second the story that preempted it waits.
+      terminationGracePeriodSeconds: 0
+      containers:
+        - name: pause
+          image: registry.k8s.io/pause:3.9
+          resources:
+            requests: {cpu: "3300m", memory: "11Gi"}
+            limits: {cpu: "3300m", memory: "11Gi"}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: warm-medium
+  namespace: ${NAMESPACE}
+  labels: {app: warm-medium, managed-by: kernel}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: warm-medium}
+  template:
+    metadata:
+      labels: {app: warm-medium}
+    spec:
+      priorityClassName: warm-placeholder
+      nodeSelector: {agentos.io/node-class: medium, agentos.io/env: "${ENV_NAME}"}
+      terminationGracePeriodSeconds: 0
+      containers:
+        - name: pause
+          image: registry.k8s.io/pause:3.9
+          resources:
+            requests: {cpu: "7300m", memory: "25Gi"}
+            limits: {cpu: "7300m", memory: "25Gi"}

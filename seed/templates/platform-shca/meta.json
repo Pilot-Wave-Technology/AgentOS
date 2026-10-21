@@ -3,7 +3,7 @@
   "type": "PlatformAssistant",
   "name": "Platform Integration Assistant",
   "description": "Admins-only assistant on the Platform goal: plans + executes the 4 no-code integration operations (model/skill/tool/credential) from steward-created stories.",
-  "model": "anthropic-sonnet-200k/claude-sonnet-4-5-200k",
+  "model": "anthropic-sonnet55-200k/claude-sonnet-5-5-200k",
   "emoji": "🛠️",
   "tools_allow": [
     "read",

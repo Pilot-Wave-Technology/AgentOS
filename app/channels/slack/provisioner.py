@@ -13,6 +13,8 @@ Provisioning creates:
 The Slack bot token comes from platform_integrations.credentials_json (stored
 during OAuth install). No imports from app.slack.*.
 """
+
+from app.channels.slack.client import make_async_client
 import logging
 
 from app.channels.base import ChannelProvisioner
@@ -53,12 +55,12 @@ class SlackProvisioner(ChannelProvisioner):
     async def provision_member(self, goal_id: str, uid: str, pool) -> None:
         """Invite a new member to the goal channel.
 
-        Personal channel creation is attempted immediately if the member already
-        has an active SHCA thread for this goal (_do_provision_member skips
-        gracefully when none exists, deferring to first story accept/start).
+        It used to also create a private (member x goal) channel. That
+        tier is gone -- see the note where `_do_provision_member` was.
+        A member now gets the goal channel here and a story channel when
+        there is a story, which is every channel they ever read.
         """
         await _invite_member_to_goal_channel(goal_id, uid, pool)
-        await _do_provision_member(goal_id, uid, pool)
 
     async def deprovision_member(self, goal_id: str, uid: str, pool) -> None:
         """Remove a departed member's access, sharing their personal channel
@@ -70,9 +72,14 @@ class SlackProvisioner(ChannelProvisioner):
         member out, then archive it — an archived Slack channel is natively
         read-only for everyone but stays visible to anyone with access, so no
         separate "read-only" flag is needed. The binding row is deliberately
-        left untouched (not archived_at'd) so a rejoin finds and unarchives
-        this same channel rather than ensure_user_goal_channel creating a new
-        one — see ensure_user_goal_channel's existing-binding branch.
+        left untouched (not archived_at'd).
+
+        THAT LAST PART IS NOW ONLY FOR THE RECORD. It was there so a
+        rejoin would find and unarchive the same channel; the path that
+        did the unarchiving went with the (member x goal) tier on
+        2026-10-19. This still runs because channels created before the
+        removal are still in the table and a departing member's should
+        still go read-only — but nothing will bring one back.
         """
         await _remove_member_from_goal_channel(goal_id, uid, pool)
         await _archive_and_share_personal_channel(goal_id, uid, pool)
@@ -129,13 +136,10 @@ async def _do_provision_goal(goal_id: str, integration_id: str, pool) -> str | N
                     "Slack provision (update): member invite failed goal=%s uid=%s: %s",
                     goal_id, m["uid"], exc,
                 )
-            try:
-                await _do_provision_member(goal_id, m["uid"], pool)
-            except Exception as exc:
-                _log.warning(
-                    "Slack provision (update): personal channel creation failed goal=%s uid=%s: %s",
-                    goal_id, m["uid"], exc,
-                )
+            # No personal channel to create any more: the (member x goal)
+            # tier was removed on 2026-10-19. The invite above is now the
+            # whole of what a member gets here; their story channels come
+            # from `thread_channels.ensure_channel_for_thread`.
         return None
 
     # Branch B — create mode: build full channel structure
@@ -168,12 +172,15 @@ async def _do_provision_goal(goal_id: str, integration_id: str, pool) -> str | N
     go_agent_id = await pool.fetchval("SELECT go_agent_id FROM goals WHERE id = $1", goal_id) or ""
     await pool.execute(
         """INSERT INTO platform_channel_bindings
-               (goal_id, integration_id, thread_id, actor_id, agent_id, external_channel_id)
-           VALUES ($1, $2, $3, NULL, $4, $5)
+               (goal_id, integration_id, thread_id, actor_id, agent_id,
+                external_channel_id, channel_name)
+           VALUES ($1, $2, $3, NULL, $4, $5, $6)
            ON CONFLICT (goal_id, integration_id, external_channel_id)
-           DO UPDATE SET thread_id = $3, agent_id = $4, archived_at = NULL""",
+           DO UPDATE SET thread_id = $3, agent_id = $4, archived_at = NULL,
+                         channel_name = COALESCE(EXCLUDED.channel_name,
+                                                 platform_channel_bindings.channel_name)""",
         goal_id, integration_id, go_thread_id, go_agent_id,
-        channels["goal_channel_id"],
+        channels["goal_channel_id"], channels.get("goal_channel_name") or None,
     )
     _log.info(
         "Slack provision (create): GO binding saved goal=%s channel=%s thread=%s",
@@ -181,9 +188,8 @@ async def _do_provision_goal(goal_id: str, integration_id: str, pool) -> str | N
     )
 
     # Invite all current goal members to the goal + orch channels.
-    # Also attempt personal channel creation now for members who already have
-    # an active SHCA thread — _do_provision_member skips gracefully when none exists,
-    # so new members without an SHCA still get deferred to first story accept/start.
+    # That is all this does now: the private (member x goal) channel it
+    # also used to create was removed on 2026-10-19.
     members = await pool.fetch(
         """SELECT u.uid FROM goal_members gm JOIN users u ON u.uid = gm.uid
            WHERE gm.goal_id = $1""",
@@ -199,13 +205,7 @@ async def _do_provision_goal(goal_id: str, integration_id: str, pool) -> str | N
                 goal_id, m["uid"], exc,
             )
             member_errors += 1
-        try:
-            await _do_provision_member(goal_id, m["uid"], pool)
-        except Exception as exc:
-            _log.warning(
-                "Slack provision (create): personal channel creation failed goal=%s uid=%s: %s",
-                goal_id, m["uid"], exc,
-            )
+        # Same as the update path above: no personal channel to create.
 
     _log.info(
         "Slack provision (create): done goal=%s members=%d errors=%d goal_ch=%s orch_ch=%s",
@@ -218,9 +218,9 @@ async def _do_provision_goal(goal_id: str, integration_id: str, pool) -> str | N
 async def _invite_member_to_goal_channel(goal_id: str, uid: str, pool) -> None:
     """Invite a member to the shared goal channel only.
 
-    Called on member add. Personal channel creation is intentionally skipped
-    here — it happens in _do_provision_member when the member's first story
-    is accepted or started, matching the UI behaviour.
+    Called on member add. There is no personal channel to create: that
+    tier was removed on 2026-10-19 and a member's other channels are the
+    story ones, opened per story thread.
 
     Slack user ID resolution order:
     1. platform_user_map (confirmed mapping from prior Slack interaction)
@@ -240,9 +240,8 @@ async def _invite_member_to_goal_channel(goal_id: str, uid: str, pool) -> None:
     if not user_row or not user_row["actor_id"]:
         return
 
-    from slack_sdk import WebClient
     from slack_sdk.errors import SlackApiError
-    client = WebClient(token=cfg["bot_token"])
+    client = make_async_client(cfg["bot_token"])
 
     # Try confirmed mapping first
     slack_user_id = await get_slack_user_id_for_actor(user_row["actor_id"], pool)
@@ -250,7 +249,7 @@ async def _invite_member_to_goal_channel(goal_id: str, uid: str, pool) -> None:
     # Fall back to email lookup if no mapping exists yet
     if not slack_user_id and user_row.get("email"):
         try:
-            resp = client.users_lookupByEmail(email=user_row["email"])
+            resp = await client.users_lookupByEmail(email=user_row["email"])
             slack_user_id = resp["user"]["id"]
             _log.info(
                 "Slack invite_to_goal_channel: resolved uid=%s via email lookup → %s",
@@ -280,7 +279,7 @@ async def _invite_member_to_goal_channel(goal_id: str, uid: str, pool) -> None:
 
     for channel_id in filter(None, [cfg.get("goal_channel_id"), cfg.get("orch_channel_id")]):
         try:
-            client.conversations_invite(channel=channel_id, users=slack_user_id)
+            await client.conversations_invite(channel=channel_id, users=slack_user_id)
             _log.info("Slack invite_to_goal_channel: invited uid=%s to channel=%s", uid, channel_id)
         except SlackApiError as exc:
             error = exc.response.get("error", str(exc))
@@ -312,9 +311,8 @@ async def _remove_member_from_goal_channel(goal_id: str, uid: str, pool) -> None
     if not user_row or not user_row["actor_id"]:
         return
 
-    from slack_sdk import WebClient
     from slack_sdk.errors import SlackApiError
-    client = WebClient(token=cfg["bot_token"])
+    client = make_async_client(cfg["bot_token"])
 
     slack_user_id = await get_slack_user_id_for_actor(user_row["actor_id"], pool)
     if not slack_user_id:
@@ -326,7 +324,7 @@ async def _remove_member_from_goal_channel(goal_id: str, uid: str, pool) -> None
 
     for channel_id in filter(None, [cfg.get("goal_channel_id"), cfg.get("orch_channel_id")]):
         try:
-            client.conversations_kick(channel=channel_id, user=slack_user_id)
+            await client.conversations_kick(channel=channel_id, user=slack_user_id)
             _log.info("Slack remove_from_goal_channel: kicked uid=%s from channel=%s", uid, channel_id)
         except SlackApiError as exc:
             error = exc.response.get("error", str(exc))
@@ -343,9 +341,13 @@ async def _archive_and_share_personal_channel(goal_id: str, uid: str, pool) -> N
     Archiving is Slack's own read-only mechanism — every current member keeps
     read access to the history, and nobody (member or otherwise) can post,
     with no separate app-level flag needed on the Slack side. The binding row
-    in platform_channel_bindings is deliberately left as-is (not archived_at'd)
-    so a rejoin's ensure_user_goal_channel call finds and unarchives this same
-    channel instead of provisioning a new one.
+    in platform_channel_bindings is deliberately left as-is (not archived_at'd).
+
+    LEGACY ONLY SINCE 2026-10-19. The (member x goal) tier was removed,
+    so no new personal channel is ever created and nothing unarchives an
+    old one. This keeps running for the channels that already exist: a
+    departing member's should still become read-only. Once those are
+    gone from the table, so can this.
     """
     from app.channels.slack.config import get_slack_config_for_goal
     from app.channels.slack.thread_map import get_slack_user_id_for_actor
@@ -373,9 +375,8 @@ async def _archive_and_share_personal_channel(goal_id: str, uid: str, pool) -> N
 
     channel_id = binding["external_channel_id"]
 
-    from slack_sdk import WebClient
     from slack_sdk.errors import SlackApiError
-    client = WebClient(token=cfg["bot_token"])
+    client = make_async_client(cfg["bot_token"])
 
     remaining = await pool.fetch(
         """SELECT u.actor_id FROM goal_members gm
@@ -388,7 +389,7 @@ async def _archive_and_share_personal_channel(goal_id: str, uid: str, pool) -> N
         if not member_slack_id:
             continue
         try:
-            client.conversations_invite(channel=channel_id, users=member_slack_id)
+            await client.conversations_invite(channel=channel_id, users=member_slack_id)
         except SlackApiError as exc:
             error = exc.response.get("error", str(exc))
             if error != "already_in_channel":
@@ -400,7 +401,7 @@ async def _archive_and_share_personal_channel(goal_id: str, uid: str, pool) -> N
     departed_slack_id = await get_slack_user_id_for_actor(user_row["actor_id"], pool)
     if departed_slack_id:
         try:
-            client.conversations_kick(channel=channel_id, user=departed_slack_id)
+            await client.conversations_kick(channel=channel_id, user=departed_slack_id)
         except SlackApiError as exc:
             error = exc.response.get("error", str(exc))
             if error not in ("not_in_channel", "cant_kick_self"):
@@ -409,7 +410,7 @@ async def _archive_and_share_personal_channel(goal_id: str, uid: str, pool) -> N
                 )
 
     try:
-        client.conversations_archive(channel=channel_id)
+        await client.conversations_archive(channel=channel_id)
         _log.info(
             "Slack archive_and_share: archived channel=%s for departed uid=%s goal=%s "
             "(shared with %d remaining member(s))",
@@ -423,111 +424,19 @@ async def _archive_and_share_personal_channel(goal_id: str, uid: str, pool) -> N
             _log.warning("Slack archive_and_share: archive failed channel=%s: %s", channel_id, error)
 
 
-async def _do_provision_member(goal_id: str, uid: str, pool) -> None:
-    """Create the personal user-goal Slack channel for a member.
-
-    Called when a story is accepted or started — mirrors the UI behaviour where
-    the assistant channel appears on first story import. Looks up the member's
-    SHCA thread and calls ensure_user_goal_channel to create the binding.
-    """
-    from app.channels.slack.config import get_slack_config_for_goal
-    from app.channels.slack.lifecycle import ensure_user_goal_channel
-    from app.channels.slack.thread_map import get_slack_user_id_for_actor
-
-    cfg = await get_slack_config_for_goal(goal_id, pool)
-    if not cfg or not cfg.get("bot_token"):
-        _log.debug("Slack provision_member: no Slack config for goal=%s", goal_id)
-        return
-
-    # Get user's actor_id and display name
-    user_row = await pool.fetchrow(
-        "SELECT actor_id, display_name, email FROM users WHERE uid = $1", uid,
-    )
-    if not user_row or not user_row["actor_id"]:
-        _log.debug("Slack provision_member: no actor_id for uid=%s", uid)
-        return
-
-    actor_id = user_row["actor_id"]
-    display_name = user_row["display_name"] or uid
-
-    # Resolve Slack user ID for this member (may be None if not yet mapped)
-    slack_user_id = await get_slack_user_id_for_actor(actor_id, pool)
-
-    # Find the member's SHCA thread for this goal. Prefer a thread whose goal_id
-    # matches exactly (per-goal isolation); fall back to any active SHCA thread
-    # for threads created before per-goal isolation was introduced.
-    shca_row = await pool.fetchrow(
-        """SELECT t.id AS thread_id, a.id AS agent_id
-             FROM threads t
-             JOIN agents a ON a.id = t.agent_id
-             JOIN agent_contexts ac ON ac.agent_id = a.id
-            WHERE ac.goal_id = $1
-              AND t.goal_id  = $1
-              AND a.type = 'SHCA'
-              AND a.status = 'active'
-              AND a.owner_actor_id = $2
-              AND (t.status IS NULL OR t.status IN ('active', 'open'))
-              AND t.task_id IS NULL
-            ORDER BY t.created_at DESC
-            LIMIT 1""",
-        goal_id, actor_id,
-    )
-
-    if not shca_row:
-        # Fallback: legacy threads without goal_id set — accept any SHCA thread
-        # registered in agent_contexts for this goal.
-        shca_row = await pool.fetchrow(
-            """SELECT t.id AS thread_id, a.id AS agent_id
-                 FROM threads t
-                 JOIN agents a ON a.id = t.agent_id
-                 JOIN agent_contexts ac ON ac.agent_id = a.id
-                WHERE ac.goal_id = $1
-                  AND a.type = 'SHCA'
-                  AND a.status = 'active'
-                  AND a.owner_actor_id = $2
-                  AND (t.status IS NULL OR t.status IN ('active', 'open'))
-                  AND t.task_id IS NULL
-                ORDER BY t.created_at DESC
-                LIMIT 1""",
-            goal_id, actor_id,
-        )
-        if shca_row:
-            _log.warning(
-                "Slack provision_member: no per-goal SHCA thread for uid=%s goal=%s "
-                "— falling back to shared thread %s (upgrade path: accept story to create a per-goal thread)",
-                uid, goal_id, str(shca_row["thread_id"])[:12],
-            )
-
-    if not shca_row:
-        _log.info(
-            "Slack provision_member: no SHCA thread found for uid=%s goal=%s — skipping personal channel",
-            uid, goal_id,
-        )
-        return
-
-    thread_id = str(shca_row["thread_id"])
-    agent_id = str(shca_row["agent_id"])
-
-    channel_id = await ensure_user_goal_channel(
-        goal_id=goal_id,
-        user_uid=uid,
-        user_actor_id=actor_id,
-        user_display_name=display_name,
-        slack_user_id=slack_user_id or "",
-        thread_id=thread_id,
-        agent_id=agent_id,
-        integration_id=cfg["integration_id"],
-        bot_token=cfg["bot_token"],
-        pool=pool,
-    )
-
-    if channel_id:
-        _log.info(
-            "Slack provision_member: provisioned uid=%s goal=%s channel=%s",
-            uid, goal_id, channel_id,
-        )
-    else:
-        _log.warning(
-            "Slack provision_member: channel creation failed uid=%s goal=%s",
-            uid, goal_id,
-        )
+# `_do_provision_member` WAS HERE AND IS GONE (2026-10-19).
+#
+# It created the private (member x goal) Slack channel on story accept
+# or start. That tier predated story channels and had stopped carrying
+# anything a person reads -- the conversation, the cards and the agent's
+# replies all land in the story's own channel.
+#
+# It was also where `<goal>-<name>-<env>-2` came from. It resolved the
+# member's SHCA thread and handed it to `ensure_user_goal_channel`,
+# whose lookup matched only an UNARCHIVED binding -- so after a binding
+# was archived it made a FRESH Slack channel beside the one that still
+# existed, and Slack numbered it.
+#
+# Members still get the goal channel (`_invite_member_to_goal_channel`,
+# above) and a story channel per story thread
+# (`thread_channels.ensure_channel_for_thread`). Nothing else was lost.

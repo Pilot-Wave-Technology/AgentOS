@@ -1,0 +1,156 @@
+# Errand executor.
+#
+# Eb1 described this as "no contract, no criteria, no Verifier, no path to
+# merge", and Eb3 removed `propose_completion` from the surface because an
+# errand had no way to define done. Two of those four are no longer true.
+#
+# Ec2 gave an errand a definition of done that suits it — the artifacts it
+# produced — so it has a contract and criteria, proposes completion, and
+# has its claim measured before a person is asked. Still no Verifier and
+# still no path to merge: those are about code that lands, and an errand
+# produces answers, not branches.
+
+kind   = "errand"
+domain = "ops"
+
+# Ec2 — propose_completion and register_plan are BOTH here now, and the
+# flags below agree. Eb3 removed propose_completion because an errand had
+# no way to define done; Ec2d gave it one — `artifact[role=report]` — so
+# an errand can now say it is finished and have the claim measured.
+#
+# Ec1a — THE PROFILE THAT COULD COMPUTE COULD NOT PERSIST. It held `bash`
+# and no `write`; story-business held `write` and no `bash`. No profile
+# held both, and that gap — not credentials — was what stopped an errand
+# doing the work an errand is for: run the report generator locally, keep
+# the output, do not send the email.
+tools_add = [
+  # L — what this goal already settled. Read it BEFORE choosing a
+  # framework or a pattern: a plan that re-opens a decision a person
+  # already approved costs a whole review cycle to discover.
+  "goal_knowledge",
+  "bash",
+  # THE SAME LONG-WORK SET THE CODING PROFILE HAS, and an errand needs it
+  # for the same reason: `bash` stops at 120 seconds, and "run the report
+  # generator locally" is exactly the kind of job that does not. Polling
+  # `bash_output` in a loop spends a step per poll and ends the leg as
+  # `stalled` on the eighth identical one; `bash_wait` is one step
+  # however long the job runs.
+  #
+  # AND `run_check`, because an errand PLANS. `requires_plan` is true and
+  # `register_plan` is below; what Ec2d gave it is a definition of done
+  # that suits what it produces -- `{expect: "artifact", role: "report"}`
+  # -- and those are measured mechanically at the claim, with nothing to
+  # run. But "almost always artifacts" is what the prompt says, not
+  # "only": an errand may write a COMMAND check, and the prompt tells it
+  # how. That check has exactly the problem this phase exists for, a
+  # 120-second foreground ceiling over a suite that takes longer, and
+  # `run_check` is the answer to it here for the same reason it is on a
+  # coding story. Where a plan declares no command check the tool says
+  # so and runs nothing.
+  "run_check",
+  "bash_background",
+  "bash_wait",
+  "bash_output",
+  "bash_jobs",
+  "bash_kill",
+  "artifact_read",
+
+  # Ec1a — compute AND persist.
+  #
+  # `write` / `edit` are contained: stage 1 confines them to
+  # `writable_scope`, which for an errand with no grants is its own
+  # scratch root. An errand that can run a script and not save what it
+  # printed has to hold the whole result in context, which is the thing
+  # bounded output exists to avoid.
+  "write",
+  "edit",
+  # The environment an errand needs to run anything at all. Worker-side
+  # because they RECORD — and recording matters here even without a
+  # Verifier, because the next leg rebuilds context from the brief and
+  # needs to know what is already installed.
+  "env_setup",
+  "env_install",
+  # EGRESS, GRANTED DELIBERATELY. An errand that fetches a dashboard, an
+  # API response or a changelog is the ordinary case; refusing it made
+  # every such errand a question for a human. It goes through
+  # `tools_web.fetch`, which is deny-by-default on private ranges and
+  # re-checks every redirect hop.
+  #
+  # This is the widest thing on this surface. `_DESTRUCTIVE` does not yet
+  # cover cloud CLIs (Ec3a), so a shell reaching a cloud account is still
+  # classified `reversible` — but that is `bash`'s exposure, which this
+  # profile already had, not something `web_fetch` adds.
+  "web_fetch",
+
+  # Ec2c — THE ROAD OUT. Without it an errand could write files and keep
+  # nothing: its commits never land and its branch is deleted on
+  # acceptance, so a perfect report left on disk is a run that produced
+  # nothing. `publish_artifact` cannot do this
+  # job — it needs the story to already hold the target resource with a
+  # write relation, which an errand usually does not, so it would have
+  # answered E_NOT_GRANTED every time.
+  "emit_artifact",
+
+  # Ec2a — the plan an approver sees, and the claim they answer.
+  #
+  # `register_plan` parks the run until a human approves an approach.
+  # That is the whole point of an errand having a plan: it does work
+  # somebody asked for once, against systems they care about, and the
+  # cheapest moment to say "not like that" is before it starts.
+  #
+  # `propose_completion` is how it says it is done. It does NOT finish
+  # the run — the worker measures the claim against the plan's own
+  # checks and then parks on an acceptance, so a person is still the
+  # last word.
+  "register_plan",
+  "propose_completion",
+]
+
+# D1 — AN ERRAND IS ALLOCATED WHAT A STORY IS ALLOCATED.
+#
+# This was "none", on the reasoning that an errand has a scratch
+# workspace and needs no repository. That was wrong, and it is the
+# assumption two separate defects came out of:
+#
+#   * the workspace panel was empty for the ENTIRE LIFE of every errand
+#     ever run — the `none` driver never sets `workspace_path`, and the
+#     panel resolves its tree FROM `workspace_path`;
+#   * an errand that WAS given a mount could never start, because the
+#     `none` driver clones nothing while the completeness check still
+#     demands every git mount be a real checkout.
+#
+# An errand that must investigate a repository needs the repository. An
+# errand that must run a check written against trunk needs trunk. It may
+# change files to get its job done — install a dependency, flip a config,
+# add a fixture — because that is the work, not a violation of it.
+#
+# THE ONE DIFFERENCE IS THE DESTINATION: an errand's work never lands in
+# trunk. That is enforced where landing happens (the merge chokepoint and
+# the push guard), not by starving it of a workspace here.
+workspace_driver = "git"
+
+prompt_files = ["AGENTS.md", "SOUL.md"]
+
+# Ec2 — the errand proposes completion itself. The flag and the surface
+# must agree, which the profile CI check asserts.
+allows_completion = true
+
+# Ec2a — AN ERRAND PLANS. It runs commands against real systems on
+# somebody's behalf, and the cheapest moment to say "not like that" is
+# before it starts, not after. Until a plan is approved the surface is
+# read-only: orientation, skills, the goal's record, and asking.
+requires_plan = true
+
+# Still no Verifier, and that is deliberate rather than missing. A
+# Verifier rebuilds a committed tree in a fresh container to judge code
+# that will merge. An errand's work merges nowhere and its branch goes
+# when it is accepted; its deliverable is an artifact already in the
+# store under its own sha256,
+# and the check is whether that row exists — which the executor could not
+# fake without emitting the thing. The worker measures it and a person
+# decides.
+has_verifier  = false
+
+# No delegation: an errand is bounded work, and a child would outlive the
+# predicate that bounds it.
+max_subagent_depth = 0

@@ -9,6 +9,7 @@ import logging
 from app.database import get_pool
 from app.openclaw import session_manager, make_goal_session_key
 from app.services.go_agent import build_go_context
+from app.services.story_card_thread import newest_human_thread
 
 _log = logging.getLogger(__name__)
 
@@ -686,15 +687,36 @@ async def _build_story_event_message(
         acceptance = story.get("acceptance_criteria") or "None specified"
         result = story.get("result_summary") or "No result summary"
 
-        # Get assistant report messages from the story's thread
+        # ── TWO LOOKUPS THAT WERE DEAD FOR EVERY LOCAL STORY ────────
+        #
+        # `threads WHERE task_id = <story id>` found nothing: a story thread
+        # is keyed by `story_id`, and the local lane never wrote `task_id` at
+        # all. `role = 'assistant'` found nothing either: local turns are
+        # recorded as `'agent'`, the vocabulary `/report-message` has always
+        # used.
+        #
+        # So the work-report section was empty for every locally-run story, on
+        # BOTH counts, and the GO planned the next story from the board's
+        # titles and states. Neither lookup ever errored.
+        #
+        # `stories.active_thread_id` first, because that is the pointer every
+        # lane maintains; the `task_id` join stays as the fallback for rows
+        # that predate story threads.
         thread = await pool.fetchrow(
-            "SELECT id FROM threads WHERE task_id = $1 LIMIT 1", story_id,
+            "SELECT COALESCE("
+            "  (SELECT active_thread_id FROM stories WHERE id = $1),"
+            "  " + newest_human_thread("$1") + ","
+            "  (SELECT id FROM threads WHERE task_id = $1 LIMIT 1)"
+            ") AS id", story_id,
         )
         work_report = ""
-        if thread:
+        if thread and thread["id"]:
+            # BOTH ROLES. The gateway writes `assistant`, the local lane writes
+            # `agent`, and until the two vocabularies are reconciled a reader
+            # has to know both — rewriting history is not worth a migration.
             report_msgs = await pool.fetch("""
                 SELECT content FROM messages
-                WHERE thread_id = $1 AND role = 'assistant'
+                WHERE thread_id = $1 AND role IN ('assistant', 'agent')
                 ORDER BY created_at DESC LIMIT 5
             """, thread["id"])
             if report_msgs:
@@ -938,7 +960,8 @@ async def on_resource_changed(goal_id: str, resource_id: str, change_type: str, 
         SELECT sr.story_id, s.title, s.assigned_to
         FROM story_resources sr
         JOIN stories s ON s.id = sr.story_id
-        WHERE sr.resource_id = $1 AND s.state IN ('in_progress', 'accepted')
+        WHERE sr.resource_id = $1
+          AND s.state IN ('in_progress', 'accepted', 'awaiting_merge')
     """, resource_id)
 
     affected_info = ""

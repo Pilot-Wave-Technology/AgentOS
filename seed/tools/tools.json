@@ -38,7 +38,7 @@
   {
     "name": "apply_model_change",
     "label": "Change a template's model",
-    "description": "Change an agent template's model (template-only; future instances). template_id is 'go' (GO) or 'default-shca' (SHCA). model must be a supported model id.",
+    "description": "Change an agent template's model (template-only; future instances). template_id is 'go-v2' (GO) or 'kernel-assistant' (assistant). model must be a supported model id.",
     "group_name": "",
     "tags": [],
     "source": "custom",
@@ -189,6 +189,15 @@
     "status": "enabled"
   },
   {
+    "name": "github_zen",
+    "label": "GitHub Zen",
+    "description": "Get one line of GitHub Zen.",
+    "group_name": "",
+    "tags": [],
+    "source": "custom",
+    "status": "enabled"
+  },
+  {
     "name": "grant_resource",
     "label": "Grant Resource Access",
     "description": "Grant an agent access to a resource",
@@ -222,15 +231,6 @@
     "group_name": "story",
     "tags": [],
     "source": "platform",
-    "status": "enabled"
-  },
-  {
-    "name": "list_suggestions",
-    "label": "List suggestions",
-    "description": "List tracked suggestions (optional status/category filters).",
-    "group_name": "",
-    "tags": [],
-    "source": "custom",
     "status": "enabled"
   },
   {
@@ -297,6 +297,15 @@
     "status": "enabled"
   },
   {
+    "name": "pet_store_api",
+    "label": "Pet Store Api",
+    "description": "Pet Store Api. Operations: findPetsByStatus — Finds Pets by status.; getPetById — Find pet by ID.",
+    "group_name": "",
+    "tags": [],
+    "source": "custom",
+    "status": "enabled"
+  },
+  {
     "name": "process",
     "label": "process",
     "description": "Manage background processes",
@@ -321,15 +330,6 @@
     "group_name": "story",
     "tags": [],
     "source": "platform",
-    "status": "enabled"
-  },
-  {
-    "name": "record_suggestion",
-    "label": "Record suggestion",
-    "description": "Record a tracked platform-improvement suggestion (status=proposed).",
-    "group_name": "",
-    "tags": [],
-    "source": "custom",
     "status": "enabled"
   },
   {
@@ -468,15 +468,6 @@
     "status": "enabled"
   },
   {
-    "name": "spawn_research",
-    "label": "Spawn research worker",
-    "description": "Spawn/redispatch a research worker for a dimension (model|agent|tooling|infra).",
-    "group_name": "",
-    "tags": [],
-    "source": "custom",
-    "status": "enabled"
-  },
-  {
     "name": "story_create",
     "label": "Create implementation story",
     "description": "Steward only: create a platform-improvement story. For a registry finding pass `finding_id` (allowed ONLY if the reviewer marked it adopt_now); for a free-form request pass `title` + `description`. The story enters the normal board → planning → execution pipeline.",
@@ -519,15 +510,6 @@
     "group_name": "Sessions",
     "tags": [],
     "source": "core",
-    "status": "enabled"
-  },
-  {
-    "name": "submit_research",
-    "label": "Submit research finding",
-    "description": "Worker submits a structured research finding (ends the turn).",
-    "group_name": "",
-    "tags": [],
-    "source": "custom",
     "status": "enabled"
   },
   {
@@ -576,6 +558,24 @@
     "status": "enabled"
   },
   {
+    "name": "test_mcp_bearer",
+    "label": "Test Mcp Bearer",
+    "description": "Test Mcp Bearer. Tools: echo — Echo a message back unchanged.; add — Add two numbers and return the result.; get_time — Return the current UTC time as an ISO-8601 string.",
+    "group_name": "",
+    "tags": [],
+    "source": "custom",
+    "status": "enabled"
+  },
+  {
+    "name": "today_quote",
+    "label": "Today's Quote",
+    "description": "Pick a deterministic 'quote of the day' from an API based on the current day-of-year",
+    "group_name": "",
+    "tags": [],
+    "source": "custom",
+    "status": "enabled"
+  },
+  {
     "name": "tts",
     "label": "tts",
     "description": "Text-to-speech conversion",
@@ -591,15 +591,6 @@
     "group_name": "story",
     "tags": [],
     "source": "platform",
-    "status": "enabled"
-  },
-  {
-    "name": "update_suggestion",
-    "label": "Update suggestion status",
-    "description": "Change a suggestion's status (accepted|in_progress|implemented|rejected|superseded).",
-    "group_name": "",
-    "tags": [],
-    "source": "custom",
     "status": "enabled"
   },
   {

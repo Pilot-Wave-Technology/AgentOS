@@ -38,6 +38,96 @@ from app.services.dag_parser import (
     ParsedDag,
     parse_dag_from_markdown,
 )
+from app.services.story_workspace_layout import resolve_workspace_clones, write_clones
+
+
+async def _is_local_story(pool, story_id: str) -> bool:
+    """Is this story being executed in a local editor rather than the gateway?
+
+    Used only to skip repo-alias resolution — see the comment at the call site for
+    why local dispatch must not receive a `Repository: cd <subdir>/` instruction.
+    """
+    mode = await pool.fetchval(
+        "SELECT execution_mode FROM stories WHERE id = $1", story_id,
+    )
+    return (mode or "") == "local"
+
+
+async def _resolve_story_repo_aliases(pool, story_id: str) -> tuple[set[str], dict]:
+    """Repo identifiers a story's plan may name → canonical workspace subdir.
+
+    Returns (allowed_aliases, subdir_by_alias). Several spellings map to the same
+    clone on purpose: the planner reads CLAUDE.md / RESOURCES.md, which show the
+    directory (`repos/acme__web`), while it may naturally write the repo name
+    (`acme/web` or `web`). Rejecting a correct-but-differently-spelled repo would be a
+    pointless failure, so all three forms resolve to the same subdir.
+
+    Only WRITE repos are offered: a task cannot be scoped to a read-only context
+    clone, because it could not commit its work there.
+
+    Returns (set(), {}) when the story has no node rows — a single-repo or legacy
+    workspace — which makes the parser skip `repo:` validation entirely.
+    """
+    try:
+        is_local = await _is_local_story(pool, story_id)
+        # Write repos only: a task cannot be scoped to a read-only context clone,
+        # because it could never commit its work there.
+        rows = write_clones(await resolve_workspace_clones(pool, story_id))
+
+        # SINGLE-repo LOCAL stories skip alias resolution on purpose.
+        # `local_workspace_nodes` records their one clone with subdir='repo' (or, for a
+        # path-contract-capable client, `repos/<owner>__<name>`) so /internal/git-
+        # credential and the write-repo count work — but the extension opens that
+        # clone directory ITSELF as the workspace folder, so the agent's cwd is
+        # already inside it. Resolving an alias here could set `tasks.repo_subdir` and
+        # make `build_dispatch_message` emit "Repository: `repo/` — cd repo/ ...",
+        # telling the agent to cd into a directory it is already in. A single-repo
+        # local checkout has nothing to disambiguate, so skipping keeps its dispatch
+        # prompts byte-identical to before nodes were recorded.
+        #
+        # A MULTI-repo local checkout (research/NREPO_LOCAL_EXECUTION_PLAN.md, C8) is
+        # the opposite: it has extra repos the agent's cwd is NOT already inside, so a
+        # task now genuinely needs to know which one it targets — the same reason
+        # gateway/operator multi-repo stories were never exempted from this. Detected
+        # by repo COUNT, not execution_mode alone: a local story with exactly one write
+        # repo must still see the byte-identical prompt above.
+        if is_local and len(rows) <= 1:
+            return set(), {}
+    except Exception as exc:
+        _log.debug(
+            "dag_ingest: could not load workspace nodes for story=%s (%s) — "
+            "skipping repo validation", story_id, exc,
+        )
+        return set(), {}
+
+    # Unambiguous aliases first: the subdir and owner/name are unique per repo.
+    subdir_by_alias: dict[str, str] = {}
+    for row in rows:
+        for alias in (row["subdir"], f"{row['repo_owner']}/{row['repo_name']}"):
+            if alias:
+                subdir_by_alias[alias] = row["subdir"]
+
+    # The BARE repo name is only offered when it identifies exactly one repo. Two
+    # granted repos can share a name across owners (acme/web + other/web); registering
+    # both would let the last row silently win — in a row order Postgres does not
+    # guarantee — and bind a task to the wrong checkout. Ambiguous bare names are simply
+    # not accepted, so the planner gets a clear "not one of this story's repos" error
+    # listing the unambiguous forms instead of being quietly mis-resolved.
+    bare_counts: dict[str, int] = {}
+    for row in rows:
+        if row["repo_name"]:
+            bare_counts[row["repo_name"]] = bare_counts.get(row["repo_name"], 0) + 1
+    for row in rows:
+        name = row["repo_name"]
+        if name and bare_counts.get(name) == 1 and name not in subdir_by_alias:
+            subdir_by_alias[name] = row["subdir"]
+    ambiguous = sorted(n for n, c in bare_counts.items() if c > 1)
+    if ambiguous:
+        _log.info(
+            "dag_ingest: story=%s has repos sharing a bare name %s — tasks must use "
+            "the subdir or owner/name form", story_id, ambiguous,
+        )
+    return set(subdir_by_alias), subdir_by_alias
 
 
 _log = logging.getLogger(__name__)
@@ -57,8 +147,13 @@ async def ingest_approved_plan(
     plan_md: str,
     claude_session_id: str,
     approved_by_uid: str,
+    content_hash: str = "",
 ) -> dict:
     """Insert the plan_version + DAG task tree on plan approval.
+
+    `content_hash` (C3) fingerprints the approved plan markdown so a plan executed
+    end-to-end can't be silently re-run (the local plan gate refuses a re-approval whose
+    hash matches an already-'executed' version). Optional — gateway approvals leave it ''.
 
     Returns: {ok, dag_task_id, plan_version_id, task_count} on success.
     Raises DagParseError on validation failure (caller surfaces to UI).
@@ -69,8 +164,18 @@ async def ingest_approved_plan(
     phases = await cp_svc.list_phases(only_active=True)
     allowed = {p["name"] for p in phases}
 
+    # 1b. Resolve which repos this story may target (multi-repo plan M4.3). Sourced
+    # from what provisioning actually cloned, and accepted in BOTH the subdir and the
+    # bare-repo-name form because the planner sees both in its workspace docs. Empty
+    # for a single-repo/legacy story, which makes the parser ignore `repo:` entirely.
+    # NOTE: pass the MAPPING to the parser. The alias set is 3 entries per repo, so
+    # handing it a set made every single-repo story look multi-repo (see dag_parser).
+    _, subdir_by_alias = await _resolve_story_repo_aliases(pool, story_id)
+
     # 2. Parse + validate the DAG block.
-    parsed: ParsedDag = parse_dag_from_markdown(plan_md, allowed_phases=allowed)
+    parsed: ParsedDag = parse_dag_from_markdown(
+        plan_md, allowed_phases=allowed, repo_aliases=subdir_by_alias,
+    )
 
     # 3. Generate ids.
     dag_task_id = _short_id(8)
@@ -118,11 +223,11 @@ async def ingest_approved_plan(
                 """INSERT INTO plan_versions (
                        id, story_id, version, plan_doc_path,
                        task_dag, proposed_by, claude_session_id,
-                       status, approved_at, approved_by
+                       status, approved_at, approved_by, content_hash
                    ) VALUES (
                        $1, $2, $3, $4,
                        $5::JSONB, 'shca', $6,
-                       'approved', NOW(), $7
+                       'approved', NOW(), $7, $8
                    )""",
                 plan_version_id,
                 story_id,
@@ -131,6 +236,7 @@ async def ingest_approved_plan(
                 _json.dumps(task_dag_json),
                 claude_session_id,
                 approved_by_uid,
+                content_hash or "",
             )
 
             # Parent DAG task. Not dispatched directly; rolls up children.
@@ -197,7 +303,8 @@ async def ingest_approved_plan(
                            state,
                            acceptance_criteria,
                            depends_on,
-                           created_by, created_at, updated_at
+                           created_by, created_at, updated_at,
+                           repo_subdir
                        ) VALUES (
                            $1, $2, $3, $4,
                            $5, $6,
@@ -206,7 +313,8 @@ async def ingest_approved_plan(
                            $9,
                            $10,
                            $11::TEXT[],
-                           $12, NOW(), NOW()
+                           $12, NOW(), NOW(),
+                           $13
                        )""",
                     child_id,
                     goal_id,
@@ -220,6 +328,10 @@ async def ingest_approved_plan(
                     t.acceptance,
                     db_deps,
                     approved_by_uid,
+                    # Normalize whatever alias the planner wrote (subdir or repo name)
+                    # to the canonical workspace subdir, so executors get a path they
+                    # can cd into without re-resolving. None for single-repo/legacy.
+                    subdir_by_alias.get(t.repo) if t.repo else None,
                 )
 
             # System-gate tasks (G1 pre-integration, G2 integrate).

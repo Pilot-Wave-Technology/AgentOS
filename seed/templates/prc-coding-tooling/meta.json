@@ -3,7 +3,7 @@
   "type": "PlatformResearch",
   "name": "Research: Coding Tooling",
   "description": "Researches the coding subprocess (Claude Code vs alternatives) + model fit.",
-  "model": "google-flash-500k/gemini-2.5-flash-500k",
+  "model": "google-flash38-500k/gemini-3.8-flash-500k",
   "emoji": "🔬",
   "tools_allow": [
     "read",

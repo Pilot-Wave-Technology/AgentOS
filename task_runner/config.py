@@ -9,7 +9,6 @@ polls the database for work to do. Individual task types live under
 All configuration arrives via environment variables injected by the Cloud Run
 job config (Secret Manager for secrets):
   DATABASE_URL    PostgreSQL DSN — shared by every task handler.
-  GEMINI_API_KEY  Only required by goal_weightage_recompute — optional here
                   since other handlers (document_render) don't need it;
                   that handler raises its own clear error if it's missing
                   when actually called.
@@ -31,6 +30,8 @@ logging.basicConfig(
 # Shared across all task handlers — every current task reads/writes the same DB.
 DATABASE_URL = os.environ["DATABASE_URL"]
 
-# Only goal_weightage_recompute.py needs this — not required at import time
-# since it'd break every other handler if the secret weren't wired yet.
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+# NOTHING HERE NEEDS GEMINI ANY MORE. `goal_weightage_recompute` was the
+# only handler that called a model, and it is gone: a goal's weight is now
+# `1 + items completed in it this period`, computed from the taximeter view
+# at score time rather than guessed by an LLM. The secret can come off the
+# task-runner deploy.

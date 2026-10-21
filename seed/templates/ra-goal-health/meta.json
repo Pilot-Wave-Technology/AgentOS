@@ -3,12 +3,10 @@
   "type": "RA",
   "name": "Goal Health Reviewer",
   "description": "Reviews where a goal is headed: alignment with the objective, drift, risks, and what could be done better.",
-  "model": "google-flash-200k/gemini-2.5-flash-200k",
+  "model": "google-flash38-1m/gemini-3.8-flash-1m",
   "emoji": "🩺",
   "tools_allow": [
     "read",
-    "web_search",
-    "web_fetch",
     "submit_review"
   ],
   "tools_deny": [],

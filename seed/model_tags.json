@@ -1,0 +1,14 @@
+[
+  {
+    "model_id": "anthropic/claude-opus-5-5",
+    "tag_name": "go-selectable"
+  },
+  {
+    "model_id": "anthropic/claude-sonnet-5-5",
+    "tag_name": "go-selectable"
+  },
+  {
+    "model_id": "google/gemini-3.8-flash",
+    "tag_name": "go-selectable"
+  }
+]

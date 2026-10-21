@@ -34,12 +34,14 @@ import uuid
 from typing import Optional
 
 from app.database import get_pool
+from app.services.story_workspace_layout import resolve_workspace_clones, to_bundle_repos
 
 
 _log = logging.getLogger(__name__)
 
 
-_NON_TERMINAL_STATES = ("accepted", "in_progress", "blocked")
+_NON_TERMINAL_STATES = ("accepted", "in_progress", "blocked",
+                        "awaiting_merge")
 
 
 def claude_code_status(
@@ -82,21 +84,37 @@ async def resolve_active_focus_story(
     ambiguous — callers should refuse rather than guess with updated_at).
 
     Both the state snapshot (thread-keyed) and the /active-story endpoint
-    (instance-keyed) call this, so they always resolve to the SAME story. Since
-    shca_instance_id embeds thread_id, the two keys can never disagree on focus.
+    (instance-keyed) call this, so they always resolve to the SAME story.
+
+    THE TWO KEYS ARE NO LONGER EQUIVALENT. This used to say they could never
+    disagree, because `shca_instance_id` embedded `thread_id` — one instance,
+    one thread, one story. An assistant that shares one home across its
+    threads (Stage K) breaks that: the instance key now matches EVERY story in
+    the home, and each of them is `is_active_focus` in its own thread. Taking
+    the most recently updated of those would answer confidently and wrongly.
+    So the focus branch reads two rows and reports ambiguity when it finds
+    them — the thread key stays exact and is the one to pass when it is known.
     """
     if thread_id:
         key_pred, key_val = "active_thread_id = $1", thread_id
     else:
         key_pred, key_val = "LOWER(shca_instance_id) = LOWER($1)", instance_id
-    focus = await pool.fetchrow(
+    focused = await pool.fetch(
         f"SELECT * FROM stories WHERE {key_pred} "
         "AND state = ANY($2::text[]) AND is_active_focus "
-        "ORDER BY updated_at DESC NULLS LAST LIMIT 1",
+        "ORDER BY updated_at DESC NULLS LAST LIMIT 2",
         key_val, list(_NON_TERMINAL_STATES),
     )
-    if focus:
-        return focus, False
+    if len(focused) > 1:
+        _log.info(
+            "resolve_active_focus_story: %s matches %d focused stories (%s) — "
+            "ambiguous, refusing to pick",
+            "thread" if thread_id else "instance", len(focused),
+            [r["id"] for r in focused],
+        )
+        return None, True
+    if focused:
+        return focused[0], False
     rows = await pool.fetch(
         f"SELECT * FROM stories WHERE {key_pred} AND state = ANY($2::text[])",
         key_val, list(_NON_TERMINAL_STATES),
@@ -198,6 +216,16 @@ async def build_story_state_snapshot(thread_id: str) -> dict:
 
     story_id = story["id"]
 
+    # THE KERNEL FIRST. If a kernel run exists for this story, that is
+    # what is happening to it and the legacy fields below describe a
+    # machine it is not running on. Returning None means no kernel run,
+    # which is the honest answer for a control-panel story.
+    from app.services.kernel_story_state import kernel_snapshot
+    kernel = await kernel_snapshot(story)
+    if kernel is not None:
+        kernel["execution_paused"] = bool(story.get("execution_paused"))
+        return kernel
+
     # Infer story_type from attached resources. Has any kind in
     # ('repo', 'branch')? → code. Else → generic.
     code_resource = await pool.fetchval(
@@ -239,6 +267,27 @@ async def build_story_state_snapshot(thread_id: str) -> dict:
         )
         snapshot["repo"] = (repo_row and repo_row["repo_name"]) or "none"
         snapshot["branch"] = (repo_row and repo_row["branch_name"]) or "none"
+
+        # Multi-repo (plan M6.4): the scalar repo/branch above stay for compatibility —
+        # every skill and prompt that reads the snapshot expects them — and describe
+        # the PRIMARY repo. `repos` adds the full picture for a multi-repo workspace,
+        # including each clone's directory and whether it is writable, which is what
+        # the planner needs to emit per-task `repo:` fields.
+        #
+        # Sourced from story_workspace_nodes (what was actually cloned) rather than
+        # the grants, so the snapshot matches the directories that exist on disk.
+        # Absent/empty for single-repo and legacy stories — readers should treat a
+        # missing or single-entry `repos` as "use `repo`/`branch`".
+        # Degrading (non-strict) is right here: a snapshot that omits `repos` reads as
+        # single-repo, which is exactly what the reader should do when we cannot say
+        # otherwise. Unlike the diff path, nothing is committed off this answer.
+        node_rows = await resolve_workspace_clones(pool, story_id)
+        if len(node_rows) > 1:
+            # Still gated on >1: for this snapshot `repos` is EXTRA detail for the
+            # multi-repo case, and a single-entry list would be new output for every
+            # ordinary story. (The local hydration bundle deliberately differs — there
+            # `path` is the addressing scheme, so one repo needs it too.)
+            snapshot["repos"] = to_bundle_repos(node_rows)
 
         # Plan path lookup. plan_versions has the canonical record.
         plan_path = await pool.fetchval(
@@ -318,6 +367,17 @@ def format_snapshot_message(snapshot: dict) -> str:
     The fenced block uses the language tag `story_state_snapshot` so
     SHCA's skills can find it deterministically.
     """
+    # A KERNEL STORY HAS A DIFFERENT SHAPE, and describing it with these
+    # fields produced five wrong ones in a row -- `phase: planning` on a
+    # run that was VERIFYING, a workspace path in the assistant's agent
+    # home, one branch for a two-branch story, "plan not written yet"
+    # for a plan that existed in both repos, and no progress for
+    # thirty-two steps. The block is the model's most prominent context
+    # about the story, so being wrong there is expensive.
+    if snapshot.get("kernel"):
+        from app.services.kernel_story_state import render_kernel_block
+        return chr(10).join(render_kernel_block(snapshot))
+
     lines: list[str] = ["```story_state_snapshot"]
 
     # Order matters for human readability.
@@ -330,6 +390,20 @@ def format_snapshot_message(snapshot: dict) -> str:
         if field in snapshot:
             value = snapshot[field]
             lines.append(f"{field}: {value}")
+
+    # Multi-repo (plan M6.4): rendered as an indented block right after the scalar
+    # repo/branch, so a reader sees immediately that `repo:` above is only the primary
+    # one. Emitted ONLY for genuinely multi-repo stories — the snapshot for every
+    # existing single-repo story is byte-identical to before.
+    repos = snapshot.get("repos")
+    if isinstance(repos, list) and len(repos) > 1:
+        lines.append(f"repos: ({len(repos)} — this story spans multiple repositories)")
+        for r in repos:
+            access = "write" if r.get("write") else "read-only"
+            lines.append(
+                f"  - path: {r.get('path')}  repo: {r.get('name')}  "
+                f"branch: {r.get('branch')}  access: {access}"
+            )
 
     # next_action overlay (Phase 2b) — the assistant routes on this first.
     na = snapshot.get("next_action")
@@ -358,6 +432,37 @@ def format_snapshot_message(snapshot: dict) -> str:
         lines.append("recent_progress: []")
 
     lines.append("```")
+
+    # ── File-access directive (rendered AFTER the fenced block so it reads as
+    # an instruction, not a parseable snapshot field). Story files — scope.md,
+    # plans/, and everything under repo/ — live in the story workspace at
+    # `workspace_path`. The assistant's read/write/edit tools are rooted at its
+    # AGENT HOME (one level ABOVE the story), so a bare `repo/…` path resolves
+    # to a phantom dir and ENOENTs — the recurring "file access error", newly
+    # provoked by Sonnet 5 reading story files directly. custom_workspace_file
+    # is the only correct tool. Emit a ready-to-run invocation with the real
+    # values so the model cannot get the pathing wrong. Guarded to story-bound
+    # snapshots (workspace_path is a concrete path). ──
+    ws = snapshot.get("workspace_path")
+    sid = snapshot.get("story_id")
+    if ws and ws not in ("none", ""):
+        fp = (
+            f"repo/stories/{sid}/scope.md"
+            if sid and sid not in ("none", "")
+            else "repo/stories/<story_id>/scope.md"
+        )
+        lines.append("")
+        lines.append(
+            "> **To read/list/write files in THIS story (scope.md, plans/, source under `repo/`), "
+            "use the `custom_workspace_file` tool — NOT `read`/`edit`/`write`.** Those are rooted at "
+            "your agent home, not the story, so a bare `repo/…` or `stories/…` path fails with ENOENT "
+            "(phantom dir). Call: "
+            f'`custom_workspace_file(op="read", workspace_path="{ws}", file_path="{fp}")` '
+            "— `workspace_path` is the value above, verbatim; `file_path` is relative to it; "
+            '`op="list"` browses. Reserve `read`/`edit`/`write` for your OWN home files only '
+            "(MEMORY.md, RESOURCES.md, IDENTITY.md, skills)."
+        )
+
     return "\n".join(lines)
 
 
