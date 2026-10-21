@@ -7,8 +7,11 @@
 # config + synthetic models + wrappers/hooks + restart). No image registry — the
 # gateway runs from source on the VM.
 #
-# Requires: the Cloud Build service account can SSH via IAP. prerequisites.sh
-# grants it roles/iap.tunnelResourceAccessor + roles/compute.osAdminLogin.
+# Runs as agentos-build (the platform's prerequisites.sh makes it, with
+# roles/iap.tunnelResourceAccessor + roles/compute.osAdminLogin and actAs on
+# the gateway VM's account). Start it with --service-account, or pick that
+# account on the trigger -- the project's default build account holds none
+# of this.
 # Substitutions default to the terraform names.
 
 substitutions:

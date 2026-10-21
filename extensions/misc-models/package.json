@@ -1,0 +1,11 @@
+{
+  "name": "@openclaw/misc-models",
+  "version": "1.0.0",
+  "description": "OpenClaw plugin — utility-model overrides from AgentOS control panel's /internal/misc_model_settings endpoint, for direct-SDK-call purposes outside the agent-facing model registry",
+  "type": "module",
+  "openclaw": {
+    "extensions": [
+      "./index.ts"
+    ]
+  }
+}

@@ -87,4 +87,31 @@ describe("lookupContextTokens", () => {
       vi.useRealTimers();
     }
   });
+
+  it("picks up a model that arrived after the first load, on a later miss", async () => {
+    vi.useFakeTimers();
+    // The registry's synthetic variants land in models.json after boot.
+    let models: { id: string; contextWindow: number }[] = [];
+    mockContextModuleDeps(() => ({ models: {} }));
+    vi.doMock("./pi-model-discovery.js", () => ({
+      discoverAuthStorage: vi.fn(() => ({})),
+      discoverModels: vi.fn(() => ({ getAll: () => models })),
+    }));
+    try {
+      const { lookupContextTokens } = await import("./context.js");
+      expect(lookupContextTokens("gemini-3.8-flash-500k")).toBeUndefined();
+      await vi.advanceTimersByTimeAsync(0);
+
+      models = [{ id: "gemini-3.8-flash-500k", contextWindow: 500_000 }];
+      // Inside the rate limit: still the old cache.
+      expect(lookupContextTokens("gemini-3.8-flash-500k")).toBeUndefined();
+
+      await vi.advanceTimersByTimeAsync(30_000);
+      lookupContextTokens("gemini-3.8-flash-500k"); // the miss that reloads
+      await vi.advanceTimersByTimeAsync(0);
+      expect(lookupContextTokens("gemini-3.8-flash-500k")).toBe(500_000);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });

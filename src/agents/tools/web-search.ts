@@ -1,5 +1,6 @@
 import { Type } from "@sinclair/typebox";
 import { formatCliCommand } from "../../cli/command-format.js";
+import { getMiscModelOverride } from "../misc-model-overrides.js";
 import type { OpenClawConfig } from "../../config/config.js";
 import { normalizeResolvedSecretInputString } from "../../config/types.secrets.js";
 import { logVerbose } from "../../globals.js";
@@ -527,7 +528,12 @@ type GeminiGroundingResponse = {
   };
 };
 
-const DEFAULT_GEMINI_MODEL = "gemini-2.5-flash";
+// The grounded web-search default. 3.8, not 2.5: AgentOS stopped
+// offering any pre-3 Gemini on 2026-10-18, so a search tool pinned to
+// 2.5 was the last place a request for a retired model still
+// originated -- and it originated on every grounded search, from
+// agents whose own model had already moved.
+const DEFAULT_GEMINI_MODEL = "gemini-3.8-flash";
 const GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta";
 
 function resolveSearchConfig(cfg?: OpenClawConfig): WebSearchConfig {
@@ -912,7 +918,30 @@ function resolveGeminiApiKey(gemini?: GeminiConfig): string | undefined {
 function resolveGeminiModel(gemini?: GeminiConfig): string {
   const fromConfig =
     gemini && "model" in gemini && typeof gemini.model === "string" ? gemini.model.trim() : "";
-  return fromConfig || DEFAULT_GEMINI_MODEL;
+  if (fromConfig) {
+    // Explicit openclaw.json config always wins over the control-panel
+    // override — an operator who hand-set this value opted out of the
+    // shared utility-model config for this specific gateway.
+    return fromConfig;
+  }
+  // extensions/misc-models/ (control-panel-driven) stores a registry wire
+  // id ("provider/model", e.g. "google/gemini-2.5-flash") since the admin
+  // UI now offers every provider in the registry, not just Gemini — but
+  // grounded search is a Gemini-only API. Strip the "google/" prefix if
+  // present; anything from another provider can't do grounded search at
+  // all, so ignore it and fall back to the hardcoded default rather than
+  // sending a nonsense model id to Gemini's endpoint.
+  const override = getMiscModelOverride("web_search_grounding", "");
+  if (override.startsWith("google/")) {
+    return override.slice("google/".length);
+  }
+  if (override) {
+    logVerbose(
+      `web_search: web_search_grounding is configured for a non-Google model (${override}); ` +
+        `grounded search only supports Gemini — using default ${DEFAULT_GEMINI_MODEL} instead`,
+    );
+  }
+  return DEFAULT_GEMINI_MODEL;
 }
 
 async function withTrustedWebSearchEndpoint<T>(

@@ -82,6 +82,19 @@ BODY=$(jq -nc \
   --arg cwd "$CWD" \
   '{tool: $tool, file_path: $file_path, content: $content, cwd: $cwd}')
 
+# Write BODY to a temp file and hand it to curl via --data-binary @file rather
+# than --data "$BODY" (a command-line argument). A plan file's content is
+# free-form prose and routinely contains non-ASCII characters (em dashes,
+# smart quotes, etc.); passing those as an argv element through a shell that
+# spawns a native binary can mangle the encoding en route (observed on
+# Windows via Git Bash -> curl.exe: an em dash in the content silently
+# corrupted the JSON enough that the server read `tool` as empty and skipped
+# validation entirely, with no error surfaced anywhere). Piping the exact
+# bytes through a file sidesteps that argv/encoding boundary completely, on
+# every platform.
+BODY_FILE=$(mktemp)
+printf '%s' "$BODY" > "$BODY_FILE"
+
 # 60-second timeout. If the control panel is unreachable, fail open so we
 # don't block writes on infra trouble — the DB-side ingest will still
 # validate at plan-approval time as the existing backstop.
@@ -89,10 +102,13 @@ RESPONSE=$(curl -s -w "\n%{http_code}" --max-time 60 \
   -X POST "$CONTROL_PANEL_URL/internal/assistant/validate-plan" \
   -H "Authorization: Bearer $OPENCLAW_GATEWAY_TOKEN" \
   -H "Content-Type: application/json" \
-  --data "$BODY" 2>/dev/null) || {
-    echo "[validate-plan-dag] curl failed (network/timeout) — failing open" >&2
-    exit 0
-  }
+  --data-binary "@$BODY_FILE" 2>/dev/null)
+CURL_STATUS=$?
+rm -f "$BODY_FILE"
+if [ "$CURL_STATUS" -ne 0 ]; then
+  echo "[validate-plan-dag] curl failed (network/timeout) — failing open" >&2
+  exit 0
+fi
 
 # Split off status code (last line) from body.
 HTTP_CODE=$(echo "$RESPONSE" | tail -n1)

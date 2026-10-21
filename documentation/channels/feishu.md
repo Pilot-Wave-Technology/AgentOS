@@ -81,8 +81,6 @@ Lark (global) tenants should use [https://open.larksuite.com/app](https://open.l
 2. Fill in the app name + description
 3. Choose an app icon
 
-![Create enterprise app](../images/feishu-step2-create-app.png)
-
 ### 3. Copy credentials
 
 From **Credentials & Basic Info**, copy:
@@ -91,8 +89,6 @@ From **Credentials & Basic Info**, copy:
 - **App Secret**
 
 ❗ **Important:** keep the App Secret private.
-
-![Get credentials](../images/feishu-step3-credentials.png)
 
 ### 4. Configure permissions
 
@@ -126,16 +122,12 @@ On **Permissions**, click **Batch import** and paste:
 }
 ```
 
-![Configure permissions](../images/feishu-step4-permissions.png)
-
 ### 5. Enable bot capability
 
 In **App Capability** > **Bot**:
 
 1. Enable bot capability
 2. Set the bot name
-
-![Enable bot capability](../images/feishu-step5-bot-capability.png)
 
 ### 6. Configure event subscription
 
@@ -150,8 +142,6 @@ In **Event Subscription**:
 2. Add the event: `im.message.receive_v1`
 
 ⚠️ If the gateway is not running, the long-connection setup may fail to save.
-
-![Configure event subscription](../images/feishu-step6-event-subscription.png)
 
 ### 7. Publish the app
 
@@ -203,8 +193,6 @@ When using webhook mode, set `channels.feishu.verificationToken` in your config.
 2. Go to **Development** → **Events & Callbacks** (开发配置 → 事件与回调)
 3. Open the **Encryption** tab (加密策略)
 4. Copy **Verification Token**
-
-![Verification Token location](../images/feishu-verification-token.png)
 
 ### Configure via environment variables
 

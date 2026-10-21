@@ -78,6 +78,19 @@ let loadPromise: Promise<void> | null = null;
 let configuredConfig: OpenClawConfig | undefined;
 let configLoadFailures = 0;
 let nextConfigLoadAttemptAtMs = 0;
+let loadSettled = false;
+let lastLoadStartedAtMs = 0;
+
+// A MISS RELOADS, at most this often. The cache is built once, at boot, and
+// the Model Registry's synthetic variants (`gemini-3.8-flash-500k`, ...)
+// reach models.json only after the registry plugin's first poll of the
+// control panel. A gateway that booted before that poll landed -- every
+// fresh deployment, whose control panel does not exist yet -- never saw
+// them: each lookup missed, and every session recorded the 200K default.
+// The context ring showed 200K on a 500K agent and the memory flush fired
+// against the wrong budget. Rate-limited because a genuinely unknown id
+// misses on every turn.
+const MISS_RELOAD_INTERVAL_MS = 30_000;
 
 function getCommandPathFromArgv(argv: string[]): string[] {
   const args = argv.slice(2);
@@ -144,6 +157,8 @@ function ensureContextWindowCacheLoaded(): Promise<void> {
     return Promise.resolve();
   }
 
+  loadSettled = false;
+  lastLoadStartedAtMs = Date.now();
   loadPromise = (async () => {
     try {
       await ensureOpenClawModelsJson(cfg);
@@ -172,10 +187,24 @@ function ensureContextWindowCacheLoaded(): Promise<void> {
       cache: MODEL_CACHE,
       modelsConfig: cfg.models as ModelsConfig | undefined,
     });
-  })().catch(() => {
-    // Keep lookup best-effort.
-  });
+  })()
+    .catch(() => {
+      // Keep lookup best-effort.
+    })
+    .finally(() => {
+      loadSettled = true;
+    });
   return loadPromise;
+}
+
+function reloadAfterMiss(): void {
+  if (!loadSettled || Date.now() - lastLoadStartedAtMs < MISS_RELOAD_INTERVAL_MS) {
+    return;
+  }
+  // Re-read config too: providers can arrive there as well as via plugins.
+  loadPromise = null;
+  configuredConfig = undefined;
+  void ensureContextWindowCacheLoaded();
 }
 
 export function lookupContextTokens(modelId?: string): number | undefined {
@@ -184,7 +213,11 @@ export function lookupContextTokens(modelId?: string): number | undefined {
   }
   // Best-effort: kick off loading, but don't block.
   void ensureContextWindowCacheLoaded();
-  return MODEL_CACHE.get(modelId);
+  const tokens = MODEL_CACHE.get(modelId);
+  if (tokens === undefined) {
+    reloadAfterMiss();
+  }
+  return tokens;
 }
 
 if (!shouldSkipEagerContextWindowWarmup()) {

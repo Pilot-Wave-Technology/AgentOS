@@ -1363,15 +1363,119 @@ export const agentsHandlers: GatewayRequestHandlers = {
     }
 
     const { spawn } = await import("node:child_process");
-    const { existsSync } = await import("node:fs");
 
     const agentId = normalizeAgentId(String((params as any).agentId));
     const storyId = String((params as any).storyId);
-    const repoCfg = (params as any).repo as {
+    // Accept BOTH shapes (plan Phase G, backward-compatible): the legacy single
+    // `repo` object, or the multi-repo `repos` array. Normalize to one list so the
+    // rest of the handler has a single code path. The legacy form keeps cloning into
+    // `repo/` (agent docs, _resolveStoryRepoDir and every existing story on disk
+    // depend on that exact dir); the multi-repo form uses each entry's `subdir`.
+    const legacyRepoCfg = (params as any).repo as {
       cloneUrl: string; branch: string; userName?: string; userEmail?: string;
-    };
+    } | undefined;
+    const multiRepoCfg = (params as any).repos as Array<{
+      subdir: string; cloneUrl: string; branch: string; write?: boolean;
+      userName?: string; userEmail?: string;
+    }> | undefined;
+
+    // Three shapes now, not two. `repo` (legacy single), `repos` (multi), and
+    // NEITHER — a story workspace that holds documents and plans and no
+    // checkout at all, because the work happens in an executor sandbox that
+    // has its own. Sending both is still a contradiction and still refused.
+    //
+    // An empty `repos: []` is NOT the way to ask for that. It is truthy in JS,
+    // so it would slip past a `!a === !b` check and crash on an undefined
+    // primary target further down; the schema's minItems:1 rejects it before
+    // this handler runs, and the explicit length check below keeps that
+    // invariant local rather than depending on a schema in another file. Omit
+    // the field to get a docs-only workspace.
+    const docsOnly = !legacyRepoCfg && !multiRepoCfg;
+    if (legacyRepoCfg && multiRepoCfg) {
+      respond(false, undefined, errorShape(
+        ErrorCodes.INVALID_REQUEST,
+        "provide `repo` (single) or `repos` (multi), not both — or neither, " +
+        "for a story workspace with no checkout",
+      ));
+      return;
+    }
+    if (multiRepoCfg && multiRepoCfg.length === 0) {
+      respond(false, undefined, errorShape(
+        ErrorCodes.INVALID_REQUEST,
+        "`repos` must list at least one repository — omit the field entirely " +
+        "for a workspace with no checkout",
+      ));
+      return;
+    }
+
+    const isMultiRepo = Boolean(multiRepoCfg);
+    const repoList = multiRepoCfg ?? (legacyRepoCfg ? [{
+      subdir: "repo",
+      cloneUrl: legacyRepoCfg.cloneUrl,
+      branch: legacyRepoCfg.branch,
+      write: true,
+      userName: legacyRepoCfg.userName,
+      userEmail: legacyRepoCfg.userEmail,
+    }] : []);
+
+    // Each subdir must stay inside the story workspace and must not collide.
+    const seenSubdirs = new Set<string>();
+    for (const r of repoList) {
+      const sub = (r.subdir || "").trim();
+      if (!sub || sub.startsWith("/") || sub.includes("..") || path.isAbsolute(sub)) {
+        respond(false, undefined, errorShape(
+          ErrorCodes.INVALID_REQUEST,
+          `repo subdir must be a relative path without '..', got '${sub}'`,
+        ));
+        return;
+      }
+      if (seenSubdirs.has(sub)) {
+        respond(false, undefined, errorShape(
+          ErrorCodes.INVALID_REQUEST, `duplicate repo subdir '${sub}'`,
+        ));
+        return;
+      }
+      seenSubdirs.add(sub);
+    }
+
     const files = (params as any).files as Record<string, string>;
     const githubToken = (params as any).githubToken as string | undefined;
+    // When present, install a callback credential helper pointing at this URL instead
+    // of embedding the token in .git/config — see the credential-helper block below.
+    const credentialBrokerUrl =
+      String((params as any).credentialBrokerUrl ?? "").trim();
+    // Validated ONCE, here, because it is interpolated into a shell command that git
+    // executes. `new URL` both rejects malformed input and normalises/percent-encodes
+    // most of it — but a legal URL may still contain `$` or a backtick, which the shell
+    // would expand inside the helper string. Reject those outright rather than trying to
+    // quote around them. Doing this up front also stops a malformed URL throwing from
+    // inside the clone loop and failing the RPC with an unhandled error.
+    if (credentialBrokerUrl) {
+      let parsed: URL;
+      try {
+        parsed = new URL(credentialBrokerUrl);
+      } catch {
+        respond(false, undefined, errorShape(
+          ErrorCodes.INVALID_REQUEST,
+          `credentialBrokerUrl is not a valid URL`,
+        ));
+        return;
+      }
+      if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
+        respond(false, undefined, errorShape(
+          ErrorCodes.INVALID_REQUEST,
+          `credentialBrokerUrl must be http(s), got ${parsed.protocol}`,
+        ));
+        return;
+      }
+      if (/[$`"'\\;|&<>\s]/.test(credentialBrokerUrl)) {
+        respond(false, undefined, errorShape(
+          ErrorCodes.INVALID_REQUEST,
+          `credentialBrokerUrl contains characters unsafe to embed in a git credential helper`,
+        ));
+        return;
+      }
+    }
     // Story dirs the control panel says must NOT be wiped (e.g. a 'done' story
     // whose final council review hasn't run yet — it reads the live workspace).
     const protectStoryIds = new Set<string>(
@@ -1407,7 +1511,46 @@ export const agentsHandlers: GatewayRequestHandlers = {
 
     const storiesParentDir = path.join(agentWorkspaceDir, "stories");
     const wsReal = path.join(storiesParentDir, storyId);
-    const repoReal = path.join(wsReal, "repo");
+    // Absolute clone target per repo, in the caller's order (write repos first).
+    // `owner/name` parsed from the clone URL. Used to tell the credential broker
+    // WHICH repo a request is for — derived rather than passed so the legacy
+    // single-repo form gets it too, without a params change.
+    function repoNameFromCloneUrl(cloneUrl: string): string {
+      try {
+        const segments = new URL(cloneUrl).pathname
+          .replace(/\.git$/, "").split("/").filter(Boolean);
+        return segments.length >= 2
+          ? `${segments[segments.length - 2]}/${segments[segments.length - 1]}`
+          : (segments[0] ?? "");
+      } catch {
+        return "";
+      }
+    }
+
+    const repoTargets = repoList.map((r) => ({
+      ...r,
+      write: r.write !== false,
+      absPath: path.join(wsReal, r.subdir),
+      repoName: repoNameFromCloneUrl(r.cloneUrl),
+    }));
+    // Primary = the first WRITE repo (the single repo in the legacy form). Its path
+    // is what the result's `repoPath` reports for un-updated callers. Empty when
+    // nothing is being cloned — there is no primary repo to name, and reporting
+    // the story dir as one would tell the caller a checkout exists.
+    const primaryTarget = repoTargets.find((r) => r.write) ?? repoTargets[0];
+    const repoReal = primaryTarget ? primaryTarget.absPath : "";
+
+    // Defense-in-depth: every clone target must resolve inside the story workspace.
+    for (const t of repoTargets) {
+      const resolved = path.resolve(t.absPath);
+      if (!resolved.startsWith(wsReal + path.sep)) {
+        respond(false, undefined, errorShape(
+          ErrorCodes.INTERNAL_ERROR,
+          `repo subdir '${t.subdir}' escaped the story workspace`,
+        ));
+        return;
+      }
+    }
 
     // Defense-in-depth: ensure computed path is still under the agent workspace.
     if (!wsReal.startsWith(agentWorkspaceDir + path.sep)) {
@@ -1418,13 +1561,17 @@ export const agentsHandlers: GatewayRequestHandlers = {
       return;
     }
 
-    // Single-story-at-a-time invariant: if the agent has any existing
-    // stories/<other-id>/ subdirs, remove them before creating the new
-    // workspace. EXCEPTION: never delete a dir the control panel marked
-    // protected via protectStoryIds — that is a story which is 'done' but
-    // whose final council review hasn't completed (the review reads the live
-    // workspace). Such a dir survives this import; it gets cleaned on a later
-    // import once the story is 'reviewed' (and drops off the protect list).
+    // Remove the story dirs the control panel did NOT list in protectStoryIds.
+    //
+    // This began as a single-story-at-a-time invariant: one assistant held one
+    // story, so every other dir was by definition abandoned, and the protect
+    // list was a narrow exception for a 'done' story whose council review had
+    // not run yet. That reading is no longer safe — an assistant can now hold
+    // several stories at once, and this loop cannot tell a finished one from a
+    // live one. The control panel can, so the list is now the full set of
+    // stories it is still working on, and the rule here is simply: keep what
+    // was named, remove the rest. A live story omitted from the list loses its
+    // documents silently, which is why the caller sends state, not intent.
     // The new story is still imported + created regardless.
     try {
       const existing = await fs.readdir(storiesParentDir, { withFileTypes: true });
@@ -1448,16 +1595,13 @@ export const agentsHandlers: GatewayRequestHandlers = {
     }
 
     // Resolve git absolute path — the systemd-rooted gateway may not have
-    // /usr/bin on its inherited PATH. Mirrors shca-tools.ts pattern.
-    const GIT_CANDIDATES = ["/usr/bin/git", "/usr/local/bin/git", "/bin/git"];
-    let gitBin: string | null = null;
-    for (const c of GIT_CANDIDATES) {
-      if (existsSync(c)) { gitBin = c; break; }
-    }
+    // /usr/bin on its inherited PATH. Mirrors shca-tools.ts pattern. Shared
+    // resolver (_resolveGitBin) also covers Windows local-dev paths.
+    const gitBin = _resolveGitBin();
     if (!gitBin) {
       respond(false, undefined, errorShape(
         ErrorCodes.INTERNAL_ERROR,
-        `git binary not found in ${GIT_CANDIDATES.join(", ")}`,
+        `git binary not found in ${_GIT_CANDIDATES.join(", ")}`,
       ));
       return;
     }
@@ -1522,63 +1666,173 @@ export const agentsHandlers: GatewayRequestHandlers = {
     // workspace root (RESOURCES.md, IDENTITY.md, docs/, .claude/) get
     // overwritten by the writeFile loop below — no special handling
     // needed for those.
-    try {
-      await fs.rm(repoReal, { recursive: true, force: true });
-    } catch (err) {
-      respond(false, undefined, errorShape(
-        ErrorCodes.INTERNAL_ERROR,
-        `rm stale repo failed: ${(err as Error).message}`,
-      ));
-      return;
+    // In the multi-repo form the clones live under a shared `repos/` parent, so
+    // wiping that whole parent (plus any legacy `repo/` left by an earlier
+    // single-repo provisioning of the same story) is what makes re-provisioning
+    // idempotent. Collect the distinct dirs to remove rather than removing each
+    // clone target individually.
+    const staleDirs = new Set<string>([path.join(wsReal, "repo")]);
+    for (const t of repoTargets) {
+      const firstSegment = t.subdir.split(/[\\/]/)[0];
+      staleDirs.add(path.join(wsReal, firstSegment));
+    }
+    for (const dir of staleDirs) {
+      try {
+        await fs.rm(dir, { recursive: true, force: true });
+      } catch (err) {
+        respond(false, undefined, errorShape(
+          ErrorCodes.INTERNAL_ERROR,
+          `rm stale repo dir '${dir}' failed: ${(err as Error).message}`,
+        ));
+        return;
+      }
     }
 
-    // 2. Clone the branch.
-    const cloneUrlForGit = githubToken
-      ? buildAuthedCloneUrl(repoCfg.cloneUrl, githubToken)
-      : repoCfg.cloneUrl;
+    // 2-6. Clone + configure each repo. Sequential on purpose: these are network
+    // clones on a shared VM, and a failure must abort the whole provisioning rather
+    // than leave a half-built workspace the assistant would start working in.
+    const clonedRepos: Array<{
+      subdir: string; repoPath: string; branch: string; headSha: string; write: boolean;
+    }> = [];
 
-    const cloneResult = await runGit(
-      ["clone", "--single-branch", "--branch", repoCfg.branch, "--no-tags",
-       cloneUrlForGit, repoReal],
-      { env: { GIT_TERMINAL_PROMPT: "0" } },
-    );
+    for (const target of repoTargets) {
+      // 2. Clone the branch.
+      const cloneUrlForGit = githubToken
+        ? buildAuthedCloneUrl(target.cloneUrl, githubToken)
+        : target.cloneUrl;
 
-    if (!cloneResult.ok) {
-      // Redact the token from any error spillage just in case.
-      const stderr = (githubToken
-        ? cloneResult.stderr.replaceAll(githubToken, "<redacted>")
-        : cloneResult.stderr
-      ).slice(0, 1000);
-      respond(false, undefined, errorShape(
-        ErrorCodes.INTERNAL_ERROR,
-        `git clone failed: ${stderr}`,
-      ));
-      return;
+      await fs.mkdir(path.dirname(target.absPath), { recursive: true });
+
+      const cloneResult = await runGit(
+        ["clone", "--single-branch", "--branch", target.branch, "--no-tags",
+         cloneUrlForGit, target.absPath],
+        { env: { GIT_TERMINAL_PROMPT: "0" } },
+      );
+
+      if (!cloneResult.ok) {
+        // Redact the token from any error spillage just in case.
+        const stderr = (githubToken
+          ? cloneResult.stderr.replaceAll(githubToken, "<redacted>")
+          : cloneResult.stderr
+        ).slice(0, 1000);
+        respond(false, undefined, errorShape(
+          ErrorCodes.INTERNAL_ERROR,
+          `git clone failed for '${target.subdir}' (branch ${target.branch}): ${stderr}`,
+        ));
+        return;
+      }
+
+      // 3. Overwrite remote URL to drop the inline credentials from .git/config.
+      if (githubToken) {
+        await runGit(["-C", target.absPath, "remote", "set-url", "origin", target.cloneUrl]);
+      }
+
+      // 4. Configure git user.name + user.email in the clone
+      const userName = target.userName || "openclaw-shca";
+      const userEmail = target.userEmail || "openclaw+shca@noreply.agents";
+      await runGit(["-C", target.absPath, "config", "user.name", userName]);
+      await runGit(["-C", target.absPath, "config", "user.email", userEmail]);
+
+      // 5. Configure the local credential helper. Installed per clone because the
+      // operator path deliberately does not inherit a global helper.
+      //
+      // TWO MODES (plan M5/G.6):
+      //   * BROKERED (preferred) — the helper calls back to the control panel and
+      //     gets a freshly minted token per git operation. NOTHING is stored: no
+      //     token in .git/config, no 50-minute rewrite loop. The control panel
+      //     re-checks on every call that this story may touch this repo.
+      //   * INLINE (legacy) — the token is embedded in .git/config and refreshed by
+      //     later setup calls.
+      //
+      // The control panel chooses, by sending `credentialBrokerUrl`. It only does so
+      // once /internal/git-credential is live, so an older control panel (or a
+      // rollback) transparently keeps the inline helper. Both are per-clone, so a
+      // workspace can even be mixed without harm.
+      // READ-ONLY CLONES GET NO CREDENTIALS AT ALL, and lose their remote.
+      //
+      // Installing a write-capable helper in a `write: false` clone left the read-only
+      // boundary enforced by nothing but instructions in a markdown file: the clone had
+      // a working push credential and an `origin` pointing at the real remote, so one
+      // stray `git push` from the assistant would land commits in a repository the story
+      // was only ever granted READ access to. Mirrors what
+      // agents.workspace.prepareRepo already does for Security Council clones.
+      if (!target.write) {
+        await runGit(["-C", target.absPath, "remote", "remove", "origin"]);
+        // Also strip any inherited helper so a push cannot pick one up implicitly.
+        await runGit([
+          "-C", target.absPath, "config", "--local", "credential.helper", "",
+        ]);
+      } else if (credentialBrokerUrl) {
+        // $OPENCLAW_GATEWAY_TOKEN is already injected into the story workspace env
+        // (cli-spawn.ts) and is what the existing assistant hooks authenticate with.
+        // -f makes curl fail loudly rather than feeding git an HTML error page.
+        //
+        // The bearer is passed to curl on STDIN via --config, never in argv: an
+        // argument-vector secret is readable from /proc/<pid>/cmdline by any co-tenant
+        // process for the lifetime of every git operation. `--config -` makes curl read
+        // the header from stdin instead.
+        const brokerUrl = new URL(credentialBrokerUrl);
+        brokerUrl.searchParams.set("story_id", storyId);
+        brokerUrl.searchParams.set("repo", target.repoName || "");
+        const safeUrl = brokerUrl.toString();
+        const helperCmd =
+          `!f() { printf 'header = "Authorization: Bearer %s"\\n' ` +
+          `"$OPENCLAW_GATEWAY_TOKEN" | curl -sf --config - ` +
+          `${JSON.stringify(safeUrl)}; }; f`;
+        await runGit(["-C", target.absPath, "config", "credential.helper", helperCmd]);
+      } else if (githubToken) {
+        const helperCmd =
+          `!f() { echo "username=x-access-token"; echo "password=${githubToken}"; }; f`;
+        await runGit(["-C", target.absPath, "config", "credential.helper", helperCmd]);
+      }
+
+      // 6. Capture HEAD sha
+      const shaResult = await runGit(["-C", target.absPath, "rev-parse", "HEAD"]);
+      clonedRepos.push({
+        subdir: target.subdir,
+        repoPath: target.absPath,
+        branch: target.branch,
+        headSha: shaResult.stdout.trim() || "unknown",
+        write: target.write,
+      });
     }
 
-    // 3. Overwrite remote URL to drop the inline credentials from .git/config.
-    if (githubToken) {
-      await runGit(["-C", repoReal, "remote", "set-url", "origin", repoCfg.cloneUrl]);
+    const primaryClone =
+      clonedRepos.find((r) => r.repoPath === repoReal) ?? clonedRepos[0];
+    const headSha = primaryClone?.headSha;
+
+    // 6b. Write the repo manifest.
+    //
+    // WHY THIS FILE EXISTS: write-vs-read-only is a control-plane fact (it comes from
+    // story_resources.relation) that is invisible on disk — every clone looks the
+    // same. Without it, _resolveStoryRepoDirs can only order clones alphabetically,
+    // so gitDiff/gitCommit could pick a READ-ONLY context repo and commit into a repo
+    // the story was never granted write access to. The manifest is the gateway's only
+    // durable record of the distinction between provisioning and a later RPC.
+    //
+    // Dotfile at the workspace root, outside every clone, so it can never be
+    // committed. Best-effort: a manifest failure must not fail an otherwise-good
+    // workspace — the resolver falls back to alphabetical order.
+    if (isMultiRepo) {
+      try {
+        await fs.writeFile(
+          path.join(wsReal, ".openclaw-story-repos.json"),
+          JSON.stringify({ version: 1, repos: clonedRepos }, null, 2),
+          "utf-8",
+        );
+      } catch (err) {
+        // NOT non-fatal. This file is the only record of which clones are writable;
+        // without it _resolveStoryRepoDirs treats EVERY clone as writable, so a
+        // read-only context repo would become a commit target. Fail provisioning
+        // rather than hand back a workspace whose write boundary is unknown.
+        respond(false, undefined, errorShape(
+          ErrorCodes.INTERNAL_ERROR,
+          `failed to write the repo manifest, so the read-only boundary cannot be ` +
+          `enforced: ${(err as Error).message}`,
+        ));
+        return;
+      }
     }
-
-    // 4. Configure git user.name + user.email in the clone
-    const userName = repoCfg.userName || "openclaw-shca";
-    const userEmail = repoCfg.userEmail || "openclaw+shca@noreply.agents";
-    await runGit(["-C", repoReal, "config", "user.name", userName]);
-    await runGit(["-C", repoReal, "config", "user.email", userEmail]);
-
-    // 5. Configure local credential helper (matches existing IA pattern from
-    // resource_provisioning._git_setup_section). Embedded inline token;
-    // refreshed by future setup calls.
-    if (githubToken) {
-      const helperCmd =
-        `!f() { echo "username=x-access-token"; echo "password=${githubToken}"; }; f`;
-      await runGit(["-C", repoReal, "config", "credential.helper", helperCmd]);
-    }
-
-    // 6. Capture HEAD sha
-    const shaResult = await runGit(["-C", repoReal, "rev-parse", "HEAD"]);
-    const headSha = shaResult.stdout.trim() || "unknown";
 
     // 7. Write scaffolding files. Path safety: relPath must be relative,
     // no `..`, no absolute paths.
@@ -1601,9 +1855,18 @@ export const agentsHandlers: GatewayRequestHandlers = {
     respond(true, {
       ok: true,
       workspacePath: wsReal,
-      repoPath: repoReal,
-      branch: repoCfg.branch,
-      headSha,
+      // Primary-repo fields stay populated in BOTH cloning forms so a control
+      // panel that predates the multi-repo result shape keeps working (see the
+      // schema comment). Omitted entirely when nothing was cloned: an empty
+      // string would read as a path, and a made-up one as a checkout.
+      ...(primaryClone ? {
+        repoPath: repoReal,
+        branch: primaryClone.branch,
+        headSha,
+      } : {}),
+      // Per-repo detail only in the multi-repo form — omitted for legacy callers so
+      // the response is byte-identical to what they got before this change.
+      ...(isMultiRepo ? { repos: clonedRepos } : {}),
       filesWritten,
     }, undefined);
   },
@@ -1616,7 +1879,6 @@ export const agentsHandlers: GatewayRequestHandlers = {
   // clone and is never written into the workspace.
   "agents.workspace.prepareRepo": async ({ params, respond }) => {
     const { spawn } = await import("node:child_process");
-    const { existsSync } = await import("node:fs");
 
     const agentId = normalizeAgentId(String((params as any).agentId ?? ""));
     const cloneUrl = String((params as any).cloneUrl ?? "").trim();
@@ -1660,12 +1922,10 @@ export const agentsHandlers: GatewayRequestHandlers = {
       return;
     }
 
-    const GIT_CANDIDATES = ["/usr/bin/git", "/usr/local/bin/git", "/bin/git"];
-    let gitBin: string | null = null;
-    for (const c of GIT_CANDIDATES) { if (existsSync(c)) { gitBin = c; break; } }
+    const gitBin = _resolveGitBin();
     if (!gitBin) {
       respond(false, undefined, errorShape(
-        ErrorCodes.INTERNAL_ERROR, `git binary not found in ${GIT_CANDIDATES.join(", ")}`,
+        ErrorCodes.INTERNAL_ERROR, `git binary not found in ${_GIT_CANDIDATES.join(", ")}`,
       ));
       return;
     }
@@ -1824,7 +2084,7 @@ export const agentsHandlers: GatewayRequestHandlers = {
   // List files under <agentWorkspace>/stories/<storyId>/ — used by the
   // SHCA chat's right-rail file viewer. Returns a flat list of entries
   // (paths relative to the story workspace root). Excludes noise dirs
-  // (.git, __pycache__, node_modules, .pytest_cache). Cap = 2000 entries.
+  // (.git, __pycache__, node_modules, .pytest_cache). Cap = 10000 entries.
   "shca.workspace.listFiles": async ({ params, respond }) => {
     if (!validateShcaWorkspaceListFilesParams(params)) {
       respondInvalidMethodParams(
@@ -1852,7 +2112,7 @@ export const agentsHandlers: GatewayRequestHandlers = {
     // openclaw state dir and must be the story's own dir (basename === storyId).
     // Re-derivation is unreliable for long / uppercase agent ids because
     // normalizeAgentId lowercases+truncates, so the derived dir can miss the
-    // actual worktree (e.g. goal ids like RLAGT).
+    // actual worktree (e.g. goal ids like MARL).
     const explicitPath = typeof (params as any).workspacePath === "string"
       ? String((params as any).workspacePath).trim() : "";
     let storyRoot: string;
@@ -1889,7 +2149,7 @@ export const agentsHandlers: GatewayRequestHandlers = {
       ".git", "__pycache__", "node_modules", ".pytest_cache",
       ".venv", "venv", ".mypy_cache", ".ruff_cache", "dist", "build",
     ]);
-    const MAX_ENTRIES = 2000;
+    const MAX_ENTRIES = 10000;
 
     const entries: Array<{ path: string; type: "file" | "dir"; size: number; mtimeMs: number }> = [];
     let truncated = false;
@@ -1976,7 +2236,7 @@ export const agentsHandlers: GatewayRequestHandlers = {
     // story's real provisioned dir), confined to the openclaw state dir and
     // required to be the story's own dir; else re-derive from the agent id.
     // Re-derivation is unreliable for long / uppercase agent ids because
-    // normalizeAgentId lowercases+truncates (e.g. goal ids like RLAGT).
+    // normalizeAgentId lowercases+truncates (e.g. goal ids like MARL).
     const explicitPath = typeof (params as any).workspacePath === "string"
       ? String((params as any).workspacePath).trim() : "";
     let storyRoot: string;
@@ -2133,7 +2393,7 @@ export const agentsHandlers: GatewayRequestHandlers = {
     // story's real provisioned dir), confined to the openclaw state dir and
     // required to be the story's own dir; else re-derive from the agent id.
     // Re-derivation is unreliable for long / uppercase agent ids because
-    // normalizeAgentId lowercases+truncates (e.g. goal ids like RLAGT).
+    // normalizeAgentId lowercases+truncates (e.g. goal ids like MARL).
     const explicitPath = typeof (params as any).workspacePath === "string"
       ? String((params as any).workspacePath).trim() : "";
     let storyRoot: string;
@@ -2264,7 +2524,7 @@ export const agentsHandlers: GatewayRequestHandlers = {
     // story's real provisioned dir), confined to the openclaw state dir and
     // required to be the story's own dir; else re-derive from the agent id.
     // Re-derivation is unreliable for long / uppercase agent ids because
-    // normalizeAgentId lowercases+truncates (e.g. goal ids like RLAGT).
+    // normalizeAgentId lowercases+truncates (e.g. goal ids like MARL).
     const explicitPath = typeof (params as any).workspacePath === "string"
       ? String((params as any).workspacePath).trim() : "";
     let storyRoot: string;
@@ -2341,26 +2601,62 @@ export const agentsHandlers: GatewayRequestHandlers = {
     const paths = (params as any).paths as string[];
     const message = String((params as any).message);
     const push = (params as any).push !== false;
+    // Multi-repo (plan G.5): commit + push EVERY write repo. Opt-in, so existing
+    // callers keep the single-repo response shape they parse today.
+    const allRepos = (params as any).allRepos === true;
 
     const cfg = loadConfig();
     if (!isConfiguredAgent(cfg, agentId)) {
       respondAgentNotFound(respond, agentId);
       return;
     }
-    const repoDir = await _resolveStoryRepoDir(cfg, agentId, storyId);
-    if (!repoDir) {
+    const allDirs = await _resolveStoryRepoDirs(cfg, agentId, storyId);
+    // Never commit in a read-only context clone — the story has no write grant there
+    // and the push would be rejected (or worse, accepted for a repo nobody reviewed).
+    const commitTargets = allRepos ? allDirs.filter((d) => d.write) : allDirs.slice(0, 1);
+    if (commitTargets.length === 0) {
       respond(false, undefined, errorShape(
         ErrorCodes.INVALID_REQUEST,
         `story repo not found at <agent-ws>/stories/${storyId}/repo`,
       ));
       return;
     }
+    const repoDir = commitTargets[0].repoPath;
     const gitBin = _resolveGitBin();
     if (!gitBin) {
       respond(false, undefined, errorShape(
         ErrorCodes.INTERNAL_ERROR,
         `git binary not found`,
       ));
+      return;
+    }
+
+    // MULTI-REPO PATH. Each repo is committed and pushed independently and the
+    // per-repo outcome is reported, because there is no way to make N pushes atomic:
+    // repo A can land while repo B's push is rejected. Reporting each outcome lets the
+    // control panel show a partial-land state instead of a single misleading ok/fail.
+    if (allRepos) {
+      const results: Array<{
+        subdir: string; commit_sha: string; pushed: boolean;
+        nothing_to_commit?: boolean; push_error?: string; error?: string;
+      }> = [];
+      for (const target of commitTargets) {
+        const res = await _commitOneRepo(
+          gitBin, target.repoPath, paths, message, push,
+        );
+        results.push({ subdir: target.subdir, ...res });
+      }
+      const failed = results.filter((r) => r.error);
+      const primaryRes = results[0];
+      respond(true, {
+        ok: failed.length === 0,
+        // Legacy top-level fields describe the primary repo.
+        commit_sha: primaryRes.commit_sha,
+        pushed: results.every((r) => r.pushed),
+        ...(results.every((r) => r.nothing_to_commit) ? { nothing_to_commit: true } : {}),
+        ...(failed.length ? { error: failed.map((f) => `${f.subdir}: ${f.error}`).join("; ") } : {}),
+        repos: results,
+      }, undefined);
       return;
     }
 
@@ -2480,14 +2776,20 @@ export const agentsHandlers: GatewayRequestHandlers = {
     const storyId = String((params as any).storyId);
     const scope = (params as any).scope || "all";
     const writeToPath = (params as any).writeToPath as string | undefined;
+    // Multi-repo (plan G.4): diff EVERY write repo instead of just the primary.
+    // Opt-in so existing callers keep the exact single-repo response they parse.
+    const allRepos = (params as any).allRepos === true;
 
     const cfg = loadConfig();
     if (!isConfiguredAgent(cfg, agentId)) {
       respondAgentNotFound(respond, agentId);
       return;
     }
-    const repoDir = await _resolveStoryRepoDir(cfg, agentId, storyId);
-    if (!repoDir) {
+    const allDirs = await _resolveStoryRepoDirs(cfg, agentId, storyId);
+    // Read-only context clones are excluded even under allRepos: the story cannot
+    // commit there, so any diff in one is not part of the change under review.
+    const targets = allRepos ? allDirs.filter((d) => d.write) : allDirs.slice(0, 1);
+    if (targets.length === 0) {
       respond(false, undefined, errorShape(
         ErrorCodes.INVALID_REQUEST,
         `story repo not found`,
@@ -2502,59 +2804,84 @@ export const agentsHandlers: GatewayRequestHandlers = {
       return;
     }
 
-    // Pick the right diff args.
-    let diffArgs: string[];
-    if (scope === "staged") {
-      diffArgs = ["-C", repoDir, "diff", "--staged"];
-    } else if (scope === "unstaged") {
-      diffArgs = ["-C", repoDir, "diff"];
-    } else if (scope === "vs_origin") {
-      const branchR = await _runGit(gitBin,
-        ["-C", repoDir, "symbolic-ref", "--short", "HEAD"], {});
-      const branch = branchR.stdout.trim();
-      diffArgs = ["-C", repoDir, "diff", `origin/${branch}...HEAD`];
-    } else {
-      // "all" = staged + unstaged + untracked. `git diff HEAD` alone
-      // skips untracked files; mark them intent-to-add (-N) so they
-      // surface as additions in the diff. This adds zero-blob index
-      // entries — no content is staged, `git commit` won't commit them,
-      // and a later `git add -A` cleanly replaces them.
-      const intentR = await _runGit(gitBin,
-        ["-C", repoDir, "add", "--intent-to-add", "-A"],
-        { timeoutMs: 30_000 },
-      );
-      if (!intentR.ok) {
+    const MAX_DIFF_BYTES = 1024 * 1024; // 1 MB, per repo
+
+    async function diffOneRepo(repoDir: string): Promise<
+      { ok: true; diff: string; truncated: boolean; statSummary: string }
+      | { ok: false; error: string }
+    > {
+      // Pick the right diff args.
+      let diffArgs: string[];
+      if (scope === "staged") {
+        diffArgs = ["-C", repoDir, "diff", "--staged"];
+      } else if (scope === "unstaged") {
+        diffArgs = ["-C", repoDir, "diff"];
+      } else if (scope === "vs_origin") {
+        const branchR = await _runGit(gitBin as string,
+          ["-C", repoDir, "symbolic-ref", "--short", "HEAD"], {});
+        const branch = branchR.stdout.trim();
+        diffArgs = ["-C", repoDir, "diff", `origin/${branch}...HEAD`];
+      } else {
+        // "all" = staged + unstaged + untracked. `git diff HEAD` alone
+        // skips untracked files; mark them intent-to-add (-N) so they
+        // surface as additions in the diff. This adds zero-blob index
+        // entries — no content is staged, `git commit` won't commit them,
+        // and a later `git add -A` cleanly replaces them.
+        const intentR = await _runGit(gitBin as string,
+          ["-C", repoDir, "add", "--intent-to-add", "-A"],
+          { timeoutMs: 30_000 },
+        );
+        if (!intentR.ok) {
+          return { ok: false, error: `git add --intent-to-add failed: ${intentR.stderr.slice(0, 400)}` };
+        }
+        diffArgs = ["-C", repoDir, "diff", "HEAD"];
+      }
+
+      const r = await _runGit(gitBin as string, diffArgs, { timeoutMs: 60_000 });
+      if (!r.ok) {
+        return { ok: false, error: `git diff failed: ${r.stderr.slice(0, 600)}` };
+      }
+
+      let diff = r.stdout;
+      let truncated = false;
+      if (diff.length > MAX_DIFF_BYTES) {
+        diff = diff.slice(0, MAX_DIFF_BYTES);
+        truncated = true;
+      }
+
+      // Stat summary (e.g. "5 files changed, 100 insertions(+), 20 deletions(-)")
+      const statR = await _runGit(gitBin as string, [...diffArgs, "--shortstat"],
+        { timeoutMs: 30_000 });
+      return { ok: true, diff, truncated, statSummary: statR.stdout.trim() };
+    }
+
+    const perRepo: Array<{
+      subdir: string; diff: string; truncated: boolean; stat_summary: string;
+    }> = [];
+    for (const t of targets) {
+      const res = await diffOneRepo(t.repoPath);
+      if (!res.ok) {
         respond(false, undefined, errorShape(
-          ErrorCodes.INTERNAL_ERROR,
-          `git add --intent-to-add failed: ${intentR.stderr.slice(0, 400)}`,
+          ErrorCodes.INTERNAL_ERROR, `${t.subdir}: ${res.error}`,
         ));
         return;
       }
-      diffArgs = ["-C", repoDir, "diff", "HEAD"];
+      perRepo.push({
+        subdir: t.subdir, diff: res.diff, truncated: res.truncated,
+        stat_summary: res.statSummary,
+      });
     }
 
-    const r = await _runGit(gitBin, diffArgs, { timeoutMs: 60_000 });
-    if (!r.ok) {
-      respond(false, undefined, errorShape(
-        ErrorCodes.INTERNAL_ERROR,
-        `git diff failed: ${r.stderr.slice(0, 600)}`,
-      ));
-      return;
-    }
-
-    const MAX_DIFF_BYTES = 1024 * 1024; // 1 MB
-    let diff = r.stdout;
-    let truncated = false;
-    if (diff.length > MAX_DIFF_BYTES) {
-      diff = diff.slice(0, MAX_DIFF_BYTES);
-      truncated = true;
-    }
-
-    // Stat summary (e.g. "5 files changed, 100 insertions(+), 20 deletions(-)")
-    const statArgs = [...diffArgs];
-    statArgs.push("--shortstat");
-    const statR = await _runGit(gitBin, statArgs, { timeoutMs: 30_000 });
-    const statSummary = statR.stdout.trim();
+    // Legacy top-level fields describe the PRIMARY repo. Under allRepos the diffs are
+    // concatenated with a per-repo banner so a caller that only reads `diff` still
+    // sees every change rather than silently reviewing one repo out of N.
+    const primary = perRepo[0];
+    const combinedDiff = allRepos && perRepo.length > 1
+      ? perRepo.map((p) => `=== ${p.subdir} ===\n${p.diff}`).join("\n")
+      : primary.diff;
+    const combinedStat = allRepos && perRepo.length > 1
+      ? perRepo.map((p) => `${p.subdir}: ${p.stat_summary || "no changes"}`).join("; ")
+      : primary.stat_summary;
 
     // Optional: write diff to a file in the story workspace.
     let writtenTo: string | undefined;
@@ -2566,7 +2893,10 @@ export const agentsHandlers: GatewayRequestHandlers = {
         ));
         return;
       }
-      const storyWs = path.dirname(repoDir);
+      // The story workspace root — NOT path.dirname(repoDir). That shortcut was only
+      // correct for the legacy `<ws>/repo` layout; for `<ws>/repos/<name>` it resolves
+      // to `<ws>/repos` and would write the diff inside the clones.
+      const storyWs = await _resolveStoryWorkspaceDir(cfg, agentId, storyId);
       const abs = path.resolve(storyWs, writeToPath);
       if (!abs.startsWith(storyWs + path.sep)) {
         respond(false, undefined, errorShape(
@@ -2576,17 +2906,18 @@ export const agentsHandlers: GatewayRequestHandlers = {
         return;
       }
       await fs.mkdir(path.dirname(abs), { recursive: true });
-      await fs.writeFile(abs, diff, "utf-8");
+      await fs.writeFile(abs, combinedDiff, "utf-8");
       writtenTo = writeToPath;
     }
 
     respond(true, {
       ok: true,
-      diff,
+      diff: combinedDiff,
       scope,
       written_to: writtenTo,
-      truncated,
-      stat_summary: statSummary,
+      truncated: perRepo.some((p) => p.truncated),
+      stat_summary: combinedStat,
+      ...(allRepos ? { repos: perRepo } : {}),
     }, undefined);
   },
 
@@ -2610,8 +2941,14 @@ export const agentsHandlers: GatewayRequestHandlers = {
       respondAgentNotFound(respond, agentId);
       return;
     }
-    const repoDir = await _resolveStoryRepoDir(cfg, agentId, storyId);
-    if (!repoDir) {
+    // EVERY write clone, not just the first. This RPC was not migrated with
+    // gitDiff/gitCommit, so on a multi-write story it refreshed only the primary clone
+    // and the others kept the ~1h setup token — then started failing pushes with no
+    // obvious cause. Read-only clones are skipped: they deliberately have no remote and
+    // no credential helper.
+    const refreshDirs = (await _resolveStoryRepoDirs(cfg, agentId, storyId))
+      .filter((d) => d.write);
+    if (refreshDirs.length === 0) {
       respond(false, undefined, errorShape(
         ErrorCodes.INVALID_REQUEST,
         `story repo not found`,
@@ -2628,6 +2965,10 @@ export const agentsHandlers: GatewayRequestHandlers = {
 
     const helperCmd =
       `!f() { echo "username=x-access-token"; echo "password=${githubToken}"; }; f`;
+
+    const refreshed: string[] = [];
+    for (const target of refreshDirs) {
+      const repoDir = target.repoPath;
 
     // Wipe any prior LOCAL credential.helper entries. Multiple values
     // accumulate over refreshes because `git config key value` only
@@ -2661,12 +3002,15 @@ export const agentsHandlers: GatewayRequestHandlers = {
     if (!r.ok) {
       respond(false, undefined, errorShape(
         ErrorCodes.INTERNAL_ERROR,
-        `git config credential.helper failed: ${r.stderr.slice(0, 400)}`,
+        `git config credential.helper failed for ${target.subdir}: ` +
+        `${r.stderr.slice(0, 400)}`,
       ));
       return;
     }
+      refreshed.push(target.subdir);
+    }
 
-    respond(true, { ok: true }, undefined);
+    respond(true, { ok: true, ...(refreshed.length > 1 ? { repos: refreshed } : {}) }, undefined);
   },
 
   // Fetch the trunk and merge it into the story's branch LOCALLY, returning any
@@ -3050,7 +3394,25 @@ export const agentsHandlers: GatewayRequestHandlers = {
 
 // ── Git helpers shared by the workspace RPCs above ──────────────────────────
 
-const _GIT_CANDIDATES = ["/usr/bin/git", "/usr/local/bin/git", "/bin/git"];
+// Ubuntu (prod VM) paths -- the only ones that are ever real in a deployed
+// environment; the systemd-rooted gateway may not have /usr/bin on its
+// inherited PATH, hence resolving an absolute path instead of trusting PATH.
+const _GIT_CANDIDATES_PROD = ["/usr/bin/git", "/usr/local/bin/git", "/bin/git"];
+// Standard Windows Git-for-Windows install locations. NOT a production
+// concern (the gateway VM is always Ubuntu) -- purely a local-dev
+// accommodation, so it only applies when OPENCLAW_LOCAL_DEV=1, a flag our
+// own local-development/scripts/run/gateway.ps1 sets (never present on the
+// deployed VM). Keeps this list from silently growing prod's search surface
+// for something prod can never use.
+const _GIT_CANDIDATES_LOCAL_DEV_WIN32 = [
+  "C:\\Program Files\\Git\\cmd\\git.exe",
+  "C:\\Program Files\\Git\\bin\\git.exe",
+  "C:\\Program Files (x86)\\Git\\cmd\\git.exe",
+  "C:\\Program Files (x86)\\Git\\bin\\git.exe",
+];
+const _GIT_CANDIDATES = process.env.OPENCLAW_LOCAL_DEV === "1"
+  ? [..._GIT_CANDIDATES_PROD, ..._GIT_CANDIDATES_LOCAL_DEV_WIN32]
+  : _GIT_CANDIDATES_PROD;
 let _gitBinCached: string | null | undefined;
 
 function _resolveGitBin(): string | null {
@@ -3063,11 +3425,76 @@ function _resolveGitBin(): string | null {
   return null;
 }
 
-async function _resolveStoryRepoDir(
+/**
+ * Stage → commit → push ONE repo. Shared by the multi-repo branch of
+ * `shca.workspace.gitCommit` (plan G.5).
+ *
+ * Mirrors the single-repo path's semantics exactly, including the subtle one: when
+ * there is nothing staged we STILL push if asked, because the branch may hold
+ * unpushed commits (the assistant already committed, or a trunk pull created a merge
+ * commit) and leaving those local means the git engine — which compares the REMOTE
+ * against trunk — never sees the work.
+ *
+ * Never throws for a git-level failure; returns `error` so the caller can report a
+ * per-repo outcome rather than failing the whole multi-repo commit.
+ */
+async function _commitOneRepo(
+  gitBin: string, repoDir: string, paths: string[], message: string, push: boolean,
+): Promise<{
+  commit_sha: string; pushed: boolean; nothing_to_commit?: boolean;
+  push_error?: string; error?: string;
+}> {
+  if (paths.length === 1 && paths[0] === "all") {
+    const r = await _runGit(gitBin, ["-C", repoDir, "add", "-A"], {});
+    if (!r.ok) {
+      return { commit_sha: "", pushed: false, error: `git add -A failed: ${r.stderr.slice(0, 400)}` };
+    }
+  } else {
+    for (const p of paths) {
+      const r = await _runGit(gitBin, ["-C", repoDir, "add", "--", p], {});
+      if (!r.ok) {
+        return { commit_sha: "", pushed: false, error: `git add ${p} failed: ${r.stderr.slice(0, 300)}` };
+      }
+    }
+  }
+
+  async function pushCurrentBranch(sha: string, nothingToCommit: boolean) {
+    const branchR = await _runGit(gitBin,
+      ["-C", repoDir, "symbolic-ref", "--short", "HEAD"], {});
+    const branch = branchR.stdout.trim() || "HEAD";
+    const pushR = await _runGit(gitBin, ["-C", repoDir, "push", "origin", branch],
+      { timeoutMs: 120_000 });
+    return {
+      commit_sha: sha,
+      pushed: pushR.ok,
+      ...(nothingToCommit ? { nothing_to_commit: true } : {}),
+      ...(pushR.ok ? {} : { push_error: pushR.stderr.slice(0, 600) }),
+    };
+  }
+
+  const staged = await _runGit(gitBin, ["-C", repoDir, "diff", "--staged", "--quiet"], {});
+  if (staged.code === 0) {
+    if (!push) return { commit_sha: "", pushed: false, nothing_to_commit: true };
+    const headR = await _runGit(gitBin, ["-C", repoDir, "rev-parse", "HEAD"], {});
+    return await pushCurrentBranch(headR.stdout.trim(), true);
+  }
+
+  const commitR = await _runGit(gitBin, ["-C", repoDir, "commit", "-m", message],
+    { timeoutMs: 60_000 });
+  if (!commitR.ok) {
+    return { commit_sha: "", pushed: false, error: `git commit failed: ${commitR.stderr.slice(0, 400)}` };
+  }
+  const shaR = await _runGit(gitBin, ["-C", repoDir, "rev-parse", "HEAD"], {});
+  const commit_sha = shaR.stdout.trim();
+  if (!push) return { commit_sha, pushed: false };
+  return await pushCurrentBranch(commit_sha, false);
+}
+
+async function _resolveStoryWorkspaceDir(
   cfg: ReturnType<typeof loadConfig>,
   agentId: string,
   storyId: string,
-): Promise<string | null> {
+): Promise<string> {
   const raw = resolveAgentWorkspaceDir(cfg, agentId);
   let agentWs: string;
   try {
@@ -3075,12 +3502,101 @@ async function _resolveStoryRepoDir(
   } catch {
     agentWs = path.resolve(raw);
   }
-  const repoDir = path.join(agentWs, "stories", storyId, "repo");
+  return path.join(agentWs, "stories", storyId);
+}
+
+/**
+ * Every git clone in a story workspace, in a stable order.
+ *
+ * Two layouts coexist by design (plan Phase G): the legacy single-repo layout has
+ * one clone at `<workspace>/repo`, the multi-repo layout has N clones at
+ * `<workspace>/repos/<subdir>`. A story provisioned before the multi-repo rollout
+ * keeps the legacy layout for its whole life — nothing migrates it — so callers must
+ * handle both indefinitely, not just during the transition.
+ *
+ * A directory counts only if it actually contains `.git`, which keeps a stray
+ * `repos/` scaffolding dir from being mistaken for a clone.
+ */
+async function _resolveStoryRepoDirs(
+  cfg: ReturnType<typeof loadConfig>,
+  agentId: string,
+  storyId: string,
+): Promise<Array<{ subdir: string; repoPath: string; write: boolean }>> {
+  const wsDir = await _resolveStoryWorkspaceDir(cfg, agentId, storyId);
+
+  async function isGitClone(dir: string): Promise<boolean> {
+    try {
+      const st = await fs.stat(path.join(dir, ".git"));
+      return st.isDirectory() || st.isFile();  // .git is a file in worktrees
+    } catch {
+      return false;
+    }
+  }
+
+  // The manifest written by shca.workspace.setup is the ONLY source of the
+  // write/read-only flag — it cannot be inferred from the filesystem. Absent (legacy
+  // workspace, or a best-effort write that failed) every clone is treated as
+  // writable, which is exactly the pre-multi-repo behaviour.
+  const writeBySubdir = new Map<string, boolean>();
   try {
-    const st = await fs.stat(repoDir);
-    if (st.isDirectory()) return repoDir;
-  } catch { /* fallthrough */ }
-  return null;
+    const raw = await fs.readFile(
+      path.join(wsDir, ".openclaw-story-repos.json"), "utf-8",
+    );
+    const parsed = JSON.parse(raw) as { repos?: Array<{ subdir?: string; write?: boolean }> };
+    for (const entry of parsed.repos ?? []) {
+      if (entry.subdir) writeBySubdir.set(entry.subdir, entry.write !== false);
+    }
+  } catch { /* no manifest — every clone counts as writable */ }
+
+  const found: Array<{ subdir: string; repoPath: string; write: boolean }> = [];
+
+  const legacyDir = path.join(wsDir, "repo");
+  if (await isGitClone(legacyDir)) {
+    found.push({ subdir: "repo", repoPath: legacyDir, write: true });
+  }
+
+  const reposParent = path.join(wsDir, "repos");
+  try {
+    const entries = await fs.readdir(reposParent, { withFileTypes: true });
+    // Sort by name for a deterministic base order, then hoist write repos below.
+    for (const ent of entries.sort((a, b) => a.name.localeCompare(b.name))) {
+      if (!ent.isDirectory()) continue;
+      const abs = path.join(reposParent, ent.name);
+      if (await isGitClone(abs)) {
+        const subdir = `repos/${ent.name}`;
+        found.push({ subdir, repoPath: abs, write: writeBySubdir.get(subdir) ?? true });
+      }
+    }
+  } catch { /* no repos/ dir — legacy layout only */ }
+
+  // WRITE repos first. Callers that take index 0 as "the" repo (diff, commit) must
+  // never land on a read-only context clone. Stable within each group.
+  const writes = found.filter((r) => r.write);
+  const reads = found.filter((r) => !r.write);
+  return [...writes, ...reads];
+}
+
+/**
+ * The story's PRIMARY repo dir, or null.
+ *
+ * SINGLE-REPO SHIM: preserves the original behaviour for callers not yet migrated to
+ * `_resolveStoryRepoDirs`. On a legacy workspace this returns exactly what it always
+ * did (`<workspace>/repo`); on a multi-repo workspace it returns the first WRITE
+ * clone — correct for any story that writes to exactly one repo (including the
+ * read-context case: N repos referenced, one written).
+ *
+ * KNOWN LIMITATION: for a genuinely multi-WRITE story this returns only the first
+ * write repo, so a caller using it would diff/commit just that one. That is why the
+ * plan requires gitDiff/gitCommit to move to `_resolveStoryRepoDirs` (Phase G.4/G.5)
+ * before multi-write is enabled — this shim is sufficient for Stage 1 only.
+ */
+async function _resolveStoryRepoDir(
+  cfg: ReturnType<typeof loadConfig>,
+  agentId: string,
+  storyId: string,
+): Promise<string | null> {
+  const dirs = await _resolveStoryRepoDirs(cfg, agentId, storyId);
+  return dirs.length > 0 ? dirs[0].repoPath : null;
 }
 
 async function _runGit(

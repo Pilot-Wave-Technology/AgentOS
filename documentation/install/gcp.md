@@ -124,7 +124,7 @@ gcloud services enable compute.googleapis.com
 
 ```bash
 gcloud compute instances create openclaw-gateway \
-  --zone=${GCP_REGION}-a \
+  --zone=us-central1-a \
   --machine-type=e2-small \
   --boot-disk-size=20GB \
   --image-family=debian-12 \
@@ -135,7 +135,7 @@ gcloud compute instances create openclaw-gateway \
 
 1. Go to Compute Engine > VM instances > Create instance
 2. Name: `openclaw-gateway`
-3. Region: `${GCP_REGION}`, Zone: `${GCP_REGION}-a`
+3. Region: `us-central1`, Zone: `us-central1-a`
 4. Machine type: `e2-small`
 5. Boot disk: Debian 12, 20GB
 6. Create
@@ -147,7 +147,7 @@ gcloud compute instances create openclaw-gateway \
 **CLI:**
 
 ```bash
-gcloud compute ssh openclaw-gateway --zone=${GCP_REGION}-a
+gcloud compute ssh openclaw-gateway --zone=us-central1-a
 ```
 
 **Console:**
@@ -176,7 +176,7 @@ exit
 Then SSH back in:
 
 ```bash
-gcloud compute ssh openclaw-gateway --zone=${GCP_REGION}-a
+gcloud compute ssh openclaw-gateway --zone=us-central1-a
 ```
 
 Verify:
@@ -398,7 +398,7 @@ Success:
 Create an SSH tunnel to forward the Gateway port:
 
 ```bash
-gcloud compute ssh openclaw-gateway --zone=${GCP_REGION}-a -- -L 18789:127.0.0.1:18789
+gcloud compute ssh openclaw-gateway --zone=us-central1-a -- -L 18789:127.0.0.1:18789
 ```
 
 Open in your browser:
@@ -477,15 +477,15 @@ If Docker build fails with `Killed` and `exit code 137`, the VM was OOM-killed. 
 
 ```bash
 # Stop the VM first
-gcloud compute instances stop openclaw-gateway --zone=${GCP_REGION}-a
+gcloud compute instances stop openclaw-gateway --zone=us-central1-a
 
 # Change machine type
 gcloud compute instances set-machine-type openclaw-gateway \
-  --zone=${GCP_REGION}-a \
+  --zone=us-central1-a \
   --machine-type=e2-small
 
 # Start the VM
-gcloud compute instances start openclaw-gateway --zone=${GCP_REGION}-a
+gcloud compute instances start openclaw-gateway --zone=us-central1-a
 ```
 
 ---

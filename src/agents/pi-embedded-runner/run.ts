@@ -26,6 +26,7 @@ import {
   CONTEXT_WINDOW_HARD_MIN_TOKENS,
   CONTEXT_WINDOW_WARN_BELOW_TOKENS,
   evaluateContextWindowGuard,
+  getAgentContextTokens,
   resolveContextWindowInfo,
 } from "../context-window-guard.js";
 import { DEFAULT_CONTEXT_TOKENS, DEFAULT_MODEL, DEFAULT_PROVIDER } from "../defaults.js";
@@ -382,6 +383,7 @@ export async function runEmbeddedPiAgent(
         modelId,
         modelContextWindow: model.contextWindow,
         defaultTokens: DEFAULT_CONTEXT_TOKENS,
+        agentContextTokens: getAgentContextTokens(params.config, workspaceResolution.agentId),
       });
       // Apply contextTokens cap to model so pi-coding-agent's auto-compaction
       // threshold uses the effective limit, not the native context window.

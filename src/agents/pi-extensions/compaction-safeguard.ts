@@ -20,6 +20,7 @@ import {
   summarizeInStages,
 } from "../compaction.js";
 import { collectTextContentBlocks } from "../content-blocks.js";
+import { capPreservedToolResults } from "./preserved-tool-result-cap.js";
 import { wrapUntrustedPromptDataBlock } from "../sanitize-for-prompt.js";
 import { repairToolUseResultPairing } from "../session-transcript-repair.js";
 import { extractToolCallsFromAssistant, extractToolResultId } from "../tool-call-id.js";
@@ -271,6 +272,20 @@ function formatNonTextPlaceholder(content: unknown): string | null {
 export function splitPreservedRecentTurnsByTokens(params: {
   messages: AgentMessage[];
   keepRecentTokensBudget: number;
+  /** Cap on a single preserved `toolResult`, in estimated tokens. 0 or
+   *  undefined disables capping, which is the pre-existing behaviour.
+   *
+   *  THE BUDGET ALONE DOES NOT BOUND THE TAIL. The walk below counts what
+   *  it adds, and then the pairing pass adds every toolResult belonging to
+   *  a preserved assistant turn WITHOUT counting it — deliberately, so a
+   *  tool call never loses its result. Those are unbudgeted, and on a
+   *  tool-heavy agent they are most of what survives: a goal orchestrator
+   *  logged `preserved=181 (~99141 tokens)` against a 100000 budget and
+   *  carried 212,303 into its next call.
+   *
+   *  Capping the RESULT keeps every message — the turns, the reasoning,
+   *  which tools ran — and shortens only the payload. */
+  preservedToolResultMaxTokens?: number;
 }): { summarizableMessages: AgentMessage[]; preservedMessages: AgentMessage[] } {
   const budget = Math.max(0, Math.floor(params.keepRecentTokensBudget));
   if (budget <= 0) {
@@ -341,15 +356,53 @@ export function splitPreservedRecentTurnsByTokens(params: {
 
   const summarizableMessages = params.messages.filter((_, idx) => !preservedIndexSet.has(idx));
   const repairedSummarizableMessages = repairToolUseResultPairing(summarizableMessages).messages;
-  const preservedMessages = params.messages
+  const preservedBeforeCap = params.messages
     .filter((_, idx) => preservedIndexSet.has(idx))
     .filter((msg) => {
       const role = (msg as { role?: unknown }).role;
       return role === "user" || role === "assistant" || role === "toolResult";
     });
 
+  // WHAT IS LEFT OF THE BUDGET AFTER THE MESSAGES THEMSELVES.
+  //
+  // The conversation -- user turns, assistant reasoning, which tools ran --
+  // is what the budget exists to protect, so it is counted first and in
+  // full. Whatever remains is the allowance for the tool-result payloads,
+  // which the pairing pass has until now added for free. On go-goal1 that
+  // free tail was ~100K against a 100K budget: the number was never a bound
+  // on anything, it was a bound on half of something.
+  const nonResultTokens = estimateMessagesTokens(
+    preservedBeforeCap.filter(
+      (m) => (m as { role?: unknown }).role !== "toolResult",
+    ),
+  );
+  const resultsBudget = Math.max(0, budget - nonResultTokens);
+
+  const { messages: preservedMessages, cappedCount, tokensDropped, elidedCount } =
+    capPreservedToolResults(
+      preservedBeforeCap, params.preservedToolResultMaxTokens ?? 0, resultsBudget,
+    );
+
+  // THE TRUE TOTAL, not `runningTokens`.
+  //
+  // `runningTokens` is what the backward walk counted, and the pairing pass
+  // above adds messages to the preserved set after it — so the number this
+  // line used to print was the PRE-PAIRING figure and always understated
+  // what survived, by exactly the weight of the paired tool results. That
+  // is the half of the floor nobody could see: 99,141 logged against a real
+  // ~180K. Measuring the set we are actually returning costs one estimator
+  // pass over a bounded list and makes the line mean what it says.
+  const preservedTokens = estimateMessagesTokens(preservedMessages);
   log.info(
-    `Compaction safeguard: keepRecentMode=tokens budget=${budget} preserved=${preservedMessages.length} messages (~${runningTokens} tokens)`,
+    `Compaction safeguard: keepRecentMode=tokens budget=${budget} `
+      + `preserved=${preservedMessages.length} messages (~${preservedTokens} tokens`
+      + `, walk counted ~${runningTokens})`
+      + ` resultsBudget=${resultsBudget}`
+      + (cappedCount > 0
+        ? ` cappedToolResults=${cappedCount}`
+        : "")
+      + (elidedCount > 0 ? ` elidedToolResults=${elidedCount}` : "")
+      + (tokensDropped > 0 ? ` (~${tokensDropped} tokens dropped)` : ""),
   );
 
   return { summarizableMessages: repairedSummarizableMessages, preservedMessages };
@@ -944,6 +997,7 @@ export default function compactionSafeguardExtension(api: ExtensionAPI): void {
         ? splitPreservedRecentTurnsByTokens({
             messages: messagesToSummarize,
             keepRecentTokensBudget,
+            preservedToolResultMaxTokens: runtime?.preservedToolResultMaxTokens,
           })
         : splitPreservedRecentTurns({
             messages: messagesToSummarize,

@@ -1,0 +1,10 @@
+{
+  "id": "model-registry",
+  "name": "Model Registry",
+  "description": "Fetches provider + model definitions from the AgentOS control panel's /internal/model_catalog endpoint and contributes them to models.json via the resolve_providers hook. Refreshes every 5 minutes and on models.reload RPC.",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  }
+}

@@ -31,6 +31,10 @@ export type CompactionSafeguardRuntimeValue = {
    * Ignored when keepRecentMode is "turns".
    */
   keepRecentTokensBudget?: number;
+
+  /** Cap on a single preserved `toolResult`, in estimated tokens.
+   *  From `agents.defaults.compaction.preservedToolResultMaxTokens`. */
+  preservedToolResultMaxTokens?: number;
   qualityGuardEnabled?: boolean;
   qualityGuardMaxRetries?: number;
   /**

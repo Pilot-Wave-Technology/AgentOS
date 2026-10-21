@@ -24,14 +24,20 @@ export type NormalizedPluginsConfig = {
 };
 
 // Hard-fork trim: this deployment is a headless gateway driven by the control
-// panel over the WS protocol. Only these three bundled extensions are used —
+// panel over the WS protocol. Only these five bundled extensions are used —
 // custom-tools (control-panel dynamic tools), workspace-ops (git diff/merge
 // preview RPCs the merge orchestrator calls), insights (sandbox.status for the
-// admin dashboard). device-pair / phone-control / talk-voice were default-on
-// upstream but are unused here (no hardware/voice), so they were removed.
+// admin dashboard), model-registry (provider + model catalog from the control
+// panel via the resolve_providers hook), misc-models (utility-purpose Gemini
+// overrides from the control panel, e.g. web-search grounding — a separate,
+// Gemini-only config from model-registry's agent-facing catalog).
+// device-pair / phone-control / talk-voice were default-on upstream but are
+// unused here (no hardware/voice), so they were removed.
 export const BUNDLED_ENABLED_BY_DEFAULT = new Set<string>([
   "custom-tools",
   "insights",
+  "misc-models",
+  "model-registry",
   "workspace-ops",
 ]);
 

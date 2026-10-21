@@ -34,6 +34,9 @@ import {
   grantResourceTool, revokeResourceTool, listAllocationsTool,
   recordDecisionTool, listDecisionsTool, criticalPathTool,
 } from "./tools/story-tools.js";
+import { kernelAssistantTools } from "./tools/kernel-assistant-tools.js";
+import { kernelGoTools } from "./tools/kernel-go-tools.js";
+import { kernelConfigured } from "./tools/kernel-url.js";
 import {
   storyPhaseTool, storyStateTool, snapshotCheckpointTool, planVersionTool,
   escalateForApprovalTool, workspaceFileTool, gitTool, worktreeTool, sessionControlTool,
@@ -47,6 +50,57 @@ import {
 import { createTtsTool } from "./tools/tts-tool.js";
 import { createWebFetchTool, createWebSearchTool } from "./tools/web-tools.js";
 import { resolveWorkspaceRoot } from "./workspace-dir.js";
+
+/**
+ * `cancel_story` and `grant_resource` exist TWICE in this registry.
+ *
+ * The legacy story surface declares both, and so does the kernel — the
+ * same two words for two different backends. Nothing downstream
+ * deduplicates: the allowlist filter returns an array, so an agent
+ * permitted `cancel_story` sends the provider two functions with one
+ * name, which is a hard rejection on every turn rather than a subtly
+ * wrong call. It is not a collision anybody would see by reading either
+ * file, because neither file is wrong.
+ *
+ * Where the kernel is configured it OWNS these two names, and the
+ * legacy pair is dropped. Where it is not, nothing changes and the
+ * legacy surface is untouched — which is what makes this safe to land
+ * before the old surface is retired.
+ *
+ * This shadows real behaviour, so it is a deliberate switch and not a
+ * dedupe-by-position: last-wins would silently repoint the legacy
+ * agents, and first-wins would silently break the kernel ones.
+ */
+const KERNEL_OWNED_NAMES = new Set([
+  "cancel_story",
+  // register_ and grant_ must resolve to the SAME catalogue. GO had
+  // the control panel's register and the kernel's grant sitting side
+  // by side describing one workflow, so registering then granting
+  // returned E_NO_SUCH_RESOURCE -- the grant looked in the kernel
+  // catalogue and the register had written the other one.
+  "register_resource",
+  "grant_resource",
+]);
+
+function kernelSupersedes(tools: AnyAgentTool[]): AnyAgentTool[] {
+  // The SAME resolution the kernel tools use. Asking a different
+  // question here than build() asks is how one name ends up declared
+  // twice -- a hard provider rejection on every turn.
+  if (!kernelConfigured()) return tools;
+  const seen = new Set<string>();
+  // Walk from the END so the kernel's copy — registered last — is the
+  // one kept, and drop the earlier legacy twin.
+  const kept: AnyAgentTool[] = [];
+  for (let i = tools.length - 1; i >= 0; i--) {
+    const tool = tools[i];
+    if (KERNEL_OWNED_NAMES.has(tool.name)) {
+      if (seen.has(tool.name)) continue;
+      seen.add(tool.name);
+    }
+    kept.push(tool);
+  }
+  return kept.reverse();
+}
 
 export function createOpenClawTools(
   options?: {
@@ -298,6 +352,23 @@ export function createOpenClawTools(
       config: options?.config,
       agentSessionKey: options?.agentSessionKey,
     }),
+    // ── H10b: the assistant's eight, pointed at the kernel ──────────────
+    //
+    // Registered alongside the old surface rather than replacing it, so
+    // the two can coexist while assistants are migrated. What decides
+    // which an agent gets is its ALLOWLIST, not what is registered here
+    // -- and the new assistant template lists exactly these eight.
+    ...kernelAssistantTools({
+      config: options?.config,
+      agentSessionKey: options?.agentSessionKey,
+    }),
+    // GO's three, on their own kernel surface. Registered here like
+    // everything else; which agent GETS them is decided by its
+    // allowlist, and the assistant template does not list them.
+    ...kernelGoTools({
+      config: options?.config,
+      agentSessionKey: options?.agentSessionKey,
+    }),
     // ── SHCA operator tools (Phase 2 of SHCA refactor) ──────────────────
     storyPhaseTool({ config: options?.config, agentSessionKey: options?.agentSessionKey }),
     storyStateTool({ config: options?.config, agentSessionKey: options?.agentSessionKey }),
@@ -380,5 +451,8 @@ export function createOpenClawTools(
     toolAllowlist: options?.pluginToolAllowlist,
   });
 
-  return [...tools, ...pluginTools];
+  // Applied to the WHOLE list, plugins included: a plugin that
+  // declares one of these names collides exactly as the legacy
+  // surface does.
+  return kernelSupersedes([...tools, ...pluginTools]);
 }

@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { resetSubagentRegistryForTests } from "./subagent-registry.js";
-import { decodeStrictBase64, spawnSubagentDirect } from "./subagent-spawn.js";
+import { decodeStrictBase64, spawnSubagentDirect, splitModelRef } from "./subagent-spawn.js";
 
 const callGatewayMock = vi.fn();
 
@@ -137,6 +137,46 @@ describe("decodeStrictBase64", () => {
     const result = decodeStrictBase64(encoded, maxBytes);
     expect(result).not.toBeNull();
     expect(result?.byteLength).toBe(1024);
+  });
+});
+
+// --- splitModelRef ---
+
+describe("splitModelRef", () => {
+  it("returns undefined/undefined for no ref", () => {
+    expect(splitModelRef(undefined)).toEqual({ provider: undefined, model: undefined });
+    expect(splitModelRef("")).toEqual({ provider: undefined, model: undefined });
+    expect(splitModelRef("   ")).toEqual({ provider: undefined, model: undefined });
+  });
+
+  it("treats a ref with no slash as a bare model, no provider", () => {
+    expect(splitModelRef("claude-opus-4-8")).toEqual({ provider: undefined, model: "claude-opus-4-8" });
+  });
+
+  it("splits a single-slash ref into provider + model", () => {
+    expect(splitModelRef("anthropic/claude-opus-4-8")).toEqual({
+      provider: "anthropic",
+      model: "claude-opus-4-8",
+    });
+  });
+
+  it("treats a trailing-slash-only ref (empty model half) as a bare model", () => {
+    expect(splitModelRef("foo/")).toEqual({ provider: undefined, model: "foo/" });
+  });
+
+  it("keeps everything after the FIRST slash for a multi-segment model id", () => {
+    // Regression: the old implementation used `trimmed.split("/", 2)`,
+    // which — unlike Python's `split(sep, maxsplit=1)` — splits on every
+    // "/" first and only then truncates the result array, silently
+    // discarding anything past the second segment.
+    expect(splitModelRef("vertex/publishers/google/models/gemini-pro")).toEqual({
+      provider: "vertex",
+      model: "publishers/google/models/gemini-pro",
+    });
+  });
+
+  it("handles exactly two slashes the same way", () => {
+    expect(splitModelRef("a/b/c")).toEqual({ provider: "a", model: "b/c" });
   });
 });
 

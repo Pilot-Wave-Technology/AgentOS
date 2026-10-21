@@ -13,7 +13,7 @@ locals {
 
   # Fixed secret ids (prerequisites.sh created them, blank or real).
   sec_gateway_token = "openclaw-gateway-token"
-  sec_anthropic     = "claude-api-key"
+  sec_anthropic     = "anthropic-api-key"
   sec_gemini        = "gemini-api-key"
   sec_openai        = "openai-api-key"
   sec_cp_url        = "control-panel-url"
@@ -72,11 +72,26 @@ locals {
     repo_token_secret            = local.sec_repo_token
     archive_bucket               = local.archive_bucket
     processes_per_vm             = var.processes_per_vm
+    compaction_model             = var.compaction_model
     enable_chrome_remote_desktop = var.enable_chrome_remote_desktop
   })
 }
 
 # ─── The VM (runs as the prereq-created gateway SA) ─────────────────────────
+# THE GATEWAY'S ADDRESS IS RESERVED, not ephemeral. The control plane
+# connects to ws://<this>:18789, and an ephemeral IP changes whenever the VM
+# is recreated -- which left a working control plane pointed at an address
+# nothing listened on, and the dashboard reporting the gateway offline.
+# Reserved, it survives recreation; and the platform stack looks it up by
+# this NAME, so nobody copies an IP between the two stacks.
+resource "google_compute_address" "gateway" {
+  name         = "${var.name_prefix}-gateway-ip"
+  region       = var.region
+  subnetwork   = google_compute_subnetwork.subnet.id
+  address_type = "INTERNAL"
+  address      = var.gateway_internal_ip == "" ? null : var.gateway_internal_ip
+}
+
 resource "google_compute_instance" "gateway" {
   name         = var.name
   machine_type = var.machine_type
@@ -93,6 +108,7 @@ resource "google_compute_instance" "gateway" {
   network_interface {
     network    = google_compute_network.vpc.id
     subnetwork = google_compute_subnetwork.subnet.id
+    network_ip = google_compute_address.gateway.address
     dynamic "access_config" {
       for_each = var.ssh_iap_only ? [] : [1]
       content {}

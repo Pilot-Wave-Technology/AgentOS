@@ -11,6 +11,7 @@ import {
   resolveAnthropicBetas,
   resolveCacheRetention,
 } from "./anthropic-stream-wrappers.js";
+import { baseProviderKey } from "./cache-ttl.js";
 import { log } from "./logger.js";
 import {
   createMoonshotThinkingWrapper,
@@ -38,6 +39,45 @@ import {
  *
  * @internal Exported for testing only
  */
+/**
+ * Params for the REAL model behind a synthetic context-window variant.
+ *
+ * Synthetic variants are registered as their own provider — `anthropic-sonnet-1m`
+ * wrapping `anthropic`, with model id `claude-sonnet-4-5-1m` and `upstreamId`
+ * `claude-sonnet-4-5`. Nothing writes params for those synthetic keys: the control
+ * plane emits `models.providers` only, and `agents.defaults.models` carries entries
+ * for BASE ids. A variant therefore resolved to no params at all and silently lost
+ * every per-model setting the base model has — `cacheRetention`, `betas`,
+ * `context1m`.
+ *
+ * Inheriting is the fix rather than emitting params per variant: a variant IS the
+ * base model at a smaller declared window, so its behaviour should differ in exactly
+ * that one respect and nothing else. It also removes a whole class of drift, since
+ * there is no duplicated per-variant copy to keep in sync.
+ *
+ * Purely additive: it only applies when the variant has no entry of its own, so an
+ * explicit variant entry still wins and nothing that resolves params today changes.
+ * The same base-provider convention `cache-ttl.ts` already uses (`baseProviderKey`).
+ */
+function resolveBaseModelConfig(
+  cfg: OpenClawConfig | undefined,
+  provider: string,
+  modelId: string,
+): { params?: Record<string, unknown> } | undefined {
+  const base = baseProviderKey(provider);
+  if (base === provider) {
+    return undefined; // not a synthetic variant — nothing to inherit from
+  }
+  const providers = cfg?.models?.providers as
+    | Record<string, { models?: Array<{ id?: string; upstreamId?: string }> }>
+    | undefined;
+  const upstreamId = providers?.[provider]?.models?.find((m) => m?.id === modelId)?.upstreamId;
+  if (!upstreamId) {
+    return undefined;
+  }
+  return cfg?.agents?.defaults?.models?.[`${base}/${upstreamId}`];
+}
+
 export function resolveExtraParams(params: {
   cfg: OpenClawConfig | undefined;
   provider: string;
@@ -45,7 +85,9 @@ export function resolveExtraParams(params: {
   agentId?: string;
 }): Record<string, unknown> | undefined {
   const modelKey = `${params.provider}/${params.modelId}`;
-  const modelConfig = params.cfg?.agents?.defaults?.models?.[modelKey];
+  const modelConfig =
+    params.cfg?.agents?.defaults?.models?.[modelKey] ??
+    resolveBaseModelConfig(params.cfg, params.provider, params.modelId);
   const globalParams = modelConfig?.params ? { ...modelConfig.params } : undefined;
   const agentParams =
     params.agentId && params.cfg?.agents?.list

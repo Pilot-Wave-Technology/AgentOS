@@ -22,7 +22,9 @@ proceed to the platform branch for Stage ②.
 
 ## What's in here
 - `src/`, `apps/`, `extensions/`, … — the OpenClaw gateway source (built on the VM).
-- `terraform/` — the VM, VPC, archive bucket, firewall, and secrets it reads.
+- `terraform/` — creates the VM, VPC network, reserved internal address, archive
+  bucket, and firewalls. It creates no secrets or service accounts; those come
+  from the platform branch's `prerequisites.sh`, and terraform only reads them.
 - `scripts/gateway-provision.sh` — the single provisioning script the VM runs on
   boot (build → write `openclaw.json` → install wrappers/hooks → start the service).
 - `cloudbuild.yaml` — the update loop: push to this branch → the VM pulls, rebuilds,

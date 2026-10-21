@@ -159,7 +159,7 @@ isolate.executeTool(tool, args, ctx)
 ## What's NOT in this phase
 
 - Wiring this into the plugin's `registerTool` factory (Phase 2 — plugin needs to know which tools are "runtime tools" via the new `manifest` column)
-- The SDK library modules (`@pwt/sdk/http`, `@pwt/sdk/openapi`, `@pwt/sdk/mcp`) that wizards will generate against (Phase 2)
+- A standalone, importable SDK package for tool authors (Phase 2). Today the `http` and `openapi` helpers in [`sdk/`](sdk/) are injected as globals, not imported, and there is no `mcp` helper — tools use the `mcp` capability directly
 - Wizard generators (Phase 3)
 - Migration of existing tier rows (Phase 4)
 

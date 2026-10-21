@@ -5,6 +5,7 @@
  * error handling, priority ordering, and async support.
  */
 
+import type { ProviderConfig } from "../agents/models-config.providers.js";
 import { concatOptionalTextSegments } from "../shared/text/join-segments.js";
 import type { PluginRegistry } from "./registry.js";
 import type {
@@ -16,6 +17,8 @@ import type {
   PluginHookBeforeAgentStartResult,
   PluginHookBeforeModelResolveEvent,
   PluginHookBeforeModelResolveResult,
+  PluginHookResolveProvidersEvent,
+  PluginHookResolveProvidersResult,
   PluginHookBeforePromptBuildEvent,
   PluginHookBeforePromptBuildResult,
   PluginHookBeforeCompactionEvent,
@@ -59,6 +62,8 @@ export type {
   PluginHookBeforeAgentStartResult,
   PluginHookBeforeModelResolveEvent,
   PluginHookBeforeModelResolveResult,
+  PluginHookResolveProvidersEvent,
+  PluginHookResolveProvidersResult,
   PluginHookBeforePromptBuildEvent,
   PluginHookBeforePromptBuildResult,
   PluginHookLlmInputEvent,
@@ -95,6 +100,13 @@ export type {
   PluginHookGatewayStartEvent,
   PluginHookGatewayStopEvent,
 };
+
+/**
+ * Soft per-handler budget for `resolve_providers`. Handlers that exceed this
+ * wall-clock are skipped with a `warn`-level log; the models.json plan pass
+ * proceeds with the accumulated contributions from the remaining handlers.
+ */
+export const RESOLVE_PROVIDERS_HANDLER_TIMEOUT_MS = 500;
 
 export type HookRunnerLogger = {
   debug?: (message: string) => void;
@@ -378,6 +390,128 @@ export function createHookRunner(registry: PluginRegistry, options: HookRunnerOp
     ctx: PluginHookAgentContext,
   ): Promise<void> {
     return runVoidHook("before_reset", event, ctx);
+  }
+
+  /**
+   * Run resolve_providers hook.
+   *
+   * Fired once per `planOpenClawModelsJson` pass, after implicit-provider
+   * resolution and before normalization / secret enforcement. Plugin
+   * contributions merge into the models.json pipeline with precedence
+   * `explicit > plugin > implicit` (the caller enforces the outer
+   * precedence).
+   *
+   * Semantics:
+   * - Handlers run sequentially in priority DESC order (via
+   *   `getHooksForName`), registration order as the stable tie-breaker.
+   * - Each handler is awaited under a soft
+   *   {@link RESOLVE_PROVIDERS_HANDLER_TIMEOUT_MS} budget; on overrun the
+   *   handler is skipped with a warn log and the pass continues.
+   * - Thrown errors are handled by the runner's `catchErrors` policy
+   *   (default: log via `handleHookError` and continue).
+   * - Merge is **first-wins-per-key**: the higher-priority (earlier-run)
+   *   handler's value for a given provider key survives. Later handlers
+   *   that also return the same key are recorded in `collisions` and
+   *   the caller emits a `warn`-level diagnostic on `plugins.diagnostics`.
+   *   Rationale: matches `mergeBeforeModelResolve` and every other
+   *   modifying hook in this file, keeps user config authoritative when
+   *   two plugins fight, and gives operators a way to pin a winner via
+   *   `plugins.entries.<id>.hooks.priority`.
+   * - Undefined / void returns and missing `providers` fields are
+   *   treated as "no contribution".
+   */
+  async function runResolveProviders(params: {
+    event: PluginHookResolveProvidersEvent;
+    ctx: PluginHookAgentContext;
+  }): Promise<{
+    providers: Record<string, ProviderConfig>;
+    collisions: Array<{ pluginId: string; key: string }>;
+  }> {
+    const hookName: PluginHookName = "resolve_providers";
+    const hooks = getHooksForName(registry, hookName);
+    const providers: Record<string, ProviderConfig> = {};
+    const collisions: Array<{ pluginId: string; key: string }> = [];
+    if (hooks.length === 0) {
+      return { providers, collisions };
+    }
+
+    logger?.debug?.(
+      `[hooks] running ${hookName} (${hooks.length} handlers, sequential)`,
+    );
+
+    for (const hook of hooks) {
+      const handler = hook.handler as (
+        event: PluginHookResolveProvidersEvent,
+        ctx: PluginHookAgentContext,
+      ) =>
+        | Promise<PluginHookResolveProvidersResult | void>
+        | PluginHookResolveProvidersResult
+        | void;
+
+      let handlerResult: PluginHookResolveProvidersResult | void | undefined;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+
+      try {
+        const handlerPromise = Promise.resolve(handler(params.event, params.ctx));
+        const timeoutPromise = new Promise<{ kind: "timeout" }>((resolve) => {
+          timer = setTimeout(
+            () => resolve({ kind: "timeout" }),
+            RESOLVE_PROVIDERS_HANDLER_TIMEOUT_MS,
+          );
+        });
+        const raced = await Promise.race([
+          handlerPromise.then((value) => ({ kind: "ok" as const, value })),
+          timeoutPromise,
+        ]);
+        if (raced.kind === "timeout") {
+          const msg =
+            `${hookName} handler from ${hook.pluginId} exceeded ` +
+            `${RESOLVE_PROVIDERS_HANDLER_TIMEOUT_MS}ms budget; skipped`;
+          logger?.warn(`[hooks] ${msg}`);
+          registry.diagnostics.push({
+            level: "warn",
+            pluginId: hook.pluginId,
+            source: hook.pluginId,
+            message: msg,
+          });
+          // The (still-running) handler could reject after we've moved on.
+          // Drain that tail so it never surfaces as an unhandled promise
+          // rejection (Node's default --unhandled-rejections=throw would
+          // otherwise terminate the gateway). Fast rejections that fire
+          // BEFORE the race resolves via timeout still surface through
+          // the outer try/catch below and reach handleHookError.
+          handlerPromise.catch(() => {});
+          continue;
+        }
+        handlerResult = raced.value;
+      } catch (err) {
+        handleHookError({ hookName, pluginId: hook.pluginId, error: err });
+        continue;
+      } finally {
+        if (timer) {
+          clearTimeout(timer);
+        }
+      }
+
+      const contributed = handlerResult?.providers;
+      if (!contributed) {
+        continue;
+      }
+
+      for (const [rawKey, provider] of Object.entries(contributed)) {
+        const key = rawKey.trim();
+        if (!key) {
+          continue;
+        }
+        if (Object.prototype.hasOwnProperty.call(providers, key)) {
+          collisions.push({ pluginId: hook.pluginId, key });
+          continue;
+        }
+        providers[key] = provider;
+      }
+    }
+
+    return { providers, collisions };
   }
 
   // =========================================================================
@@ -733,6 +867,7 @@ export function createHookRunner(registry: PluginRegistry, options: HookRunnerOp
     runBeforeCompaction,
     runAfterCompaction,
     runBeforeReset,
+    runResolveProviders,
     // Message hooks
     runMessageReceived,
     runMessageSending,

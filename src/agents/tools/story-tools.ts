@@ -190,7 +190,80 @@ const CreateStorySchema = Type.Object({
   assigned_to: Type.Optional(Type.String({ description: "Human uid to assign to." })),
   priority: Type.Optional(Type.String({ description: "low, medium, high, or critical." })),
   depends_on: Type.Optional(Type.Array(Type.String(), { description: "Story IDs or titles this depends on." })),
-  estimated_effort: Type.Optional(Type.String({ description: "e.g. '2 days', '1 week'" })),
+  // THE CANONICAL SIZE FIELD WAS THE ONE GO COULD NOT SET.
+  // `estimated_effort` is free text and `app/models/story.py` records it
+  // as "retired from active use" -- yet it was the only sizing parameter
+  // offered here, so every GO-created story filled the retired field and
+  // rendered "Not sized" on the board.
+  story_weight: Type.Optional(
+    Type.Integer({
+      description:
+        "SIZE, 1-5. This is the canonical size field: the day/week label " +
+        "the board shows is derived from it, and the Taximeter reads it. " +
+        "Omit it and the story renders 'Not sized'. 1 = under a day, " +
+        "3 = a few days, 5 = a week or more.",
+    }),
+  ),
+  estimated_effort: Type.Optional(Type.String({
+    description:
+      "Free text, e.g. '2 days'. RETIRED: prefer `story_weight`, which " +
+      "the board and the Taximeter actually read.",
+  })),
+  // F8 — WHICH SHAPE OF WORK THIS IS. Without this field the column
+  // stories.work_kind stayed NULL, NULL means story, and every errand GO
+  // created resolved to the story profile: coding domain, wanting a
+  // branch and a merge for work that produces a report. GO had been
+  // TOLD to say which it is and had nowhere to say it, so it prefixed
+  // "[Errand]" to the title instead.
+  // G5 — TAUGHT IN THE PROMPT, DECLARABLE NOWHERE. GO's prompt named
+  // `land_together` twice, `stories.land_together` is live, and the
+  // endpoint reads it off the body -- but no schema declared it, so the
+  // model had no way to send it. Same shape as F8 one migration later:
+  // a field the prompt teaches and the tool cannot carry.
+  land_together: Type.Optional(
+    Type.Boolean({
+      description:
+        "Join this story's branch to a dependency's, so the two land " +
+        "as one merge. Only meaningful when both were granted the SAME " +
+        "TRUNK LANE: one repo can carry several lanes in a goal " +
+        "(cal_backend, cal_frontend), and two stories on DIFFERENT " +
+        "lanes of one repo have different merge targets and can never " +
+        "land as one merge. Same repository is not the test; same lane " +
+        "is. Default false: they land separately.",
+    }),
+  ),
+  work_kind: Type.Optional(
+    Type.String({
+      description:
+        "story (default) or errand. A STORY's work lands on trunk: a " +
+        "feature, a fix, a refactor. An ERRAND's never does -- its " +
+        "deliverable is the artifacts it emits, and its commits stay on " +
+        "its own branch. Both get a workspace and their resources and " +
+        "both may write; only one lands. Say which, every time: leaving " +
+        "it out means story.",
+    }),
+  ),
+  // THE SAME SHAPE AS work_kind ABOVE, one stage later. The size ladder,
+  // the resolver and the node pools all existed and nothing could ASK
+  // for a rung, so every story in the system ran `small` -- including
+  // the ones whose suite needs 8 GiB and dies for it.
+  // REQUIRED, not optional. Left optional, it is the field a model
+  // omits -- and every story then ran `small`, which is how a suite
+  // that needs 8 GiB dies looking merely slow. Choosing is cheap;
+  // discovering you should have chosen costs a run.
+  sandbox_size: Type.String({
+      description:
+        "REQUIRED. small, medium or large -- the machine this story's " +
+        "work runs on. A TIER IS SOMEBODY'S MONEY: pick the cheapest " +
+        "rung that does the work, and leave it out unless you have a " +
+        "reason. small is 2.5 CPU / 9 GiB and fits most work. Ask for " +
+        "medium (6.5 / 23) when a suite or a build is known to need it, " +
+        "and large (14 / 52) only for something measured -- a large pod " +
+        "can make the cluster add a node. A person can change this on " +
+        "the story before it runs, and it is fixed for the life of a " +
+        "run -- cancel it and you can change the machine and start " +
+        "again.",
+  }),
 });
 
 export function storyCreateTool(opts?: {
@@ -204,7 +277,11 @@ export function storyCreateTool(opts?: {
     description:
       "Create a new story on the Story Board. Stories are human-level work items. " +
       "Only create stories after the team has approved your plan. " +
-      "The story appears as 'proposed' and the assigned human must accept it.",
+      "The story appears as 'proposed' and the assigned human must accept it. " +
+      "PASS `work_kind`: `story` for work that lands on trunk, `errand` " +
+      "for work whose deliverable is an answer. Omitting it means story, " +
+      "so an errand left unmarked runs with a branch and a merge it " +
+      "should never have had.",
     parameters: CreateStorySchema,
     execute: async (_toolCallId: string, args: unknown, _signal: unknown) => {
       const params = args as Record<string, unknown>;
@@ -239,7 +316,33 @@ const UpdateStorySchema = Type.Object({
   priority: Type.Optional(Type.String({ description: "New priority." })),
   assigned_to: Type.Optional(Type.String({ description: "New assignee uid." })),
   depends_on: Type.Optional(Type.Array(Type.String(), { description: "New dependency list." })),
-  estimated_effort: Type.Optional(Type.String({ description: "New effort estimate." })),
+  story_weight: Type.Optional(
+    Type.Integer({
+      description:
+        "SIZE, 1-5. This is the canonical size field: the day/week label " +
+        "the board shows is derived from it, and the Taximeter reads it. " +
+        "Omit it and the story renders 'Not sized'. 1 = under a day, " +
+        "3 = a few days, 5 = a week or more.",
+    }),
+  ),
+  estimated_effort: Type.Optional(Type.String({
+    description: "Free text. RETIRED: prefer `story_weight`.",
+  })),
+  // REVISABLE UNTIL IT IS NOT. You often only learn a suite needs a
+  // bigger machine after the first run dies on the small one, and
+  // without this the only fix was to cancel the story and write a new
+  // one.
+  sandbox_size: Type.Optional(
+    Type.String({
+      description:
+        "small, medium or large -- change the machine this story runs " +
+        "on. Only while it is `proposed` or `accepted`: the rung is " +
+        "fixed once a run picks it up, and editing it after that is " +
+        "refused rather than silently doing nothing. A TIER IS " +
+        "SOMEBODY'S MONEY -- go up when you have seen it fail, not in " +
+        "case.",
+    }),
+  ),
 });
 
 export function storyModifyTool(opts?: {

@@ -5,6 +5,7 @@ import {
   usesOpenAiFunctionAnthropicToolSchema,
   usesOpenAiStringModeAnthropicToolChoice,
 } from "../provider-capabilities.js";
+import { baseProviderKey } from "./cache-ttl.js";
 import { log } from "./logger.js";
 
 const ANTHROPIC_CONTEXT_1M_BETA = "context-1m-2025-08-07";
@@ -183,7 +184,11 @@ export function resolveCacheRetention(
   extraParams: Record<string, unknown> | undefined,
   provider: string,
 ): CacheRetention | undefined {
-  const isAnthropicDirect = provider === "anthropic";
+  // Base-provider comparison for the same reason as resolveAnthropicBetas above:
+  // a synthetic variant of an Anthropic model is still Anthropic, so it should get
+  // the same default prompt-cache retention as its base. cache-ttl.ts already
+  // treats these variants as eligible; this gate disagreed with it.
+  const isAnthropicDirect = baseProviderKey(provider) === "anthropic";
   const hasBedrockOverride =
     extraParams?.cacheRetention !== undefined || extraParams?.cacheControlTtl !== undefined;
   const isAnthropicBedrock = provider === "amazon-bedrock" && hasBedrockOverride;
@@ -213,7 +218,14 @@ export function resolveAnthropicBetas(
   provider: string,
   modelId: string,
 ): string[] | undefined {
-  if (provider !== "anthropic") {
+  // Base-provider comparison, not exact equality: synthetic context-window
+  // variants are registered under their own provider key ("anthropic-sonnet-1m"
+  // wrapping "anthropic"). Exact equality rejected every one of them, so NO sized
+  // Anthropic variant could ever receive a beta header regardless of configuration
+  // — `anthropic-sonnet-1m` could never actually serve 1M, because the beta that
+  // unlocks it was unreachable. Same convention cache-ttl.ts already uses; a
+  // "google-flash-1m" still resolves to base "google" and is correctly excluded.
+  if (baseProviderKey(provider) !== "anthropic") {
     return undefined;
   }
 

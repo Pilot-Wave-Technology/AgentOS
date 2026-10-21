@@ -344,12 +344,37 @@ export const ShcaWorkspaceSetupParamsSchema = Type.Object(
   {
     agentId: NonEmptyString,            // SHCA instance id (e.g. user-shca-GOAL-<uuid>)
     storyId: NonEmptyString,            // story id (e.g. abcd1234)
-    repo: Type.Object({
+    // SINGLE-REPO (legacy) form. Optional so a multi-repo caller can send `repos`
+    // instead, or send NEITHER for a docs-only workspace — a story directory with
+    // documents and plans and no checkout, because the work happens in an executor
+    // sandbox that has its own. At most one of the two, enforced at runtime in the
+    // handler (JSON Schema oneOf would break additionalProperties composition
+    // here). Old control-panel builds keep sending this and are unaffected.
+    repo: Type.Optional(Type.Object({
       cloneUrl: NonEmptyString,         // https://github.com/foo/bar.git
       branch: NonEmptyString,           // story/<sid>-<slug>
       userName: Type.Optional(NonEmptyString),    // for git user.name
       userEmail: Type.Optional(NonEmptyString),   // for git user.email
-    }),
+    })),
+    // MULTI-REPO form (control-plane plan M1/M3): one entry per repo the story
+    // touches. Each is cloned into its own directory under `repos/<subdir>/`
+    // instead of the single legacy `repo/` dir. Write repos are committed from;
+    // `write: false` entries are read-only context clones (no branch is cut for
+    // them and the diff/commit RPCs skip them).
+    repos: Type.Optional(Type.Array(Type.Object({
+      subdir: NonEmptyString,           // workspace-relative, e.g. repos/owner__name
+      cloneUrl: NonEmptyString,
+      branch: NonEmptyString,
+      write: Type.Optional(Type.Boolean()),       // default true
+      userName: Type.Optional(NonEmptyString),
+      userEmail: Type.Optional(NonEmptyString),
+    }), { minItems: 1 })),
+    // Absolute URL of the control panel's /internal/git-credential endpoint. When
+    // present, each clone gets a CALLBACK credential helper (a token is minted per
+    // git operation and nothing is stored on disk) instead of the inline-token
+    // helper. Optional so an older control panel keeps the legacy behaviour — see
+    // the credential-helper block in shca.workspace.setup.
+    credentialBrokerUrl: Type.Optional(NonEmptyString),
     githubToken: Type.Optional(NonEmptyString),
     // ↑ Optional so callers can pre-write RESOURCES.md with the embedded
     //   credential helper (existing pattern). If provided, this RPC will
@@ -367,12 +392,17 @@ export const ShcaWorkspaceSetupParamsSchema = Type.Object(
       "docs/plans/INDEX.md": Type.Optional(Type.String()),
       "docs/DECISIONS.md": Type.Optional(Type.String()),
       "docs/CODE_NOTES.md": Type.Optional(Type.String()),
-      ".claude/settings.json": Type.String(),
+      // Optional since the docs-only form: settings.json is the Claude Code
+      // permission file, and a workspace with no checkout never spawns one.
+      // Required → optional is safe in the one direction compatibility runs:
+      // a new gateway still accepts every older control panel's params.
+      ".claude/settings.json": Type.Optional(Type.String()),
     }, { additionalProperties: Type.String() }),
-    // Sibling stories/<id>/ dirs that must NOT be wiped by the single-story
-    // cleanup (e.g. a 'done' story whose final council review hasn't run yet —
-    // it reads the live workspace). The new story is still created; protected
-    // dirs are cleaned on a later import once they drop off this list.
+    // Sibling stories/<id>/ dirs that must NOT be wiped by the cleanup below.
+    // Originally just "a 'done' story whose council review hasn't run yet";
+    // now the full set of stories the control panel is still working on, since
+    // one assistant can hold several at once. Anything not named here is
+    // removed, so an omitted live story loses its documents.
     protectStoryIds: Type.Optional(Type.Array(Type.String())),
   },
   { additionalProperties: false },
@@ -382,9 +412,26 @@ export const ShcaWorkspaceSetupResultSchema = Type.Object(
   {
     ok: Type.Literal(true),
     workspacePath: NonEmptyString,
-    repoPath: NonEmptyString,
-    branch: NonEmptyString,
-    headSha: NonEmptyString,
+    // repoPath/branch/headSha describe the PRIMARY repo — the single repo in the
+    // legacy form, or the first WRITE repo in the multi-repo form. Always sent
+    // whenever anything was cloned, so an un-updated control panel reading these
+    // fields still works after the gateway is redeployed (the deploy-ordering
+    // requirement in the plan's §10).
+    //
+    // Optional ONLY for the docs-only form, where no repo was cloned and there
+    // is therefore no primary to describe. An older control panel never asks for
+    // that form (it always sends `repo` or `repos`), so it never sees them absent.
+    repoPath: Type.Optional(NonEmptyString),
+    branch: Type.Optional(NonEmptyString),
+    headSha: Type.Optional(NonEmptyString),
+    // Per-repo detail, present only when the caller used the multi-repo `repos` form.
+    repos: Type.Optional(Type.Array(Type.Object({
+      subdir: NonEmptyString,
+      repoPath: NonEmptyString,
+      branch: NonEmptyString,
+      headSha: NonEmptyString,
+      write: Type.Boolean(),
+    }))),
     filesWritten: Type.Number(),
   },
   { additionalProperties: false },
@@ -536,6 +583,10 @@ export const ShcaWorkspaceGitCommitParamsSchema = Type.Object(
                                             // OR "all" for everything currently modified
     message: NonEmptyString,                // commit message
     push: Type.Optional(Type.Boolean()),    // default true
+    // Multi-repo (plan G.5): commit + push every WRITE repo in the workspace rather
+    // than only the primary. Read-only context clones are always skipped. Opt-in so
+    // existing single-repo callers are unaffected.
+    allRepos: Type.Optional(Type.Boolean()),
   },
   { additionalProperties: false },
 );
@@ -547,6 +598,18 @@ export const ShcaWorkspaceGitCommitResultSchema = Type.Object(
     pushed: Type.Boolean(),
     push_error: Type.Optional(Type.String()),  // present if push=true and push failed
     nothing_to_commit: Type.Optional(Type.Boolean()),
+    // Aggregate failure text when allRepos was used and one or more repos failed.
+    error: Type.Optional(Type.String()),
+    // Per-repo outcome, present only for allRepos. N pushes cannot be atomic, so each
+    // repo reports independently and the caller can surface a partial land.
+    repos: Type.Optional(Type.Array(Type.Object({
+      subdir: NonEmptyString,
+      commit_sha: Type.String(),
+      pushed: Type.Boolean(),
+      nothing_to_commit: Type.Optional(Type.Boolean()),
+      push_error: Type.Optional(Type.String()),
+      error: Type.Optional(Type.String()),
+    }))),
   },
   { additionalProperties: false },
 );
@@ -566,6 +629,9 @@ export const ShcaWorkspaceGitDiffParamsSchema = Type.Object(
       Type.Literal("vs_origin"), // local HEAD vs origin/<branch>
     ])),
     writeToPath: Type.Optional(NonEmptyString),   // workspace-relative; if set, also write diff content here
+    // Multi-repo (plan G.4): diff every WRITE repo. Read-only context clones are
+    // excluded — the story cannot commit there, so their state is not under review.
+    allRepos: Type.Optional(Type.Boolean()),
   },
   { additionalProperties: false },
 );
@@ -578,6 +644,15 @@ export const ShcaWorkspaceGitDiffResultSchema = Type.Object(
     written_to: Type.Optional(NonEmptyString),
     truncated: Type.Boolean(),
     stat_summary: Type.String(),    // e.g. "5 files changed, 100 insertions(+), 20 deletions(-)"
+    // Per-repo diffs, present only for allRepos. The top-level `diff` is then the
+    // concatenation (banner-separated) so a caller reading only `diff` still sees
+    // every repo's changes instead of silently reviewing one of N.
+    repos: Type.Optional(Type.Array(Type.Object({
+      subdir: NonEmptyString,
+      diff: Type.String(),
+      truncated: Type.Boolean(),
+      stat_summary: Type.String(),
+    }))),
   },
   { additionalProperties: false },
 );

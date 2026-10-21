@@ -151,6 +151,9 @@ vi.mock("./lanes.js", () => ({
 
 vi.mock("../context-window-guard.js", () => ({
   resolveContextWindowInfo: vi.fn(() => ({ tokens: 128_000 })),
+  // getAgentContextTokens defaults to undefined (no per-agent cap); individual
+  // tests override with mockReturnValue to verify threading behaviour.
+  getAgentContextTokens: vi.fn(() => undefined),
 }));
 
 vi.mock("../bootstrap-files.js", () => ({
@@ -282,6 +285,9 @@ vi.mock("./utils.js", () => ({
 import { getApiProvider, unregisterApiProviders } from "@mariozechner/pi-ai";
 import { getCustomApiRegistrySourceId } from "../custom-api-registry.js";
 import { compactEmbeddedPiSessionDirect, compactEmbeddedPiSession } from "./compact.js";
+import { getAgentContextTokens, resolveContextWindowInfo } from "../context-window-guard.js";
+import { resolveSessionAgentIds } from "../agent-scope.js";
+import type { OpenClawConfig } from "../../config/config.js";
 
 const sessionHook = (action: string) =>
   triggerInternalHook.mock.calls.find(
@@ -564,5 +570,121 @@ describe("compactEmbeddedPiSession hooks (ownsCompaction engine)", () => {
     expect(result.ok).toBe(true);
     expect(result.compacted).toBe(true);
     expect(contextEngineCompactMock).toHaveBeenCalled();
+  });
+});
+
+describe("compactEmbeddedPiSession — per-agent contextTokens threading (acd626a5)", () => {
+  beforeEach(() => {
+    hookRunner.hasHooks.mockReset();
+    hookRunner.runBeforeCompaction.mockReset();
+    hookRunner.runAfterCompaction.mockReset();
+    contextEngineCompactMock.mockReset();
+    contextEngineCompactMock.mockResolvedValue({
+      ok: true,
+      compacted: true,
+      reason: undefined,
+      result: { summary: "engine-summary", tokensAfter: 50 },
+    });
+    resolveModelMock.mockReset();
+    resolveModelMock.mockReturnValue({
+      model: { provider: "openai", api: "responses", id: "fake", input: [], contextWindow: 200_000 },
+      error: null,
+      authStorage: { setRuntimeApiKey: vi.fn() },
+      modelRegistry: {},
+    });
+    vi.mocked(resolveContextWindowInfo).mockReset();
+    vi.mocked(resolveContextWindowInfo).mockReturnValue({ tokens: 32_000 } as ReturnType<
+      typeof resolveContextWindowInfo
+    >);
+    // mockReset restores a fresh vi.fn() that returns undefined by default —
+    // matches the initial factory value at the top of this file.
+    vi.mocked(getAgentContextTokens).mockReset();
+    vi.mocked(resolveSessionAgentIds).mockReset();
+  });
+
+  it("resolves sessionAgentId before ceCtxInfo and threads agentContextTokens into resolveContextWindowInfo", async () => {
+    // resolveSessionAgentIds returns agent "z" for this sessionKey.
+    vi.mocked(resolveSessionAgentIds).mockReturnValue({
+      defaultAgentId: "z",
+      sessionAgentId: "z",
+    } as ReturnType<typeof resolveSessionAgentIds>);
+    // The real getAgentContextTokens would look up cfg.agents.list; for this
+    // test we stub the lookup directly so the assertion below is unambiguous.
+    vi.mocked(getAgentContextTokens).mockReturnValue(32_000);
+
+    const cfg = {
+      agents: {
+        list: [{ id: "z", contextTokens: 32_000 }],
+      },
+    } as OpenClawConfig;
+
+    const result = await compactEmbeddedPiSession({
+      sessionId: "session-1",
+      sessionKey: "agent:z:session-1",
+      sessionFile: "/tmp/session.jsonl",
+      workspaceDir: "/tmp",
+      customInstructions: "focus on decisions",
+      config: cfg,
+      enqueue: (task) => task(),
+    });
+
+    expect(result.ok).toBe(true);
+
+    // getAgentContextTokens was called with (cfg, "z") — proving the reorder
+    // put sessionAgentId in scope before the resolveContextWindowInfo call.
+    expect(vi.mocked(getAgentContextTokens)).toHaveBeenCalledWith(cfg, "z");
+
+    // resolveContextWindowInfo received agentContextTokens: 32000.
+    expect(vi.mocked(resolveContextWindowInfo)).toHaveBeenCalledWith(
+      expect.objectContaining({ agentContextTokens: 32_000 }),
+    );
+  });
+
+  it("passes agentContextTokens undefined when the session doesn't map to an agent with contextTokens", async () => {
+    vi.mocked(resolveSessionAgentIds).mockReturnValue({
+      defaultAgentId: undefined,
+      sessionAgentId: undefined,
+    } as unknown as ReturnType<typeof resolveSessionAgentIds>);
+    // Default mock behaviour: getAgentContextTokens returns undefined.
+
+    const result = await compactEmbeddedPiSession({
+      sessionId: "session-1",
+      sessionKey: "session-1",
+      sessionFile: "/tmp/session.jsonl",
+      workspaceDir: "/tmp",
+      customInstructions: "no agent",
+      enqueue: (task) => task(),
+    });
+
+    expect(result.ok).toBe(true);
+    expect(vi.mocked(resolveContextWindowInfo)).toHaveBeenCalledWith(
+      expect.objectContaining({ agentContextTokens: undefined }),
+    );
+  });
+
+  it("existing hook context still uses the same sessionAgentId (no duplicate resolution)", async () => {
+    vi.mocked(resolveSessionAgentIds).mockReturnValue({
+      defaultAgentId: "z",
+      sessionAgentId: "z",
+    } as ReturnType<typeof resolveSessionAgentIds>);
+    hookRunner.hasHooks.mockReturnValue(true);
+
+    await compactEmbeddedPiSession({
+      sessionId: "session-1",
+      sessionKey: "agent:z:session-1",
+      sessionFile: "/tmp/session.jsonl",
+      workspaceDir: "/tmp",
+      customInstructions: "focus on decisions",
+      enqueue: (task) => task(),
+    });
+
+    // resolveSessionAgentIds should be called exactly once for the whole flow
+    // (the reorder must not have accidentally introduced a second call).
+    expect(vi.mocked(resolveSessionAgentIds)).toHaveBeenCalledTimes(1);
+    // Before-compaction hook still fires with the resolved session key.
+    expect(hookRunner.runBeforeCompaction).toHaveBeenCalledWith(
+      expect.any(Object),
+      expect.objectContaining({ sessionKey: "agent:z:session-1" }),
+    );
   });
 });

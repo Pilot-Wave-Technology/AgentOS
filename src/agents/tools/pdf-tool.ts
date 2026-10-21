@@ -105,7 +105,7 @@ export function resolvePdfModelConfigForTool(params: {
   } else if (anthropicOk) {
     preferred = ANTHROPIC_PDF_PRIMARY;
   } else if (googleOk) {
-    preferred = "google/gemini-2.5-pro";
+    preferred = "google/gemini-3.8-flash";
   } else if (openaiOk) {
     preferred = "openai/gpt-5-mini";
   }

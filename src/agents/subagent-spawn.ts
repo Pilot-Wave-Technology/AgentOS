@@ -108,7 +108,22 @@ export function splitModelRef(ref?: string) {
   if (!trimmed) {
     return { provider: undefined, model: undefined };
   }
-  const [provider, model] = trimmed.split("/", 2);
+  // Split on the FIRST "/" only, keeping everything after it intact —
+  // NOT `trimmed.split("/", 2)`. JS's `split(separator, limit)` splits on
+  // every occurrence of the separator and only THEN truncates the result
+  // array to `limit` entries (unlike Python's `split(sep, maxsplit=1)`,
+  // which stops splitting after the first match). So for a model ref with
+  // more than one slash (e.g. a Vertex-style
+  // "vertex/publishers/google/models/gemini-pro"), the old
+  // `split("/", 2)` silently discarded everything after the second slash,
+  // returning model="publishers" instead of the real model id. Mirrors
+  // `parseModelRef` in model-selection.ts, which already gets this right.
+  const slash = trimmed.indexOf("/");
+  if (slash === -1) {
+    return { provider: undefined, model: trimmed };
+  }
+  const provider = trimmed.slice(0, slash);
+  const model = trimmed.slice(slash + 1);
   if (model) {
     return { provider, model };
   }

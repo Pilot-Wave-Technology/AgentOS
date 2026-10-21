@@ -37,5 +37,5 @@ Fetches both refs, then returns `git diff origin/<baseRef>...<headRef>`. Used by
 
 ## Related docs
 
-- [agentos — documentation/story-integration/SYSTEM_GATE.md](https://github.com/Pilot-Wave-Technology/AgentOS/blob/main/documentation/story-integration/SYSTEM_GATE.md) and [CODE_INTEGRATION.md](https://github.com/Pilot-Wave-Technology/AgentOS/blob/main/documentation/story-integration/CODE_INTEGRATION.md) — full design and the control panel's merge orchestrator that calls these RPCs
+- [`agent_os_platform` — app/services/merge_orchestrator/](https://github.com/Pilot-Wave-Technology/AgentOS/tree/agent_os_platform/app/services/merge_orchestrator) — the control panel's merge orchestrator that calls these RPCs
 - [ARCHITECTURE.md](../../ARCHITECTURE.md#gateway-side-extensions) for how this fits alongside the other gateway extensions

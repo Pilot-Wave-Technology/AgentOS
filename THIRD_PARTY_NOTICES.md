@@ -8,7 +8,7 @@ This repository is a fork of [OpenClaw](https://github.com/openclaw/openclaw), w
 - **Copyright:** (c) 2026 OpenClaw Foundation
 - **License:** MIT — full text in [LICENSE-MIT](LICENSE-MIT)
 
-The MIT License requires that its copyright notice and permission notice be included in all copies or substantial portions of the software. That notice is preserved, unmodified, in [LICENSE-MIT](LICENSE-MIT), and applies to the upstream codebase this repo builds on: `src/`, `apps/`, `packages/`, `ui/`, `documentation/` (excluding `documentation/deployment/`), and every `extensions/` plugin except the ones listed below.
+The MIT License requires that its copyright notice and permission notice be included in all copies or substantial portions of the software. That notice is preserved, unmodified, in [LICENSE-MIT](LICENSE-MIT), and applies to the upstream codebase this repo builds on: `src/`, `apps/`, `packages/`, `ui/`, `documentation/`, and every `extensions/` plugin except the ones listed below.
 
 This repository's root [LICENSE](LICENSE) file is Apache 2.0, covering the additions made by Port33, inc. (below) — it is not a relicensing of the upstream MIT code, which remains under [LICENSE-MIT](LICENSE-MIT) regardless of which file GitHub displays as the repo's primary license.
 
@@ -52,8 +52,10 @@ The following are original work by Port33, inc., licensed separately under **Apa
 - `extensions/custom-tools/`
 - `extensions/insights/`
 - `extensions/workspace-ops/`
+- `extensions/model-registry/`
+- `extensions/misc-models/`
 - `infra/`
-- `documentation/deployment/`
+- `terraform/`, `cloudbuild.yaml`, `deploy/`, `reset.sh`
 - `start-openclaw.sh`
 - `scripts/gateway-provision.sh`, `scripts/wrappers/`
 - The AgentOS-specific patches to core gateway `src/` described in [ARCHITECTURE.md](ARCHITECTURE.md#core-gateway-patches) — these are modifications to upstream files rather than new files, and remain layered on top of the upstream MIT-licensed source they modify. The Apache 2.0 license applies to the modifications themselves; the surrounding upstream file remains MIT-licensed per the terms above.

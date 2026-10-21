@@ -20,10 +20,25 @@ function isOpenRouterCacheTtlModel(modelId: string): boolean {
   return OPENROUTER_CACHE_TTL_MODEL_PREFIXES.some((prefix) => modelId.startsWith(prefix));
 }
 
+/** Base provider for a (possibly synthetic) provider key: the segment before
+ *  the first "-". Synthetic context-window variants are registered under keys
+ *  like "anthropic-sonnet-100k" (base "anthropic"), each wrapping a real
+ *  upstream model. Cache-TTL eligibility is a property of the BASE provider, so
+ *  synthetic Anthropic/moonshot/zai variants inherit it. "google-flash-50k"
+ *  resolves to base "google", which is intentionally NOT eligible — cache-TTL
+ *  is an Anthropic-family prompt-cache mechanism, not a Gemini one. */
+export function baseProviderKey(provider: string): string {
+  const dash = provider.indexOf("-");
+  return dash > 0 ? provider.slice(0, dash) : provider;
+}
+
 export function isCacheTtlEligibleProvider(provider: string, modelId: string): boolean {
   const normalizedProvider = provider.toLowerCase();
   const normalizedModelId = modelId.toLowerCase();
-  if (CACHE_TTL_NATIVE_PROVIDERS.has(normalizedProvider)) {
+  // Native cache-TTL providers, INCLUDING their synthetic context-window
+  // variants (e.g. "anthropic-sonnet-100k" -> base "anthropic"). google/*
+  // synthetic variants resolve to base "google" and stay ineligible.
+  if (CACHE_TTL_NATIVE_PROVIDERS.has(baseProviderKey(normalizedProvider))) {
     return true;
   }
   if (normalizedProvider === "openrouter" && isOpenRouterCacheTtlModel(normalizedModelId)) {

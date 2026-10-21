@@ -33,7 +33,7 @@ import { resolveSessionAgentIds } from "../agent-scope.js";
 import type { ExecElevatedDefaults } from "../bash-tools.js";
 import { makeBootstrapWarn, resolveBootstrapContextForRun } from "../bootstrap-files.js";
 import { listChannelSupportedActions, resolveChannelMessageToolHints } from "../channel-tools.js";
-import { resolveContextWindowInfo } from "../context-window-guard.js";
+import { getAgentContextTokens, resolveContextWindowInfo } from "../context-window-guard.js";
 import { ensureCustomApiRegistered } from "../custom-api-registry.js";
 import { formatUserTime, resolveUserTimeFormat, resolveUserTimezone } from "../date-time.js";
 import { DEFAULT_CONTEXT_TOKENS, DEFAULT_MODEL, DEFAULT_PROVIDER } from "../defaults.js";
@@ -95,6 +95,7 @@ import { splitSdkTools } from "./tool-split.js";
 import type { EmbeddedPiCompactResult } from "./types.js";
 import { describeUnknownError, mapThinkingLevel } from "./utils.js";
 import { flushPendingToolResultsAfterIdle } from "./wait-for-idle-before-flush.js";
+import { getMiscModelOverride } from "../misc-model-overrides.js";
 
 export type CompactEmbeddedPiSessionParams = {
   sessionId: string;
@@ -278,7 +279,11 @@ export async function compactEmbeddedPiSessionDirect(
   const prevCwd = process.cwd();
 
   // Resolve compaction model: prefer config override, then fall back to caller-supplied model
-  const compactionModelOverride = params.config?.agents?.defaults?.compaction?.model?.trim();
+  // The control panel's choice first, as in the async path (attempt.ts).
+  const compactionModelOverride = getMiscModelOverride(
+    "gateway_compaction",
+    params.config?.agents?.defaults?.compaction?.model ?? "",
+  ).trim();
   let provider: string;
   let modelId: string;
   // When switching provider via override, drop the primary auth profile to avoid
@@ -415,6 +420,11 @@ export async function compactEmbeddedPiSessionDirect(
       modelId,
       modelContextWindow: model.contextWindow,
       defaultTokens: DEFAULT_CONTEXT_TOKENS,
+      agentContextTokens: getAgentContextTokens(
+        params.config,
+        resolveSessionAgentIds({ sessionKey: params.sessionKey, config: params.config })
+          .sessionAgentId,
+      ),
     });
     const effectiveModel =
       ctxInfo.tokens < (model.contextWindow ?? Infinity)
@@ -962,12 +972,17 @@ export async function compactEmbeddedPiSession(
         const ceModelId = (params.model ?? DEFAULT_MODEL).trim() || DEFAULT_MODEL;
         const agentDir = params.agentDir ?? resolveOpenClawAgentDir();
         const { model: ceModel } = resolveModel(ceProvider, ceModelId, agentDir, params.config);
+        const { sessionAgentId } = resolveSessionAgentIds({
+          sessionKey: params.sessionKey,
+          config: params.config,
+        });
         const ceCtxInfo = resolveContextWindowInfo({
           cfg: params.config,
           provider: ceProvider,
           modelId: ceModelId,
           modelContextWindow: ceModel?.contextWindow,
           defaultTokens: DEFAULT_CONTEXT_TOKENS,
+          agentContextTokens: getAgentContextTokens(params.config, sessionAgentId),
         });
         // When the context engine owns compaction, its compact() implementation
         // bypasses compactEmbeddedPiSessionDirect (which fires the hooks internally).
@@ -976,10 +991,6 @@ export async function compactEmbeddedPiSession(
         const engineOwnsCompaction = contextEngine.info.ownsCompaction === true;
         const hookRunner = engineOwnsCompaction ? getGlobalHookRunner() : null;
         const hookSessionKey = params.sessionKey?.trim() || params.sessionId;
-        const { sessionAgentId } = resolveSessionAgentIds({
-          sessionKey: params.sessionKey,
-          config: params.config,
-        });
         const resolvedMessageProvider = params.messageChannel ?? params.messageProvider;
         const hookCtx = {
           sessionId: params.sessionId,

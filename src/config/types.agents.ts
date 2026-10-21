@@ -65,6 +65,15 @@ export type AgentConfig = {
   workspace?: string;
   agentDir?: string;
   model?: AgentModelConfig;
+  /**
+   * Optional per-agent context-window cap (positive integer).
+   * When set, overrides agents.defaults.contextTokens for this
+   * agent; the effective window is
+   * min(contextTokens, model.contextWindow). When unset, falls
+   * back to agents.defaults.contextTokens, then the model's
+   * native window.
+   */
+  contextTokens?: number;
   /** Optional allowlist of skills for this agent (omit = all skills; empty = none). */
   skills?: string[];
   memorySearch?: MemorySearchConfig;

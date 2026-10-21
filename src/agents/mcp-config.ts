@@ -8,7 +8,7 @@
  * The MCP server path is read from OPENCLAW_MCP_SERVER_PATH, which must be
  * set in start-openclaw.sh to the ABSOLUTE path of mcp-server.ts:
  *
- *   export OPENCLAW_MCP_SERVER_PATH="$HOME/openclaw_fork_03122026/extensions/custom-tools/mcp-server.ts"
+ *   export OPENCLAW_MCP_SERVER_PATH="$HOME/agentos-gateway/extensions/custom-tools/mcp-server.ts"
  *
  * tsx is used to execute the TypeScript entry point. Its path is resolved via
  * OPENCLAW_TSX_PATH (also set in start-openclaw.sh) or falls back to the tsx

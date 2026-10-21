@@ -17,7 +17,8 @@
  * claude -p invocation per turn, no openclaw session tracking.
  */
 import { spawn } from "node:child_process";
-import { existsSync, statSync, realpathSync } from "node:fs";
+import { existsSync, statSync, realpathSync, mkdtempSync, writeFileSync, rmSync, readFileSync } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 
@@ -38,6 +39,17 @@ const log = createSubsystemLogger("agent/cli-spawn");
 const _childrenByTask  = new Map<string, ReturnType<typeof spawn>>();
 const _childrenByStory = new Map<string, ReturnType<typeof spawn>>();
 
+// Marks children killed via abortCliByTask/abortCliByStory (the shca.claude.abort
+// RPC, used by the chat pause button and the operator force-kill switch) so the
+// close handler below can tell an intentional abort apart from a real crash or
+// the internal timeout-kill. Without this, an aborted turn's SIGTERM shows up in
+// the close handler exactly like a genuine nonzero exit, and gets reported as
+// "claude exited with code 143" instead of a clean abort — which is then
+// misread as a task failure by the caller instead of the intended pause/blocked
+// outcome. A WeakSet needs no cleanup: entries fall out once the child (and its
+// spawnCliDirect call) are done and unreferenced.
+const _killSwitchAborted = new WeakSet<ReturnType<typeof spawn>>();
+
 // C3 per-story turn lock: at most ONE `claude -p --resume` in flight per story
 // (or per resume-session id when there is no story). Two concurrent resumes of
 // the same session corrupt the transcript → OFF_PROTOCOL. Both the phase
@@ -47,6 +59,7 @@ const _childrenByStory = new Map<string, ReturnType<typeof spawn>>();
 const _turnInFlightByStory = new Set<string>();
 
 function _killChild(child: ReturnType<typeof spawn>, label: string): void {
+  _killSwitchAborted.add(child);
   log.warn(`abort: SIGTERM claude child for ${label} (pid=${child.pid ?? "?"})`);
   try { child.kill("SIGTERM"); } catch { /* ignore */ }
   setTimeout(() => {
@@ -86,12 +99,32 @@ export function abortCliByStory(storyId: string): boolean {
   return true;
 }
 
-const CLAUDE_CANDIDATES = [
+// Ubuntu (prod VM) paths -- the only ones ever real in a deployed environment.
+const CLAUDE_CANDIDATES_PROD = [
   "/usr/local/bin/claude",
   "/usr/bin/claude",
   "/home/openclaw/.local/bin/claude",
   "/home/openclaw/.npm-global/bin/claude",
 ];
+// Windows locations. NOT a production concern (the gateway VM is always
+// Ubuntu) -- purely a local-dev accommodation, so only checked when
+// OPENCLAW_LOCAL_DEV=1 (set by local-development/scripts/run/gateway.ps1,
+// never present on the deployed VM). Mirrors the same gating in agents.ts's
+// git-binary resolution.
+const CLAUDE_CANDIDATES_LOCAL_DEV_WIN32 = [
+  // local-development's own portable npm global install --
+  // `npm install -g @anthropic-ai/claude-code`. AGENTOS_TOOLS_DIR is always
+  // exported by lib/tools.ps1 (dot-sourced by run/gateway.ps1), so this should
+  // always be set in practice; its default lives next to agentos (a
+  // sibling dev-tools\ dir), which isn't a fixed path from here, hence no
+  // hardcoded fallback -- this candidate is simply skipped if the var is unset.
+  ...(process.env.AGENTOS_TOOLS_DIR ? [`${process.env.AGENTOS_TOOLS_DIR}\\node\\claude.cmd`] : []),
+  // Standard Windows npm global install location for a system-wide npm.
+  `${process.env.APPDATA || ""}\\npm\\claude.cmd`,
+];
+const CLAUDE_CANDIDATES = process.env.OPENCLAW_LOCAL_DEV === "1"
+  ? [...CLAUDE_CANDIDATES_PROD, ...CLAUDE_CANDIDATES_LOCAL_DEV_WIN32]
+  : CLAUDE_CANDIDATES_PROD;
 
 let _claudeBinCached: string | null | undefined;
 
@@ -109,6 +142,59 @@ function resolveClaudeBin(): string | null {
   }
   _claudeBinCached = null;
   return null;
+}
+
+// Claude Code's workspace-trust dialog is a SEPARATE gate from
+// --permission-mode bypassPermissions: the latter skips per-tool prompts, but
+// a directory the CLI has never seen before still refuses to honor
+// .claude/settings.json's permissions.allow at all until it's been through the
+// trust dialog (interactively) or has `hasTrustDialogAccepted: true` recorded
+// in ~/.claude.json for that exact path. A headless `-p` spawn has no
+// interactive dialog to accept, and every operator story workspace is a BRAND
+// NEW directory (<agent-ws>/stories/<storyId>) the CLI has never seen — so
+// without this, every fresh operator story would silently run with none of
+// its 32 permissions.allow entries honored. Found live 2026-08-20 via the
+// stderrSnippet fix (previously this failure mode produced no diagnostic at
+// all — see claude-code-communication-tool.ts).
+//
+// Best-effort and defensive: this edits the OPERATOR'S REAL ~/.claude.json,
+// which may hold other real projects' settings, so it only ever adds/updates
+// the ONE entry for cwdResolved — never overwrites the file wholesale, never
+// throws (a failure here just means the ORIGINAL trust error surfaces via
+// stderr, same as before this existed).
+function _ensureWorkspaceTrusted(cwdResolved: string): void {
+  const claudeJsonPath = path.join(os.homedir(), ".claude.json");
+  try {
+    let parsed: Record<string, unknown> = {};
+    if (existsSync(claudeJsonPath)) {
+      try {
+        parsed = JSON.parse(readFileSync(claudeJsonPath, "utf8"));
+      } catch (err) {
+        log.warn(
+          `cli-spawn: ~/.claude.json exists but failed to parse — leaving trust `
+          + `state untouched: ${(err as Error)?.message || err}`,
+        );
+        return;
+      }
+    }
+    const projects = (parsed.projects && typeof parsed.projects === "object")
+      ? parsed.projects as Record<string, Record<string, unknown>>
+      : {};
+    const existing = projects[cwdResolved];
+    if (existing?.hasTrustDialogAccepted === true) {
+      return; // already trusted — nothing to do
+    }
+    projects[cwdResolved] = { ...(existing || {}), hasTrustDialogAccepted: true };
+    parsed.projects = projects;
+    writeFileSync(claudeJsonPath, JSON.stringify(parsed, null, 2), "utf8");
+    log.info(`cli-spawn: marked workspace trusted in ~/.claude.json: ${cwdResolved}`);
+  } catch (err) {
+    log.warn(
+      `cli-spawn: could not update ~/.claude.json to trust ${cwdResolved}: `
+      + `${(err as Error)?.message || err} — spawn will proceed and may hit the `
+      + `trust-dialog error itself`,
+    );
+  }
 }
 
 export interface SpawnCliParams {
@@ -146,7 +232,7 @@ export interface CliToolCall {
 }
 
 export interface SpawnCliResult {
-  status: "ok" | "error" | "busy";
+  status: "ok" | "error" | "busy" | "aborted";
   sessionId: string;
   text: string;                     // final assistant text
   toolCalls: CliToolCall[];         // tool calls Claude made during the turn
@@ -223,11 +309,27 @@ async function _spawnCliDirectInner(params: SpawnCliParams): Promise<SpawnCliRes
   if (params.model) {
     args.push("--model", params.model);
   }
+  // --append-system-prompt takes the text inline on the command line, which is
+  // subject to the OS's max command-line length -- Windows CreateProcess caps
+  // at ~32k chars ("The command line is too long"), and a per-agent system
+  // prompt (full IDENTITY.md + RESOURCES.md content folded in) can exceed
+  // that. Writing it to a temp file and passing --append-system-prompt-file
+  // instead removes the ceiling entirely and behaves identically on every
+  // platform, so this isn't gated behind OPENCLAW_LOCAL_DEV.
+  let appendSystemPromptDir: string | undefined;
   if (params.appendSystemPrompt) {
-    args.push("--append-system-prompt", params.appendSystemPrompt);
+    try {
+      appendSystemPromptDir = mkdtempSync(path.join(os.tmpdir(), "claude-sysprompt-"));
+      const file = path.join(appendSystemPromptDir, "system-prompt.txt");
+      writeFileSync(file, params.appendSystemPrompt, "utf8");
+      args.push("--append-system-prompt-file", file);
+    } catch (err) {
+      log.warn(`cli-spawn: failed to write system-prompt temp file, falling back to inline: ${(err as Error)?.message || err}`);
+      args.push("--append-system-prompt", params.appendSystemPrompt);
+    }
   }
-  // Prompt MUST be last; claude -p reads it as a positional arg.
-  args.push(params.task);
+  // The task prompt is piped via stdin (below) rather than passed positionally
+  // for the same reason -- phase-turn prompts routinely exceed the same limit.
 
   // Derive the authoritative cwd from (agentId, storyId). The gateway OWNS the
   // workspace layout — an operator story always lives at <agent-ws>/stories/<storyId>
@@ -308,6 +410,8 @@ async function _spawnCliDirectInner(params: SpawnCliParams): Promise<SpawnCliRes
       error: `cwd does not exist: ${cwdResolved}`,
     };
   }
+
+  _ensureWorkspaceTrusted(cwdResolved);
 
   // ── Scoped hook credential (shared-token exfiltration fix) ──────────
   // The spawned `claude` child has a Bash tool, so ANYTHING in its env is
@@ -392,9 +496,24 @@ async function _spawnCliDirectInner(params: SpawnCliParams): Promise<SpawnCliRes
         // cards back to the control panel.
         ...hookEnv,
       },
-      shell: false,
-      stdio: ["ignore", "pipe", "pipe"],
+      // false in prod (spawns a real ELF binary directly -- no shell-injection
+      // surface). The npm-installed Windows claude CLI is only a .cmd/.ps1
+      // shim script, which Windows' CreateProcess cannot exec without shell
+      // interpretation (spawn EINVAL otherwise) -- true ONLY under our local-
+      // dev flag, so this never changes prod's security posture.
+      shell: process.env.OPENCLAW_LOCAL_DEV === "1",
+      stdio: ["pipe", "pipe", "pipe"],
     });
+
+    // Prompt goes over stdin, not argv -- see the comment above args.push
+    // for why. claude -p reads the full prompt once stdin closes.
+    child.stdin.write(params.task);
+    child.stdin.end();
+
+    const cleanupSystemPromptFile = () => {
+      if (!appendSystemPromptDir) return;
+      try { rmSync(appendSystemPromptDir, { recursive: true, force: true }); } catch { /* best-effort */ }
+    };
 
     // Kill switch — register under taskId (phase turns) or storyId (planning turns
     // with no taskId) so shca.claude.abort can reach this child. Both are cleaned
@@ -442,6 +561,7 @@ async function _spawnCliDirectInner(params: SpawnCliParams): Promise<SpawnCliRes
 
     child.on("error", (err) => {
       clearTimeout(timer);
+      cleanupSystemPromptFile();
       if (params.taskId) _childrenByTask.delete(params.taskId);
       else if (params.storyId) _childrenByStory.delete(params.storyId);
       log.warn(`claude spawn error: ${err.message}`);
@@ -458,15 +578,22 @@ async function _spawnCliDirectInner(params: SpawnCliParams): Promise<SpawnCliRes
 
     child.on("close", (code) => {
       clearTimeout(timer);
+      cleanupSystemPromptFile();
       if (params.taskId) _childrenByTask.delete(params.taskId);
       else if (params.storyId) _childrenByStory.delete(params.storyId);
       const parsed = parseStreamJson(stdoutBuf);
       const finalSessionId = parsed.sessionId || sessionId;
-      const status: "ok" | "error" = killed
+      // A kill-switch abort (chat pause / operator force-kill) only counts once
+      // the timeout-kill path hasn't already claimed this exit — timeout keeps
+      // its existing "error" classification below.
+      const wasKillSwitchAborted = !killed && _killSwitchAborted.has(child);
+      const status: "ok" | "error" | "aborted" = killed
         ? "error"
-        : code === 0
-          ? "ok"
-          : "error";
+        : wasKillSwitchAborted
+          ? "aborted"
+          : code === 0
+            ? "ok"
+            : "error";
 
       // C4 safe resume-fallback: a `--resume` that failed because the session is
       // PROVABLY gone (workspace recreated, transcript pruned, id expired —
@@ -545,6 +672,23 @@ async function _spawnCliDirectInner(params: SpawnCliParams): Promise<SpawnCliRes
         });
       }
 
+      // A genuine crash (not a timeout, not an intentional abort, not the
+      // session_expired retry above — that path already logs its own
+      // CLAUDE_SESSION_FORKED warning and returns before reaching here) had
+      // NOTHING logged anywhere before this: stderrSnippet only ever reached
+      // the resolve() below, and claude-code-communication-tool.ts drops it
+      // when relaying the error to the caller, so the actual crash reason was
+      // captured for a moment and then lost — never logged, never surfaced.
+      // Found live 2026-08-20 diagnosing a "claude exited with code 1" report
+      // with no stderr anywhere to explain it.
+      if (status === "error" && !killed && !wasKillSwitchAborted) {
+        log.warn(
+          `cli-spawn: claude exited with code ${code} for `
+          + `${params.storyId ? `story=${params.storyId}` : `task=${params.taskId}`}`
+          + (stderrBuf ? ` — stderr: ${stderrBuf.slice(0, 1000)}` : " — stderr was empty"),
+        );
+      }
+
       resolve({
         status,
         sessionId: finalSessionId,
@@ -555,9 +699,11 @@ async function _spawnCliDirectInner(params: SpawnCliParams): Promise<SpawnCliRes
         durationMs: Date.now() - started,
         error: killed
           ? `timed out after ${timeoutMs}ms`
-          : code !== 0
-            ? `claude exited with code ${code}`
-            : undefined,
+          : wasKillSwitchAborted
+            ? "turn aborted by operator (pause/force-kill)"
+            : code !== 0
+              ? `claude exited with code ${code}`
+              : undefined,
       });
     });
   });

@@ -43,9 +43,13 @@ export function createResourceSummaryTool(opts?: {
     label: "Resource Summary",
     name: "resource_summary",
     description:
-      "Get the stored summary for a goal resource (repo, document, file). " +
-      "Returns the analysis/summary from the last scan. Fast — reads from database. " +
-      "If the summary is stale or missing, use resource_scan to generate a fresh one.",
+      "Get the stored summary for a goal resource (trunk branch, document, " +
+      "file). FOR CODE THE SUMMARY LIVES ON THE TRUNK BRANCH, one per lane " +
+      "— `myrepo:cal_backend` — and never on the bare repo row, which only " +
+      "anchors those branches and carries no summary of its own. One repo " +
+      "can have several trunk branches in a goal, each its own merge " +
+      "target, so ask about the lane you mean. Fast — reads from database. " +
+      "If the summary is stale or missing, use resource_scan.",
     parameters: ResourceSummarySchema,
     execute: async (_toolCallId, args, signal) => {
       const params = args as Record<string, unknown>;
@@ -103,10 +107,14 @@ export function createResourceScanTool(opts?: {
     label: "Resource Scan",
     name: "resource_scan",
     description:
-      "Trigger a fresh scan and analysis of a goal resource. " +
-      "For repos: fetches file tree, README, key configs, recent commits, then summarizes with AI. " +
-      "For documents (PDF, Excel, Word): extracts text and generates summary. " +
-      "Slower than resource_summary — use only when you need fresh data or no summary exists.",
+      "Start a fresh scan of a goal resource. Returns as soon as it is " +
+      "STARTED, not when it is done — read the result with " +
+      "resource_summary, which reports whether it is stale. " +
+      "For a TRUNK BRANCH: fetches that branch's file tree, README and key " +
+      "configs, then summarizes with AI. Scanning a bare repo row is a " +
+      "no-op once the goal has declared trunk branches — the lanes carry " +
+      "the summaries, so name the lane you mean. " +
+      "For documents (PDF, Excel, Word): extracts text and generates summary.",
     parameters: ResourceScanSchema,
     execute: async (_toolCallId, args, signal) => {
       const params = args as Record<string, unknown>;
@@ -164,7 +172,12 @@ const ResourceReadSchema = Type.Object({
       "Not needed for uploaded documents — leave empty to read the full document.",
   })),
   lines: Type.Optional(Type.Number({
-    description: "Maximum number of lines to return. Default: 500.",
+    description: "Maximum number of lines to return in this call (a window). Default 1500. "
+      + "Pass a value >= total_lines to read a whole file at once.",
+  })),
+  offset: Type.Optional(Type.Number({
+    description: "0-based start line for a range/paged read; returns lines [offset, offset+lines). "
+      + "Default 0. Use the response's total_lines/next_offset to page through a large file.",
   })),
 });
 
@@ -185,7 +198,8 @@ export function createResourceReadTool(opts?: {
       const params = args as Record<string, unknown>;
       const resourceId = readStringParam(params, "resource_id", { required: true, trim: true });
       const path = readStringParam(params, "path") || "";
-      const lines = typeof params.lines === "number" ? params.lines : 500;
+      const lines = typeof params.lines === "number" ? params.lines : 1500;
+      const offset = typeof params.offset === "number" ? params.offset : 0;
 
       const goalId = resolveGoalIdFromSession(opts?.agentSessionKey) || "";
       if (!goalId) {
@@ -199,6 +213,7 @@ export function createResourceReadTool(opts?: {
         const queryParams = new URLSearchParams({
           path,
           lines: String(lines),
+          offset: String(offset),
         });
 
         const res = await fetch(

@@ -193,9 +193,15 @@ export function createClaudeCodeCommunicationTool(
         });
       }
       if (result.status === "error") {
+        // result.stderrSnippet was previously dropped here — the SHCA (and anyone
+        // reading its report) only ever saw the bare "claude exited with code N",
+        // with the actual crash reason nowhere to be found (not even logged; see
+        // cli-spawn.ts's close handler). Include it so a real diagnosis is
+        // possible without gateway/runtime log access.
         return jsonResult({
           status: "error",
           error: result.error || "Claude Code returned an error.",
+          ...(result.stderrSnippet ? { stderr: result.stderrSnippet } : {}),
         });
       }
       return jsonResult({

@@ -2,7 +2,7 @@ import type { Api, Model } from "@mariozechner/pi-ai";
 import type { ExtensionFactory, SessionManager } from "@mariozechner/pi-coding-agent";
 import type { OpenClawConfig } from "../../config/config.js";
 import { createSubsystemLogger } from "../../logging/subsystem.js";
-import { resolveContextWindowInfo } from "../context-window-guard.js";
+import { getAgentContextTokens, resolveContextWindowInfo } from "../context-window-guard.js";
 
 const log = createSubsystemLogger("async-compaction");
 import { DEFAULT_CONTEXT_TOKENS } from "../defaults.js";
@@ -20,6 +20,7 @@ function resolveContextWindowTokens(params: {
   provider: string;
   modelId: string;
   model: Model<Api> | undefined;
+  agentId?: string;
 }): number {
   return resolveContextWindowInfo({
     cfg: params.cfg,
@@ -27,6 +28,7 @@ function resolveContextWindowTokens(params: {
     modelId: params.modelId,
     modelContextWindow: params.model?.contextWindow,
     defaultTokens: DEFAULT_CONTEXT_TOKENS,
+    agentContextTokens: getAgentContextTokens(params.cfg, params.agentId),
   }).tokens;
 }
 
@@ -36,6 +38,7 @@ function buildContextPruningFactory(params: {
   provider: string;
   modelId: string;
   model: Model<Api> | undefined;
+  agentId?: string;
 }): ExtensionFactory | undefined {
   const raw = params.cfg?.agents?.defaults?.contextPruning;
   if (raw?.mode !== "cache-ttl") {
@@ -121,6 +124,7 @@ export function buildEmbeddedExtensionFactories(params: {
       modelId: params.modelId,
       modelContextWindow: params.model?.contextWindow,
       defaultTokens: DEFAULT_CONTEXT_TOKENS,
+      agentContextTokens: getAgentContextTokens(params.cfg, params.agentId),
     });
     setCompactionSafeguardRuntime(params.sessionManager, {
       maxHistoryShare: defaultsCfg?.maxHistoryShare,
@@ -158,6 +162,9 @@ export function buildEmbeddedExtensionFactories(params: {
         contextWindowInfo.tokens > 0
           ? Math.max(1, Math.floor(contextWindowInfo.tokens * defaultsCfg.keepRecentTokensPct))
           : undefined,
+      // Bounds a single preserved toolResult. The budget above does not:
+      // the pairing pass adds results without counting them.
+      preservedToolResultMaxTokens: defaultsCfg?.preservedToolResultMaxTokens,
     });
     factories.push(compactionSafeguardExtension);
   }

@@ -41,7 +41,7 @@ AgentOS ships as a single repository —
 | Branch | Role | Language |
 |---|---|---|
 | **`agent_os_openclaw`** ← *this branch* | **Gateway** — the runtime that executes the AI agents: agent runtime, workspace management, LLM calls, custom-tool execution | Node.js / TypeScript |
-| `agent_os_platform` | **Control plane** — goals, stories, tasks, memory, platform integrations, and the UI that drives the gateway | Python / FastAPI / PostgreSQL |
+| `agent_os_platform` | **Control plane** — goals, stories, executions, memory, platform integrations, and the UI that drives the gateway | Python / FastAPI / PostgreSQL |
 
 This is **Stage ① of a deployment: the gateway** — the process that actually
 runs the agents. Deploy it first; the control plane reuses its VPC and secrets
@@ -85,14 +85,17 @@ name.
 ## Gateway-side extensions
 
 [`extensions/`](extensions/) carries the fork-authored plugins that couple the
-gateway to AgentOS. Each one is a self-contained OpenClaw plugin — all coupling
-flows through the plugin RPC interface, with no edits to OpenClaw core:
+gateway to AgentOS. Each one is a self-contained OpenClaw plugin — the plugin
+coupling itself flows through the plugin RPC interface and needs no core edits
+(the fork's separate core patches are listed [below](#core-gateway-patches)):
 
 | Plugin | Origin | Purpose |
 |---|---|---|
 | `custom-tools/` | Fork-authored | Loads admin-defined tools (HTTP, OpenAPI, TypeScript/Deno sandbox, MCP) from the control plane's database at runtime — no gateway restart needed. See [`extensions/custom-tools/README.md`](extensions/custom-tools/README.md) for the full lifecycle. |
 | `insights/` | Fork-authored | Read-only RPCs for the control plane's dashboard — e.g. `sandbox.status` (container runtime health, active sandbox count). See [`extensions/insights/README.md`](extensions/insights/README.md). |
 | `workspace-ops/` | Fork-authored | Admin RPCs for the merge/review flow — `workspace.mergePreview` (runs a preview merge in the agent's workspace) and `workspace.gitDiff` (net diff for human review before integration). See [`extensions/workspace-ops/README.md`](extensions/workspace-ops/README.md). |
+| `model-registry/` | Fork-authored | Serves the agent-facing model catalog from the control plane: polls `/internal/model_catalog` and contributes those providers/models to the gateway's model config; the `models.reload` RPC is the fast path after an admin edit. See [`extensions/model-registry/README.md`](extensions/model-registry/README.md). |
+| `misc-models/` | Fork-authored | Purpose-scoped model overrides for direct model calls outside the agent catalog — including the gateway's compaction summarizer: polls `/internal/misc_model_settings`; `misc-models.reload` refreshes it on demand. |
 | `memory-core/` | Upstream, kept in use | Not fork-authored, but deliberately retained — it's the active memory-search backend agents use. |
 
 `shared/` and `test-utils/` hold supporting test helpers for the fork-authored
@@ -124,7 +127,7 @@ Beyond the plugin layer, this fork also carries direct patches to core gateway
 These are **not** a clean, unmodified upstream tree — they're real fork patches
 that must be carried forward on every upstream rebase. The standing rule for
 *new* changes is to prefer consuming an existing gateway interface over patching
-source (see [`AGENTS.md`](AGENTS.md)); that rule governs future work and does not
+source (see the "Minimal surface area" principle in [`VISION.md`](VISION.md)); that rule governs future work and does not
 describe the current patch set, which predates it and accumulated incrementally.
 There is no single document enumerating every patch — `git log` against this
 fork's divergence point from upstream is the source of truth.
@@ -136,8 +139,10 @@ Deployment is **branch-based and single-environment**: pushing to
 deploy artifacts, all at the repo root:
 
 - [`terraform/`](terraform/) — a GCP VM module (`main.tf`, `variables.tf`,
-  `outputs.tf`, `startup.sh.tpl`) that stands up the VM, VPC, firewall, archive
-  bucket, and the secrets the gateway reads. Point `repo_url` in your
+  `outputs.tf`, `startup.sh.tpl`) that stands up the VM, VPC network, reserved
+  internal address, firewalls, and archive bucket. It creates no secrets or
+  service accounts — it **reads** the ones the platform branch's
+  `prerequisites.sh` creates. Point `repo_url` in your
   `terraform.tfvars` at your fork; the VM clones it on boot.
 - [`cloudbuild.yaml`](cloudbuild.yaml) — the push-to-deploy pipeline: on every
   push to your fork's branch, the VM pulls, rebuilds, and restarts.
@@ -171,10 +176,9 @@ before the control plane exists and picks up its counterpart on the next
 provision.
 
 See [`deploy/README.md`](deploy/README.md) for the step-by-step deployment
-guide, [`terraform/README.md`](terraform/README.md) for the module reference,
-and [`infra/README.md`](infra/README.md) for the Claude Code hooks
-([`infra/hooks/`](infra/hooks/)) and synthetic-model config
-([`infra/config/`](infra/config/)) the provisioning step installs.
+guide and [`terraform/README.md`](terraform/README.md) for the module
+reference. The Claude Code hooks the provisioning step installs are in
+[`infra/hooks/`](infra/hooks/).
 
 ## Repository layout
 
@@ -187,6 +191,8 @@ agent_os_openclaw/
 │   ├── custom-tools/               Fork-authored — see above
 │   ├── insights/                   Fork-authored — see above
 │   ├── workspace-ops/              Fork-authored — see above
+│   ├── model-registry/             Fork-authored — see above
+│   ├── misc-models/                Fork-authored — see above
 │   ├── memory-core/                Upstream, kept in use — see above
 │   └── shared/, test-utils/        Test helpers for the fork-authored plugins
 ├── terraform/                      Our addition — GCP VM module (main.tf, …, startup.sh.tpl)
@@ -195,18 +201,19 @@ agent_os_openclaw/
 │   ├── gateway-provision.sh        Our addition — on-VM build + configure + restart
 │   └── wrappers/                   Our addition — agent → control plane HTTP callbacks
 ├── infra/
-│   ├── hooks/                      Our addition — Claude Code guardrail hooks
-│   └── config/                     Our addition — synthetic-model config
-├── documentation/                  Upstream OpenClaw docs, plus:
-│   └── deployment/                 Runbook / deployment notes (our addition)
+│   └── hooks/                      Our addition — Claude Code guardrail hooks
+├── documentation/                  Upstream OpenClaw docs
 ├── deploy/README.md                Our addition — the deployment guide
-└── start-openclaw.sh               Our addition — VM boot/config helper
+├── reset.sh                        Our addition — tears down the gateway stack
+└── start-openclaw.sh               Our addition — legacy local helper; the VM does
+                                    not use it (systemd runs the gateway, and
+                                    provisioning is scripts/gateway-provision.sh)
 ```
 
 ## Further reading
 
 - [`deploy/README.md`](deploy/README.md) — the step-by-step deployment guide (start here)
-- [`terraform/README.md`](terraform/README.md) and [`infra/README.md`](infra/README.md) — the deployment reference
-- [`extensions/custom-tools/README.md`](extensions/custom-tools/README.md), [`extensions/insights/README.md`](extensions/insights/README.md), [`extensions/workspace-ops/README.md`](extensions/workspace-ops/README.md) — the three fork-authored extensions, each documented
-- [`AGENTS.md`](AGENTS.md) — ground rules for changing this fork (prefer consuming existing gateway interfaces over patching source)
-- The [`agent_os_platform` branch](https://github.com/Pilot-Wave-Technology/AgentOS/tree/agent_os_platform) — control-plane-side architecture and the domain model (Goal / Story / Task) that ultimately drives what gets sent over the WebSocket RPC described here
+- [`terraform/README.md`](terraform/README.md) — the deployment reference
+- [`extensions/custom-tools/README.md`](extensions/custom-tools/README.md), [`extensions/insights/README.md`](extensions/insights/README.md), [`extensions/workspace-ops/README.md`](extensions/workspace-ops/README.md), [`extensions/model-registry/README.md`](extensions/model-registry/README.md) — the documented fork-authored extensions (`misc-models` is described in its `openclaw.plugin.json` and above)
+- [`VISION.md`](VISION.md) — this branch's principles, including the rule for changing this fork (prefer consuming existing gateway interfaces over patching source)
+- The [`agent_os_platform` branch](https://github.com/Pilot-Wave-Technology/AgentOS/tree/agent_os_platform) — control-plane-side architecture and the domain model (goal / story / execution) that ultimately drives what gets sent over the WebSocket RPC described here

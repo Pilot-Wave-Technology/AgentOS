@@ -10,6 +10,11 @@ OpenClaw Gateway over WebSocket. It keeps ACP session ids mapped to Gateway
 session keys so IDEs can reconnect to the same agent transcript or reset it on
 request.
 
+> **On the AgentOS gateway VM** there is no global `openclaw` binary — the
+> gateway runs from source. Run the bridge from the checkout as
+> `node openclaw.mjs acp` (as the `openclaw` user) wherever this document says
+> `openclaw acp`.
+
 Key goals:
 
 - Minimal ACP surface area (stdio, NDJSON).

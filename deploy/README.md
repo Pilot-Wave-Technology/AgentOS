@@ -12,18 +12,24 @@ stack reuses those and connects to it.
 
 ```
    STAGE 1 (this branch)                 STAGE 2 (platform branch)
-   ┌─────────────────────────┐          ┌──────────────────────────┐
-   │ OpenClaw gateway VM      │          │ Control plane (Cloud Run)│
-   │  + shared VPC            │  reused  │  + Cloud SQL, buckets,    │
-   │  + archive bucket        │─────────▶│    connector on the VPC   │
-   │  (reads prereq secrets)  │  outputs │  + the web app            │
-   └─────────────────────────┘          └──────────────────────────┘
+   ┌─────────────────────────┐          ┌──────────────────────────────┐
+   │ OpenClaw gateway VM      │          │ Control plane: 5 Cloud Run   │
+   │  + shared VPC            │  reused  │  services (web, council, git,│
+   │  + archive bucket        │─────────▶│  management, scheduler)      │
+   │  (reads prereq secrets)  │  outputs │ + Cloud SQL, buckets, VPC    │
+   └─────────────────────────┘          │   connector                  │
+                                         │ + GKE execution plane:       │
+                                         │   conductor + one executor   │
+                                         │   pod per story (work runs   │
+                                         │   here)                      │
+                                         └──────────────────────────────┘
 ```
 
 ## Prerequisites
 - A GCP project with **billing** and **owner** access (e.g. `my-agentos-472913`).
 - `gcloud` + `terraform` installed; `gcloud auth login` and
-  `gcloud auth application-default login` done.
+  `gcloud auth application-default login` done. (The platform guide's file 00
+  lists the full tool set — bash, openssl, Python 3, kubectl.)
 - Both branches checked out (this one + `agent_os_platform`).
 
 > ⚠️ **Pick ONE region and use it everywhere** — here, in `prerequisites.sh`, and
@@ -36,10 +42,15 @@ Run it from your **platform-branch** clone (the `agentos-platform` folder from
 prerequisite 0.5):
 ```bash
 cd ../agentos-platform               # your agent_os_platform clone
-cp secrets.env.example secrets.env   # fill in LLM keys (+ GATEWAY_REPO_TOKEN if private)
+cp secrets.env.example secrets.env   # fill in the REQUIRED values (+ GATEWAY_REPO_TOKEN if private)
 ./prerequisites.sh <PROJECT_ID> <REGION>
 cd -                                 # back to this gateway folder
 ```
+> **It stops (exit 2) on a blank required secret** — `gemini-api-key`,
+> `anthropic-api-key`, `firebase-service-account`, `github-app-key` — and prints
+> the exact `set-secret.sh` command for each. Re-running never replaces an
+> existing version, so load late values with `set-secret.sh`, not `secrets.env`.
+> Using a non-default `name_prefix`? Run `NAME_PREFIX=<prefix> ./prerequisites.sh …`.
 > **Private fork?** The gateway VM clones your fork on boot, so if it's private
 > it needs a read-only clone token in `secrets.env` as `GATEWAY_REPO_TOKEN`
 > **before** you run `prerequisites.sh`. The step-by-step for generating that
@@ -59,6 +70,13 @@ Edit `terraform.tfvars`:
 - `repo_url` = your AgentOS fork URL (the VM clones this branch on boot);
   `repo_branch` defaults to `agent_os_openclaw`.
 - For repeatable testing leave `force_destroy_buckets = true`.
+- `compaction_model` — the model that writes compaction summaries. Default
+  `google/gemini-3.8-flash`; you can leave it. Once Stage 2 is live, the
+  platform's **Model Registry → Utility Models → "Gateway compaction summarizer"**
+  overrides it at runtime.
+- `gateway_internal_ip` — leave empty: GCP picks an internal address and
+  reserves it, so it survives a VM recreate. Set it only to adopt an address an
+  existing VM already has.
 
 > You do **not** set LLM/provider flags here — the gateway just reads whatever LLM
 > key secrets exist in Secret Manager, and those were already created by
@@ -84,7 +102,7 @@ live):
 ```bash
 cd ../agentos-platform      # adjust if your platform checkout is elsewhere
 printf %s 'REAL_GEMINI_KEY'    | ./set-secret.sh gemini-api-key
-printf %s 'REAL_ANTHROPIC_KEY' | ./set-secret.sh claude-api-key
+printf %s 'REAL_ANTHROPIC_KEY' | ./set-secret.sh anthropic-api-key
 ```
 If you set keys AFTER the VM booted, reboot it so it re-reads them:
 ```bash
@@ -96,16 +114,20 @@ gcloud compute instances reset agentos-gateway --zone <your-zone>
 ```bash
 terraform output
 ```
-Copy these three into the **platform** stack's `terraform.tfvars`:
+Copy these two into the **platform** stack's `terraform.tfvars`:
 - `network_name`   → platform `network_name`
 - `archive_bucket` → platform `archive_bucket`
-- `openclaw_ws_url` → platform `openclaw_ws_url`
+
+Not the URL: the gateway's internal address is reserved as
+`<name_prefix>-gateway-ip`, and the platform stack looks it up itself.
 
 > **What happens on boot.** The VM installs deps, clones your fork, then runs
 > `scripts/gateway-provision.sh` — the single provisioning script that builds the
-> gateway, writes the full `openclaw.json` (LAN bind, compaction/memory-v2, the
-> synthetic context-window models every agent needs, model registry), installs
-> the CLI wrappers + Claude Code hooks, and starts the service. First boot takes
+> gateway, writes the full `openclaw.json` (LAN bind, compaction/memory-v2),
+> installs the CLI wrappers + Claude Code hooks, and starts the service. There is
+> no synthetic-models file: the models agents are pinned to come from the control
+> plane's **Model Registry** (pushed via `models.reload`; the gateway also polls
+> `/internal/model_catalog`), so they resolve once Stage ② is live. First boot takes
 > ~5–8 min. Watch it with:
 > ```bash
 > gcloud compute instances get-serial-port-output agentos-gateway \
@@ -156,18 +178,27 @@ run does the full provisioning, and it's also your update loop.**
 - **Gateway:** the `cloudbuild.yaml` in this branch SSHes into the VM and re-runs
   the *same* `scripts/gateway-provision.sh` (pull → build → reconfigure → restart).
   Point a Cloud Build trigger at your fork's `agent_os_openclaw` branch (or run it
-  manually with `gcloud builds submit --config cloudbuild.yaml .`). The Cloud Build
-  service account already has the IAP-SSH roles it needs (granted by
-  `prerequisites.sh`). So: **edit fork → push → gateway reconfigures + rebuilds.**
+  manually with `gcloud builds submit --config cloudbuild.yaml
+  --service-account=projects/<PROJECT>/serviceAccounts/agentos-build@<PROJECT>.iam.gserviceaccount.com
+  --substitutions=_ZONE=<zone>,_VM_NAME=<vm> .` — `_ZONE` defaults to
+  `us-central1-a` and `_VM_NAME` to `agentos-gateway`; pass yours if they differ).
+  Run it as **`agentos-build`** — on the trigger too: the platform's
+  `prerequisites.sh` gave that account the IAP-SSH roles; the project's default
+  build account has none of them. So: **edit fork → push → gateway reconfigures + rebuilds.**
   - **Watch the run.** A manual `gcloud builds submit` streams the log to your
     terminal. For a trigger-started run, follow it with:
     ```bash
-    gcloud builds list --ongoing --region <REGION>           # find the BUILD_ID
-    gcloud builds log <BUILD_ID> --region <REGION> --stream   # live log
+    gcloud builds list --ongoing           # find the BUILD_ID
+    gcloud builds log <BUILD_ID> --stream  # live log
     ```
+    (No `--region`: a `gcloud builds submit` without `--region` is a global
+    build, and a regional list does not show it.)
     The build ends `SUCCESS` only if the on-VM `gateway-provision.sh` finished
     with `failed=0` (it propagates the exit code back).
-- **Config/secret changes** (e.g. a new model in `models-synthetic.json`, or a
-  rotated key in Secret Manager) are picked up by that same redeploy — no VM
-  recreate needed.
-- **Tear down to re-test from scratch:** `./reset.sh` (see the repo root).
+- **Config/secret changes** (e.g. a rotated key in Secret Manager) are picked up
+  by that same redeploy, or by a VM restart
+  (`gcloud compute instances reset agentos-gateway --zone <zone>`) — no VM
+  recreate needed. **Models** are not a gateway file: add or change them in the
+  control plane's **Model Registry**, which pushes them to the gateway
+  (`models.reload`; the gateway also polls `/internal/model_catalog`).
+- **Tear down:** from the platform checkout, `./teardown.sh` removes the platform and then this gateway ([platform file 12](https://github.com/Pilot-Wave-Technology/AgentOS/blob/agent_os_platform/deploy/12-teardown.md)). This branch's `./reset.sh` alone removes only the gateway, and must run after the platform's.

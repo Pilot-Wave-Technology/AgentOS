@@ -18,6 +18,9 @@ import {
   resolveAuthStorePathForDisplay,
 } from "./auth-profiles.js";
 import { PROVIDER_ENV_API_KEY_CANDIDATES } from "./model-auth-env-vars.js";
+// Model Registry fork addition — logic lives in the file we own; see its
+// header for why this hook exists and when it can be deleted.
+import { resolveVariantEnvApiKey } from "./model-registry-variant-auth.js";
 import {
   isKnownEnvApiKeyMarker,
   isNonSecretApiKeyMarker,
@@ -355,6 +358,22 @@ export function resolveEnvApiKey(
     }
     return { apiKey: envKey, source: "gcloud adc" };
   }
+
+  // MODEL REGISTRY (fork addition — see model-registry-variant-auth.ts for the
+  // full rationale). Last resort only: a synthesized context-window variant id
+  // like `anthropic-sonnet-200k` is not a real provider and never appears in
+  // PROVIDER_ENV_API_KEY_CANDIDATES, so it falls through everything above.
+  // Resolve it via its real upstream instead. Runs only after stock resolution
+  // has already returned nothing, so it can add a result but never change one.
+  const variantResolved = resolveVariantEnvApiKey(
+    normalized,
+    (upstream) => PROVIDER_ENV_API_KEY_CANDIDATES[upstream],
+    pick,
+  );
+  if (variantResolved) {
+    return variantResolved;
+  }
+
   return null;
 }
 

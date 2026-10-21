@@ -601,6 +601,112 @@ Migration guidance:
 - Move static guidance from `prependContext` to `prependSystemContext` (or `appendSystemContext`) so providers can cache stable system-prefix content.
 - Keep `prependContext` for per-turn dynamic context that should stay tied to the user message.
 
+### `resolve_providers` hook
+
+Lets a plugin contribute or override `ProviderConfig` entries in the
+`<agent-dir>/models.json` map that OpenClaw plans on every config apply.
+This is the runtime extension point for the model registry: use it to
+add a new provider, patch an existing implicit provider's `baseUrl`,
+or attach additional models to a discovered provider.
+
+When it fires:
+
+- Once per `planOpenClawModelsJson` pass, after
+  `resolveImplicitProviders` has settled the auto-discovered provider
+  map, and **before** the normalisation / secret-enforcement chain
+  (`normalizeProviders`, `enforceSourceManagedProviderSecrets`).
+- Handlers see the pre-normalised, pre-merged provider maps and their
+  contributions flow through the same normalisation as user config.
+
+Event fields:
+
+- `agentDir: string` — the agent directory the write targets.
+- `implicit: Readonly<Record<string, ProviderConfig>>` — providers
+  auto-discovered from env vars and auth profiles. Read-only snapshot.
+- `explicit: Readonly<Record<string, ProviderConfig>>` — providers
+  declared in the user config. Read-only snapshot. Plugins can check
+  this to no-op when the user has already set a key.
+
+Return shape:
+
+```ts
+type PluginHookResolveProvidersResult = {
+  providers?: Record<string, ProviderConfig>;
+} | void;
+```
+
+Return `void` (or omit `providers`) to contribute nothing.
+
+Precedence:
+
+- `explicit > plugin > implicit`. User config always wins. Plugins
+  can override implicit-provider fields (e.g. rewrite `ollama.baseUrl`)
+  but cannot silently replace a provider the user declared.
+
+Error semantics:
+
+- A handler that throws is caught, logged via the plugins subsystem
+  logger, and skipped; other handlers still run.
+- A handler that exceeds the soft per-handler timeout budget is
+  skipped, and a warning diagnostic is written to `plugins.diagnostics`.
+- The models.json write never fails because of a broken plugin.
+
+Collision policy:
+
+- Handlers run in priority DESC order; within a priority bucket,
+  registration order is preserved.
+- On a key collision between two plugin handlers, the
+  **higher-priority handler wins** (first-wins-per-key, matching every
+  other modifying hook in OpenClaw). Later handlers on the same key
+  are ignored for that key.
+- Each collision emits a `warn`-level entry on `plugins.diagnostics`
+  identifying the offending plugin and key.
+
+Worked example:
+
+```ts
+// Add a brand-new provider and override an implicit `ollama` baseUrl,
+// but only when the user has not already set one.
+export default function register(api) {
+  api.on(
+    "resolve_providers",
+    (event) => {
+      const providers: Record<string, ProviderConfig> = {
+        "acme-lab": {
+          baseUrl: "https://api.acme-lab.internal",
+          apiKey: "ACME_LAB_TOKEN",
+          models: [{ id: "acme-large" }],
+        },
+      };
+      if (!event.explicit.ollama) {
+        providers.ollama = {
+          ...event.implicit.ollama,
+          baseUrl: "http://ollama-lb.internal:11434",
+        };
+      }
+      return { providers };
+    },
+    { priority: 10 },
+  );
+}
+```
+
+Gotchas:
+
+- Return env-var-name apiKeys (e.g. `"ACME_LAB_TOKEN"`), **not**
+  resolved secret values. Plaintext secrets in the returned map risk
+  landing in `models.json`; OpenClaw has a reverse-lookup safety net
+  for env-var-managed secrets but it does not cover every codepath.
+- Do not mutate `event.implicit` or `event.explicit` in place — they
+  are `Readonly` snapshots shared with other handlers on the same
+  pass.
+- Prefer contributing only the keys you own. Returning a large map
+  that mirrors `event.implicit` makes collision diagnostics noisier
+  without adding value.
+- The hook fires on every models.json plan pass. Keep handler work
+  short (well under the soft timeout budget); cache expensive
+  discovery in the plugin's own state.
+
 ## Provider plugins (model auth)
 
 Plugins can register **model provider auth** flows so users can run OAuth or

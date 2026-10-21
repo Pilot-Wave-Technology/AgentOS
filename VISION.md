@@ -19,10 +19,12 @@ for both branches.
 ## Why this branch exists
 
 AgentOS needs somewhere to *actually run* agents — call LLMs, execute tools,
-manage per-agent workspaces, and hold conversations across channels. Rather
-than build an agent runtime from scratch, this branch takes OpenClaw's
-multi-channel gateway and adapts it into a focused, deployable runtime for
-AgentOS.
+manage per-agent workspaces, and hold long-running conversations. Rather than
+build an agent runtime from scratch, this branch takes OpenClaw's gateway and
+adapts it into a focused, deployable runtime for AgentOS. OpenClaw's messaging
+channels (chat apps, voice, and the like) were removed in this fork: the
+gateway's client is the AgentOS control plane, and people reach agents through
+the control plane's UI and integrations.
 
 The control plane (`agent_os_platform`) is the brain: it decides which agents
 exist, what they may do, and what work is queued. This branch is the hands: it
@@ -62,11 +64,12 @@ is documented end-to-end in [`deploy/README.md`](deploy/README.md).
 
 ## Scope — what this branch will not do
 
-- **Re-implement OpenClaw's product decisions.** Channels, model routing, the
-  plugin system, CLI UX — if AgentOS needs a change to that behavior, the change
+- **Re-implement OpenClaw's product decisions.** Model routing, the plugin
+  system, CLI UX — if AgentOS needs a change to that behavior, the change
   belongs upstream or should be reachable through an existing extension point.
 - **Accumulate features unrelated to the AgentOS integration.** This is not a
-  general-purpose OpenClaw distribution. It is the AgentOS runtime.
+  general-purpose OpenClaw distribution. It is the AgentOS runtime — which is
+  why OpenClaw's messaging channels are gone rather than maintained here.
 - **Maintain long-lived divergence in files it doesn't need to touch.** If a
   patch to core source turns out to be a genuine upstream improvement, the right
   outcome is to contribute it upstream and drop it from this branch.

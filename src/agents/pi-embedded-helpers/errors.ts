@@ -930,7 +930,15 @@ function isCliSessionExpiredErrorMessage(raw: string): boolean {
     lower.includes("no such session") ||
     lower.includes("invalid session") ||
     lower.includes("session id not found") ||
-    lower.includes("conversation id not found")
+    lower.includes("conversation id not found") ||
+    // "No conversation found with session ID: <id>" — the real claude-cli
+    // --resume error message, found live 2026-08-20. Word order is REVERSED
+    // from every check above ("no X found" vs "X not found"), so none of
+    // them matched it — this classifier returned null for the exact message
+    // it exists to catch, meaning the session_expired fresh-session retry
+    // (cli-spawn.ts) never triggered for a genuinely stale session id.
+    lower.includes("no conversation found") ||
+    lower.includes("no session found")
   );
 }
 

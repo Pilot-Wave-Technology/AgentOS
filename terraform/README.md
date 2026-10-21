@@ -20,7 +20,7 @@ created. `main.tf` has no `google_service_account` and no
 ## Prereqs
 Run the platform branch's **`prerequisites.sh`** first (from your
 `agentos-platform` clone). It creates the scoped gateway service account and the
-Secret Manager secrets (`openclaw-gateway-token`, `claude-api-key`,
+Secret Manager secrets (`openclaw-gateway-token`, `anthropic-api-key`,
 `gemini-api-key`, `control-panel-url`, optional `openai-api-key`) and populates
 them from `secrets.env`. The VM reads those secrets on boot.
 
@@ -36,10 +36,13 @@ default (`<name_prefix>-agent-data-<project>`); leave it unset unless you need a
 specific name.
 
 ## Wire it to the control plane
-After apply, take the `openclaw_ws_url` output (e.g. `ws://10.20.x.x:18789`) plus
-`network_name` and `archive_bucket`, and feed them into the platform (Stage ②)
-`terraform.tfvars`. The platform stack sets the `control-panel-url` secret for
-you.
+After apply, take `network_name` and `archive_bucket` into the platform (Stage ②)
+`terraform.tfvars`. The URL needs no copying: the VM's internal address is
+reserved as `<name_prefix>-gateway-ip` (it survives recreation) and the
+platform stack derives `ws://<address>:18789` from it. The `control-panel-url`
+secret is **not** set by the platform stack: you set it in the platform guide's
+step 7.0.a (before the first build), and the platform build's sync-url step keeps
+it current after that.
 
 > **Only if you are NOT using the platform Stage ②** do you need to write the
 > control-panel URL yourself so the gateway can call back:
@@ -62,8 +65,8 @@ you.
 
 ## Updating the gateway
 A redeploy **must** re-run `scripts/gateway-provision.sh` — it regenerates
-`openclaw.json` (LAN bind, compaction/memory, synthetic models, model registry,
-claude-cli backend), refreshes secrets, installs the scanners (rg, gitleaks,
+`openclaw.json` (LAN bind, compaction/memory, model registry, claude-cli
+backend), refreshes secrets, installs the scanners (rg, gitleaks,
 trivy, semgrep), and installs the CLI wrappers + hooks. Do **not** shortcut it
 with a bare `git pull && pnpm install && pnpm build && restart` — that skips
 provisioning and leaves the gateway misconfigured.

@@ -1,0 +1,10 @@
+{
+  "id": "misc-models",
+  "name": "Utility Models",
+  "description": "Fetches utility-purpose Gemini model overrides from the AgentOS control panel's /internal/misc_model_settings endpoint (e.g. web-search grounding) — a separate, Gemini-only config from extensions/model-registry's agent-facing catalog. Refreshes every 5 minutes and on models.reload RPC.",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  }
+}

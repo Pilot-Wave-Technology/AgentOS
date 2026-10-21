@@ -26,6 +26,7 @@ CONTROL_PANEL_URL_SECRET="${control_panel_url_secret}"
 REPO_TOKEN_SECRET="${repo_token_secret}"
 ARCHIVE_BUCKET="${archive_bucket}"
 PROCESSES_PER_VM=${processes_per_vm}
+COMPACTION_MODEL="${compaction_model}"
 ENABLE_CRD="${enable_chrome_remote_desktop}"
 
 REPO_DIR=/opt/agentos-gateway
@@ -62,12 +63,56 @@ REPO_TOKEN=$(gcloud secrets versions access latest --secret="$REPO_TOKEN_SECRET"
 if [ -n "$REPO_TOKEN" ]; then
   CLONE_URL=$(echo "$REPO_URL" | sed -E "s#https://#https://x-access-token:$REPO_TOKEN@#")
 fi
+# WHY THIS IS WRAPPED. `set -e` on a failed clone leaves git's own
+# message as the entire diagnosis, and for this failure git's message
+# is actively misleading: a FINE-GRAINED token that does not list this
+# repository produces
+#
+#     remote: Write access to repository not granted.
+#     fatal: ... The requested URL returned error: 403
+#
+# on a READ. Nothing in that mentions the token, the secret it came
+# from, or the fact that the repo is simply outside the token's scope
+# -- and "write access" sends you to look at permissions on a clone.
+# The same token returns 404, not 403, from the REST API for the same
+# reason, which is its own small trap.
+#
+# Measured: a clean-room gateway died here, and the serial console
+# gave four words of truth in forty lines of apt output.
+_clone_failed() {
+  echo "ERROR: could not clone $REPO_URL (branch $REPO_BRANCH)." >&2
+  if [ -n "$REPO_TOKEN" ]; then
+    echo "       A token WAS supplied, from the '$REPO_TOKEN_SECRET' secret." >&2
+    echo "       If git said 'Write access to repository not granted', that" >&2
+    echo "       is what a FINE-GRAINED token says about a repository it" >&2
+    echo "       does not list -- it is a scope problem, not a write" >&2
+    echo "       problem, and read access is all that is needed here." >&2
+    echo "" >&2
+    echo "       Check the token covers THIS repository:" >&2
+    echo "         Settings -> Developer settings -> Fine-grained tokens" >&2
+    echo "         Repository access -> Only select repositories" >&2
+    echo "         Permissions -> Contents -> Read-only" >&2
+    echo "" >&2
+    echo "       Then update it and rebuild this VM:" >&2
+    echo "         printf %s 'NEW_TOKEN' | ./set-secret.sh $REPO_TOKEN_SECRET" >&2
+  else
+    echo "       NO token was supplied: the '$REPO_TOKEN_SECRET' secret is" >&2
+    echo "       empty, so the clone was attempted anonymously. That is" >&2
+    echo "       correct for a public fork and cannot work for a private" >&2
+    echo "       one. Load a token (re-running prerequisites.sh will not" >&2
+    echo "       replace the blank version), then reset this VM:" >&2
+    echo "         printf %s 'TOKEN' | ./set-secret.sh $REPO_TOKEN_SECRET" >&2
+  fi
+  exit 1
+}
+
 if [ ! -d "$REPO_DIR/.git" ]; then
-  git clone --branch "$REPO_BRANCH" --depth 1 "$CLONE_URL" "$REPO_DIR"
+  git clone --branch "$REPO_BRANCH" --depth 1 "$CLONE_URL" "$REPO_DIR" \
+    || _clone_failed
 else
   git -C "$REPO_DIR" remote set-url origin "$CLONE_URL"
-  git -C "$REPO_DIR" fetch --depth 1 origin "$REPO_BRANCH"
-  git -C "$REPO_DIR" reset --hard "origin/$REPO_BRANCH"
+  git -C "$REPO_DIR" fetch --depth 1 origin "$REPO_BRANCH" || _clone_failed
+  git -C "$REPO_DIR" reset --hard "origin/$REPO_BRANCH" || _clone_failed
 fi
 # For a PRIVATE repo the remote keeps the token so later `git pull` (redeploy)
 # still authenticates. It lives only in root-owned /opt/agentos-gateway/.git/config
@@ -106,6 +151,7 @@ GEMINI_KEY_SECRET=$GEMINI_KEY_SECRET
 OPENAI_KEY_SECRET=$OPENAI_KEY_SECRET
 CONTROL_PANEL_URL_SECRET=$CONTROL_PANEL_URL_SECRET
 PROCESSES_PER_VM=$PROCESSES_PER_VM
+COMPACTION_MODEL=$COMPACTION_MODEL
 EOF
 chmod 600 /etc/openclaw/provision.env
 

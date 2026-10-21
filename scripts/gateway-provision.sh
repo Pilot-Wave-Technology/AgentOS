@@ -141,18 +141,29 @@ oc config set agents.defaults.memorySearch.provider gemini
 oc config set agents.defaults.memorySearch.model gemini-embedding-001
 oc config set agents.defaults.timeoutSeconds 7200
 oc config set agents.defaults.heartbeat.every 30m
-oc config set agents.defaults.model google/gemini-2.5-flash
+oc config set agents.defaults.model google/gemini-3.8-flash
 oc config set session.reset.mode idle
 oc config set session.reset.idleMinutes 86400
 
 # Compaction / memory-v2.
 oc config set agents.defaults.compaction.mode safeguard
-oc config set agents.defaults.compaction.model google/gemini-2.5-flash
+# The model that writes compaction summaries. A BASE model, not a Model
+# Registry variant: it must resolve from the first boot, before the
+# registry plugin's first poll has supplied any variant. Set it with the
+# terraform variable `compaction_model`.
+oc config set agents.defaults.compaction.model "${COMPACTION_MODEL:-google/gemini-3.8-flash}"
 oc config set agents.defaults.compaction.reserveTokensPct 0
 oc config set agents.defaults.compaction.memoryFlush.flushThresholdPct 0.7
 oc config set agents.defaults.compaction.memoryFlush.softThresholdPct 0
 oc config set agents.defaults.compaction.maxHistoryShare 0.8
 oc config set agents.defaults.compaction.keepRecentTokensPct 0.2
+# Caps ONE preserved tool result. The kept-tail budget above does not bound
+# the tool results paired with kept turns; on a tool-heavy agent they are
+# most of what survives a compaction.
+oc config set agents.defaults.compaction.preservedToolResultMaxTokens 1500
+# Context pruning: trims old, large tool results from the REQUEST only
+# (never the stored transcript, so compaction still sees the originals).
+oc config set agents.defaults.contextPruning.mode cache-ttl
 oc config set agents.defaults.compaction.aggregateTimeoutMs 300000
 oc config set agents.defaults.compaction.recentTurnsPreserve 2
 oc config set agents.defaults.compaction.keepRecentMode tokens
@@ -166,20 +177,33 @@ oc config set agents.defaults.compaction.memoryFlush.memoryFileTargetChars 24000
 oc config set agents.defaults.compaction.memoryFlush.compactionSummary.maxTokens 4000
 oc config set agents.defaults.compaction.memoryFlush.compactionSummary.maxChars 16000
 
-# Synthetic context-window model variants (GO/SHCA/councils/research pin these).
-SYNTHETIC_MODELS_FILE="$REPO_DIR/infra/config/models-synthetic.json"
-if [ -f "$SYNTHETIC_MODELS_FILE" ]; then
-  echo "  merging synthetic context-window models"
-  jq -s '.[0] * (.[1] | del(._comment))' "$OPENCLAW_CONFIG" "$SYNTHETIC_MODELS_FILE" > /tmp/oc-merged.json
-  mv /tmp/oc-merged.json "$OPENCLAW_CONFIG"; own_config
-fi
+# SYNTHETIC CONTEXT-WINDOW MODELS ARE NOT SET UP HERE, AND THAT IS NOT AN
+# OMISSION. GO, the assistant, the councils and the research agents all pin
+# ids like `google-flash38-500k/gemini-3.8-flash-500k` -- one model with its
+# context window clamped -- and those are supplied at RUNTIME by the control
+# panel's Model Registry: it serves GET /internal/model_catalog, and the
+# gateway's `extensions/model-registry` polls it every five minutes with a
+# self-heal loop that re-asserts them.
+#
+# This block used to merge a static `infra/config/models-synthetic.json`.
+# That file was retired on 2026-08-06 in favour of the registry, and its own
+# header says in as many words not to re-wire it into a boot script. It was
+# read here behind an `if [ -f ]`, so once the file went the step became a
+# silent no-op pointing at a path that no longer exists -- which is exactly
+# the thing a deployer would find and spend an afternoon chasing when a
+# template failed to resolve its model.
+#
+# WHAT TO EXPECT ON A FIRST BOOT: until the first poll succeeds, an agent
+# pinned to a synthetic id has no model to resolve. That window closes by
+# itself. If it does NOT, the fault is reachability between the gateway and
+# the control panel -- check CONTROL_PANEL_URL and the registry extension's
+# log, not this script.
 
 # Model registry: cache retention + 1M-context betas + claude-cli backend.
 jq '.agents.defaults.models["anthropic/claude-haiku-4-5"]  = {"params": {"cacheRetention": "short"}}
   | .agents.defaults.models["anthropic/claude-sonnet-4-5"] = {"params": {"cacheRetention": "short"}}
   | .agents.defaults.models["anthropic/claude-opus-4-7"]   = {"params": {"cacheRetention": "short", "betas": ["context-1m-2025-08-07"]}}
-  | .agents.defaults.models["google/gemini-2.5-flash"]     = {}
-  | .agents.defaults.models["google/gemini-2.5-pro"]       = {}
+  | .agents.defaults.models["google/gemini-3.8-flash"]     = {}
   | .agents.defaults.models["google/gemini-embedding-001"] = {}
   | .agents.defaults.cliBackends["claude-cli"] = {
       "command": "claude",

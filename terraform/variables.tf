@@ -31,6 +31,12 @@ variable "name_prefix" {
   default     = "agentos"
 }
 
+variable "gateway_internal_ip" {
+  type        = string
+  description = "Pin the gateway's internal IP. Empty (the default) lets GCP pick one from the subnet and RESERVES it, so it survives the VM being recreated. Set it only to adopt an address a VM already has."
+  default     = ""
+}
+
 variable "name" {
   type        = string
   description = "Gateway VM name."
@@ -84,6 +90,12 @@ variable "boot_image" {
   type    = string
   default = "ubuntu-os-cloud/ubuntu-2404-lts-amd64"
 }
+variable "compaction_model" {
+  type        = string
+  description = "Model that writes compaction summaries (agents.defaults.compaction.model). A base provider/model id, so it resolves from the first boot."
+  default     = "google/gemini-3.8-flash"
+}
+
 variable "processes_per_vm" {
   type    = number
   default = 1

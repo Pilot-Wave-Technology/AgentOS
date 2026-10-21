@@ -85,10 +85,12 @@ on("gateway_stop") — clearInterval the periodic refresh + stopAuditSink()
 
 If you change `index.ts`, `cache.ts`, or `types.ts`:
 
-1. Push to the OpenClaw setup repo.
-2. Trigger the Cloud Build that streams source into the existing VM and runs
-   `redeploy.sh` (`pnpm install` → `pnpm build` → `systemctl restart
-   openclaw-gateway`). **Same VM** — terraform doesn't replace anything.
+1. Push to your fork's `agent_os_openclaw` branch.
+2. The gateway Cloud Build (`cloudbuild.yaml`) SSHes into the existing VM over
+   IAP, runs `git pull`, then `scripts/gateway-provision.sh` (`pnpm install` →
+   `pnpm build` → write config → restart the gateway units). Restarting the VM
+   re-runs the same provisioning. **Same VM** — terraform doesn't replace
+   anything.
 
 A full VM replace (terraform destroy + apply) is only needed if the
 infra/terraform module changes (machine type, disk, startup-script template,
@@ -98,7 +100,7 @@ service-account binding). None of that is in scope for tool changes.
 
 | Variable | Source | Set by |
 |---|---|---|
-| `CONTROL_PANEL_URL` | injected env on VM | `start-openclaw.sh` (control panel's Cloud Run URL) |
+| `CONTROL_PANEL_URL` | Secret Manager (`control-panel-url`) → `/etc/openclaw/env` | `terraform/startup.sh.tpl`, kept current by the `refresh-control-panel-url` systemd timer |
 | `OPENCLAW_GATEWAY_TOKEN` | Secret Manager → `/etc/openclaw/env` | terraform startup script |
 
 If `CONTROL_PANEL_URL` is missing the plugin logs a warning and disables
@@ -106,6 +108,5 @@ itself — the gateway still starts, just without dynamic tools.
 
 ## Related docs
 
-- Overview + sequence diagrams: [agentos — documentation/CUSTOM_TOOLS.md](https://github.com/Pilot-Wave-Technology/AgentOS/blob/main/documentation/CUSTOM_TOOLS.md)
-- Control panel routes: [agentos — app/routers/custom_tools/README.md](https://github.com/Pilot-Wave-Technology/AgentOS/blob/main/app/routers/custom_tools/README.md)
-- Control panel services: [agentos — app/services/custom_tools/README.md](https://github.com/Pilot-Wave-Technology/AgentOS/blob/main/app/services/custom_tools/README.md)
+- Control panel routes: [`agent_os_platform` — app/routers/custom_tools/](https://github.com/Pilot-Wave-Technology/AgentOS/tree/agent_os_platform/app/routers/custom_tools)
+- Control panel services: [`agent_os_platform` — app/services/custom_tools/](https://github.com/Pilot-Wave-Technology/AgentOS/tree/agent_os_platform/app/services/custom_tools)

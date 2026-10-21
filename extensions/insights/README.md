@@ -38,5 +38,5 @@ Detection logic: tries `podman --version` first, then `docker --version`; whiche
 
 ## Related docs
 
-- Consumed by the AgentOS dashboard — see [agentos — documentation/DASHBOARD.md](https://github.com/Pilot-Wave-Technology/AgentOS/blob/main/documentation/DASHBOARD.md) and [app/services/gateway_cache.py](https://github.com/Pilot-Wave-Technology/AgentOS/blob/main/app/services/gateway_cache.py) (caches the RPC response so the dashboard doesn't call the gateway on every page load)
+- Consumed by the AgentOS dashboard — see [`agent_os_platform` — app/services/gateway_cache.py](https://github.com/Pilot-Wave-Technology/AgentOS/blob/agent_os_platform/app/services/gateway_cache.py) (caches the RPC response so the dashboard doesn't call the gateway on every page load)
 - [ARCHITECTURE.md](../../ARCHITECTURE.md#gateway-side-extensions) for how this fits alongside the other gateway extensions

@@ -601,7 +601,11 @@ export function resolveModelDirectiveSelection(params: {
 }
 
 export function resolveContextTokens(params: {
-  agentCfg: NonNullable<NonNullable<OpenClawConfig["agents"]>["defaults"]> | undefined;
+  // Accepts anything with a contextTokens?: number field — today this
+  // is either AgentDefaultsConfig (the global defaults) or AgentConfig
+  // (per-agent, after cb11f6b9). Structural typing keeps the resolver
+  // agnostic to which side supplied the cap.
+  agentCfg: { contextTokens?: number } | undefined;
   model: string;
 }): number {
   return (

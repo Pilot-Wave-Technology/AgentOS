@@ -42,6 +42,7 @@ import {
 import { resolveAgentWorkspaceDir } from "../../agents/agent-scope.js";
 import type { FollowupRun } from "./queue.js";
 import { incrementCompactionCount } from "./session-updates.js";
+import { acquireConsolidationLock } from "./memory-consolidation-lock.js";
 
 /** Min interval between two STANDALONE memory consolidations for the same
  *  session. Standalone consolidation is evaluated on every turn (size-
@@ -591,6 +592,40 @@ export async function runMemoryFlushIfNeeded(params: {
   ]
     .filter(Boolean)
     .join("\n\n");
+  // ONE CONSOLIDATION AT A TIME PER WORKSPACE. An agent has one
+  // workspace and one MEMORY.md but a SESSION PER THREAD, so N threads
+  // drive N independent turn loops over one file. A flush is
+  // append-only and interleaves safely; a consolidation REWRITES the
+  // whole file, so two at once means the slower one writes back a
+  // document built from what it read before the other one's rewrite
+  // existed — a silent lost update of everything the other kept.
+  //
+  // The existing cooldown is stored on the SESSION entry, so it spaces
+  // out consolidations within one thread and says nothing about two
+  // threads firing together. That was rare until the Goal Orchestrator
+  // started holding a thread per live autonomous errand.
+  //
+  // SKIPPED, NOT QUEUED: see the lock module. A waiter would redo the
+  // same lost update one step later; the size trigger is
+  // level-triggered, so a still-over-cap file fires again next turn.
+  let releaseConsolidationLock: (() => void) | null = null;
+  if (useConsolidationPrompts) {
+    releaseConsolidationLock = acquireConsolidationLock(workspaceDir);
+    if (!releaseConsolidationLock) {
+      logVerbose(
+        `memoryFlush: consolidation already running for ${workspaceDir} — ` +
+          `skipping this turn (sessionKey=${params.sessionKey})`,
+      );
+      return entry ?? params.sessionEntry;
+    }
+  }
+
+  // ACQUIRED HERE AND NOWHERE EARLIER. The first draft took the lock
+  // next to the decision that needs it, which is further up — and the
+  // `!canAttemptFlush` guard between the two returns without releasing,
+  // stranding the workspace for the life of the process. Nothing
+  // between this line and the `try` can return or throw, so the
+  // `finally` below is reached on every path that gets past here.
   try {
     await runWithModelFallback({
       ...resolveModelFallbackOptions(params.followupRun.run),
@@ -692,6 +727,12 @@ export async function runMemoryFlushIfNeeded(params: {
     }
   } catch (err) {
     logVerbose(`memory flush run failed: ${String(err)}`);
+  } finally {
+    // ALWAYS, and from a finally rather than the happy path: a stranded
+    // holder disables consolidation for that agent until the gateway
+    // restarts, and the symptom — a MEMORY.md that grows for ever and
+    // never consolidates — looks nothing like a lock bug.
+    releaseConsolidationLock?.();
   }
 
   return activeSessionEntry;

@@ -2,6 +2,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import type { AgentMessage } from "@mariozechner/pi-agent-core";
 import type { Command } from "commander";
 import type { AuthProfileCredential, OAuthCredential } from "../agents/auth-profiles/types.js";
+import type { ProviderConfig } from "../agents/models-config.providers.js";
 import type { AnyAgentTool } from "../agents/tools/common.js";
 import type { ReplyPayload } from "../auto-reply/types.js";
 import type { ChannelDock } from "../channels/dock.js";
@@ -320,6 +321,7 @@ export type PluginDiagnostic = {
 
 export type PluginHookName =
   | "before_model_resolve"
+  | "resolve_providers"
   | "before_prompt_build"
   | "before_agent_start"
   | "llm_input"
@@ -346,6 +348,7 @@ export type PluginHookName =
 
 export const PLUGIN_HOOK_NAMES = [
   "before_model_resolve",
+  "resolve_providers",
   "before_prompt_build",
   "before_agent_start",
   "llm_input",
@@ -417,6 +420,28 @@ export type PluginHookBeforeModelResolveResult = {
   modelOverride?: string;
   /** Override the provider for this agent run. E.g. "ollama" */
   providerOverride?: string;
+};
+
+// resolve_providers hook
+export type PluginHookResolveProvidersEvent = {
+  /** Agent directory the models.json write is targeting. */
+  agentDir: string;
+  /**
+   * Providers auto-discovered from the environment / auth profiles (read-only
+   * snapshot). Plugins may inspect these to decide whether to contribute.
+   */
+  implicit: Readonly<Record<string, ProviderConfig>>;
+  /**
+   * Providers declared in the user config (read-only snapshot). Explicit
+   * config wins on collision, so plugins can safely no-op when a key already
+   * has an explicit entry.
+   */
+  explicit: Readonly<Record<string, ProviderConfig>>;
+};
+
+export type PluginHookResolveProvidersResult = {
+  /** Provider entries the plugin contributes to models.json. */
+  providers?: Record<string, ProviderConfig>;
 };
 
 // before_prompt_build hook
@@ -791,6 +816,13 @@ export type PluginHookHandlerMap = {
   ) =>
     | Promise<PluginHookBeforeModelResolveResult | void>
     | PluginHookBeforeModelResolveResult
+    | void;
+  resolve_providers: (
+    event: PluginHookResolveProvidersEvent,
+    ctx: PluginHookAgentContext,
+  ) =>
+    | Promise<PluginHookResolveProvidersResult | void>
+    | PluginHookResolveProvidersResult
     | void;
   before_prompt_build: (
     event: PluginHookBeforePromptBuildEvent,

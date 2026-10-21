@@ -24,6 +24,7 @@ export function resolveContextWindowInfo(params: {
   modelId: string;
   modelContextWindow?: number;
   defaultTokens: number;
+  agentContextTokens?: number;
 }): ContextWindowInfo {
   const fromModelsConfig = (() => {
     const providers = params.cfg?.models?.providers as
@@ -41,12 +42,32 @@ export function resolveContextWindowInfo(params: {
       ? { tokens: fromModel, source: "model" as const }
       : { tokens: Math.floor(params.defaultTokens), source: "default" as const };
 
-  const capTokens = normalizePositiveInt(params.cfg?.agents?.defaults?.contextTokens);
+  // Per-agent cap wins over the global default cap; either only clamps
+  // downward from baseInfo.tokens (never raises above the model window).
+  const capTokens =
+    normalizePositiveInt(params.agentContextTokens) ??
+    normalizePositiveInt(params.cfg?.agents?.defaults?.contextTokens);
   if (capTokens && capTokens < baseInfo.tokens) {
     return { tokens: capTokens, source: "agentContextTokens" };
   }
 
   return baseInfo;
+}
+
+/**
+ * Look up the per-agent `contextTokens` cap for `agentId` from the
+ * config's `agents.list`. Returns undefined when the agent has no
+ * entry or no explicit value.
+ */
+export function getAgentContextTokens(
+  cfg: OpenClawConfig | undefined,
+  agentId: string | undefined,
+): number | undefined {
+  if (!cfg || !agentId) return undefined;
+  const normalized = agentId.toLowerCase();
+  const entry = cfg.agents?.list?.find((a) => a.id?.toLowerCase() === normalized);
+  const raw = entry?.contextTokens;
+  return normalizePositiveInt(raw) ?? undefined;
 }
 
 export type ContextWindowGuardResult = ContextWindowInfo & {

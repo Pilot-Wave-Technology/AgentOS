@@ -339,6 +339,9 @@ export type AgentCompactionConfig = {
    * earlier (more headroom, more compactions). Higher fires later
    * (risk of cliff if compaction is still running when context fills).
    */
+  /** Cap on a single preserved `toolResult`, in estimated tokens. Absent
+   *  or 0 disables capping — the behaviour before this existed. */
+  preservedToolResultMaxTokens?: number;
   asyncSoftTriggerPct?: number;
   /**
    * Debounce window (ms) between trigger and snapshot. Lets any in-

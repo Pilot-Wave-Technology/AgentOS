@@ -9,8 +9,10 @@ The following are original work by Port33, inc., licensed under the Apache Licen
 - `extensions/custom-tools/`
 - `extensions/insights/`
 - `extensions/workspace-ops/`
+- `extensions/model-registry/`
+- `extensions/misc-models/`
 - `infra/`
-- `documentation/deployment/`
+- `terraform/`, `cloudbuild.yaml`, `deploy/`, `reset.sh`
 - `start-openclaw.sh`
 - `scripts/gateway-provision.sh`, `scripts/wrappers/`
 - The AgentOS-specific patches to core gateway `src/` described in [ARCHITECTURE.md](ARCHITECTURE.md#core-gateway-patches) — modifications to upstream files, layered on top of the upstream MIT-licensed source they modify.

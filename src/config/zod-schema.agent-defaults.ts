@@ -90,6 +90,11 @@ export const AgentDefaultsSchema = z
         reserveTokens: z.number().int().nonnegative().optional(),
         keepRecentTokens: z.number().int().positive().optional(),
         keepRecentTokensPct: z.number().min(0).max(1).optional(),
+        // Cap on a single PRESERVED toolResult, in estimated tokens.
+        // Lives in defaults (not per-agent) on purpose: per-agent
+        // compaction config is pushed once at agent creation, so a
+        // per-agent key would never reach the agents already running.
+        preservedToolResultMaxTokens: z.number().int().nonnegative().optional(),
         reserveTokensFloor: z.number().int().nonnegative().optional(),
         // Percentage-of-contextWindow reserve. When set, supersedes
         // reserveTokens/reserveTokensFloor — every model size gets the

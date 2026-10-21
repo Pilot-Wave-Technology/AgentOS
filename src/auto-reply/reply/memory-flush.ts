@@ -169,6 +169,14 @@ const normalizeNonNegativeInt = (value: unknown): number | null => {
   return int >= 0 ? int : null;
 };
 
+const normalizePositiveInt = (value: unknown): number | undefined => {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return undefined;
+  }
+  const int = Math.floor(value);
+  return int > 0 ? int : undefined;
+};
+
 export function resolveMemoryFlushSettings(
   cfg?: OpenClawConfig,
   agentId?: string,
@@ -325,22 +333,18 @@ export function resolveMemoryFlushContextWindowTokens(params: {
   cfg?: OpenClawConfig;
 }): number {
   const modelTokens = lookupContextTokens(params.modelId);
-  const base =
-    modelTokens ?? params.agentCfgContextTokens ?? DEFAULT_CONTEXT_TOKENS;
-  // Honor the global `agents.defaults.contextTokens` cap when set and
-  // smaller than the resolved base. Without this, the flush threshold
-  // computes against the model's native window (e.g. 1M for Gemini
-  // Flash) and never fires on agents that should see a smaller window
-  // via the cap. Matches the precedence in resolveContextWindowInfo's
-  // "Priority 3" cap check in context-window-guard.ts.
-  const cap = params.cfg?.agents?.defaults?.contextTokens;
-  if (
-    typeof cap === "number" &&
-    Number.isFinite(cap) &&
-    cap > 0 &&
-    cap < base
-  ) {
-    return Math.floor(cap);
+  const base = modelTokens ?? DEFAULT_CONTEXT_TOKENS;
+  // Precedence matches resolveContextWindowInfo in
+  // src/agents/context-window-guard.ts: per-agent contextTokens wins
+  // over agents.defaults.contextTokens; either only clamps downward
+  // from the model's native window (or DEFAULT_CONTEXT_TOKENS when
+  // the model is unknown), so the flush threshold never rises above
+  // the effective context window.
+  const cap =
+    normalizePositiveInt(params.agentCfgContextTokens) ??
+    normalizePositiveInt(params.cfg?.agents?.defaults?.contextTokens);
+  if (cap !== undefined && cap < base) {
+    return cap;
   }
   return base;
 }

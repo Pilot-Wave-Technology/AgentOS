@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
+import { DEFAULT_CONTEXT_TOKENS } from "../../agents/defaults.js";
 import type { OpenClawConfig } from "../../config/config.js";
-import { createModelSelectionState } from "./model-selection.js";
+import { createModelSelectionState, resolveContextTokens } from "./model-selection.js";
 
 vi.mock("../../agents/model-catalog.js", () => ({
   loadModelCatalog: vi.fn(async () => [
@@ -294,5 +295,45 @@ describe("createModelSelectionState resolveDefaultReasoningLevel", () => {
       hasModelDirective: false,
     });
     await expect(state.resolveDefaultReasoningLevel()).resolves.toBe("off");
+  });
+});
+
+describe("resolveContextTokens (cb11f6b9)", () => {
+  it("returns agentCfg.contextTokens when set", () => {
+    expect(
+      resolveContextTokens({
+        agentCfg: { contextTokens: 50_000 },
+        model: "anthropic/claude-opus-4-5",
+      }),
+    ).toBe(50_000);
+  });
+
+  it("returns agentCfg.contextTokens even for an unknown model id (agent wins over lookup)", () => {
+    expect(
+      resolveContextTokens({
+        agentCfg: { contextTokens: 12_345 },
+        model: "not-a-real-provider/not-a-real-model",
+      }),
+    ).toBe(12_345);
+  });
+
+  it("falls back to DEFAULT_CONTEXT_TOKENS when agentCfg is undefined and the model is unknown", () => {
+    // Use a model id lookupContextTokens cannot resolve so the fall-through is
+    // deterministic (lookupContextTokens returns undefined -> DEFAULT_CONTEXT_TOKENS).
+    expect(
+      resolveContextTokens({
+        agentCfg: undefined,
+        model: "not-a-real-provider/not-a-real-model",
+      }),
+    ).toBe(DEFAULT_CONTEXT_TOKENS);
+  });
+
+  it("falls back to DEFAULT_CONTEXT_TOKENS when agentCfg is empty", () => {
+    expect(
+      resolveContextTokens({
+        agentCfg: {},
+        model: "not-a-real-provider/not-a-real-model",
+      }),
+    ).toBe(DEFAULT_CONTEXT_TOKENS);
   });
 });

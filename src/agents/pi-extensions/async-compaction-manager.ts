@@ -136,11 +136,10 @@ export function maybeRunStandaloneConsolidation(params: { sessionKey: string }):
 /** Phase of the per-session state machine.
  *  - idle/scheduled/snapshotting/summarizing/splicing: normal lifecycle
  *  - failed: transient — auto-reset to idle after a 30s cooldown
- *  - disabled: TERMINAL — reached when failed-attempt count hits
- *    asyncMaxFailedAttempts. No auto-reset. Subsequent turns on this
- *    session are rejected by the pre-turn check in attempt.ts. Cleared
- *    only by explicit operator intervention (gateway restart, /reset,
- *    or a future admin RPC). */
+ *  - disabled: back-off after the failed-attempt count hits
+ *    asyncMaxFailedAttempts. SELF-HEALING — auto-re-enables (→ idle) after
+ *    DISABLED_COOLDOWN_MS (half-open). Does NOT gate agent turns; it only
+ *    pauses RE-TRIGGERING of background compaction during the back-off. */
 export type AsyncCompactionPhase =
   | "idle"
   | "scheduled"
@@ -262,6 +261,16 @@ const registry = new Map<string, AsyncCompactionState>();
 // Global semaphore — cap concurrent summarizer calls across all sessions
 let inFlightSummarizers = 0;
 
+// Hard deadline for one background summarizer round. If the summarizer hangs
+// (provider stall, dropped socket), abort it so the phase can't wedge at
+// "summarizing" forever and permanently leak an inFlightSummarizers slot (which
+// would silently starve compaction for every session). Real rounds run 30s–4min.
+const SUMMARIZER_TIMEOUT_MS = 300_000;
+// After asyncMaxFailedAttempts consecutive failures, stop RE-TRIGGERING for this
+// long, then re-enable (half-open). This is NOT a turn gate — the agent keeps
+// working throughout; it only paces retries of the background summarizer.
+const DISABLED_COOLDOWN_MS = 600_000;
+
 function getOrInitState(sessionKey: string): AsyncCompactionState {
   let state = registry.get(sessionKey);
   if (!state) {
@@ -316,6 +325,12 @@ export function maybeRequestAsyncCompaction(params: {
   /** Token budget for recent-turn preservation (mirror of safeguard
    *  keepRecentTokensBudget — derived from keepRecentTokensPct × contextWindow). */
   keepRecentTokensBudget?: number;
+
+  /** Cap on a single preserved `toolResult`, in estimated tokens. The
+   *  async path needs this as much as the sync one: both call the same
+   *  splitter, and the pairing pass there preserves tool results the
+   *  budget never counted. */
+  preservedToolResultMaxTokens?: number;
   /** Per-agent sessions.json path. When provided, the manager bumps
    *  compactionCount AND resets memoryFlushLastFiredAtTokens=null on
    *  every successful SPLICED. Without this, async splices don't tick
@@ -353,12 +368,12 @@ export function maybeRequestAsyncCompaction(params: {
   // IDLE is the single source of truth for retry cadence.
   if (state.phase !== "idle") {
     if (state.phase === "disabled") {
-      // Hit the consecutive-failure cap. attempt.ts will see this state
-      // via getAsyncCompactionState and reject the turn with an error
-      // event. This log line is just here for visibility on each
-      // trigger that gets dropped post-disable.
+      // Backing off after the consecutive-failure cap. This does NOT gate the
+      // agent's turns (attempt.ts no longer rejects) — it only skips RE-
+      // TRIGGERING compaction until the cooldown re-enables us (half-open).
+      // Log for visibility on each trigger dropped during the back-off.
       log.warn(
-        `[async-compaction] skip (DISABLED): session=${params.sessionKey} consecutiveFailures=${state.failed} lastError=${state.lastError ?? "?"}`,
+        `[async-compaction] skip (backing off): session=${params.sessionKey} consecutiveFailures=${state.failed} lastError=${state.lastError ?? "?"}`,
       );
     } else {
       log.debug(
@@ -413,6 +428,7 @@ export function maybeRequestAsyncCompaction(params: {
     contextWindow: params.contextWindow,
     totalTokens: params.totalTokens,
     keepRecentTokensBudget: params.keepRecentTokensBudget ?? 0,
+    preservedToolResultMaxTokens: params.preservedToolResultMaxTokens ?? 0,
     storePath: params.storePath,
   }).catch((err) => {
     handlePipelineFailure({
@@ -425,9 +441,9 @@ export function maybeRequestAsyncCompaction(params: {
 }
 
 /**
- * Returns the current state snapshot for a session (or null). Pre-turn
- * checks in attempt.ts use this to detect the DISABLED terminal state
- * and refuse to dispatch the turn.
+ * Returns the current state snapshot for a session (or null). Exposed for
+ * observability/diagnostics — it does NOT gate turns. (Turns are never gated
+ * on async-compaction state; async compaction is a background optimization.)
  */
 export function getAsyncCompactionState(
   sessionKey: string,
@@ -436,9 +452,9 @@ export function getAsyncCompactionState(
 }
 
 /**
- * Convenience predicate for the attempt.ts pre-turn check. Returns
- * { disabled: true, ... } iff the session's async compaction is in
- * the terminal DISABLED state (hit asyncMaxFailedAttempts).
+ * Observability predicate: returns { disabled: true, ... } iff the session's
+ * async compaction is currently in its self-healing back-off. Diagnostics
+ * only — no caller uses this to block a turn.
  */
 export function isAsyncCompactionDisabled(sessionKey: string): {
   disabled: boolean;
@@ -481,6 +497,7 @@ async function runAsyncCompactionPipeline(params: {
   contextWindow: number;
   totalTokens: number;
   keepRecentTokensBudget: number;
+  preservedToolResultMaxTokens: number;
   storePath?: string;
 }): Promise<void> {
   const { state } = params;
@@ -563,6 +580,19 @@ async function runAsyncCompactionPipeline(params: {
   state.phase = "summarizing";
   state.abortController = new AbortController();
   inFlightSummarizers += 1;
+  // Hard deadline: abort a hung summarizer so the phase can't wedge and the
+  // inFlight slot can't leak. The finally below always clears it and releases
+  // the slot, on EVERY exit path (no-op return, throw, or fall-through).
+  const summarizerTimeout = setTimeout(() => {
+    log.warn(
+      `[async-compaction] summarizer exceeded ${SUMMARIZER_TIMEOUT_MS}ms — aborting: session=${state.sessionKey}`,
+    );
+    try {
+      state.abortController?.abort();
+    } catch {
+      /* already settled */
+    }
+  }, SUMMARIZER_TIMEOUT_MS);
 
   const summarizationStart = Date.now();
   let summaryResult: SummaryResult;
@@ -577,6 +607,7 @@ async function runAsyncCompactionPipeline(params: {
       ? splitPreservedRecentTurnsByTokens({
           messages: messagesAfterPriorSummary,
           keepRecentTokensBudget: params.keepRecentTokensBudget,
+          preservedToolResultMaxTokens: params.preservedToolResultMaxTokens,
         })
       : (() => {
           // Fallback: no budget configured — preserve only the last message
@@ -593,12 +624,15 @@ async function runAsyncCompactionPipeline(params: {
     );
 
     if (summarizableMessages.length === 0) {
+      // Honest no-op: the tail already fits keepRecentTokensBudget, so there's
+      // nothing older to summarize — this reduced NOTHING. If the session is
+      // still over threshold here, that's a keepRecentTokensPct signal, not a
+      // compaction that silently "succeeded" at shrinking context.
       log.info(
-        `[async-compaction] nothing to summarize: session=${state.sessionKey} sincePriorSummary=${messagesAfterPriorSummary.length} all-preserved — skipping`,
+        `[async-compaction] nothing to summarize (reduced 0 tokens): session=${state.sessionKey} sincePriorSummary=${messagesAfterPriorSummary.length} all within keepRecent budget — skipping`,
       );
       state.phase = "idle";
-      inFlightSummarizers -= 1;
-      emitAsyncCompactionEvent(state, "end", { ok: true, reason: "no-op" });
+      emitAsyncCompactionEvent(state, "end", { ok: true, reason: "no-op", reducedTokens: 0 });
       return;
     }
 
@@ -663,12 +697,12 @@ async function runAsyncCompactionPipeline(params: {
       );
     }
 
-    // Estimate the post-splice context size so the post-splice store
-    // update can write a fresh, reduced totalTokens. Mirrors the sync
-    // safeguard's newContentTokens math (compaction-safeguard.ts): the
-    // summarized messages are removed and replaced by the (much smaller)
-    // summary. summaryTokens uses a chars/4 estimate — it's tiny relative
-    // to the freed amount, so precision there is irrelevant.
+    // PROVISIONAL post-splice estimate from the SNAPSHOT populations. It is
+    // OVERWRITTEN at splice time (below) with the true size measured from the
+    // live retained entries: the snapshot math ignores turns that accreted
+    // during the window, so on its own it writes a fictionally-low totalTokens
+    // (which is exactly why the next trigger never re-fired and context stayed
+    // high).
     const summarizableTokens = estimateMessagesTokens(summarizableMessages);
     const summaryTokens = Math.ceil(summary.length / 4);
     const tokensAfter = Math.max(
@@ -686,7 +720,6 @@ async function runAsyncCompactionPipeline(params: {
       `[async-compaction] summary done: session=${state.sessionKey} chars=${summary.length} elapsedMs=${summaryResult.summarizationMs}`,
     );
   } catch (err) {
-    inFlightSummarizers -= 1;
     handlePipelineFailure({
       state,
       errorMessage: err instanceof Error ? err.message : String(err),
@@ -694,8 +727,10 @@ async function runAsyncCompactionPipeline(params: {
       context: "summarize",
     });
     return;
+  } finally {
+    clearTimeout(summarizerTimeout);
+    inFlightSummarizers -= 1;
   }
-  inFlightSummarizers -= 1;
 
   // ── SPLICING ─────────────────────────────────────────────────────────
   state.phase = "splicing";
@@ -726,13 +761,28 @@ async function runAsyncCompactionPipeline(params: {
     return;
   }
 
-  // Count of message-type entries added between snapshot and splice —
-  // these survive the splice because they were appended AFTER firstKeptEntryId.
-  const messageEntriesAtSplice = liveEntriesAtSplice.filter(
-    (e) => e?.type === "message",
-  ).length;
-  const messagesAddedDuringWindow =
-    messageEntriesAtSplice - messageEntriesAfterPriorSummary.length;
+  // TRUTHFUL post-splice size, measured from the LIVE retained set: the new
+  // summary marker PLUS every entry kept from firstKeptEntryId onward (which
+  // includes the turns that accreted during the window). Overwrites the
+  // snapshot-based provisional above. With an honest totalTokens, the existing
+  // per-turn trigger re-fires while the session is still over threshold and
+  // folds the accreted turns into the cumulative summary over the next turn or
+  // two — lossless, because nothing is dropped until a summary already covers
+  // it. (firstKeptEntryId is guaranteed present — checked just above.)
+  const firstKeptIndex = liveEntriesAtSplice.findIndex(
+    (e) => e?.id === summaryResult.firstKeptEntryId,
+  );
+  const keptMessages =
+    firstKeptIndex >= 0
+      ? liveEntriesAtSplice
+          .slice(firstKeptIndex)
+          .map((e) => e?.message)
+          .filter((m): m is AgentMessage => !!m)
+      : [];
+  const messagesKeptAfterSplice = keptMessages.length;
+  summaryResult.tokensAfter =
+    Math.ceil(summaryResult.summary.length / 4) +
+    estimateMessagesTokens(keptMessages);
   try {
     params.sessionManager.appendCompaction(
       summaryResult.summary,
@@ -741,7 +791,7 @@ async function runAsyncCompactionPipeline(params: {
       {
         asyncTriggered: true,
         summarizationMs: summaryResult.summarizationMs,
-        messagesAddedDuringWindow,
+        messagesKeptAfterSplice,
       },
       true, // fromHook
     );
@@ -754,7 +804,7 @@ async function runAsyncCompactionPipeline(params: {
     state.failed = 0;
     state.lastError = undefined;
     log.info(
-      `[async-compaction] SPLICED: session=${state.sessionKey} summary=${summaryResult.summary.length}c tokensBefore=${summaryResult.tokensBefore} messagesAddedDuringWindow=${messagesAddedDuringWindow} totalElapsedMs=${Date.now() - state.startedAt} succeeded#${state.succeeded}${failedAtSuccessReset > 0 ? ` consecutiveFailuresResetFrom=${failedAtSuccessReset}` : ""}`,
+      `[async-compaction] SPLICED: session=${state.sessionKey} summary=${summaryResult.summary.length}c tokensBefore=${summaryResult.tokensBefore} tokensAfter=${summaryResult.tokensAfter} messagesKeptAfterSplice=${messagesKeptAfterSplice} totalElapsedMs=${Date.now() - state.startedAt} succeeded#${state.succeeded}${failedAtSuccessReset > 0 ? ` consecutiveFailuresResetFrom=${failedAtSuccessReset}` : ""}`,
     );
     // Splice committed — context is now reduced. Tell subscribers (chat
     // dispatcher on the control panel) it's safe to dispatch new turns.
@@ -825,8 +875,10 @@ async function runAsyncCompactionPipeline(params: {
 // ── Helpers ────────────────────────────────────────────────────────────────
 
 /** Centralized failure handler. Bumps the consecutive-failure counter
- *  and transitions to either FAILED (transient, auto-reset in 30s) or
- *  DISABLED (terminal — only cleared by operator intervention).
+ *  and transitions to either FAILED (transient, auto-reset in 30s) or,
+ *  past the cap, DISABLED — a SELF-HEALING back-off that re-enables after
+ *  DISABLED_COOLDOWN_MS (half-open). Neither state gates agent turns; both
+ *  only pace background compaction retries.
  *
  *  Failure count is reset to 0 on any SPLICED success — so the cap
  *  is for consecutive failures, not lifetime. */
@@ -840,18 +892,33 @@ function handlePipelineFailure(params: {
   state.failed += 1;
   state.lastError = errorMessage;
   if (state.failed >= maxFailedAttempts) {
+    // Back off from RE-TRIGGERING compaction for a cooldown, then re-enable
+    // (half-open). This is NOT a turn gate: the agent keeps taking turns
+    // throughout (attempt.ts no longer rejects) — async compaction is a
+    // background optimization, and the sync safeguard bounds context at the
+    // hard limit if a broken summarizer keeps this backed off. Self-healing —
+    // the next successful splice resets the counter to 0.
     state.phase = "disabled";
     log.error(
-      `[async-compaction] DISABLED (terminal): session=${state.sessionKey} consecutiveFailures=${state.failed} cap=${maxFailedAttempts} context=${context} lastError=${errorMessage}. No further attempts will be made. Pre-turn check in attempt.ts will reject new turns. Manual unblock required: gateway restart or admin RPC.`,
+      `[async-compaction] backing off (self-healing): session=${state.sessionKey} consecutiveFailures=${state.failed} cap=${maxFailedAttempts} context=${context} lastError=${errorMessage}. Retrying after ${Math.round(DISABLED_COOLDOWN_MS / 1000)}s; agent turns are unaffected.`,
     );
-    // Terminal — dispatcher must stop waiting (will never resume on its own).
+    // terminal:false — this resumes on its own; the CP dispatcher must not
+    // treat it as permanent.
     emitAsyncCompactionEvent(state, "end", {
       ok: false,
-      terminal: true,
+      terminal: false,
       reason: context,
       consecutiveFailures: state.failed,
       lastError: errorMessage,
     });
+    setTimeout(() => {
+      if (state.phase === "disabled") {
+        state.phase = "idle";
+        log.info(
+          `[async-compaction] cooldown elapsed — re-enabling (half-open): session=${state.sessionKey}`,
+        );
+      }
+    }, DISABLED_COOLDOWN_MS);
     return;
   }
   state.phase = "failed";

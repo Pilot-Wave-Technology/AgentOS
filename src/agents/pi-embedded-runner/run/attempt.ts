@@ -35,6 +35,8 @@ import { isReasoningTagProvider } from "../../../utils/provider-utils.js";
 import { resolveOpenClawAgentDir } from "../../agent-paths.js";
 import { resolveSessionAgentIds } from "../../agent-scope.js";
 import { createAnthropicPayloadLogger } from "../../anthropic-payload-log.js";
+// Model Registry fork addition — logic lives in the file we own.
+import { createGeminiFinishReasonLogger } from "../../google-finish-reason-log.js";
 import {
   analyzeBootstrapBudget,
   buildBootstrapPromptWarning,
@@ -102,7 +104,6 @@ import { appendCacheTtlTimestamp, isCacheTtlEligibleProvider } from "../cache-tt
 import type { CompactEmbeddedPiSessionParams } from "../compact.js";
 import { buildEmbeddedExtensionFactories } from "../extensions.js";
 import {
-  isAsyncCompactionDisabled,
   maybeRequestAsyncCompaction,
   maybeRunStandaloneConsolidation,
   type AsyncCompactionSessionEntry,
@@ -146,6 +147,7 @@ import { pruneProcessedHistoryImages } from "./history-image-prune.js";
 import { detectAndLoadPromptImages } from "./images.js";
 import type { EmbeddedRunAttemptParams, EmbeddedRunAttemptResult } from "./types.js";
 import { fireLifecycleWebhook } from "../../../agents/lifecycle-webhook.js";
+import { getMiscModelOverride } from "../../misc-model-overrides.js";
 
 type PromptBuildHookRunner = {
   hasHooks: (hookName: "before_prompt_build" | "before_agent_start") => boolean;
@@ -1430,29 +1432,12 @@ export async function runEmbeddedAttempt(
         );
       }
 
-      // Pre-turn block: if async compaction hit its consecutive-failure
-      // cap on a previous turn, refuse to dispatch this one. The agent
-      // is in a terminal DISABLED state until the gateway restarts
-      // (which is the operator unblock mechanism). Emitting an error
-      // here means no LLM call, no context growth, no further data-loss
-      // risk from a broken summarizer.
-      if (asyncCompactionEnabled) {
-        const disableCheck = isAsyncCompactionDisabled(
-          sandboxSessionKey ?? params.sessionId,
-        );
-        if (disableCheck.disabled) {
-          const errMsg =
-            `Agent is in async-compaction-disabled state ` +
-            `(${disableCheck.consecutiveFailures} consecutive failures; ` +
-            `last error: ${disableCheck.lastError ?? "?"}). ` +
-            `No new turns will be processed until manual intervention ` +
-            `(gateway restart).`;
-          log.error(
-            `[async-compaction] REJECTING turn: session=${sandboxSessionKey ?? params.sessionId} ${errMsg}`,
-          );
-          throw new Error(errMsg);
-        }
-      }
+      // Async compaction NEVER gates a turn. By design the agent is available
+      // at all times — async compaction is a background optimization. If the
+      // summarizer is failing, the manager backs off and self-heals, and the
+      // SYNC safeguard (configured just below, using the agent's own model)
+      // bounds context at the hard limit. We deliberately do NOT reject turns
+      // on async-compaction state.
 
       // Sets compaction/pruning runtime state and returns extension factories
       // that must be passed to the resource loader for the safeguard to be active.
@@ -1567,6 +1552,19 @@ export async function runEmbeddedAttempt(
         modelId: params.modelId,
         modelApi: params.model.api,
         workspaceDir: params.workspaceDir,
+      });
+
+      // MODEL REGISTRY (fork addition — see google-finish-reason-log.ts for the
+      // full rationale). There is no Google equivalent of the Anthropic payload
+      // logger above: pi-ai maps Gemini's `finishReason` onto a generic
+      // stopReason and throws the constant "An unknown error occurred",
+      // destroying the only field that says WHY. This records it. Idempotent,
+      // silent unless a turn ends abnormally, and fail-open throughout.
+      const geminiFinishReasonLogger = createGeminiFinishReasonLogger({
+        runId: params.runId,
+        sessionId: activeSession.sessionId,
+        provider: params.provider,
+        modelId: params.modelId,
       });
 
       // Ollama native API: bypass SDK's streamSimple and use direct /api/chat calls
@@ -1738,6 +1736,15 @@ export async function runEmbeddedAttempt(
         );
       }
 
+      // Fork addition. Establishes this run's identity in an AsyncLocalStorage scope so
+      // the Gemini diagnostic's process-wide fetch interceptor labels each anomaly with
+      // the run that actually caused it. Without this, concurrent Gemini agents share a
+      // single "current run" and failures get mis-attributed. Adds no behaviour to the
+      // stream itself — it only carries context.
+      activeSession.agent.streamFn = geminiFinishReasonLogger.wrapStreamFn(
+        activeSession.agent.streamFn,
+      );
+
       try {
         const prior = await sanitizeSessionHistory({
           messages: activeSession.messages,
@@ -1870,13 +1877,21 @@ export async function runEmbeddedAttempt(
       // agent's model fails when it's a synthetic context-window variant
       // — verified 2026-05-26 when gemini-2.5-flash-100k returned 404 from
       // Gemini's API and the fallback chain produced an 84-char stub that
-      // replaced 47 messages of real conversation. The synthetic-id rewrite
-      // only fires at createAgentSession boundary, not on ad-hoc
-      // generateSummary calls.
+      // replaced 47 messages of real conversation. As a defensive guard we
+      // now ALSO run the upstream-id rewrite on the resolved summarizer model
+      // below (the same one createAgentSession applies), so even a synthetic
+      // compaction.model is sent to the provider as its real upstream id
+      // instead of 404-ing.
       let asyncCompactionApiKey: string | undefined;
       let asyncCompactionModel: typeof params.model | undefined;
       if (params.config?.agents?.defaults?.compaction?.asyncEnabled) {
-        const configuredModelRef = params.config?.agents?.defaults?.compaction?.model;
+        // The control panel's choice (Model Registry -> misc models ->
+        // "Gateway compaction summarizer") wins; the provisioned config
+        // value is what a gateway uses before its first poll lands.
+        const configuredModelRef = getMiscModelOverride(
+          "gateway_compaction",
+          params.config?.agents?.defaults?.compaction?.model ?? "",
+        );
         if (typeof configuredModelRef === "string" && configuredModelRef.length > 0) {
           const slashIdx = configuredModelRef.indexOf("/");
           if (slashIdx > 0) {
@@ -1888,7 +1903,18 @@ export async function runEmbeddedAttempt(
                 summarizerModelId,
               ) as typeof params.model | null;
               if (resolved) {
-                asyncCompactionModel = resolved;
+                // Defensive: rewrite a synthetic context-window id (e.g.
+                // gemini-2.5-flash-100k) to its real upstream id before the
+                // ad-hoc generateSummary call — exactly as the primary turn
+                // does at the createAgentSession boundary. A real id (the
+                // intended config, e.g. google/gemini-2.5-flash) passes through
+                // unchanged.
+                asyncCompactionModel = applyUpstreamIdForApiCall({
+                  cfg: params.config,
+                  provider: summarizerProvider,
+                  modelId: summarizerModelId,
+                  model: resolved,
+                });
               } else {
                 log.warn(
                   `[async-compaction] configured summarizer model ${configuredModelRef} not found in registry — async compaction will no-op until config is fixed`,
@@ -2059,6 +2085,9 @@ export async function runEmbeddedAttempt(
             customInstructions: asyncCompactionCustomInstructions,
             summarizationInstructions: asyncCompactionSummarizationInstructions,
             keepRecentTokensBudget: asyncCompactionKeepRecentTokensBudget,
+            preservedToolResultMaxTokens:
+              params.config?.agents?.defaults?.compaction
+                ?.preservedToolResultMaxTokens ?? 0,
             // Per-agent sessions.json path — the async manager writes
             // here after each successful SPLICED to bump compactionCount
             // and reset memoryFlushLastFiredAtTokens=null (without this,
