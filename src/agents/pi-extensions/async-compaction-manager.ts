@@ -603,7 +603,7 @@ async function runAsyncCompactionPipeline(params: {
     // appendCompaction replaces all entries before it with the new
     // compactionSummary marker.
     const messagesAfterPriorSummary = snapshot.messages;
-    const { summarizableMessages, preservedMessages } = params.keepRecentTokensBudget > 0
+    let { summarizableMessages, preservedMessages } = params.keepRecentTokensBudget > 0
       ? splitPreservedRecentTurnsByTokens({
           messages: messagesAfterPriorSummary,
           keepRecentTokensBudget: params.keepRecentTokensBudget,
@@ -622,6 +622,36 @@ async function runAsyncCompactionPipeline(params: {
     log.info(
       `[async-compaction] split: session=${state.sessionKey} summarizable=${summarizableMessages.length} preservedVerbatim=${preservedMessages.length} budget=${params.keepRecentTokensBudget}`,
     );
+
+    // THE TAIL ITSELF IS OVER BUDGET. This compaction was triggered because
+    // the session is past asyncSoftTriggerPct, yet the split kept every
+    // entry since the last summary as "recent". That happens when the newest
+    // turns are heavy -- above all a large tool result, which the pairing
+    // pass keeps without counting against the budget. Skipping here left the
+    // session over threshold on every later turn, triggering and skipping
+    // until it overflowed (seen on a GO: 82%, 85%, 91%, all "nothing to
+    // summarize"). Retry with the smallest tail possible -- the latest
+    // assistant step and its tool results -- and summarize everything before
+    // it, including the human message that started the current tool loop
+    // (the summary carries it). Anchoring on the user+assistant PAIR would
+    // keep that whole loop, which is exactly the case that gets stuck.
+    // The splice keeps original entries, so summarizing is the only thing
+    // that actually removes an oversized result from the session.
+    if (summarizableMessages.length === 0 && params.keepRecentTokensBudget > 0) {
+      const minimal = splitPreservedRecentTurnsByTokens({
+        messages: messagesAfterPriorSummary,
+        keepRecentTokensBudget: 1,
+        preservedToolResultMaxTokens: params.preservedToolResultMaxTokens,
+        anchorAssistantOnly: true,
+      });
+      if (minimal.summarizableMessages.length > 0) {
+        log.info(
+          `[async-compaction] tail over budget — retrying with minimal tail: session=${state.sessionKey} summarizable=${minimal.summarizableMessages.length} preservedVerbatim=${minimal.preservedMessages.length}`,
+        );
+        summarizableMessages = minimal.summarizableMessages;
+        preservedMessages = minimal.preservedMessages;
+      }
+    }
 
     if (summarizableMessages.length === 0) {
       // Honest no-op: the tail already fits keepRecentTokensBudget, so there's

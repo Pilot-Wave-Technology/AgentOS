@@ -286,6 +286,17 @@ export function splitPreservedRecentTurnsByTokens(params: {
    *  Capping the RESULT keeps every message — the turns, the reasoning,
    *  which tools ran — and shortens only the payload. */
   preservedToolResultMaxTokens?: number;
+  /** Anchor on the latest assistant message alone instead of the latest
+   *  user+assistant pair. Default false (the pair).
+   *
+   *  The pair anchor walks back until it meets a user message, so on an
+   *  agent running a long tool loop in reply to ONE human message, the
+   *  whole loop -- every call and every result since that message -- is
+   *  "the latest pair" and can never be summarized. Async compaction uses
+   *  this as its last resort when the normal split leaves nothing to
+   *  summarize: the latest model step and its results stay verbatim, and
+   *  the summary carries the request that started the loop. */
+  anchorAssistantOnly?: boolean;
 }): { summarizableMessages: AgentMessage[]; preservedMessages: AgentMessage[] } {
   const budget = Math.max(0, Math.floor(params.keepRecentTokensBudget));
   if (budget <= 0) {
@@ -308,8 +319,11 @@ export function splitPreservedRecentTurnsByTokens(params: {
     }
     const msgTokens = estimateMessagesTokens([msg]);
     const wouldExceed = runningTokens + msgTokens > budget && preservedIndexSet.size > 0;
-    // Guarantee at least one user+assistant pair regardless of size.
-    const isLatestPairAnchor = !latestUserSeen || !latestAssistantSeen;
+    // Guarantee at least one user+assistant pair regardless of size (or, with
+    // anchorAssistantOnly, the latest assistant message).
+    const isLatestPairAnchor = params.anchorAssistantOnly
+      ? !latestAssistantSeen
+      : !latestUserSeen || !latestAssistantSeen;
     if (wouldExceed && !isLatestPairAnchor) {
       break;
     }

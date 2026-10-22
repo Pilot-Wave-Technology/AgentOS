@@ -55,7 +55,7 @@ import { DEFAULT_CONTEXT_TOKENS } from "../../defaults.js";
 import { resolveOpenClawDocsPath } from "../../docs-path.js";
 import { isTimeoutError } from "../../failover-error.js";
 import { resolveImageSanitizationLimits } from "../../image-sanitization.js";
-import { resolveModelAuthMode } from "../../model-auth.js";
+import { getApiKeyForModel, resolveModelAuthMode } from "../../model-auth.js";
 import { normalizeProviderId, resolveDefaultModelForAgent } from "../../model-selection.js";
 import { supportsModelTools } from "../../model-tool-support.js";
 import { createConfiguredOllamaStreamFn } from "../../ollama-stream.js";
@@ -117,7 +117,7 @@ import {
 } from "../google.js";
 import { getDmHistoryLimitFromSessionKey, limitHistoryTurns } from "../history.js";
 import { log } from "../logger.js";
-import { buildModelAliasLines } from "../model.js";
+import { buildModelAliasLines, resolveModelWithRegistry } from "../model.js";
 import {
   clearActiveEmbeddedRun,
   type EmbeddedPiQueueHandle,
@@ -1898,10 +1898,19 @@ export async function runEmbeddedAttempt(
             const summarizerProvider = configuredModelRef.slice(0, slashIdx);
             const summarizerModelId = configuredModelRef.slice(slashIdx + 1);
             try {
-              const resolved = params.modelRegistry.find(
-                summarizerProvider,
-                summarizerModelId,
-              ) as typeof params.model | null;
+              // The same resolution an agent's own model gets: the per-agent
+              // registry (models.json) and then the providers the control
+              // plane pushes into config (models.providers), where the
+              // context-window variants live. A bare modelRegistry.find()
+              // saw only models.json, so a summarizer that was a perfectly
+              // good catalog variant was "not found" and async compaction
+              // silently no-op'd. compact.ts already resolves this way.
+              const resolved = (resolveModelWithRegistry({
+                provider: summarizerProvider,
+                modelId: summarizerModelId,
+                modelRegistry: params.modelRegistry,
+                cfg: params.config,
+              }) ?? null) as typeof params.model | null;
               if (resolved) {
                 // Defensive: rewrite a synthetic context-window id (e.g.
                 // gemini-2.5-flash-100k) to its real upstream id before the
@@ -1937,8 +1946,24 @@ export async function runEmbeddedAttempt(
         }
         if (asyncCompactionModel) {
           try {
+            // The gateway's own auth path first (provider config pushed by
+            // the control plane, auth profiles, env), as compact.ts and the
+            // primary turn use; the registry's view only as a fallback. A
+            // summarizer resolved from models.providers is not in the
+            // registry, so registry-only lookup returned no key and the
+            // manager no-op'd silently.
+            const auth = await getApiKeyForModel({
+              model: asyncCompactionModel,
+              cfg: params.config,
+              agentDir,
+            });
             asyncCompactionApiKey =
-              await params.modelRegistry.getApiKey(asyncCompactionModel);
+              auth.apiKey ?? (await params.modelRegistry.getApiKey(asyncCompactionModel));
+            if (!asyncCompactionApiKey) {
+              log.warn(
+                `[async-compaction] no API key for summarizer ${asyncCompactionModel.provider}/${asyncCompactionModel.id ?? "?"} (auth mode: ${auth.mode}) — async compaction will no-op`,
+              );
+            }
           } catch (err) {
             log.warn(
               `[async-compaction] apiKey resolution failed for summarizer ${asyncCompactionModel.id ?? "?"}: ${err instanceof Error ? err.message : String(err)} — async compaction will no-op`,

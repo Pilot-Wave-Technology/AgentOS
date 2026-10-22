@@ -264,3 +264,52 @@ describe("capPreservedToolResults with a total allowance", () => {
 function assertNotEqual(a: number, b: number): void {
   if (a === b) throw new Error(`expected a difference, both were ${a}`);
 }
+
+/**
+ * A tool loop in reply to ONE human message can never be summarized by the
+ * pair anchor: the walk keeps going until it meets that user message, so
+ * every call and result in the loop -- including a huge one -- is "recent".
+ * Async compaction triggered, found nothing to summarize and skipped on
+ * every later turn while the session sat above its threshold. Its last
+ * resort anchors on the latest assistant step instead.
+ */
+describe("splitPreservedRecentTurnsByTokens anchor", () => {
+  const loop = [
+    user("summarize the repo"),
+    assistantCalling("a"),
+    tr("a", big(200_000)),
+    assistantCalling("b"),
+    tr("b", "ok"),
+    assistantCalling("c"),
+    tr("c", "ok"),
+  ];
+
+  it("keeps a whole single-message tool loop with the default pair anchor", () => {
+    const out = splitPreservedRecentTurnsByTokens({
+      messages: loop,
+      keepRecentTokensBudget: 20_000,
+    });
+    expect(out.summarizableMessages).toHaveLength(0);
+  });
+
+  it("opens the loop when anchored on the latest assistant step", () => {
+    const out = splitPreservedRecentTurnsByTokens({
+      messages: loop,
+      keepRecentTokensBudget: 1,
+      anchorAssistantOnly: true,
+    });
+    // The latest step and its result stay; the request, the huge result and
+    // the earlier steps go to the summarizer.
+    expect(out.preservedMessages).toEqual([loop[5], loop[6]]);
+    expect(out.summarizableMessages).toContain(loop[0]);
+    expect(out.summarizableMessages).toContain(loop[2]);
+  });
+
+  it("leaves the default anchor unchanged for the in-line safeguard", () => {
+    const withoutFlag = splitPreservedRecentTurnsByTokens({
+      messages: loop,
+      keepRecentTokensBudget: 1,
+    });
+    expect(withoutFlag.summarizableMessages).toHaveLength(0);
+  });
+});
