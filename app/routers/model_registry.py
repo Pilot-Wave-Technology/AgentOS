@@ -100,6 +100,7 @@ from app.services.model_registry.emitter import (
     build_providers_payload,
 )
 from app.services.model_registry.gateway_sync import sync_gateway_model_catalog
+from app.services.model_registry.gateway_variant import gateway_model_id
 from app.services.model_registry.management import (
     ManagementError,
     add_context_window_v2,
@@ -199,6 +200,15 @@ async def internal_misc_model_settings(request: Request):
     # provisioned value (see `gateway_compaction` in misc_models.py).
     overrides = {row["purpose_key"]: row["model_id"] for row in rows
                  if row["is_override"] or row["serve_default"]}
+    # The gateway looks the compaction summarizer up in its own registry,
+    # which holds context-window variants, not base ids: serve the largest
+    # variant (gateway_variant.py says why).
+    if "gateway_compaction" in overrides:
+        try:
+            overrides["gateway_compaction"] = await gateway_model_id(
+                pool, overrides["gateway_compaction"])
+        except Exception as exc:
+            logger.error("misc_model_settings: summarizer variant lookup failed — %s", exc)
     payload = {
         "overrides": overrides,
         "generated_at": datetime.now(timezone.utc).isoformat(),
